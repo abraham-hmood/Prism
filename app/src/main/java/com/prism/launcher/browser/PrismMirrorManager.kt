@@ -18,7 +18,9 @@ import java.security.MessageDigest
 object PrismMirrorManager {
 
     private const val TAG = "PrismMirror"
-    private val scope = CoroutineScope(Dispatchers.IO)
+    private val scope = CoroutineScope(
+        Dispatchers.IO + com.prism.launcher.PrismLogger.coroutineHandler("MirrorManager")
+    )
 
     private val _syncProgress = MutableStateFlow<Map<String, Int>>(emptyMap())
     val syncProgress: StateFlow<Map<String, Int>> = _syncProgress
@@ -33,11 +35,11 @@ object PrismMirrorManager {
                 val response = engine.fetchMeshContent(manifestUrl) ?: throw Exception("Host unreachable (Remote)")
                 if (!response.isSuccessful) throw Exception("Failed to fetch manifest: ${response.code}")
                 
-                val manifestJson = org.json.JSONObject(response.body?.string() ?: "{}")
+                val manifestJson = com.prism.core.json.JSONObject(response.body?.string() ?: "{}")
                 val files = manifestJson.getJSONArray("files")
                 val total = files.length()
                 
-                val mirrorsDir = PrismSettings.getMirrorsDir(context)
+                val mirrorsDir = PrismSettings.getMirrorsDir()
                 val siteDir = java.io.File(mirrorsDir, domain)
                 if (!siteDir.exists()) siteDir.mkdirs()
 
@@ -113,7 +115,7 @@ object PrismMirrorManager {
 
     private fun finalizeMirror(context: Context, domain: String, localPath: String) {
         // 1. Register as a Mirror for internal tracking
-        val mirrors = PrismSettings.getP2pMirroredSites(context).toMutableList()
+        val mirrors = PrismSettings.getP2pMirroredSites().toMutableList()
         mirrors.removeAll { it.domain == domain }
         mirrors.add(PrismSettings.P2pMirroredSite(
             domain,
@@ -121,17 +123,17 @@ object PrismMirrorManager {
             originalHost = "Mesh",
             lastSync = System.currentTimeMillis()
         ))
-        PrismSettings.setP2pMirroredSites(context, mirrors)
+        PrismSettings.setP2pMirroredSites(mirrors)
         
         // 2. Automatically start HOSTING this content to the mesh
-        val hosting = PrismSettings.getP2pHostedSites(context).toMutableList()
+        val hosting = PrismSettings.getP2pHostedSites().toMutableList()
         if (hosting.none { it.domain == domain }) {
             hosting.add(PrismSettings.P2pHostedSite(
                 domain = domain,
                 localPath = localPath,
                 isActive = true
             ))
-            PrismSettings.setP2pHostedSites(context, hosting)
+            PrismSettings.setP2pHostedSites(hosting)
         }
 
         // 3. Register in local DNS as a provider (prioritizes local loopback)

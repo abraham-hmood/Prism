@@ -239,7 +239,7 @@ class ConversationActivity : AppCompatActivity() {
     }
 
     private suspend fun loadAiMessages() {
-        val dao = com.prism.launcher.AppDatabase.get(this@ConversationActivity).aiMessageDao()
+        val dao = com.prism.launcher.AppDatabase.get().aiMessageDao()
         dao.getAllMessages().collect { entities ->
             val messages = entities.map {
                 MessageInfo(it.text, it.isSent, it.attachmentUri?.let { Uri.parse(it) }, it.attachmentType, timestamp = it.timestamp)
@@ -359,7 +359,7 @@ class ConversationActivity : AppCompatActivity() {
             com.prism.launcher.nora.NoraChatStore.setFeedback(
                 ctx, token, feedback = value, showFeedback = keepVisible
             )
-            val accepted = com.prism.launcher.nora.NoraFeedback.rate(ctx, token, positive)
+            val accepted = com.prism.launcher.nora.NoraFeedback.rate(token, positive)
             loadNoraMessages()
             withContext(Dispatchers.Main) {
                 if (accepted) {
@@ -442,7 +442,7 @@ class ConversationActivity : AppCompatActivity() {
 
     private fun sendToSam(text: String, uri: Uri?, mime: String?) {
         lifecycleScope.launch(Dispatchers.IO) {
-            val db = com.prism.launcher.AppDatabase.get(this@ConversationActivity)
+            val db = com.prism.launcher.AppDatabase.get()
             val dao = db.aiMessageDao()
 
             // 1. Save User Message

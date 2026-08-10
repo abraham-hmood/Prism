@@ -124,7 +124,7 @@ class NoraTrainingActivity : PrismBaseActivity() {
         box.addView(
             IosUi.sectionFooter(
                 ctx,
-                "Drop images into ${NoraConfig.datasetDir(ctx).absolutePath} and name each file " +
+                "Drop images into ${NoraConfig.datasetDir().absolutePath} and name each file " +
                     "after what it shows — “a red apple on a table.png” teaches exactly that."
             )
         )
@@ -266,7 +266,7 @@ class NoraTrainingActivity : PrismBaseActivity() {
             clipToOutline = true
         }
 
-        if (PrismSettings.getNoraVisualizerEnabled(ctx)) {
+        if (PrismSettings.getNoraVisualizerEnabled()) {
             brainView = NoraBrainView(ctx).apply {
                 setDarkTheme(IosUi.isDark(ctx))
                 layoutParams = FrameLayout.LayoutParams(
@@ -382,7 +382,7 @@ class NoraTrainingActivity : PrismBaseActivity() {
         val n = NoraStudio.datasetSize(this)
         datasetValue.text = "$n image${if (n == 1) "" else "s"}"
         statusValue.text = if (NoraStudio.isTrained(this)) {
-            "${NoraPersistence.sizeBytes(this) / 1024} KB on disk"
+            "${NoraPersistence.sizeBytes() / 1024} KB on disk"
         } else {
             "Untrained"
         }
@@ -547,7 +547,7 @@ class NoraTrainingActivity : PrismBaseActivity() {
         androidx.appcompat.app.AlertDialog.Builder(this)
             .setTitle("Storage access needed")
             .setMessage(
-                "Nora reads her dataset from ${NoraConfig.datasetDir(this).absolutePath} and " +
+                "Nora reads her dataset from ${NoraConfig.datasetDir().absolutePath} and " +
                     "checkpoints her connectome alongside it. Without all-files access that " +
                     "folder reads as empty even when it isn't."
             )

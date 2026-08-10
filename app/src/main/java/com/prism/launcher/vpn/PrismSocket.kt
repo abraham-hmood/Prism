@@ -5,7 +5,7 @@ import com.prism.launcher.PrismApp
 import com.prism.launcher.PrismLogger
 import com.prism.launcher.browser.P2pDnsManager
 import com.prism.launcher.browser.PrivateDnsVpnService
-import com.prism.launcher.MeshUtils
+import com.prism.core.MeshUtils
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetAddress

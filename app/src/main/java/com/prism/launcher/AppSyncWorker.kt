@@ -22,7 +22,7 @@ class AppSyncWorker(
 
     override suspend fun doWork(): Result {
         return try {
-            val dao = AppDatabase.get(ctx).installedAppDao()
+            val dao = AppDatabase.get().installedAppDao()
             val entities = queryLauncherApps(ctx)
             dao.clearAll()
             dao.insertAll(entities)

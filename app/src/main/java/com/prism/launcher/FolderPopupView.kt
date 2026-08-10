@@ -33,7 +33,7 @@ class FolderPopupView(
         binding.folderPopupRoot.setOnClickListener { onDismiss() }
         binding.folderCard.setOnClickListener { /* consume */ }
 
-        val glowColor = PrismSettings.getGlowColor(context)
+        val glowColor = PrismSettings.getGlowColor()
         binding.folderCard.background = NeonGlowDrawable(
             color = glowColor,
             cornerRadius = 32f * resources.displayMetrics.density,

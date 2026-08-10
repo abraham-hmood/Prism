@@ -1,5 +1,6 @@
 package com.prism.launcher.accesspoint
 
+import com.prism.launcher.accesspoint.AccessPointStore
 import android.os.Bundle
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
@@ -7,7 +8,7 @@ import androidx.lifecycle.lifecycleScope
 import com.prism.launcher.PrismBaseActivity
 import com.prism.launcher.PrismSettings
 import kotlinx.coroutines.launch
-import org.json.JSONObject
+import com.prism.core.json.JSONObject
 
 /**
  * Activity for creating and editing Prism Access Points.
@@ -172,7 +173,7 @@ class CreateAccessPointActivity : PrismBaseActivity() {
     private fun loadAccessPointData(apId: Long) {
         lifecycleScope.launch {
             try {
-                val aps = PrismSettings.getAccessPoints(this@CreateAccessPointActivity)
+                val aps = AccessPointStore.getAccessPoints()
                 val ap = aps.find { it.id == apId }
                 
                 if (ap != null) {
@@ -224,7 +225,7 @@ class CreateAccessPointActivity : PrismBaseActivity() {
 
             lifecycleScope.launch {
                 try {
-                    PrismSettings.saveAccessPoint(this@CreateAccessPointActivity, ap)
+                    AccessPointStore.saveAccessPoint(ap)
                     statusText.text = "✓ Access Point saved successfully"
                     
                     // Return to portal

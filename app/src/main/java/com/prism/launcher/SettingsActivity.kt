@@ -1,5 +1,7 @@
 package com.prism.launcher
 
+import com.prism.launcher.accesspoint.AccessPointStore
+import com.prism.core.MeshUtils
 import android.os.Bundle
 import android.text.InputType
 import android.widget.EditText
@@ -30,9 +32,210 @@ import com.prism.launcher.browser.P2pDnsManager
 
 class SettingsActivity : PrismBaseActivity() {
 
+    /**
+     * How the flat setting list is carved into top-level screens.
+     *
+     * Grouping is derived from the `SettingItem.Header` rows that already existed rather than
+     * from a second, parallel description of the settings. That is deliberate and it is the
+     * whole reason this refactor is safe: [buildItems] is untouched, so a setting cannot be
+     * dropped by being forgotten in a new list. Anything whose header is not claimed below
+     * still appears, under "Other" — the partition is total by construction.
+     */
+    private data class Group(val title: String, val summary: String, val headers: List<String>)
+
+    private companion object {
+        const val EXTRA_GROUP = "settings_group"
+
+        val GROUPS = listOf(
+            Group(
+                "Launcher & Appearance",
+                "Default page, gestures, layout, theme and fonts",
+                listOf("Launcher", "Launcher Aesthetic", "Typography")
+            ),
+            Group(
+                "Browser & Content",
+                "Search engine, browsing behaviour and blocked domains",
+                listOf("Browser", "Blocklist")
+            ),
+            Group(
+                "Network, VPN & Mesh",
+                "Tunnelling, hotspot gateway, WireGuard and decentralized DNS",
+                listOf(
+                    "Privacy & VPN",
+                    "Mesh Bootstrap Server",
+                    "Access Points (Hotspot Gateway)",
+                    "Native VPN Server (WireGuard)",
+                    "Decentralized Name System"
+                )
+            ),
+            Group(
+                "Intelligence & Messaging",
+                "AI engine, models, image generation, Nora and response behaviour",
+                listOf(
+                    "Intelligence & Messaging",
+                    "Available LLM Models",
+                    "Visual Intelligence (Diffusion)",
+                    "Nora (Brain-Based Generation)",
+                    "Response Behavior"
+                )
+            ),
+            Group(
+                "Virtualization",
+                "Run a guest OS inside Prism",
+                listOf("OS Virtualization")
+            )
+        )
+    }
+
     private lateinit var binding: ActivitySettingsBinding
     private lateinit var adapter: SettingsAdapter
+
+    /** Null on the root screen; otherwise the group whose settings are being shown. */
+    private var activeGroup: String? = null
+
+    private var searchQuery: String = ""
+
+    /** One header's worth of settings, in the order [buildItems] produced them. */
+    private class Block(val header: String, val items: List<SettingItem>)
+
+    /**
+     * Splits the flat list at its Header rows.
+     *
+     * Items before the first header (there are none today, but nothing enforces that) are kept
+     * under an empty header so they cannot silently vanish.
+     */
+    private fun blocks(): List<Block> {
+        val out = ArrayList<Block>()
+        var header = ""
+        var current = ArrayList<SettingItem>()
+        for (item in buildItems()) {
+            if (item is SettingItem.Header) {
+                if (current.isNotEmpty() || header.isNotEmpty()) out.add(Block(header, current))
+                header = item.title
+                current = ArrayList()
+            } else {
+                current.add(item)
+            }
+        }
+        if (current.isNotEmpty() || header.isNotEmpty()) out.add(Block(header, current))
+        return out
+    }
+
+    /** Which group a header belongs to, falling back so nothing is orphaned. */
+    private fun groupOf(header: String): String =
+        GROUPS.firstOrNull { header in it.headers }?.title ?: "Other"
+
+    /** What the list should currently show: root, one group, or search results. */
+    private fun displayItems(): List<SettingItem> {
+        val all = blocks()
+
+        if (searchQuery.isNotBlank()) return searchResults(all, searchQuery)
+
+        val group = activeGroup
+        if (group != null) {
+            return all.filter { groupOf(it.header) == group }
+                .flatMap { listOf(SettingItem.Header(it.header)) + it.items }
+        }
+
+        // Root: one row per group, plus "Other" if anything fell outside the map.
+        val present = all.groupBy { groupOf(it.header) }
+        val ordered = GROUPS.map { it.title } + listOf("Other")
+        return ordered.mapNotNull { title ->
+            val members = present[title] ?: return@mapNotNull null
+            if (members.all { it.items.isEmpty() }) return@mapNotNull null
+            val summary = GROUPS.firstOrNull { it.title == title }?.summary
+                ?: members.joinToString(", ") { it.header }
+            SettingItem.Nav(title, summary, {
+                startActivity(
+                    Intent(this, SettingsActivity::class.java).putExtra(EXTRA_GROUP, title)
+                )
+            })
+        }
+    }
+
+    /**
+     * Flat, cross-group search.
+     *
+     * Every query token has to appear somewhere in the setting's title or its description, so
+     * "wire guard port" finds the WireGuard port field and "dark" finds the theme control.
+     * Matching includes the description because that is usually where the word someone
+     * remembers actually lives; the result row then replaces that description with the path to
+     * the setting, which is the thing you need in order to act on it — the same trade Android's
+     * settings search makes.
+     */
+    private fun searchResults(all: List<Block>, query: String): List<SettingItem> {
+        val tokens = query.trim().lowercase().split(Regex("\\s+")).filter { it.isNotEmpty() }
+        val results = ArrayList<SettingItem>()
+
+        for (block in all) {
+            val path = "${groupOf(block.header)} › ${block.header}"
+            for (item in block.items) {
+                val haystack = (titleOf(item) + " " + subtitleOf(item) + " " + block.header).lowercase()
+                if (tokens.all { haystack.contains(it) }) results.add(withBreadcrumb(item, path))
+            }
+        }
+
+        if (results.isEmpty()) {
+            return listOf(SettingItem.Nav("No results", "Nothing matches \"$query\"", {}, isEnabled = false))
+        }
+        return results
+    }
+
+    private fun titleOf(item: SettingItem): String = when (item) {
+        is SettingItem.Header -> item.title
+        is SettingItem.Toggle -> item.title
+        is SettingItem.Picker -> item.title
+        is SettingItem.TextInput -> item.title
+        is SettingItem.Nav -> item.title
+    }
+
+    private fun subtitleOf(item: SettingItem): String = when (item) {
+        is SettingItem.Header -> ""
+        is SettingItem.Toggle -> item.subtitle
+        is SettingItem.Picker -> item.subtitle
+        is SettingItem.TextInput -> item.subtitle
+        is SettingItem.Nav -> item.subtitle
+    }
+
+    /** Same setting, same behaviour, with its description replaced by where it lives. */
+    private fun withBreadcrumb(item: SettingItem, path: String): SettingItem = when (item) {
+        is SettingItem.Toggle -> item.copy(subtitle = path)
+        is SettingItem.Picker -> item.copy(subtitle = path)
+        is SettingItem.TextInput -> item.copy(subtitle = path)
+        is SettingItem.Nav -> item.copy(subtitle = path)
+        is SettingItem.Header -> item
+    }
+
+    /** Rebuilds whatever the screen is currently showing. */
+    private fun refresh() {
+        if (::adapter.isInitialized) adapter.setItems(displayItems())
+    }
     
+    /**
+     * Picks a folder to auto-caption.
+     *
+     * OpenDocumentTree rather than a path field, because that is the only picker Android will show
+     * for a directory. The tree URI it returns is not a filesystem path, so [resolveTreePath]
+     * converts it -- Prism already holds All Files Access for the agentic file tools, so a real
+     * java.io.File is usable once the path is known, and the caption service can then be the same
+     * code on both platforms.
+     */
+    private val captionDirPicker = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) {
+            val path = resolveTreePath(uri)
+            if (path == null) {
+                Toast.makeText(
+                    this,
+                    "That folder is on storage Prism can't address directly (SD card or a cloud provider). " +
+                        "Pick one on internal storage.",
+                    Toast.LENGTH_LONG
+                ).show()
+            } else {
+                startCaptionPreview(path)
+            }
+        }
+    }
+
     private val fontPicker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) {
             copyFontToInternal(uri)
@@ -44,7 +247,7 @@ class SettingsActivity : PrismBaseActivity() {
             val fileName = getFileNameFromUri(uri)
             com.prism.launcher.messaging.ModelDownloadManager.copyUriToInternal(this, uri, fileName, isPickingImageModel) { success, error ->
                 if (success) {
-                    adapter.setItems(buildItems())
+                    refresh()
                 } else {
                     Toast.makeText(this, "Import failed: $error Please try again.", Toast.LENGTH_LONG).show()
                 }
@@ -59,13 +262,13 @@ class SettingsActivity : PrismBaseActivity() {
 
     private fun rescanOllama() {
         ollamaScanning = true
-        adapter.setItems(buildItems())
+        refresh()
         lifecycleScope.launch(Dispatchers.IO) {
-            val results = com.prism.launcher.messaging.OllamaDiscoveryService.scan(this@SettingsActivity)
+            val results = com.prism.launcher.messaging.OllamaDiscoveryService.scan()
             withContext(Dispatchers.Main) {
                 ollamaScanResults = results
                 ollamaScanning = false
-                adapter.setItems(buildItems())
+                refresh()
                 if (results.isEmpty()) {
                     Toast.makeText(this@SettingsActivity, "No Ollama servers found on this network", Toast.LENGTH_SHORT).show()
                 }
@@ -82,8 +285,8 @@ class SettingsActivity : PrismBaseActivity() {
                         input.copyTo(output)
                     }
                     kotlinx.coroutines.withContext(Dispatchers.Main) {
-                        PrismSettings.setCustomFontPath(this@SettingsActivity, file.absolutePath)
-                        adapter.setItems(buildItems())
+                        PrismSettings.setCustomFontPath(file.absolutePath)
+                        refresh()
                         Toast.makeText(this@SettingsActivity, "Custom Font Applied", Toast.LENGTH_SHORT).show()
                     }
                 }
@@ -97,47 +300,8 @@ class SettingsActivity : PrismBaseActivity() {
         if (uri != null) copyIsoToInternal(uri)
     }
 
-    // ── Nora backup / import ────────────────────────────────────────────────
-
-    private val noraBackupPicker =
-        registerForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
-            if (uri == null) return@registerForActivityResult
-            lifecycleScope.launch {
-                val result = com.prism.launcher.nora.NoraArchive.backup(this@SettingsActivity, uri)
-                showNoraArchiveResult(if (result.ok) "Backup complete" else "Backup failed", result.message)
-            }
-        }
-
-    private val noraImportPicker =
-        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-            if (uri == null) return@registerForActivityResult
-            AlertDialog.Builder(this)
-                .setTitle("Import Nora?")
-                .setMessage(
-                    "This overwrites her connectome and merges the archive's images into your " +
-                        "dataset folder. Anything she has learned since your last backup will be lost."
-                )
-                .setPositiveButton("Import") { _, _ ->
-                    lifecycleScope.launch {
-                        val result = com.prism.launcher.nora.NoraArchive.import(this@SettingsActivity, uri)
-                        showNoraArchiveResult(
-                            if (result.ok) "Import complete" else "Import failed",
-                            result.message
-                        )
-                        if (result.ok) adapter.setItems(buildItems())
-                    }
-                }
-                .setNegativeButton("Cancel", null)
-                .show()
-        }
-
-    private fun showNoraArchiveResult(title: String, message: String) {
-        AlertDialog.Builder(this)
-            .setTitle(title)
-            .setMessage(message)
-            .setPositiveButton("OK", null)
-            .show()
-    }
+    // Nora's backup/import pickers moved to NoraSettingsActivity along with the rest of her
+    // options; an ActivityResultLauncher has to be registered by the screen that uses it.
 
     /**
      * QEMU is a native process and can't resolve content:// URIs — it needs a real path on disk.
@@ -158,8 +322,8 @@ class SettingsActivity : PrismBaseActivity() {
                 } ?: throw java.io.IOException("Could not open the selected ISO")
 
                 withContext(Dispatchers.Main) {
-                    PrismSettings.setCustomIsoPath(this@SettingsActivity, file.absolutePath)
-                    adapter.setItems(buildItems())
+                    PrismSettings.setCustomIsoPath(file.absolutePath)
+                    refresh()
                     Toast.makeText(this@SettingsActivity, "ISO imported", Toast.LENGTH_SHORT).show()
                 }
             } catch (e: Exception) {
@@ -177,8 +341,8 @@ class SettingsActivity : PrismBaseActivity() {
                     contentResolver.openInputStream(uri)?.use { stream ->
                         val contents = stream.reader().readText()
                         kotlinx.coroutines.withContext(Dispatchers.Main) {
-                            PrismSettings.setExternalVpnProfile(this@SettingsActivity, contents)
-                            adapter.setItems(buildItems())
+                            PrismSettings.setExternalVpnProfile(contents)
+                            refresh()
                             Toast.makeText(this@SettingsActivity, "External VPN Profile Loaded", Toast.LENGTH_SHORT).show()
                         }
                     }
@@ -194,7 +358,7 @@ class SettingsActivity : PrismBaseActivity() {
 
     private fun downloadModel(name: String, url: String, isImageModel: Boolean = false) {
         com.prism.launcher.messaging.ModelDownloadManager.download(this, name, url, isImageModel)
-        adapter.setItems(buildItems())
+        refresh()
     }
 
     private fun getFileNameFromUri(uri: Uri): String {
@@ -257,14 +421,14 @@ class SettingsActivity : PrismBaseActivity() {
         binding.settingsToolbar.setNavigationOnClickListener { finish() }
 
         // Setup Theme Toggle
-        val currentMode = PrismSettings.getThemeMode(this)
+        val currentMode = PrismSettings.getThemeMode()
         binding.themeToggle.setImageResource(
             if (currentMode == PrismSettings.THEME_LIGHT) R.drawable.ic_theme_moon 
             else R.drawable.ic_theme_sun
         )
         binding.themeToggle.setOnClickListener {
             val nextMode = if (currentMode == PrismSettings.THEME_LIGHT) PrismSettings.THEME_DARK else PrismSettings.THEME_LIGHT
-            PrismSettings.setThemeMode(this, nextMode)
+            PrismSettings.setThemeMode(nextMode)
             
             // Restart with fade
             finish()
@@ -272,10 +436,38 @@ class SettingsActivity : PrismBaseActivity() {
             startActivity(intent)
         }
 
+        // Root screen or one group's screen — same activity either way, so every
+        // ActivityResultLauncher and helper stays exactly where it was.
+        activeGroup = intent.getStringExtra(EXTRA_GROUP)
+        binding.settingsTitle.text = activeGroup ?: "Settings"
+
+        // Search on the root only; inside a group the list is already short.
+        binding.settingsSearch.visibility = if (activeGroup == null) View.VISIBLE else View.GONE
+        binding.settingsSearch.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {
+                searchQuery = s?.toString().orEmpty()
+                refresh()
+            }
+            override fun afterTextChanged(s: android.text.Editable?) {}
+        })
+
         // Setup RecyclerView
-        adapter = SettingsAdapter(buildItems(), this::onItemClick)
+        adapter = SettingsAdapter(displayItems(), this::onItemClick)
         binding.settingsList.layoutManager = LinearLayoutManager(this)
         binding.settingsList.adapter = adapter
+    }
+
+    override fun onBackPressed() {
+        // Backing out of a search returns to the group list rather than leaving Settings,
+        // which is what a search field inside a screen is expected to do.
+        if (searchQuery.isNotEmpty()) {
+            binding.settingsSearch.setText("")
+            binding.settingsSearch.clearFocus()
+            return
+        }
+        @Suppress("DEPRECATION")
+        super.onBackPressed()
     }
 
     override fun onResume() {
@@ -283,11 +475,11 @@ class SettingsActivity : PrismBaseActivity() {
         // Cloud model profiles (and which one is active) can change in CloudModelsActivity,
         // or on the Models desktop page, while this screen sits in the background -- refresh
         // so the "Manage Cloud Models" subtitle and AI Engine mode stay accurate on return.
-        if (::adapter.isInitialized) adapter.setItems(buildItems())
+        if (::adapter.isInitialized) refresh()
     }
 
     private fun getLocalIpAddress(): String {
-        return MeshUtils.getLocalMeshIp(this)
+        return MeshUtils.getLocalMeshIp()
     }
 
     private fun buildItems(): List<SettingItem> {
@@ -297,8 +489,8 @@ class SettingsActivity : PrismBaseActivity() {
                 "Default page",
                 "Which page shows when Prism opens",
                 listOf("Left (Browser)", "Center (Desktop)", "Right (App drawer)"),
-                PrismSettings.getDefaultPage(this),
-                { PrismSettings.setDefaultPage(this, it) }
+                PrismSettings.getDefaultPage(),
+                { PrismSettings.setDefaultPage(it) }
             ),
 
             SettingItem.Header("Launcher Aesthetic"),
@@ -307,32 +499,32 @@ class SettingsActivity : PrismBaseActivity() {
                 "Choose the appearance of app icons",
                 listOf("System Default") + IconPackEngine.getAvailableIconPacks(this).map { it.first },
                 run {
-                    val currentPkg = PrismSettings.getIconPackPackage(this)
+                    val currentPkg = PrismSettings.getIconPackPackage()
                     val packs = IconPackEngine.getAvailableIconPacks(this)
                     val idx = packs.indexOfFirst { it.second == currentPkg }
                     if (idx == -1) 0 else idx + 1
                 },
                 { idx ->
                     if (idx == 0) {
-                        PrismSettings.setIconPackPackage(this, "")
+                        PrismSettings.setIconPackPackage("")
                     } else {
                         val packs = IconPackEngine.getAvailableIconPacks(this)
-                        PrismSettings.setIconPackPackage(this, packs[idx - 1].second)
+                        PrismSettings.setIconPackPackage(packs[idx - 1].second)
                     }
-                    adapter.setItems(buildItems())
+                    refresh()
                 }
             ),
             SettingItem.Toggle(
                 "Show drawer labels",
                 "Display app names below icons in the drawer",
-                PrismSettings.getShowDrawerLabels(this),
-                { PrismSettings.setShowDrawerLabels(this, it) }
+                PrismSettings.getShowDrawerLabels(),
+                { PrismSettings.setShowDrawerLabels(it) }
             ),
             SettingItem.Picker(
                 "Glow Accent",
                 "Choose the glow color for borders and navigation",
                 listOf("Cyan", "Magenta", "Lime", "Gold", "Electric Blue"),
-                when (PrismSettings.getGlowColor(this)) {
+                when (PrismSettings.getGlowColor()) {
                     android.graphics.Color.parseColor("#FFFF00FF") -> 1
                     android.graphics.Color.parseColor("#FF00FF00") -> 2
                     android.graphics.Color.parseColor("#FFFFD700") -> 3
@@ -347,8 +539,8 @@ class SettingsActivity : PrismBaseActivity() {
                         4 -> "#FF2222FF" // Electric Blue
                         else -> "#FF7C9EFF" // Cyan
                     }
-                    PrismSettings.setGlowColor(this, android.graphics.Color.parseColor(color))
-                    adapter.setItems(buildItems()) // Refresh to update neon borders if needed
+                    PrismSettings.setGlowColor(android.graphics.Color.parseColor(color))
+                    refresh() // Refresh to update neon borders if needed
                 }
             ),
 
@@ -357,7 +549,7 @@ class SettingsActivity : PrismBaseActivity() {
                 "Search engine",
                 "Default engine for the address bar",
                 listOf("DuckDuckGo", "Google", "Bing", "Custom"),
-                when (PrismSettings.getSearchEngine(this)) {
+                when (PrismSettings.getSearchEngine()) {
                     "google" -> 1
                     "bing" -> 2
                     "custom" -> 3
@@ -370,79 +562,79 @@ class SettingsActivity : PrismBaseActivity() {
                         3 -> "custom"
                         else -> "ddg"
                     }
-                    PrismSettings.setSearchEngine(this, engine)
+                    PrismSettings.setSearchEngine(engine)
                     if (engine == "custom") promptCustomSearchUrl()
                 }
             ),
             SettingItem.Toggle(
                 "Enable JavaScript",
                 "Allow JS execution in standard tabs",
-                PrismSettings.getJsEnabled(this),
-                { PrismSettings.setJsEnabled(this, it) }
+                PrismSettings.getJsEnabled(),
+                { PrismSettings.setJsEnabled(it) }
             ),
             SettingItem.Toggle(
                 "Private by default",
                 "New tabs open in private mode",
-                PrismSettings.getPrivateByDefault(this),
-                { PrismSettings.setPrivateByDefault(this, it) }
+                PrismSettings.getPrivateByDefault(),
+                { PrismSettings.setPrivateByDefault(it) }
             ),
 
             SettingItem.Header("Privacy & VPN"),
             SettingItem.Toggle(
                 "Enable VPN Tunneling",
                 "Route traffic through Prism or an external VPN",
-                PrismSettings.getVpnTunnelingEnabled(this),
+                PrismSettings.getVpnTunnelingEnabled(),
                 { 
-                    PrismSettings.setVpnTunnelingEnabled(this, it) 
-                    adapter.setItems(buildItems())
+                    PrismSettings.setVpnTunnelingEnabled(it) 
+                    refresh()
                 }
             ),
             SettingItem.Toggle(
                 "VPN auto-start",
                 "Automatically connect VPN when a private tab opens",
-                PrismSettings.getVpnAutoStart(this),
-                { PrismSettings.setVpnAutoStart(this, it) },
-                isEnabled = PrismSettings.getVpnTunnelingEnabled(this)
+                PrismSettings.getVpnAutoStart(),
+                { PrismSettings.setVpnAutoStart(it) },
+                isEnabled = PrismSettings.getVpnTunnelingEnabled()
             ),
             SettingItem.Picker(
                 "VPN Mode",
                 "Choose Prism P2P VPN or an external provider",
                 listOf("Prism VPN", "External VPN"),
-                if (PrismSettings.getVpnMode(this) == PrismSettings.VPN_MODE_EXTERNAL) 1 else 0,
+                if (PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_EXTERNAL) 1 else 0,
                 {
-                    PrismSettings.setVpnMode(this, if (it == 1) PrismSettings.VPN_MODE_EXTERNAL else PrismSettings.VPN_MODE_PRISM)
-                    adapter.setItems(buildItems())
+                    PrismSettings.setVpnMode(if (it == 1) PrismSettings.VPN_MODE_EXTERNAL else PrismSettings.VPN_MODE_PRISM)
+                    refresh()
                 },
-                isEnabled = PrismSettings.getVpnTunnelingEnabled(this)
+                isEnabled = PrismSettings.getVpnTunnelingEnabled()
             ),
             SettingItem.Toggle(
                 "Persistent VPN Server",
                 "Keep Prism Server running even outside of private browsing (Backbone mode)",
-                PrismSettings.getVpnServerAlwaysOn(this),
+                PrismSettings.getVpnServerAlwaysOn(),
                 { 
-                    PrismSettings.setVpnServerAlwaysOn(this, it) 
-                    adapter.setItems(buildItems())
+                    PrismSettings.setVpnServerAlwaysOn(it) 
+                    refresh()
                     // Start or let service re-evaluate
                     com.prism.launcher.browser.PrivateDnsVpnService.start(this)
                 },
-                isEnabled = PrismSettings.getVpnTunnelingEnabled(this) && PrismSettings.getVpnMode(this) == PrismSettings.VPN_MODE_PRISM
+                isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM
             ),
             SettingItem.Picker(
                 "Prism VPN Role",
                 "Serve as a node or connect as a client",
                 listOf("Client", "Server"),
-                if (PrismSettings.getPrismVpnRole(this) == PrismSettings.PRISM_ROLE_SERVER) 1 else 0,
+                if (PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_SERVER) 1 else 0,
                 {
-                    PrismSettings.setPrismVpnRole(this, if (it == 1) PrismSettings.PRISM_ROLE_SERVER else PrismSettings.PRISM_ROLE_CLIENT)
-                    adapter.setItems(buildItems())
+                    PrismSettings.setPrismVpnRole(if (it == 1) PrismSettings.PRISM_ROLE_SERVER else PrismSettings.PRISM_ROLE_CLIENT)
+                    refresh()
                 },
-                isEnabled = PrismSettings.getVpnTunnelingEnabled(this) && PrismSettings.getVpnMode(this) == PrismSettings.VPN_MODE_PRISM
+                isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM
             ),
             SettingItem.Picker(
                 "VPN Protocol",
                 "Choose protocol or let Prism auto-detect",
                 listOf("Automatic (Detected)", "IKEv2", "L2TP", "Proxy Only"),
-                when (PrismSettings.getVpnProtocolMode(this)) {
+                when (PrismSettings.getVpnProtocolMode()) {
                     PrismSettings.VPN_PROTOCOL_IKEV2 -> 1
                     PrismSettings.VPN_PROTOCOL_L2TP -> 2
                     PrismSettings.VPN_PROTOCOL_PROXY -> 3
@@ -455,66 +647,66 @@ class SettingsActivity : PrismBaseActivity() {
                         3 -> PrismSettings.VPN_PROTOCOL_PROXY
                         else -> PrismSettings.VPN_PROTOCOL_AUTO
                     }
-                    PrismSettings.setVpnProtocolMode(this, mode)
-                    adapter.setItems(buildItems())
+                    PrismSettings.setVpnProtocolMode(mode)
+                    refresh()
                 },
-                isEnabled = PrismSettings.getVpnTunnelingEnabled(this) && PrismSettings.getVpnMode(this) == PrismSettings.VPN_MODE_PRISM && PrismSettings.getPrismVpnRole(this) == PrismSettings.PRISM_ROLE_SERVER
+                isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM && PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_SERVER
             ),
             SettingItem.Nav(
                 "Device IP Address",
                 getLocalIpAddress(),
                 {},
-                isEnabled = PrismSettings.getVpnTunnelingEnabled(this) && PrismSettings.getVpnMode(this) == PrismSettings.VPN_MODE_PRISM && PrismSettings.getPrismVpnRole(this) == PrismSettings.PRISM_ROLE_SERVER
+                isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM && PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_SERVER
             ),
             SettingItem.TextInput(
                 "Server Port",
                 "Port to accept P2P nodes (Default 8080)",
-                PrismSettings.getPrismVpnPort(this),
-                { PrismSettings.setPrismVpnPort(this, it) },
-                isEnabled = PrismSettings.getVpnTunnelingEnabled(this) && PrismSettings.getVpnMode(this) == PrismSettings.VPN_MODE_PRISM && PrismSettings.getPrismVpnRole(this) == PrismSettings.PRISM_ROLE_SERVER
+                PrismSettings.getPrismVpnPort(),
+                { PrismSettings.setPrismVpnPort(it) },
+                isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM && PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_SERVER
             ),
             SettingItem.TextInput(
                 "Proxy Auth Password",
                 "(Optional) Set Password for incoming clients",
-                PrismSettings.getPrismVpnPassword(this),
-                { PrismSettings.setPrismVpnPassword(this, it) },
-                isEnabled = PrismSettings.getVpnTunnelingEnabled(this) && PrismSettings.getVpnMode(this) == PrismSettings.VPN_MODE_PRISM && PrismSettings.getPrismVpnRole(this) == PrismSettings.PRISM_ROLE_SERVER
+                PrismSettings.getPrismVpnPassword(),
+                { PrismSettings.setPrismVpnPassword(it) },
+                isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM && PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_SERVER
             ),
             SettingItem.TextInput(
                 "Proxy Auth Username",
                 "(Optional) Set Username for incoming clients",
-                PrismSettings.getPrismVpnUsername(this),
-                { PrismSettings.setPrismVpnUsername(this, it) },
-                isEnabled = PrismSettings.getVpnTunnelingEnabled(this) && PrismSettings.getVpnMode(this) == PrismSettings.VPN_MODE_PRISM && PrismSettings.getPrismVpnRole(this) == PrismSettings.PRISM_ROLE_SERVER
+                PrismSettings.getPrismVpnUsername(),
+                { PrismSettings.setPrismVpnUsername(it) },
+                isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM && PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_SERVER
             ),
             SettingItem.Nav(
                 "Manage Prism Servers",
-                "${PrismSettings.getPrismServers(this).size} servers saved (Auto-failover active)",
+                "${PrismSettings.getPrismServers().size} servers saved (Auto-failover active)",
                 { showServerFleetManager() },
-                isEnabled = PrismSettings.getVpnTunnelingEnabled(this) && PrismSettings.getVpnMode(this) == PrismSettings.VPN_MODE_PRISM && PrismSettings.getPrismVpnRole(this) == PrismSettings.PRISM_ROLE_CLIENT
+                isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM && PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_CLIENT
             ),
             SettingItem.Header("Mesh Bootstrap Server"),
             SettingItem.TextInput(
                 "Bootstrap Address",
                 "Primary entry point for P2P DNS & Mesh search",
-                PrismSettings.getMeshBootstrapAddress(this),
-                { PrismSettings.setMeshBootstrapAddress(this, it) },
-                isEnabled = PrismSettings.getVpnTunnelingEnabled(this) && PrismSettings.getVpnMode(this) == PrismSettings.VPN_MODE_PRISM && PrismSettings.getPrismVpnRole(this) == PrismSettings.PRISM_ROLE_CLIENT
+                PrismSettings.getMeshBootstrapAddress(),
+                { PrismSettings.setMeshBootstrapAddress(it) },
+                isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM && PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_CLIENT
             ),
             SettingItem.TextInput(
                 "Bootstrap Port",
                 "Port of the bootstrap node (Default 8081)",
-                PrismSettings.getMeshBootstrapPort(this),
-                { PrismSettings.setMeshBootstrapPort(this, it) },
-                isEnabled = PrismSettings.getVpnTunnelingEnabled(this) && PrismSettings.getVpnMode(this) == PrismSettings.VPN_MODE_PRISM && PrismSettings.getPrismVpnRole(this) == PrismSettings.PRISM_ROLE_CLIENT
+                PrismSettings.getMeshBootstrapPort(),
+                { PrismSettings.setMeshBootstrapPort(it) },
+                isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM && PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_CLIENT
             ),
             SettingItem.Nav(
                 "Configure External VPN",
-                if (PrismSettings.getExternalVpnProfile(this).isEmpty()) "Setup WireGuard profile (.conf)" else "WireGuard Profile Loaded",
+                if (PrismSettings.getExternalVpnProfile().isEmpty()) "Setup WireGuard profile (.conf)" else "WireGuard Profile Loaded",
                 {
                     vpnProfilePicker.launch("*/*")
                 },
-                isEnabled = PrismSettings.getVpnTunnelingEnabled(this) && PrismSettings.getVpnMode(this) == PrismSettings.VPN_MODE_EXTERNAL
+                isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_EXTERNAL
             ),
             SettingItem.Nav(
                 "App Whitelists",
@@ -522,19 +714,19 @@ class SettingsActivity : PrismBaseActivity() {
                 {
                     startActivity(android.content.Intent(this@SettingsActivity, com.prism.launcher.vpn.WhitelistActivity::class.java))
                 },
-                isEnabled = PrismSettings.getVpnTunnelingEnabled(this)
+                isEnabled = PrismSettings.getVpnTunnelingEnabled()
             ),
             SettingItem.Toggle(
                 "Locked private tabs",
                 "Require biometric unlock to access private tabs",
-                PrismSettings.getPrivateTabsLocked(this),
-                { PrismSettings.setPrivateTabsLocked(this, it) }
+                PrismSettings.getPrivateTabsLocked(),
+                { PrismSettings.setPrivateTabsLocked(it) }
             ),
             
             SettingItem.Header("Access Points (Hotspot Gateway)"),
             SettingItem.Nav(
                 "Manage Access Points",
-                "${PrismSettings.getAccessPoints(this).size} hotspot(s) configured",
+                "${AccessPointStore.getAccessPoints().size} hotspot(s) configured",
                 {
                     startActivity(android.content.Intent(this@SettingsActivity, com.prism.launcher.accesspoint.AccessPointPortalActivity::class.java))
                 }
@@ -542,9 +734,9 @@ class SettingsActivity : PrismBaseActivity() {
             SettingItem.Toggle(
                 "Enable DNS Proxy",
                 "Listen on 0.0.0.0:53 for P2P DNS queries from connected devices",
-                PrismSettings.getDnsProxyEnabled(this),
+                PrismSettings.getDnsProxyEnabled(),
                 { enabled ->
-                    PrismSettings.setDnsProxyEnabled(this, enabled)
+                    PrismSettings.setDnsProxyEnabled(enabled)
                     if (enabled) {
                         startService(android.content.Intent(this@SettingsActivity, com.prism.launcher.browser.DnsProxyService::class.java))
                         Toast.makeText(this@SettingsActivity, "DNS Proxy started on port 53", Toast.LENGTH_SHORT).show()
@@ -552,19 +744,19 @@ class SettingsActivity : PrismBaseActivity() {
                         stopService(android.content.Intent(this@SettingsActivity, com.prism.launcher.browser.DnsProxyService::class.java))
                         Toast.makeText(this@SettingsActivity, "DNS Proxy stopped", Toast.LENGTH_SHORT).show()
                     }
-                    adapter.setItems(buildItems())
+                    refresh()
                 }
             ),
             SettingItem.Picker(
                 "DNS Proxy Mode",
                 "Behavior when domain is not in P2P DNS",
                 listOf("P2P Isolation (NXDOMAIN)", "Fallback to Global DNS"),
-                if (PrismSettings.getDnsProxyMode(this) == "fallback") 1 else 0,
+                if (PrismSettings.getDnsProxyMode() == "fallback") 1 else 0,
                 { idx ->
                     val mode = if (idx == 1) "fallback" else "p2p_only"
-                    PrismSettings.setDnsProxyMode(this, mode)
+                    PrismSettings.setDnsProxyMode(mode)
                 },
-                isEnabled = PrismSettings.getDnsProxyEnabled(this)
+                isEnabled = PrismSettings.getDnsProxyEnabled()
             ),
             SettingItem.Nav(
                 "P2P DNS Records",
@@ -583,25 +775,25 @@ class SettingsActivity : PrismBaseActivity() {
             SettingItem.Toggle(
                 "Host My Active Model",
                 "Let other Prism peers on your mesh use your currently active local AI model",
-                PrismSettings.getP2pModelHostingEnabled(this),
+                PrismSettings.getP2pModelHostingEnabled(),
                 { enabled ->
-                    PrismSettings.setP2pModelHostingEnabled(this, enabled)
+                    PrismSettings.setP2pModelHostingEnabled(enabled)
                     if (enabled) {
-                        val modelPath = PrismSettings.getLocalAiModelPath(this)
-                        val displayName = PrismSettings.getImportedModels(this).find { it.path == modelPath }?.displayName
+                        val modelPath = PrismSettings.getLocalAiModelPath()
+                        val displayName = PrismSettings.getImportedModels().find { it.path == modelPath }?.displayName
                             ?: modelPath.substringAfterLast('/').ifBlank { "Local Model" }
                         com.prism.launcher.mesh.P2pModelRegistry.announce(this, displayName)
                     } else {
                         com.prism.launcher.mesh.P2pModelRegistry.revoke(this)
                     }
-                    adapter.setItems(buildItems())
+                    refresh()
                 },
-                isEnabled = PrismSettings.getVpnTunnelingEnabled(this) && PrismSettings.getVpnMode(this) == PrismSettings.VPN_MODE_PRISM && PrismSettings.getPrismVpnRole(this) == PrismSettings.PRISM_ROLE_SERVER
+                isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM && PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_SERVER
             ),
             run {
                 val hostedModels = com.prism.launcher.mesh.P2pModelRegistry.getAll()
-                    .filter { it.peerIp != MeshUtils.getLocalMeshIp(this) }
-                val selected = PrismSettings.getSelectedP2pModel(this)
+                    .filter { it.peerIp != MeshUtils.getLocalMeshIp() }
+                val selected = PrismSettings.getSelectedP2pModel()
                 val options = listOf("None (use Local/Cloud AI)") + hostedModels.map { "${it.peerIp} • ${it.modelName}" }
                 val currentIdx = if (selected == null) {
                     0
@@ -615,54 +807,54 @@ class SettingsActivity : PrismBaseActivity() {
                     currentIdx,
                     { idx ->
                         if (idx == 0) {
-                            PrismSettings.clearSelectedP2pModel(this)
+                            PrismSettings.clearSelectedP2pModel()
                         } else {
                             val m = hostedModels[idx - 1]
-                            PrismSettings.setSelectedP2pModel(this, m.peerIp, m.modelName)
+                            PrismSettings.setSelectedP2pModel(m.peerIp, m.modelName)
                         }
-                        adapter.setItems(buildItems())
+                        refresh()
                     },
-                    isEnabled = PrismSettings.getVpnTunnelingEnabled(this) && PrismSettings.getPrismVpnRole(this) == PrismSettings.PRISM_ROLE_CLIENT
+                    isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_CLIENT
                 )
             },
             SettingItem.TextInput(
                 "Primary DNS",
                 "Used by the private VPN tunnel",
-                PrismSettings.getPrimaryDns(this),
-                { PrismSettings.setPrimaryDns(this, it) },
-                isEnabled = PrismSettings.getVpnTunnelingEnabled(this)
+                PrismSettings.getPrimaryDns(),
+                { PrismSettings.setPrimaryDns(it) },
+                isEnabled = PrismSettings.getVpnTunnelingEnabled()
             ),
             SettingItem.TextInput(
                 "Secondary DNS",
                 "Used by the private VPN tunnel",
-                PrismSettings.getSecondaryDns(this),
-                { PrismSettings.setSecondaryDns(this, it) },
-                isEnabled = PrismSettings.getVpnTunnelingEnabled(this)
+                PrismSettings.getSecondaryDns(),
+                { PrismSettings.setSecondaryDns(it) },
+                isEnabled = PrismSettings.getVpnTunnelingEnabled()
             ),
 
             SettingItem.Header("Native VPN Server (WireGuard)"),
             SettingItem.TextInput(
                 "WireGuard Listen Port",
                 "Port for direct VPN connections (Default 51820)",
-                PrismSettings.getWgServerPort(this).toString(),
+                PrismSettings.getWgServerPort().toString(),
                 { 
                     val p = it.toIntOrNull() ?: 51820
-                    PrismSettings.setWgServerPort(this, p) 
+                    PrismSettings.setWgServerPort(p) 
                 },
-                isEnabled = PrismSettings.getVpnTunnelingEnabled(this)
+                isEnabled = PrismSettings.getVpnTunnelingEnabled()
             ),
             SettingItem.TextInput(
                 "Allowed IPs",
                 "Traffic to route through VPN (e.g. 0.0.0.0/0 for everything)",
-                PrismSettings.getWgAllowedIps(this),
-                { PrismSettings.setWgAllowedIps(this, it) },
-                isEnabled = PrismSettings.getVpnTunnelingEnabled(this)
+                PrismSettings.getWgAllowedIps(),
+                { PrismSettings.setWgAllowedIps(it) },
+                isEnabled = PrismSettings.getVpnTunnelingEnabled()
             ),
             SettingItem.Nav(
                 "Copy Client Config",
                 "Generate .conf for Windows WireGuard app",
                 {
-                    val config = PrismSettings.generateWgClientConfig(this)
+                    val config = PrismSettings.generateWgClientConfig()
                         .replace("YOUR_PHONE_IP_HERE", getLocalIpAddress())
                     
                     val clipboard = getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
@@ -670,7 +862,7 @@ class SettingsActivity : PrismBaseActivity() {
                     
                     PrismDialogFactory.show(this, "Config Copied", "Paste this into a new tunnel in your Windows WireGuard app. \n\nNOTE: Replace 'CLIENT_PRIVATE_KEY_HERE' in the config with your own generated key.")
                 },
-                isEnabled = PrismSettings.getVpnTunnelingEnabled(this)
+                isEnabled = PrismSettings.getVpnTunnelingEnabled()
             ),
             SettingItem.Nav(
                 "Establish Mesh Trust",
@@ -683,15 +875,21 @@ class SettingsActivity : PrismBaseActivity() {
                         Toast.makeText(this, "Failed to export Root CA", Toast.LENGTH_SHORT).show()
                     }
                 },
-                isEnabled = PrismSettings.getVpnTunnelingEnabled(this)
+                isEnabled = PrismSettings.getVpnTunnelingEnabled()
             ),
 
             SettingItem.Header("Intelligence & Messaging"),
+            SettingItem.Nav(
+                "Auto-caption a folder",
+                "Caption every image in a folder and rename each file to match. Shows a preview " +
+                    "first -- nothing is renamed until you confirm.",
+                { captionDirPicker.launch(null) }
+            ),
             SettingItem.Picker(
                 "Prism AI Engine",
                 "Choose between local on-device AI, cloud LLM, or a Local Cloud (Ollama) server found on your WiFi network",
                 listOf("Local AI", "Cloud API", "Local Cloud (Ollama)"),
-                when (PrismSettings.getAiMode(this)) {
+                when (PrismSettings.getAiMode()) {
                     PrismSettings.AI_MODE_CLOUD -> 1
                     PrismSettings.AI_MODE_LOCAL_CLOUD -> 2
                     else -> 0
@@ -702,11 +900,11 @@ class SettingsActivity : PrismBaseActivity() {
                         2 -> PrismSettings.AI_MODE_LOCAL_CLOUD
                         else -> PrismSettings.AI_MODE_LOCAL
                     }
-                    PrismSettings.setAiMode(this, newMode)
+                    PrismSettings.setAiMode(newMode)
                     if (newMode == PrismSettings.AI_MODE_LOCAL_CLOUD && ollamaScanResults.isEmpty() && !ollamaScanning) {
                         rescanOllama()
                     } else {
-                        adapter.setItems(buildItems())
+                        refresh()
                     }
                 }
             ),
@@ -714,11 +912,11 @@ class SettingsActivity : PrismBaseActivity() {
                 "Rescan Network for Ollama",
                 if (ollamaScanning) "Scanning your WiFi network…" else "Find Ollama servers hosting models on your network",
                 { if (!ollamaScanning) rescanOllama() },
-                isEnabled = PrismSettings.getAiMode(this) == PrismSettings.AI_MODE_LOCAL_CLOUD && !ollamaScanning
+                isEnabled = PrismSettings.getAiMode() == PrismSettings.AI_MODE_LOCAL_CLOUD && !ollamaScanning
             ),
             run {
                 val entries = ollamaScanResults.flatMap { server -> server.models.map { m -> server to m } }
-                val selected = PrismSettings.getSelectedOllamaEndpoint(this)
+                val selected = PrismSettings.getSelectedOllamaEndpoint()
                 val options = if (entries.isEmpty()) listOf("None found yet") else entries.map { (s, m) -> "${s.host} • $m" }
                 val currentIdx = entries.indexOfFirst { (s, m) -> selected != null && s.host == selected.host && m == selected.model }
                 SettingItem.Picker(
@@ -729,17 +927,17 @@ class SettingsActivity : PrismBaseActivity() {
                     { idx ->
                         if (entries.isNotEmpty()) {
                             val (server, modelName) = entries[idx]
-                            PrismSettings.setSelectedOllamaEndpoint(this, PrismSettings.OllamaEndpoint(server.host, server.port, modelName))
-                            adapter.setItems(buildItems())
+                            PrismSettings.setSelectedOllamaEndpoint(PrismSettings.OllamaEndpoint(server.host, server.port, modelName))
+                            refresh()
                         }
                     },
-                    isEnabled = PrismSettings.getAiMode(this) == PrismSettings.AI_MODE_LOCAL_CLOUD && entries.isNotEmpty()
+                    isEnabled = PrismSettings.getAiMode() == PrismSettings.AI_MODE_LOCAL_CLOUD && entries.isNotEmpty()
                 )
             },
 
             run {
-                val cloudModels = PrismSettings.getCloudModels(this)
-                val active = PrismSettings.getActiveCloudModel(this)
+                val cloudModels = PrismSettings.getCloudModels()
+                val active = PrismSettings.getActiveCloudModel()
                 SettingItem.Nav(
                     "Manage Cloud Models",
                     when {
@@ -748,7 +946,7 @@ class SettingsActivity : PrismBaseActivity() {
                         else -> "${cloudModels.size} saved • None active"
                     },
                     { startActivity(android.content.Intent(this, CloudModelsActivity::class.java)) },
-                    isEnabled = PrismSettings.getAiMode(this) == PrismSettings.AI_MODE_CLOUD
+                    isEnabled = PrismSettings.getAiMode() == PrismSettings.AI_MODE_CLOUD
                 )
             },
 
@@ -756,7 +954,7 @@ class SettingsActivity : PrismBaseActivity() {
                 "Local AI Model",
                 "Select a .task, .gguf, or .bin LLM from storage",
                 { pickLocalModel() },
-                isEnabled = PrismSettings.getAiMode(this) == PrismSettings.AI_MODE_LOCAL
+                isEnabled = PrismSettings.getAiMode() == PrismSettings.AI_MODE_LOCAL
             ),
 
             SettingItem.Header("Available LLM Models"),
@@ -764,19 +962,19 @@ class SettingsActivity : PrismBaseActivity() {
                 "Falcon-1B RefinedWeb",
                 "Fast & efficient (1B params, ~600MB)",
                 { downloadModel("Falcon-1B", PrismSettings.MODEL_FALCON_1B) },
-                isEnabled = PrismSettings.getAiMode(this) == PrismSettings.AI_MODE_LOCAL
+                isEnabled = PrismSettings.getAiMode() == PrismSettings.AI_MODE_LOCAL
             ),
             SettingItem.Nav(
                 "Qwen2.5-1.5B (Expert)",
                 "User-preferred high performance task bundle",
                 { downloadModel("Qwen-1.5B", PrismSettings.MODEL_QWEN_1_5) },
-                isEnabled = PrismSettings.getAiMode(this) == PrismSettings.AI_MODE_LOCAL
+                isEnabled = PrismSettings.getAiMode() == PrismSettings.AI_MODE_LOCAL
             ),
             SettingItem.Nav(
                 "Phi-2 (Microsoft)",
                 "High Intellect (2.7B params, ~1.5GB RAM)",
                 { downloadModel("Phi-2", PrismSettings.MODEL_PHI_2) },
-                isEnabled = PrismSettings.getAiMode(this) == PrismSettings.AI_MODE_LOCAL
+                isEnabled = PrismSettings.getAiMode() == PrismSettings.AI_MODE_LOCAL
             ),
 
             SettingItem.Header("Visual Intelligence (Diffusion)"),
@@ -789,86 +987,20 @@ class SettingsActivity : PrismBaseActivity() {
                 "Stable Diffusion v1.5",
                 "Generate realistic images locally (~2GB RAM needed)",
                 { downloadModel("SD-1.5", PrismSettings.MODEL_SD_1_5_CPU, isImageModel = true) },
-                isEnabled = PrismSettings.getAiMode(this) == PrismSettings.AI_MODE_LOCAL
+                isEnabled = PrismSettings.getAiMode() == PrismSettings.AI_MODE_LOCAL
             ),
 
             SettingItem.Header("Nora (Brain-Based Generation)"),
-            SettingItem.Nav(
-                "Train Nora",
-                "Teach her from images, and watch her connectome while she learns",
-                { startActivity(android.content.Intent(this, com.prism.launcher.nora.NoraTrainingActivity::class.java)) }
-            ),
-            SettingItem.Nav(
-                "Backup Nora",
-                "Save her connectome, dataset and conversation to a zip archive",
-                { noraBackupPicker.launch(com.prism.launcher.nora.NoraArchive.suggestedFileName()) }
-            ),
-            SettingItem.Nav(
-                "Import Nora",
-                "Restore everything from a Nora backup zip",
-                { noraImportPicker.launch(arrayOf("application/zip", "application/octet-stream", "*/*")) }
-            ),
-            SettingItem.Toggle(
-                "Denoising curriculum",
-                "Train on corrupted images and learn to recover the original — several times " +
-                    "more supervision per image, at no generation-time cost",
-                PrismSettings.getNoraDenoisingEnabled(this),
-                { PrismSettings.setNoraDenoisingEnabled(this, it) }
-            ),
-            SettingItem.Toggle(
-                "Connectome visualization",
-                "Live brain map during training. Renders on its own thread, but still costs " +
-                    "frames on a hot phone — turn it off if training feels sluggish",
-                PrismSettings.getNoraVisualizerEnabled(this),
-                { PrismSettings.setNoraVisualizerEnabled(this, it) }
-            ),
             run {
-                val messagesActive = com.prism.launcher.nora.NoraAutoTrainWorker.messagesPageActive(this)
-                val exempt = com.prism.launcher.nora.NoraAutoTrainWorker.batteryExempt(this)
-                SettingItem.Toggle(
-                    "Autonomous training",
-                    when {
-                        !messagesActive ->
-                            "Add the Messages page to a desktop slot to enable this — Nora is " +
-                                "only reachable through it."
-                        !exempt ->
-                            "Retrain on her dataset periodically while the phone is idle. " +
-                                "Prism is not exempt from battery optimization, so Android will " +
-                                "likely refuse the background start — grant the exemption from " +
-                                "her training screen first."
-                        else ->
-                            "Retrain on her dataset periodically while the phone is idle. Holds " +
-                                "a wake lock and saturates the CPU while it runs."
-                    },
-                    PrismSettings.getNoraAutoTrainEnabled(this) && messagesActive,
-                    { enabled ->
-                        PrismSettings.setNoraAutoTrainEnabled(this, enabled)
-                        com.prism.launcher.nora.NoraAutoTrainWorker.schedule(this)
-                        adapter.setItems(buildItems())
-                    },
-                    isEnabled = messagesActive
-                )
-            },
-            run {
-                // 1..24, per spec. Presented in full so the user picks an hour rather than a
-                // bucket -- the setting only exists because ten hours is not right for everyone.
-                val hours = (1..24).toList()
-                val autoOn = PrismSettings.getNoraAutoTrainEnabled(this) &&
-                    com.prism.launcher.nora.NoraAutoTrainWorker.messagesPageActive(this)
-                SettingItem.Picker(
-                    "Autonomous training interval",
-                    if (autoOn)
-                        "How often an idle phone triggers a ${com.prism.launcher.nora.NoraConfig.AUTO_TRAIN_EPOCHS}-epoch run."
-                    else
-                        "Enable autonomous training to set how often it runs.",
-                    hours.map { "$it hour${if (it == 1) "" else "s"}" },
-                    hours.indexOf(PrismSettings.getNoraAutoTrainIntervalHours(this)).coerceAtLeast(0),
-                    { idx ->
-                        PrismSettings.setNoraAutoTrainIntervalHours(this, hours[idx])
-                        com.prism.launcher.nora.NoraAutoTrainWorker.schedule(this)
-                        adapter.setItems(buildItems())
-                    },
-                    isEnabled = autoOn
+                // Everything Nora lives on its own screen now. Brain size alone is nine coupled
+                // numbers plus a cost readout, which does not belong interleaved with the
+                // AI-model and messaging options it used to sit among.
+                val g = com.prism.launcher.nora.NoraConfig.geometry
+                SettingItem.Nav(
+                    "Nora",
+                    "Brain size, training, self-test, backup — " +
+                        "${com.prism.launcher.nora.NoraGeometry.formatCount(g.totalNeurons)} neurons",
+                    { startActivity(android.content.Intent(this, com.prism.launcher.nora.NoraSettingsActivity::class.java)) }
                 )
             },
 
@@ -876,24 +1008,24 @@ class SettingsActivity : PrismBaseActivity() {
             SettingItem.Toggle(
                 "Stream Responses",
                 "Show tokens as they're generated instead of waiting for the full reply",
-                PrismSettings.getStreamingEnabled(this),
+                PrismSettings.getStreamingEnabled(),
                 {
-                    PrismSettings.setStreamingEnabled(this, it)
-                    adapter.setItems(buildItems())
+                    PrismSettings.setStreamingEnabled(it)
+                    refresh()
                 }
             ),
             SettingItem.TextInput(
                 "Max Tokens",
                 "Cap on generated tokens per response. -1 = unlimited (generate until the model stops)",
-                PrismSettings.getMaxTokens(this).toString(),
-                { PrismSettings.setMaxTokens(this, it.toIntOrNull() ?: -1) },
+                PrismSettings.getMaxTokens().toString(),
+                { PrismSettings.setMaxTokens(it.toIntOrNull() ?: -1) },
                 isSingleLine = true
             ),
             SettingItem.Picker(
                 "KV Cache Compression",
                 "Compress conversation memory for GGUF models — trades a little accuracy for lower RAM use and longer context",
                 listOf("Off (Full Precision)", "Light (Q8, ~2x smaller)", "Max (Q4, ~4x smaller)"),
-                when (PrismSettings.getKvCacheQuant(this)) {
+                when (PrismSettings.getKvCacheQuant()) {
                     PrismSettings.KV_CACHE_Q8_0 -> 1
                     PrismSettings.KV_CACHE_Q4_0 -> 2
                     else -> 0
@@ -904,8 +1036,8 @@ class SettingsActivity : PrismBaseActivity() {
                         2 -> PrismSettings.KV_CACHE_Q4_0
                         else -> PrismSettings.KV_CACHE_F16
                     }
-                    PrismSettings.setKvCacheQuant(this, value)
-                    adapter.setItems(buildItems())
+                    PrismSettings.setKvCacheQuant(value)
+                    refresh()
                 }
             ),
             SettingItem.Picker(
@@ -926,17 +1058,17 @@ class SettingsActivity : PrismBaseActivity() {
                     }
                     options
                 },
-                PrismSettings.getAiBackend(this).coerceAtMost(
+                PrismSettings.getAiBackend().coerceAtMost(
                     (if (com.prism.launcher.messaging.GgufInferenceService.hasHexagonSupport()) 2 else 1)
                 ),
                 { idx ->
-                    PrismSettings.setAiBackend(this, idx)
-                    adapter.setItems(buildItems())
+                    PrismSettings.setAiBackend(idx)
+                    refresh()
                 }
             ),
             run {
                 val intervalHours = listOf(1, 2, 4, 6, 12, 24)
-                val nebulaActive = SlotPreferences(this).getAssignments().any { it is SlotAssignment.NebulaSocial }
+                val nebulaActive = SlotPreferences().getAssignments().any { it is SlotAssignment.NebulaSocial }
                 SettingItem.Picker(
                     "Nebula Post Generation Interval",
                     if (nebulaActive)
@@ -944,11 +1076,11 @@ class SettingsActivity : PrismBaseActivity() {
                     else
                         "Add the Nebula Social page to a desktop slot to enable background post generation.",
                     intervalHours.map { "$it hour${if (it == 1) "" else "s"}" },
-                    intervalHours.indexOf(PrismSettings.getNebulaGenerationIntervalHours(this)).coerceAtLeast(0),
+                    intervalHours.indexOf(PrismSettings.getNebulaGenerationIntervalHours()).coerceAtLeast(0),
                     { idx ->
-                        PrismSettings.setNebulaGenerationIntervalHours(this, intervalHours[idx])
+                        PrismSettings.setNebulaGenerationIntervalHours(intervalHours[idx])
                         com.prism.launcher.social.SocialBotWorker.schedule(this)
-                        adapter.setItems(buildItems())
+                        refresh()
                     },
                     isEnabled = nebulaActive
                 )
@@ -991,7 +1123,7 @@ class SettingsActivity : PrismBaseActivity() {
                 "Font Style",
                 "Choose the default app & browser font",
                 listOf("System Default", "Nasalization (Modern)", "Custom File (.ttf)"),
-                when(PrismSettings.getFontStyle(this)) {
+                when(PrismSettings.getFontStyle()) {
                     PrismSettings.FONT_STYLE_NASALIZATION -> 1
                     PrismSettings.FONT_STYLE_CUSTOM -> 2
                     else -> 0
@@ -1002,9 +1134,9 @@ class SettingsActivity : PrismBaseActivity() {
                         2 -> PrismSettings.FONT_STYLE_CUSTOM
                         else -> PrismSettings.FONT_STYLE_DEFAULT
                     }
-                    PrismSettings.setFontStyle(this, style)
+                    PrismSettings.setFontStyle(style)
                     // If Custom is selected but no path exists, prompt to pick
-                    if (style == PrismSettings.FONT_STYLE_CUSTOM && PrismSettings.getCustomFontPath(this).isEmpty()) {
+                    if (style == PrismSettings.FONT_STYLE_CUSTOM && PrismSettings.getCustomFontPath().isEmpty()) {
                         fontPicker.launch("*/*")
                     } else {
                         Toast.makeText(this, "Restart app to fully apply fonts", Toast.LENGTH_SHORT).show()
@@ -1015,7 +1147,7 @@ class SettingsActivity : PrismBaseActivity() {
                 "Select Custom Font",
                 "Load a .ttf or .otf file from storage",
                 { fontPicker.launch("*/*") },
-                isEnabled = PrismSettings.getFontStyle(this) == PrismSettings.FONT_STYLE_CUSTOM
+                isEnabled = PrismSettings.getFontStyle() == PrismSettings.FONT_STYLE_CUSTOM
             ),
 
             // ── OS Virtualization ────────────────────────────────────────────
@@ -1023,38 +1155,35 @@ class SettingsActivity : PrismBaseActivity() {
             SettingItem.Toggle(
                 "Enable Virtualization",
                 "Route app launches through the virtualization page",
-                PrismSettings.getVirtualizationEnabled(this),
+                PrismSettings.getVirtualizationEnabled(),
                 {
-                    PrismSettings.setVirtualizationEnabled(this, it)
-                    adapter.setItems(buildItems())
+                    PrismSettings.setVirtualizationEnabled(it)
+                    refresh()
                 }
             ),
             SettingItem.Picker(
                 "Virtualization Mode",
                 "Select the OS to run in the virtualization page",
                 listOf("PrismOS (lightweight AOSP)", "Custom ISO"),
-                if (PrismSettings.getVirtualizationMode(this) == PrismSettings.VIRT_MODE_PRISM_OS) 0 else 1,
+                if (PrismSettings.getVirtualizationMode() == PrismSettings.VIRT_MODE_PRISM_OS) 0 else 1,
                 { idx ->
-                    PrismSettings.setVirtualizationMode(
-                        this,
-                        if (idx == 0) PrismSettings.VIRT_MODE_PRISM_OS else PrismSettings.VIRT_MODE_CUSTOM_ISO
-                    )
-                    adapter.setItems(buildItems())
+                    PrismSettings.setVirtualizationMode(if (idx == 0) PrismSettings.VIRT_MODE_PRISM_OS else PrismSettings.VIRT_MODE_CUSTOM_ISO)
+                    refresh()
                 },
-                isEnabled = PrismSettings.getVirtualizationEnabled(this)
+                isEnabled = PrismSettings.getVirtualizationEnabled()
             ),
             SettingItem.Nav(
                 "Select ISO File",
-                PrismSettings.getCustomIsoPath(this).ifBlank { "No file selected" },
+                PrismSettings.getCustomIsoPath().ifBlank { "No file selected" },
                 { isoPicker.launch(arrayOf("application/octet-stream", "*/*")) },
-                isEnabled = PrismSettings.getVirtualizationEnabled(this) &&
-                    PrismSettings.getVirtualizationMode(this) == PrismSettings.VIRT_MODE_CUSTOM_ISO
+                isEnabled = PrismSettings.getVirtualizationEnabled() &&
+                    PrismSettings.getVirtualizationMode() == PrismSettings.VIRT_MODE_CUSTOM_ISO
             )
         )
     }
 
     private fun buildSlotPickers(): Array<SettingItem> {
-        val prefs = SlotPreferences(this)
+        val prefs = SlotPreferences()
         val assignments = prefs.getAssignments()
         val options = listOf("Browser", "Desktop Grid", "App Drawer", "Messaging", "Nebula Social", "Kinetic Halo", "File Explorer", "Models", "Agentic Tools")
 
@@ -1101,7 +1230,7 @@ class SettingsActivity : PrismBaseActivity() {
             is SettingItem.Toggle -> {
                 item.value = !item.value
                 item.onChanged(item.value)
-                adapter.setItems(buildItems())
+                refresh()
             }
             is SettingItem.Picker -> {
                 PrismDialogFactory.show(
@@ -1122,7 +1251,7 @@ class SettingsActivity : PrismBaseActivity() {
                         setOnItemClickListener { _, _, which, _ ->
                             item.currentSelection = which
                             item.onChanged(which)
-                            this@SettingsActivity.adapter.setItems(buildItems())
+                            this@SettingsActivity.refresh()
                         }
                     }
                 )
@@ -1154,7 +1283,7 @@ class SettingsActivity : PrismBaseActivity() {
                         if (newValue.isNotEmpty()) {
                             item.value = newValue
                             item.onChanged(newValue)
-                            this@SettingsActivity.adapter.setItems(buildItems())
+                            this@SettingsActivity.refresh()
                         }
                     },
                     customView = FrameLayout(this).apply {
@@ -1172,7 +1301,7 @@ class SettingsActivity : PrismBaseActivity() {
     }
 
     private fun showServerFleetManager() {
-        val servers = PrismSettings.getPrismServers(this)
+        val servers = PrismSettings.getPrismServers()
         val container = android.widget.LinearLayout(this).apply {
             orientation = android.widget.LinearLayout.VERTICAL
             setPadding(40, 40, 40, 40)
@@ -1190,15 +1319,15 @@ class SettingsActivity : PrismBaseActivity() {
                     val t2 = view.findViewById<android.widget.TextView>(android.R.id.text2)
                     
                     t1.text = if (s.isActive) "● ${s.name} (ACTIVE)" else s.name
-                    t1.setTextColor(if (s.isActive) PrismSettings.getGlowColor(this@SettingsActivity) else androidx.core.content.ContextCompat.getColor(this@SettingsActivity, R.color.prism_text_primary))
+                    t1.setTextColor(if (s.isActive) PrismSettings.getGlowColor() else androidx.core.content.ContextCompat.getColor(this@SettingsActivity, R.color.prism_text_primary))
                     t2.text = "${s.address}:${s.port} | User: ${s.username}"
                     t2.setTextColor(androidx.core.content.ContextCompat.getColor(this@SettingsActivity, R.color.prism_text_muted))
                     
                     view.setOnClickListener {
                         servers.forEach { it.isActive = false }
                         s.isActive = true
-                        PrismSettings.setPrismServers(this@SettingsActivity, servers)
-                        this@SettingsActivity.adapter.setItems(buildItems())
+                        PrismSettings.setPrismServers(servers)
+                        this@SettingsActivity.refresh()
                         showServerFleetManager() // Refresh
                     }
                     
@@ -1206,8 +1335,8 @@ class SettingsActivity : PrismBaseActivity() {
                         PrismDialogFactory.show(this@SettingsActivity, "Delete Server?", "Remove ${s.name} from your fleet?", onPositive = {
                             val newList = servers.toMutableList()
                             newList.removeAt(idx)
-                            PrismSettings.setPrismServers(this@SettingsActivity, newList)
-                            this@SettingsActivity.adapter.setItems(buildItems())
+                            PrismSettings.setPrismServers(newList)
+                            this@SettingsActivity.refresh()
                             showServerFleetManager()
                         })
                         true
@@ -1222,7 +1351,7 @@ class SettingsActivity : PrismBaseActivity() {
         val addBtn = android.widget.Button(this).apply {
             text = "+ ADD PRISM SERVER"
             setBackgroundColor(android.graphics.Color.TRANSPARENT)
-            setTextColor(PrismSettings.getGlowColor(this@SettingsActivity))
+            setTextColor(PrismSettings.getGlowColor())
             setOnClickListener { showAddServerDialog() }
         }
         container.addView(addBtn)
@@ -1252,7 +1381,7 @@ class SettingsActivity : PrismBaseActivity() {
             val name = nameInput.text.toString().trim()
             val ip = ipInput.text.toString().trim()
             if (name.isNotEmpty() && ip.isNotEmpty()) {
-                val servers = PrismSettings.getPrismServers(this).toMutableList()
+                val servers = PrismSettings.getPrismServers().toMutableList()
                 servers.add(PrismSettings.PrismServer(
                     name = name,
                     address = ip,
@@ -1260,8 +1389,8 @@ class SettingsActivity : PrismBaseActivity() {
                     username = userInput.text.toString(),
                     password = passInput.text.toString()
                 ))
-                PrismSettings.setPrismServers(this, servers)
-                adapter.setItems(buildItems())
+                PrismSettings.setPrismServers(servers)
+                refresh()
                 showServerFleetManager()
             }
         }, customView = layout)
@@ -1270,19 +1399,152 @@ class SettingsActivity : PrismBaseActivity() {
     private fun promptCustomSearchUrl() {
         val input = EditText(this).apply {
             inputType = InputType.TYPE_CLASS_TEXT
-            setText(PrismSettings.getCustomSearchUrl(this@SettingsActivity))
+            setText(PrismSettings.getCustomSearchUrl())
         }
         PrismDialogFactory.show(
             this,
             "Custom Search Engine",
             "Enter search URL. Use %s for query placeholder.",
             onPositive = {
-                PrismSettings.setCustomSearchUrl(this@SettingsActivity, input.text.toString().trim())
+                PrismSettings.setCustomSearchUrl(input.text.toString().trim())
             },
             customView = input
         )
     }
 
+
+    // ── Auto-caption ────────────────────────────────────────────────────────────────────────
+    //
+    // Ports prism-os/scripts/auto_caption.py. The script itself CANNOT run here: it needs CPython
+    // plus torch, transformers, OpenCV and Pillow, and none of that has an Android build. So the
+    // captions come from the vision model Prism already talks to, while the file operations --
+    // slug rules, collision suffixes, refusal to overwrite -- are CaptionService, shared with the
+    // desktop build so both platforms rename identically.
+
+    /**
+     * Turns a Storage Access Framework tree URI into a real path.
+     *
+     * Only the `primary:` volume is convertible; an SD card or a cloud document provider has no
+     * filesystem path at all, and guessing one produces a File that silently refers to nothing.
+     * Returning null there lets the caller say so instead.
+     */
+    private fun resolveTreePath(uri: android.net.Uri): java.io.File? {
+        val docId = try {
+            android.provider.DocumentsContract.getTreeDocumentId(uri)
+        } catch (e: Exception) {
+            return null
+        }
+        val parts = docId.split(":")
+        if (parts.size < 2 || parts[0] != "primary") return null
+        val relative = parts[1]
+        val root = android.os.Environment.getExternalStorageDirectory()
+        val file = if (relative.isEmpty()) root else java.io.File(root, relative)
+        return file.takeIf { it.isDirectory }
+    }
+
+    /**
+     * Captions the folder and shows the plan.
+     *
+     * THE PREVIEW IS NOT OPTIONAL, and that is inherited rather than invented: auto_caption.py
+     * defaults to a dry run and only renames when given --apply, because renaming someone's own
+     * content directory is hard to reverse. A one-tap "caption this folder" would have been less
+     * code and would have thrown that away.
+     */
+    private fun startCaptionPreview(directory: java.io.File) {
+        val captioner = com.prism.launcher.nora.VisionModelCaptioner()
+        if (!captioner.isAvailable()) {
+            android.app.AlertDialog.Builder(this)
+                .setTitle("No vision model configured")
+                .setMessage(
+                    "Auto-captioning needs a cloud model that accepts images. Set one up under " +
+                        "Cloud Models, then try again.\n\n" +
+                        "The desktop build can instead run prism-os/scripts/auto_caption.py " +
+                        "directly with BLIP; that script needs Python and PyTorch, which do not " +
+                        "exist on Android."
+                )
+                .setPositiveButton("OK", null)
+                .show()
+            return
+        }
+
+        val total = com.prism.launcher.nora.CaptionService.countCaptionable(directory)
+        if (total == 0) {
+            Toast.makeText(this, "No images in ${directory.name}", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        val progress = android.app.ProgressDialog(this).apply {
+            setTitle("Captioning")
+            setMessage("Preparing...")
+            setCancelable(false)
+            isIndeterminate = false
+            max = total
+            show()
+        }
+
+        lifecycleScope.launch {
+            val plan = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                com.prism.launcher.nora.CaptionService.plan(directory, captioner) { done, all ->
+                    runOnUiThread {
+                        progress.progress = done
+                        progress.setMessage("$done of $all")
+                    }
+                }
+            }
+            progress.dismiss()
+            showCaptionPlan(plan)
+        }
+    }
+
+    /** The dry-run preview. Renaming happens only from the positive button here. */
+    private fun showCaptionPlan(plan: com.prism.launcher.nora.CaptionService.Plan) {
+        val body = StringBuilder()
+
+        if (plan.renames.isEmpty()) {
+            body.append("Nothing to rename.\n\n")
+        } else {
+            for (r in plan.renames.take(40)) {
+                body.append(r.from.name).append("\n    -> ").append(r.to.name)
+                if (r.unchanged) body.append("  (unchanged)")
+                if (r.blocked) body.append("  (SKIPPED - name taken)")
+                body.append("\n")
+            }
+            if (plan.renames.size > 40) {
+                body.append("\n...and ").append(plan.renames.size - 40).append(" more.\n")
+            }
+        }
+
+        if (plan.failures.isNotEmpty()) {
+            body.append("\nCould not caption ").append(plan.failures.size).append(" file(s):\n")
+            plan.failures.take(8).forEach { body.append("  ").append(it).append("\n") }
+        }
+
+        body.append("\nCaptions come from a general-purpose vision model, not one trained on ")
+        body.append("your content -- expect generic or off-target descriptions on anything ")
+        body.append("unusual. Review the list above before applying.")
+
+        val builder = android.app.AlertDialog.Builder(this)
+            .setTitle("${plan.actionable} file(s) would be renamed")
+            .setMessage(body.toString())
+            .setNegativeButton("Cancel", null)
+
+        if (plan.actionable > 0) {
+            builder.setPositiveButton("Rename ${plan.actionable}") { _, _ ->
+                lifecycleScope.launch {
+                    val result = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        com.prism.launcher.nora.CaptionService.apply(plan)
+                    }
+                    val message = buildString {
+                        append("Renamed ").append(result.renamed)
+                        if (result.skipped > 0) append(", skipped ").append(result.skipped)
+                        if (result.errors.isNotEmpty()) append(", ").append(result.errors.size).append(" failed")
+                    }
+                    Toast.makeText(this@SettingsActivity, message, Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+        builder.show()
+    }
 }
 
 // ── Models & Adapter ────────────────────────────────────────────────────────
@@ -1401,4 +1663,6 @@ class SettingsAdapter(
     class HeaderVH(val binding: ItemSettingHeaderBinding) : RecyclerView.ViewHolder(binding.root)
     class ToggleVH(val binding: ItemSettingToggleBinding) : RecyclerView.ViewHolder(binding.root)
     class NavVH(val binding: ItemSettingNavBinding) : RecyclerView.ViewHolder(binding.root)
+
+
 }

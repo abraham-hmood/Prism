@@ -66,7 +66,7 @@ class ModelsPageView @JvmOverloads constructor(
     private fun scanOllama() {
         ollamaScanJob?.cancel()
         ollamaScanJob = viewScope.launch {
-            ollamaServers = OllamaDiscoveryService.scan(context)
+            ollamaServers = OllamaDiscoveryService.scan()
             refreshList()
         }
     }
@@ -77,9 +77,9 @@ class ModelsPageView @JvmOverloads constructor(
         val files = modelsDir.listFiles()?.filter { it.isFile } ?: emptyList()
         val existingPaths = files.map { it.absolutePath }.toSet()
 
-        val registry = PrismSettings.getImportedModels(context).toMutableList()
+        val registry = PrismSettings.getImportedModels().toMutableList()
         val registeredPaths = registry.map { it.path }.toSet()
-        val activeImage = PrismSettings.getLocalImageModelPath(context)
+        val activeImage = PrismSettings.getLocalImageModelPath()
 
         var changed = false
         files.forEach { file ->
@@ -95,24 +95,24 @@ class ModelsPageView @JvmOverloads constructor(
 
         val reconciled = registry.filter { it.path in existingPaths }
         if (reconciled.size != registry.size) changed = true
-        if (changed) PrismSettings.setImportedModels(context, reconciled)
+        if (changed) PrismSettings.setImportedModels(reconciled)
 
         return reconciled.sortedByDescending { it.importedAt }
     }
 
     private fun refreshList() {
         val models = loadModels()
-        val activeText = PrismSettings.getLocalAiModelPath(context)
-        val activeImage = PrismSettings.getLocalImageModelPath(context)
-        val currentMode = PrismSettings.getAiMode(context)
+        val activeText = PrismSettings.getLocalAiModelPath()
+        val activeImage = PrismSettings.getLocalImageModelPath()
+        val currentMode = PrismSettings.getAiMode()
 
         val textModels = models.filter { it.type == PrismSettings.MODEL_TYPE_TEXT }
         val imageModels = models.filter { it.type == PrismSettings.MODEL_TYPE_IMAGE }
 
-        val cloudModels = PrismSettings.getCloudModels(context)
-        val activeCloudId = PrismSettings.getActiveCloudModelId(context)
+        val cloudModels = PrismSettings.getCloudModels()
+        val activeCloudId = PrismSettings.getActiveCloudModelId()
 
-        val activeOllama = PrismSettings.getSelectedOllamaEndpoint(context)
+        val activeOllama = PrismSettings.getSelectedOllamaEndpoint()
 
         val items = mutableListOf<ModelListItem>()
         if (textModels.isNotEmpty()) {
@@ -150,25 +150,25 @@ class ModelsPageView @JvmOverloads constructor(
 
     private fun setActive(model: PrismSettings.ImportedModel) {
         if (model.type == PrismSettings.MODEL_TYPE_IMAGE) {
-            PrismSettings.setLocalImageModelPath(context, model.path)
+            PrismSettings.setLocalImageModelPath(model.path)
         } else {
-            PrismSettings.setLocalAiModelPath(context, model.path)
-            PrismSettings.setAiMode(context, PrismSettings.AI_MODE_LOCAL)
+            PrismSettings.setLocalAiModelPath(model.path)
+            PrismSettings.setAiMode(PrismSettings.AI_MODE_LOCAL)
         }
         Toast.makeText(context, "${model.displayName} is now active", Toast.LENGTH_SHORT).show()
         refreshList()
     }
 
     private fun setActiveCloud(model: PrismSettings.CloudModelProfile) {
-        PrismSettings.setActiveCloudModelId(context, model.id)
-        PrismSettings.setAiMode(context, PrismSettings.AI_MODE_CLOUD)
+        PrismSettings.setActiveCloudModelId(model.id)
+        PrismSettings.setAiMode(PrismSettings.AI_MODE_CLOUD)
         Toast.makeText(context, "${model.modelId} is now the active cloud model", Toast.LENGTH_SHORT).show()
         refreshList()
     }
 
     private fun setActiveOllama(host: String, port: Int, modelName: String) {
-        PrismSettings.setSelectedOllamaEndpoint(context, PrismSettings.OllamaEndpoint(host, port, modelName))
-        PrismSettings.setAiMode(context, PrismSettings.AI_MODE_LOCAL_CLOUD)
+        PrismSettings.setSelectedOllamaEndpoint(PrismSettings.OllamaEndpoint(host, port, modelName))
+        PrismSettings.setAiMode(PrismSettings.AI_MODE_LOCAL_CLOUD)
         Toast.makeText(context, "$modelName is now the active model", Toast.LENGTH_SHORT).show()
         refreshList()
     }
@@ -190,13 +190,13 @@ class ModelsPageView @JvmOverloads constructor(
         GgufInferenceService.unload(model.path)
 
         File(model.path).delete()
-        PrismSettings.removeImportedModel(context, model.path)
+        PrismSettings.removeImportedModel(model.path)
 
-        if (model.type == PrismSettings.MODEL_TYPE_IMAGE && PrismSettings.getLocalImageModelPath(context) == model.path) {
-            PrismSettings.setLocalImageModelPath(context, "")
+        if (model.type == PrismSettings.MODEL_TYPE_IMAGE && PrismSettings.getLocalImageModelPath() == model.path) {
+            PrismSettings.setLocalImageModelPath("")
         }
-        if (model.type == PrismSettings.MODEL_TYPE_TEXT && PrismSettings.getLocalAiModelPath(context) == model.path) {
-            PrismSettings.setLocalAiModelPath(context, "")
+        if (model.type == PrismSettings.MODEL_TYPE_TEXT && PrismSettings.getLocalAiModelPath() == model.path) {
+            PrismSettings.setLocalAiModelPath("")
         }
 
         Toast.makeText(context, "Deleted ${model.displayName}", Toast.LENGTH_SHORT).show()

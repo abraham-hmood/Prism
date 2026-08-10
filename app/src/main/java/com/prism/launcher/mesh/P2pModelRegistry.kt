@@ -1,10 +1,10 @@
 package com.prism.launcher.mesh
 
 import android.content.Context
-import com.prism.launcher.MeshUtils
+import com.prism.core.MeshUtils
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import org.json.JSONObject
+import com.prism.core.json.JSONObject
 
 /**
  * Gossips which peers on the Prism mesh are hosting a local AI model, mirroring
@@ -37,7 +37,7 @@ object P2pModelRegistry {
 
     /** Called when this device enables/updates AI model hosting — gossips it mesh-wide. */
     fun announce(context: Context, modelName: String) {
-        val myIp = MeshUtils.getLocalMeshIp(context)
+        val myIp = MeshUtils.getLocalMeshIp()
         hostedModels[myIp] = HostedModelInfo(myIp, modelName, System.currentTimeMillis())
         _models.value = hostedModels.toMap()
         broadcast(modelName)
@@ -45,7 +45,7 @@ object P2pModelRegistry {
 
     /** Called when this device disables AI model hosting. */
     fun revoke(context: Context) {
-        val myIp = MeshUtils.getLocalMeshIp(context)
+        val myIp = MeshUtils.getLocalMeshIp()
         hostedModels.remove(myIp)
         _models.value = hostedModels.toMap()
         broadcast("")

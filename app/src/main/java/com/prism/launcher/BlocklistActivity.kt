@@ -48,7 +48,7 @@ class BlocklistActivity : AppCompatActivity() {
                     }
                 }
                 if (hosts.isNotEmpty()) {
-                    PrismBlocklist.get(this@BlocklistActivity).mergeCustomDomains(hosts)
+                    PrismBlocklist.get().mergeCustomDomains(hosts)
                     withContext(Dispatchers.Main) {
                         Toast.makeText(this@BlocklistActivity, "Imported ${hosts.size} domains", Toast.LENGTH_SHORT).show()
                         refreshList()
@@ -80,7 +80,7 @@ class BlocklistActivity : AppCompatActivity() {
         binding.addDomainBtn.setOnClickListener {
             val domain = binding.addDomainInput.text.toString().trim()
             if (domain.isNotEmpty()) {
-                PrismBlocklist.get(this).addCustomDomain(domain)
+                PrismBlocklist.get().addCustomDomain(domain)
                 binding.addDomainInput.text.clear()
                 refreshList()
                 Toast.makeText(this, "Added $domain", Toast.LENGTH_SHORT).show()
@@ -103,7 +103,7 @@ class BlocklistActivity : AppCompatActivity() {
     }
 
     private fun refreshList() {
-        val store = PrismBlocklist.get(this)
+        val store = PrismBlocklist.get()
         allDomains = store.snapshotAllDomains()
         customDomains = store.snapshotCustomDomains()
         binding.blocklistStats.text = "Total blocked: ${allDomains.size} (${customDomains.size} custom)"
@@ -123,7 +123,7 @@ class BlocklistActivity : AppCompatActivity() {
 
     private fun onRemoveClicked(domain: String) {
         val clean = domain.removePrefix("*.")
-        PrismBlocklist.get(this).removeCustomDomain(clean)
+        PrismBlocklist.get().removeCustomDomain(clean)
         refreshList()
     }
 }

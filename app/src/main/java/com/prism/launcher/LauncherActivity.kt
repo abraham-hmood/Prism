@@ -89,10 +89,10 @@ class LauncherActivity : PrismBaseActivity() {
         binding = ActivityLauncherBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        slotPreferences = SlotPreferences(this)
-        desktopShortcutStore = DesktopShortcutStore(this)
+        slotPreferences = SlotPreferences()
+        desktopShortcutStore = DesktopShortcutStore()
         
-        if (PrismSettings.getVpnServerAlwaysOn(this)) {
+        if (PrismSettings.getVpnServerAlwaysOn()) {
             com.prism.launcher.browser.PrivateDnsVpnService.start(this, false)
         }
         
@@ -117,7 +117,7 @@ class LauncherActivity : PrismBaseActivity() {
             },
         )
         binding.desktopPager.adapter = mainAdapter
-        binding.desktopPager.setCurrentItem(PrismSettings.getDefaultPage(this), false)
+        binding.desktopPager.setCurrentItem(PrismSettings.getDefaultPage(), false)
         binding.desktopPager.offscreenPageLimit = 2
 
         binding.desktopPager.registerOnPageChangeCallback(object : ViewPager2.OnPageChangeCallback() {
@@ -341,8 +341,8 @@ class LauncherActivity : PrismBaseActivity() {
     }
 
     private fun launchComponent(cn: ComponentName) {
-        if (PrismSettings.getVirtualizationEnabled(this) &&
-            PrismSettings.getVirtualizationMode(this) == PrismSettings.VIRT_MODE_PRISM_OS) {
+        if (PrismSettings.getVirtualizationEnabled() &&
+            PrismSettings.getVirtualizationMode() == PrismSettings.VIRT_MODE_PRISM_OS) {
             val virtPos = findVirtualizationOsPosition()
             if (virtPos != -1) {
                 binding.desktopPager.setCurrentItem(virtPos, true)
@@ -372,7 +372,7 @@ class LauncherActivity : PrismBaseActivity() {
     private fun logLaunchStat(cn: ComponentName) {
         lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             try {
-                val db = AppDatabase.get(this@LauncherActivity)
+                val db = AppDatabase.get()
                 val hourOfDay = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
                 val cnStr = cn.flattenToString()
                 val statDao = db.appLaunchStatDao()
@@ -565,7 +565,7 @@ class LauncherActivity : PrismBaseActivity() {
         val current = binding.desktopPager.currentItem
         val targetIndex = if (current in desktopIndices) current else desktopIndices.first()
         
-        DesktopShortcutStore.add(this, item, targetIndex)
+        DesktopShortcutStore.add(item, targetIndex)
         
         // Refresh the targeted page if it's currently loaded
         findPageViewAt(targetIndex)?.let { 

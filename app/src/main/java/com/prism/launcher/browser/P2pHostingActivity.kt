@@ -1,5 +1,6 @@
 package com.prism.launcher.browser
 
+import com.prism.core.MeshUtils
 import android.content.Intent
 import android.os.Bundle
 import android.view.LayoutInflater
@@ -48,22 +49,22 @@ class P2pHostingActivity : PrismBaseActivity() {
         
         adapter = P2pHostingAdapter(
             onToggle = { site, active ->
-                val sites = PrismSettings.getP2pHostedSites(this).toMutableList()
+                val sites = PrismSettings.getP2pHostedSites().toMutableList()
                 sites.find { it.id == site.id }?.isActive = active
-                PrismSettings.setP2pHostedSites(this, sites)
+                PrismSettings.setP2pHostedSites(sites)
                 
                 if (!active) {
                     P2pDnsManager.deleteRecord(this, site.domain)
                 } else {
-                    val myIp = com.prism.launcher.MeshUtils.getLocalMeshIp(this)
+                    val myIp = MeshUtils.getLocalMeshIp()
                     P2pDnsManager.updateRecord(this, site.domain, myIp)
                 }
             },
             onDelete = { site ->
                 PrismDialogFactory.show(this, "Stop Hosting?", "Remove ${site.domain} from your local hosting list?", onPositive = {
-                    val sites = PrismSettings.getP2pHostedSites(this).toMutableList()
+                    val sites = PrismSettings.getP2pHostedSites().toMutableList()
                     sites.removeAll { it.id == site.id }
-                    PrismSettings.setP2pHostedSites(this, sites)
+                    PrismSettings.setP2pHostedSites(sites)
                     P2pDnsManager.deleteRecord(this, site.domain)
                     refresh()
                 })
@@ -173,7 +174,7 @@ class P2pHostingActivity : PrismBaseActivity() {
     }
 
     private fun refresh() {
-        adapter.submitList(PrismSettings.getP2pHostedSites(this))
+        adapter.submitList(PrismSettings.getP2pHostedSites())
     }
 
     private fun showAddSiteDialog(prefilledPath: String? = null) {
@@ -199,19 +200,19 @@ class P2pHostingActivity : PrismBaseActivity() {
     }
 
     private fun finalizeAddSite(domain: String, path: String) {
-        val sites = PrismSettings.getP2pHostedSites(this).toMutableList()
+        val sites = PrismSettings.getP2pHostedSites().toMutableList()
         if (sites.any { it.domain == domain }) {
             Toast.makeText(this, "Domain already hosted locally", Toast.LENGTH_SHORT).show()
             return
         }
         val existingIp = P2pDnsManager.resolve(domain)
-        val myIp = com.prism.launcher.MeshUtils.getLocalMeshIp(this)
+        val myIp = MeshUtils.getLocalMeshIp()
         if (existingIp != null && existingIp != myIp) {
             PrismDialogFactory.show(this, "Domain Collision", "This domain is already registered to another peer ($existingIp).")
             return
         }
         sites.add(PrismSettings.P2pHostedSite(domain = domain, localPath = path))
-        PrismSettings.setP2pHostedSites(this, sites)
+        PrismSettings.setP2pHostedSites(sites)
         refresh()
         P2pDnsManager.updateRecord(this, domain, myIp)
         PrismDialogFactory.show(this, "Website Live!", "Your site $domain is now active.")

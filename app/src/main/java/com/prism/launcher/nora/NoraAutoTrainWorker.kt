@@ -49,11 +49,11 @@ class NoraAutoTrainWorker(context: Context, params: WorkerParameters) :
         val ctx = applicationContext
 
         // Re-check every precondition. A periodic request outlives the settings that created it.
-        if (!PrismSettings.getNoraAutoTrainEnabled(ctx)) return Result.success()
+        if (!PrismSettings.getNoraAutoTrainEnabled()) return Result.success()
         if (!messagesPageActive(ctx)) return Result.success()
 
         // Nothing to learn from is not a failure, and retrying would only burn wakeups.
-        if (NoraTrainer.loadDataset(ctx).isEmpty()) {
+        if (NoraTrainer.loadDataset().isEmpty()) {
             PrismLogger.logInfo("Nora", "Autonomous training skipped: dataset is empty")
             return Result.success()
         }
@@ -95,13 +95,13 @@ class NoraAutoTrainWorker(context: Context, params: WorkerParameters) :
          * waiting for the current period to elapse first.
          */
         fun schedule(context: Context) {
-            val enabled = PrismSettings.getNoraAutoTrainEnabled(context)
+            val enabled = PrismSettings.getNoraAutoTrainEnabled()
             if (!enabled || !messagesPageActive(context)) {
                 WorkManager.getInstance(context).cancelUniqueWork(WORK_NAME)
                 return
             }
 
-            val hours = PrismSettings.getNoraAutoTrainIntervalHours(context).toLong()
+            val hours = PrismSettings.getNoraAutoTrainIntervalHours().toLong()
             val constraints = Constraints.Builder()
                 .setRequiresDeviceIdle(true)
                 .setRequiresBatteryNotLow(true)
@@ -127,7 +127,7 @@ class NoraAutoTrainWorker(context: Context, params: WorkerParameters) :
          * no way to talk to would be spending their battery on nothing.
          */
         fun messagesPageActive(context: Context): Boolean =
-            SlotPreferences(context).getAssignments().any { it is SlotAssignment.Messaging }
+            SlotPreferences().getAssignments().any { it is SlotAssignment.Messaging }
 
         /**
          * Whether Prism is exempt from battery optimization.

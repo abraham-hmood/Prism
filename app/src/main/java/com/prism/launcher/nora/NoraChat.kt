@@ -38,9 +38,18 @@ object NoraChat {
     )
 
     val COMMANDS = listOf(
+        Command("/diffuser", "<prompt>", "Real diffusion sampling, with my cortex as the denoiser", true),
         Command("/sample", "<prompt>", "Sample stochastically — different image every time", true),
         Command("/coarse", "<prompt>", "Coarse-to-fine — global structure first, detail last", true),
         Command("/video", "<prompt>", "Generate a clip instead of a still", true),
+        Command(
+            "/hallucinate", "<prompt>",
+            "Recursive video — no fixation, each frame dreamed from the last one I drew", true
+        ),
+        Command(
+            "/expose", "<prompt>",
+            "One long held gaze -- the prompt fades and I free-associate from where it left off", true
+        ),
         Command("/motion", "<template>", "Camera motion for the next clip", false),
         Command("/denoise", "on | off", "Train on corrupted images (better supervision)", false),
         Command("/status", "", "What my brain is currently doing", false),
@@ -57,7 +66,10 @@ object NoraChat {
         appendLine("that I use to see.")
         appendLine()
         appendLine("Just type what you want and I'll picture it — that uses saccadic refinement,")
-        appendLine("my default. The commands pick a different way of settling:")
+        appendLine("my default: several fixations stitched onto one canvas. /sample, /coarse and")
+        appendLine("/diffuser still stitch fixations the same way, they just settle each one")
+        appendLine("differently. /hallucinate and /expose don't stitch anything — one held gaze,")
+        appendLine("no eye movement at all:")
         appendLine()
         val width = COMMANDS.maxOf { it.trigger.length + it.argHint.length + 1 }
         for (c in COMMANDS) {
@@ -127,6 +139,12 @@ object NoraChat {
             lower == "/help" || lower == "help" -> return Reply(helpText())
             lower == "/brain" || lower == "/architecture" -> return Reply(BRAIN)
 
+            lower.startsWith("/diffuser") -> {
+                val prompt = text.removePrefix("/diffuser").trim()
+                if (prompt.isEmpty()) return Reply("Tell me what to diffuse, e.g. \"/diffuser a red apple\".")
+                return generateImage(ctx, prompt, NoraImageryMode.DIFFUSION, onProgress)
+            }
+
             lower.startsWith("/sample") -> {
                 val prompt = text.removePrefix("/sample").trim()
                 if (prompt.isEmpty()) return Reply("Tell me what to sample, e.g. \"/sample a red apple\".")
@@ -139,12 +157,24 @@ object NoraChat {
                 return generateImage(ctx, prompt, NoraImageryMode.COARSE_TO_FINE, onProgress)
             }
 
+            lower.startsWith("/hallucinate") -> {
+                val prompt = text.removePrefix("/hallucinate").trim()
+                if (prompt.isEmpty()) return Reply("Tell me what to hallucinate, e.g. \"/hallucinate a red apple\".")
+                return generateHallucination(ctx, prompt, onProgress)
+            }
+
+            lower.startsWith("/expose") -> {
+                val prompt = text.removePrefix("/expose").trim()
+                if (prompt.isEmpty()) return Reply("Tell me what to expose myself to, e.g. \"/expose a red apple\".")
+                return generateExposure(ctx, prompt, onProgress)
+            }
+
             lower.startsWith("/denoise") -> {
                 val arg = text.removePrefix("/denoise").trim().lowercase()
-                val current = com.prism.launcher.PrismSettings.getNoraDenoisingEnabled(ctx)
+                val current = com.prism.launcher.PrismSettings.getNoraDenoisingEnabled()
                 return when (arg) {
                     "on", "true", "yes" -> {
-                        com.prism.launcher.PrismSettings.setNoraDenoisingEnabled(ctx, true)
+                        com.prism.launcher.PrismSettings.setNoraDenoisingEnabled(true)
                         Reply(
                             "Denoising curriculum on. Training will corrupt each image — noise or " +
                                 "occlusion, at a strength drawn fresh each time — and learn to " +
@@ -153,7 +183,7 @@ object NoraChat {
                         )
                     }
                     "off", "false", "no" -> {
-                        com.prism.launcher.PrismSettings.setNoraDenoisingEnabled(ctx, false)
+                        com.prism.launcher.PrismSettings.setNoraDenoisingEnabled(false)
                         Reply("Denoising curriculum off. Training will learn from clean images only.")
                     }
                     else -> Reply(
@@ -173,8 +203,8 @@ object NoraChat {
                     buildString {
                         append(if (trained) "Connectome loaded.\n" else "No connectome yet -- untrained.\n")
                         append(NoraStudio.status(ctx))
-                        append("\n\nDataset: $dataset images in ${NoraConfig.datasetDir(ctx).absolutePath}")
-                        append("\nFeedback: ${NoraFeedback.summary(ctx)}")
+                        append("\n\nDataset: $dataset images in ${NoraConfig.datasetDir().absolutePath}")
+                        append("\nFeedback: ${NoraFeedback.summary()}")
                     }
                 )
             }
@@ -187,13 +217,13 @@ object NoraChat {
                     )
                     Reply(
                         "Opening my training page. Put images in " +
-                            "${NoraConfig.datasetDir(ctx).absolutePath} first — name each file " +
+                            "${NoraConfig.datasetDir().absolutePath} first — name each file " +
                             "after what it shows, like \"a red apple on a table.png\"."
                     )
                 } catch (e: Exception) {
                     Reply(
                         "Couldn't open the training page (${e.message}). Dataset folder is " +
-                            NoraConfig.datasetDir(ctx).absolutePath
+                            NoraConfig.datasetDir().absolutePath
                     )
                 }
             }
@@ -242,6 +272,9 @@ object NoraChat {
                     "Seeding \"$prompt\" with noise and annealing the temperature down…"
                 NoraImageryMode.COARSE_TO_FINE ->
                     "Holding \"$prompt\" and letting the coarse channels settle first…"
+                NoraImageryMode.DIFFUSION ->
+                    "Starting \"$prompt\" from pure noise and denoising it down " +
+                        "${NoraConfig.DIFFUSION_STEPS} levels — this one is slow…"
                 NoraImageryMode.DETERMINISTIC ->
                     "Clamping \"$prompt\" in IT and running the hierarchy top-down…"
             }
@@ -254,6 +287,10 @@ object NoraChat {
                 "Sampled, not solved — ask again and you'll get a different draw of the same idea."
             NoraImageryMode.COARSE_TO_FINE ->
                 "Built coarse to fine: magno gist first, then the detail channels unlocked in turn."
+            NoraImageryMode.DIFFUSION ->
+                "Diffusion proper: pure noise in, ${NoraConfig.DIFFUSION_STEPS} denoising passes " +
+                    "down a geometric schedule, my visual cortex standing in for the U-Net. " +
+                    "No weights involved that the other routes don't also use."
             NoraImageryMode.DETERMINISTIC ->
                 "Here's what that looks like from the inside."
         }
@@ -281,6 +318,58 @@ object NoraChat {
                 "video",
                 result.feedbackToken
             )
+        } else {
+            Reply(result.note)
+        }
+    }
+
+    private suspend fun generateHallucination(
+        ctx: Context,
+        prompt: String,
+        onProgress: (String) -> Unit
+    ): Reply {
+        onProgress(
+            "Reading \"$prompt\" once, then dreaming from what I draw -- no fixation, no eye " +
+                "movement, just looking at my own last frame and drawing the next one from it."
+        )
+        val result = NoraStudio.generateHallucination(ctx, prompt) { done, total ->
+            onProgress("Dream frame $done of $total -- perceiving my last frame before drawing the next.")
+        }
+        return if (result.uri != null) {
+            Reply(
+                "${NoraConfig.HALLUCINATION_FRAMES} frames, one held gaze, no saccades -- each " +
+                    "frame recognised from the last and re-dreamed from that. Drift is expected; " +
+                    "it isn't warped forward the way /video is, it's re-perceived.\n\n${result.note}",
+                result.uri,
+                "video",
+                result.feedbackToken
+            )
+        } else {
+            Reply(result.note)
+        }
+    }
+
+    private suspend fun generateExposure(
+        ctx: Context,
+        prompt: String,
+        onProgress: (String) -> Unit
+    ): Reply {
+        onProgress(
+            "Holding \"$prompt\" for ${NoraConfig.EXPOSURE_PRIME_ITERATIONS} iterations, then " +
+                "letting go and free-associating for ${NoraConfig.EXPOSURE_TOTAL_ITERATIONS - NoraConfig.EXPOSURE_PRIME_ITERATIONS} " +
+                "more -- this one is slow, and it's one gaze the whole way, not saccades…"
+        )
+        val result = NoraStudio.generateDeepExposure(ctx, prompt) { done, total ->
+            if (done % 20 == 0 || done == total) {
+                val phase = if (done <= NoraConfig.EXPOSURE_PRIME_ITERATIONS) "primed" else "free-running"
+                onProgress("Settling $done of $total ($phase)…")
+            }
+        }
+        val preamble = "Deep exposure: prompt released partway through, so this reflects it " +
+            "rather than resolving it. One held gaze, ${NoraConfig.EXPOSURE_TOTAL_ITERATIONS} " +
+            "iterations, no saccades."
+        return if (result.uri != null) {
+            Reply("$preamble\n\n${result.note}", result.uri, "image", result.feedbackToken)
         } else {
             Reply(result.note)
         }

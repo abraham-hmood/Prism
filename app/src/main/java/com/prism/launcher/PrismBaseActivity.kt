@@ -13,7 +13,7 @@ import androidx.appcompat.app.AppCompatActivity
 abstract class PrismBaseActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        val mode = PrismSettings.getThemeMode(this)
+        val mode = PrismSettings.getThemeMode()
         androidx.appcompat.app.AppCompatDelegate.setDefaultNightMode(
             when (mode) {
                 PrismSettings.THEME_LIGHT -> androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_NO

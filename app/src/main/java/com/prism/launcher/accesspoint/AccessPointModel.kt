@@ -2,7 +2,7 @@ package com.prism.launcher.accesspoint
 
 import androidx.room.Entity
 import androidx.room.PrimaryKey
-import org.json.JSONObject
+import com.prism.core.json.JSONObject
 
 /**
  * Represents a Prism Access Point configuration.

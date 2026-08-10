@@ -28,7 +28,9 @@ import java.io.File
  */
 object ModelDownloadManager {
 
-    private val scope = CoroutineScope(Dispatchers.IO)
+    private val scope = CoroutineScope(
+        Dispatchers.IO + com.prism.launcher.PrismLogger.coroutineHandler("ModelDownload")
+    )
 
     fun download(context: Context, name: String, url: String, isImageModel: Boolean = false) {
         val appContext = context.applicationContext
@@ -44,8 +46,8 @@ object ModelDownloadManager {
 
         val dm = appContext.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
         val downloadId = dm.enqueue(request)
-        PrismSettings.setAiDownloadId(appContext, downloadId)
-        PrismSettings.setAiDownloadIsImage(appContext, isImageModel)
+        PrismSettings.setAiDownloadId(downloadId)
+        PrismSettings.setAiDownloadIsImage(isImageModel)
 
         Toast.makeText(appContext, "Download started: $name", Toast.LENGTH_SHORT).show()
     }
@@ -54,14 +56,14 @@ object ModelDownloadManager {
     val completionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
-            if (id != -1L && id == PrismSettings.getAiDownloadId(context)) {
+            if (id != -1L && id == PrismSettings.getAiDownloadId()) {
                 checkDownloadStatus(context.applicationContext, id)
             }
         }
     }
 
     private fun checkDownloadStatus(context: Context, id: Long) {
-        val isImage = PrismSettings.getAiDownloadIsImage(context)
+        val isImage = PrismSettings.getAiDownloadIsImage()
         val q = DownloadManager.Query().setFilterById(id)
         val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
         dm.query(q)?.use { cursor ->
@@ -138,18 +140,15 @@ object ModelDownloadManager {
     /** Registers a fully-copied, verified model file as imported, and activates it. */
     fun registerImportedModel(context: Context, targetFile: File, fileName: String, isImageModel: Boolean) {
         if (isImageModel) {
-            PrismSettings.setLocalImageModelPath(context, targetFile.absolutePath)
+            PrismSettings.setLocalImageModelPath(targetFile.absolutePath)
         } else {
-            PrismSettings.setLocalAiModelPath(context, targetFile.absolutePath)
+            PrismSettings.setLocalAiModelPath(targetFile.absolutePath)
         }
-        PrismSettings.addImportedModel(
-            context,
-            PrismSettings.ImportedModel(
+        PrismSettings.addImportedModel(PrismSettings.ImportedModel(
                 path = targetFile.absolutePath,
                 displayName = fileName,
                 type = if (isImageModel) PrismSettings.MODEL_TYPE_IMAGE else PrismSettings.MODEL_TYPE_TEXT
-            )
-        )
+            ))
         toastOnMain(context, "Intelligence Acquired: $fileName")
     }
 

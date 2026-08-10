@@ -39,7 +39,7 @@ object AppUsageMonitor {
                 
                 if (latestEvent != null && latestEvent.packageName != currentPackage) {
                     currentPackage = latestEvent.packageName
-                    val appWhitelist = com.prism.launcher.PrismSettings.getAppWhitelist(context)
+                    val appWhitelist = com.prism.launcher.PrismSettings.getAppWhitelist()
                     val isWhitelisted = appWhitelist.contains(currentPackage)
                     
                     if (isWhitelisted != lastWhitelistedState) {

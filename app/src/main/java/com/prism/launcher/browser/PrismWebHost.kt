@@ -20,8 +20,8 @@ import java.util.Locale
 import java.util.TimeZone
 import androidx.documentfile.provider.DocumentFile
 import com.prism.launcher.messaging.AiManager
-import org.json.JSONArray
-import org.json.JSONObject
+import com.prism.core.json.JSONArray
+import com.prism.core.json.JSONObject
 import java.io.ByteArrayOutputStream
 
 /**
@@ -42,12 +42,12 @@ object PrismWebHost {
 
         try {
             // 1. Normal site lookup - Mapping all hosted websites to port 8080
-            val sites = com.prism.launcher.PrismSettings.getP2pHostedSites(context)
+            val sites = com.prism.launcher.PrismSettings.getP2pHostedSites()
             val site = sites.find { it.domain.equals(domain, ignoreCase = true) && it.isActive }
             
             if (site == null) {
                 // Secondary Check: Mirror Registry (P2P CDN)
-                val mirrors = com.prism.launcher.PrismSettings.getP2pMirroredSites(context)
+                val mirrors = com.prism.launcher.PrismSettings.getP2pMirroredSites()
                 val mirror = mirrors.find { it.domain.equals(domain, ignoreCase = true) && it.isActive }
                 
                 if (mirror == null) {
@@ -331,18 +331,18 @@ object PrismWebHost {
     }
 
     private suspend fun sendManifest(context: Context, output: OutputStream, domain: String, localPath: String) {
-        val json = org.json.JSONObject()
+        val json = com.prism.core.json.JSONObject()
         json.put("domain", domain)
         json.put("timestamp", System.currentTimeMillis())
         
-        val filesArray = org.json.JSONArray()
+        val filesArray = com.prism.core.json.JSONArray()
         val rootUri = Uri.parse(localPath)
         
         val files = mutableListOf<Pair<String, Any>>()
         collectFiles(context, rootUri, "", files)
         
         for (f in files) {
-            val fileObj = org.json.JSONObject()
+            val fileObj = com.prism.core.json.JSONObject()
             fileObj.put("path", f.first)
             fileObj.put("size", when(val res = f.second) {
                 is File -> res.length()

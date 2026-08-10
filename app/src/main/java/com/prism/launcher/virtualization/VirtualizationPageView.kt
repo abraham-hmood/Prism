@@ -118,11 +118,11 @@ class VirtualizationPageView(context: Context) : FrameLayout(context) {
             return
         }
 
-        val mode = when (PrismSettings.getVirtualizationMode(context)) {
+        val mode = when (PrismSettings.getVirtualizationMode()) {
             PrismSettings.VIRT_MODE_CUSTOM_ISO -> VmController.Mode.CUSTOM_ISO
             else -> VmController.Mode.PRISM_OS
         }
-        val isoPath = PrismSettings.getCustomIsoPath(context).takeIf { it.isNotBlank() }
+        val isoPath = PrismSettings.getCustomIsoPath().takeIf { it.isNotBlank() }
         PrismLogger.logInfo(TAG, "bootFromSettings(): mode=$mode isoPath=$isoPath")
 
         vmController.start(mode, isoPath, surface)

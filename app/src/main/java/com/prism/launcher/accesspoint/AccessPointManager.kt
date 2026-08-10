@@ -1,5 +1,6 @@
 package com.prism.launcher.accesspoint
 
+import com.prism.launcher.accesspoint.AccessPointStore
 import android.content.Context
 import android.net.wifi.WifiManager
 import android.net.wifi.p2p.WifiP2pConfig
@@ -25,7 +26,10 @@ class AccessPointManager(private val context: Context) {
     private val wifiManager = context.getSystemService(Context.WIFI_SERVICE) as WifiManager
     private val wifiP2pManager = context.getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager
     private val p2pChannel = wifiP2pManager.initialize(context, Looper.getMainLooper(), null)
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val scope = CoroutineScope(
+        Dispatchers.IO + SupervisorJob() +
+            com.prism.launcher.PrismLogger.coroutineHandler("AccessPoint")
+    )
 
     private val activeAccessPoints = ConcurrentHashMap<Long, AccessPointConfig>()
     private val connectedDevices = ConcurrentHashMap<String, ConnectedDevice>()
@@ -143,7 +147,7 @@ class AccessPointManager(private val context: Context) {
         val active = config.copy(isActive = true)
         activeAccessPoints[config.id] = active
         apStats[config.id] = AccessPointStats(accessPointId = config.id)
-        PrismSettings.saveAccessPoint(context, active)
+        AccessPointStore.saveAccessPoint(active)
         scope.launch { monitorConnectedDevices(config.id) }
     }
 
@@ -152,7 +156,7 @@ class AccessPointManager(private val context: Context) {
         legacyReservations.remove(apId)
         apStats.remove(apId)
         connectedDevices.entries.removeAll { it.value.accessPointId == apId }
-        PrismSettings.saveAccessPoint(context, config.copy(isActive = false))
+        AccessPointStore.saveAccessPoint(config.copy(isActive = false))
     }
 
     /** Stop an access point and tear down its network group. */

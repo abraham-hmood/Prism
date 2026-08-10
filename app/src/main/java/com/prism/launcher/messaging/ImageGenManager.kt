@@ -20,15 +20,20 @@ import java.util.UUID
 object ImageGenManager {
 
     suspend fun generateImage(context: Context, prompt: String): Uri? = withContext(Dispatchers.IO) {
-        val mode = PrismSettings.getAiMode(context)
+        val mode = PrismSettings.getAiMode()
         
         return@withContext if (mode == PrismSettings.AI_MODE_CLOUD) {
-            val cloudModel = PrismSettings.getActiveCloudModel(context) ?: return@withContext null
+            val cloudModel = PrismSettings.getActiveCloudModel() ?: return@withContext null
 
-            val bitmap = CloudAiService.fetchImage(cloudModel.baseUrl, cloudModel.apiKey, prompt)
-            bitmap?.let { saveToPublicStore(context, it) }
+            // CloudAiService returns the portable PrismImage now that it lives in :core.
+            // Converting here is the right place: this is the boundary where the image stops
+            // being data and becomes something Android has to store.
+            val image = CloudAiService.fetchImage(cloudModel.baseUrl, cloudModel.apiKey, prompt)
+            image?.let {
+                saveToPublicStore(context, com.prism.launcher.platform.AndroidImageCodec.toBitmap(it))
+            }
         } else {
-            val modelPath = PrismSettings.getLocalImageModelPath(context)
+            val modelPath = PrismSettings.getLocalImageModelPath()
             if (modelPath.isBlank()) return@withContext null
             
             val bitmap = LocalImageService.generateImage(context, modelPath, prompt)

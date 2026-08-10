@@ -13,7 +13,7 @@ import java.net.InetSocketAddress
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import com.prism.launcher.PrismApp
-import com.prism.launcher.MeshUtils
+import com.prism.core.MeshUtils
 import com.prism.launcher.PrismLogger
 
 class PrismProxyServer(
@@ -22,7 +22,9 @@ class PrismProxyServer(
     private val isProxyMode: Boolean = true
 ) {
     private var serverChannel: ServerSocketChannel? = null
-    private val proxyScope = CoroutineScope(Dispatchers.IO + Job())
+    private val proxyScope = CoroutineScope(
+        Dispatchers.IO + Job() + com.prism.launcher.PrismLogger.coroutineHandler("ProxyServer")
+    )
     private val startMutex = Mutex()
     
     private var authHeaderExpected: String? = null
@@ -232,7 +234,7 @@ class PrismProxyServer(
             val finalPort = if (isP2p) 8080 else targetPort // Mesh sites always on 8080 (Force override 443/80)
             
             // --- Local Loop Fix ---
-            val myMeshIp = com.prism.launcher.MeshUtils.getLocalMeshIp(com.prism.launcher.PrismApp.instance)
+            val myMeshIp = MeshUtils.getLocalMeshIp()
             val isLocal = targetHost == "127.0.0.1" || targetHost == "localhost" || targetHost == myMeshIp || targetHost == "::1"
             
             if (isP2p && isLocal) {

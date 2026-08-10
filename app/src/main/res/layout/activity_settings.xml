@@ -14,8 +14,11 @@
         android:elevation="0dp">
 
         <TextView
+            android:id="@+id/settingsTitle"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
+            android:ellipsize="end"
+            android:maxLines="1"
             android:text="Settings"
             android:textColor="?attr/prismTextPrimary"
             android:textSize="20sp"
@@ -33,6 +36,30 @@
             android:scaleType="centerInside"
             android:src="@drawable/ic_theme_sun" />
     </com.google.android.material.appbar.MaterialToolbar>
+
+    <!--
+        Search, shown on the root screen only — the same place Android's Settings puts it.
+        Inside a group the list is already short enough to read, and a second search field that
+        only covered part of the settings would be a worse answer than no field at all.
+    -->
+    <EditText
+        android:id="@+id/settingsSearch"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginHorizontal="16dp"
+        android:layout_marginBottom="8dp"
+        android:background="@drawable/bg_ios_pill"
+        android:drawableStart="@drawable/ic_search_24"
+        android:drawablePadding="8dp"
+        android:hint="Search settings"
+        android:imeOptions="actionSearch"
+        android:inputType="text"
+        android:maxLines="1"
+        android:paddingHorizontal="14dp"
+        android:paddingVertical="10dp"
+        android:textColor="?attr/prismTextPrimary"
+        android:textColorHint="?attr/prismTextSecondary"
+        android:textSize="15sp" />
 
     <androidx.recyclerview.widget.RecyclerView
         android:id="@+id/settingsList"

@@ -76,3 +76,26 @@ target_link_libraries(gguf_bridge
     ggml
     ${log-lib}
 )
+
+# Nora's predictive-coding kernels. Deliberately a separate library with no llama.cpp or ggml
+# dependency: it is a few hundred lines of plain float arithmetic, and linking it against the
+# inference stack would mean a failure to build llama could take Nora's accelerator down with
+# it, for nothing gained.
+#
+# -O3 and NEON, but explicitly NOT -ffast-math. The kernels guarantee bit-identical results to
+# the Kotlin implementation, and fast-math permits exactly the reassociation that would void
+# that guarantee. Vectorization does not need it here — see the note at the head of the file.
+add_library(nora_conv SHARED nora_conv.cpp)
+
+target_compile_options(nora_conv PRIVATE
+    -O3
+    -fno-fast-math
+    -fno-unsafe-math-optimizations
+)
+
+if (ANDROID_ABI STREQUAL "arm64-v8a")
+    # NEON is mandatory on arm64, so this only asks the vectorizer to use what is already there.
+    target_compile_options(nora_conv PRIVATE -ftree-vectorize)
+endif()
+
+target_link_libraries(nora_conv ${log-lib})

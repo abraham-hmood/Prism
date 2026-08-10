@@ -64,7 +64,8 @@
         android:roundIcon="@drawable/ic_launcher"
         android:supportsRtl="true"
         android:theme="@style/Theme.PrismLauncher"
-        android:hardwareAccelerated="true">
+        android:hardwareAccelerated="true"
+        android:largeHeap="true">
 
         <activity
             android:name=".LauncherActivity"
@@ -166,6 +167,22 @@
             android:theme="@style/Theme.PrismSettings"
             android:windowSoftInputMode="adjustResize" />
 
+        <activity
+            android:name=".nora.NoraSettingsActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings"
+            android:windowSoftInputMode="adjustResize" />
+
+        <activity
+            android:name=".nora.NoraSelfTestActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings"
+            android:windowSoftInputMode="adjustResize" />
+
         <!-- Training and generation both run here, not in an activity, so a long run survives
              the screen turning off, rotation, and the activity being destroyed. -->
         <service
@@ -175,6 +192,17 @@
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Long-running on-device neural network training and image generation, initiated and monitored by the user." />
+        </service>
+
+        <!-- Auto-captioning. A foreground service rather than WorkManager: this is work the
+             user just requested and is waiting on, not deferrable background work. -->
+        <service
+            android:name=".nora.CaptionForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Long-running image captioning of a user-selected folder, initiated and monitored by the user." />
         </service>
 
         <!-- Messaging Conversation -->

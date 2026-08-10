@@ -20,7 +20,10 @@ import java.util.concurrent.ConcurrentHashMap
  */
 class DnsOverrideService(private val context: Context) {
     
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val scope = CoroutineScope(
+        Dispatchers.IO + SupervisorJob() +
+            com.prism.launcher.PrismLogger.coroutineHandler("DnsOverride")
+    )
     private var dnsServerSocket: DatagramSocket? = null
     private val dnsCache = ConcurrentHashMap<String, CachedDnsEntry>()
     

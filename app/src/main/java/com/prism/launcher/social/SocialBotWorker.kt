@@ -29,7 +29,7 @@ class SocialBotWorker(context: Context, workerParams: WorkerParameters) : Corout
          * interval immediately instead of waiting for the next launch.
          */
         fun schedule(context: Context) {
-            val nebulaActive = SlotPreferences(context).getAssignments().any { it is SlotAssignment.NebulaSocial }
+            val nebulaActive = SlotPreferences().getAssignments().any { it is SlotAssignment.NebulaSocial }
             if (!nebulaActive) {
                 WorkManager.getInstance(context).cancelUniqueWork(WORK_NAME)
                 return
@@ -38,11 +38,11 @@ class SocialBotWorker(context: Context, workerParams: WorkerParameters) : Corout
             val constraintsBuilder = Constraints.Builder()
             // Local models generate fully offline; only cloud mode actually needs connectivity.
             // (NebulaSocialManager separately enforces its own idle/charging gate for local.)
-            if (PrismSettings.getAiMode(context) == PrismSettings.AI_MODE_CLOUD) {
+            if (PrismSettings.getAiMode() == PrismSettings.AI_MODE_CLOUD) {
                 constraintsBuilder.setRequiredNetworkType(NetworkType.CONNECTED)
             }
 
-            val intervalHours = PrismSettings.getNebulaGenerationIntervalHours(context).coerceAtLeast(1)
+            val intervalHours = PrismSettings.getNebulaGenerationIntervalHours().coerceAtLeast(1)
             val request = PeriodicWorkRequestBuilder<SocialBotWorker>(intervalHours.toLong(), TimeUnit.HOURS)
                 .setConstraints(constraintsBuilder.build())
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 15, TimeUnit.MINUTES)

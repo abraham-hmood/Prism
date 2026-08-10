@@ -30,7 +30,7 @@ class DrawerPageView(
     private var isReloading = false
     
     // Design tokens
-    private val glowColor = PrismSettings.getGlowColor(context)
+    private val glowColor = PrismSettings.getGlowColor()
 
     private fun resolveAttr(attr: Int): Int {
         val typedValue = android.util.TypedValue()
@@ -204,7 +204,7 @@ class DrawerPageView(
         // while this page is already attached -- or via AppPackageReceiver in the background --
         // shows up immediately, without needing to force-stop and relaunch the whole app.
         observeJob = lifecycleOwner.lifecycleScope.launch {
-            AppDatabase.get(context).installedAppDao().observeAll().collectLatest { entities ->
+            AppDatabase.get().installedAppDao().observeAll().collectLatest { entities ->
                 allApps = withContext(Dispatchers.IO) { resolveDrawerEntries(entities) }
                 val grouped = groupDrawerApps(allApps)
                 adapter.submitList(grouped)
@@ -231,7 +231,7 @@ class DrawerPageView(
         binding.reloadBtn.animate().rotationBy(360f).setDuration(500).start()
         lifecycleOwner.lifecycleScope.launch {
             withContext(Dispatchers.IO) {
-                val dao = AppDatabase.get(context).installedAppDao()
+                val dao = AppDatabase.get().installedAppDao()
                 dao.clearAll()
                 dao.insertAll(queryLauncherApps(context))
             }

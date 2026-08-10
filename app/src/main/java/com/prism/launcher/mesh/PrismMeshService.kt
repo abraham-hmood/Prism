@@ -2,13 +2,13 @@ package com.prism.launcher.mesh
 
 import android.util.Log
 import android.widget.Toast
-import com.prism.launcher.MeshUtils
+import com.prism.core.MeshUtils
 import com.prism.launcher.PrismApp
 import com.prism.launcher.PrismLogger
 import com.prism.launcher.PrismSettings
 import com.prism.launcher.browser.P2pDnsManager
 import kotlinx.coroutines.*
-import org.json.JSONObject
+import com.prism.core.json.JSONObject
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -23,7 +23,13 @@ object PrismMeshService {
     private const val DEFAULT_MESH_PORT = 8081
     private const val PROTOCOL_HEADER = "PRISM"
 
-    private val meshScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    // Without a handler, an unhandled failure inside a SupervisorJob scope can be dropped
+    // without ever reaching the global uncaught-exception handler -- so a mesh service that
+    // quietly stopped gossiping would leave nothing at all in diagnostics.
+    private val meshScope = CoroutineScope(
+        Dispatchers.IO + SupervisorJob() +
+            com.prism.launcher.PrismLogger.coroutineHandler("Mesh")
+    )
     private var socket: DatagramSocket? = null
     
     // List of active peers (IP -> PeerInfo)
@@ -40,7 +46,7 @@ object PrismMeshService {
 
     fun start() {
         val context = PrismApp.instance
-        val meshPort = try { PrismSettings.getMeshBootstrapPort(context).toInt() } catch(e: Exception) { DEFAULT_MESH_PORT }
+        val meshPort = try { PrismSettings.getMeshBootstrapPort().toInt() } catch(e: Exception) { DEFAULT_MESH_PORT }
 
         meshScope.launch {
             try {
@@ -74,7 +80,7 @@ object PrismMeshService {
             while (isActive) {
                 sendDiscoveryBroadcast(meshPort)
 
-                val nodes = PrismSettings.getAllMeshNodes(context)
+                val nodes = PrismSettings.getAllMeshNodes()
                 val myIps = MeshUtils.getAllLocalIps()
                 nodes.forEach { addr ->
                     if (!myIps.contains(addr)) {
@@ -173,7 +179,7 @@ object PrismMeshService {
     }
 
     private fun handleHeartbeat(peerIp: String, port: Int) {
-        val myPort = try { PrismSettings.getMeshBootstrapPort(PrismApp.instance).toInt() } catch(e: Exception) { DEFAULT_MESH_PORT }
+        val myPort = try { PrismSettings.getMeshBootstrapPort().toInt() } catch(e: Exception) { DEFAULT_MESH_PORT }
         sendPacket(peerIp, port, 0x0B.toByte(), "{\"port\":$myPort}")
     }
     
@@ -191,15 +197,15 @@ object PrismMeshService {
             val json = JSONObject(payload)
             val peerPort = json.optInt("port", DEFAULT_MESH_PORT)
             activePeers[peerIp]?.port = peerPort
-            val myPort = try { PrismSettings.getMeshBootstrapPort(PrismApp.instance).toInt() } catch(e: Exception) { DEFAULT_MESH_PORT }
+            val myPort = try { PrismSettings.getMeshBootstrapPort().toInt() } catch(e: Exception) { DEFAULT_MESH_PORT }
             sendPacket(peerIp, peerPort, 0x0B.toByte(), "{\"port\":$myPort}")
             requestSync(peerIp)
         } catch (e: Exception) {}
     }
 
     private fun handlePeerListReq(peerIp: String, port: Int) {
-        val myIp = MeshUtils.getLocalMeshIp(PrismApp.instance)
-        val myPort = try { PrismSettings.getMeshBootstrapPort(PrismApp.instance).toInt() } catch(e: Exception) { DEFAULT_MESH_PORT }
+        val myIp = MeshUtils.getLocalMeshIp()
+        val myPort = try { PrismSettings.getMeshBootstrapPort().toInt() } catch(e: Exception) { DEFAULT_MESH_PORT }
         val selfEntry = "$myIp:$myPort"
         val otherPeers = activePeers.entries.joinToString(",") { "${it.key}:${it.value.port}" }
         val fullList = if (otherPeers.isEmpty()) selfEntry else "$selfEntry,$otherPeers"
@@ -295,7 +301,7 @@ object PrismMeshService {
         val records = P2pDnsManager.getRecords()
         val record = records[domain] ?: return
         
-        val myIp = MeshUtils.getLocalMeshIp(PrismApp.instance)
+        val myIp = MeshUtils.getLocalMeshIp()
         val broadcastIp = if (record.ip == "127.0.0.1") myIp else record.ip
 
         val payload = JSONObject().apply {
@@ -303,7 +309,7 @@ object PrismMeshService {
             put("ip", broadcastIp)
             put("ts", record.timestamp)
             val publicAlts = record.alternates.filter { it != "127.0.0.1" }
-            if (publicAlts.isNotEmpty()) put("alts", org.json.JSONArray(publicAlts))
+            if (publicAlts.isNotEmpty()) put("alts", com.prism.core.json.JSONArray(publicAlts))
         }.toString()
         
         broadcastToOthers(0x05.toByte(), payload)
@@ -311,7 +317,7 @@ object PrismMeshService {
 
     private fun getLocalDnsJson(): JSONObject {
         val dnsJson = JSONObject()
-        val myIp = MeshUtils.getLocalMeshIp(PrismApp.instance)
+        val myIp = MeshUtils.getLocalMeshIp()
         P2pDnsManager.getRecords().forEach { (domain, record) ->
             dnsJson.put(domain, JSONObject().apply {
                 val broadcastIp = if (record.ip == "127.0.0.1") myIp else record.ip
@@ -326,11 +332,11 @@ object PrismMeshService {
                 }
                 
                 if (publicAlts.isNotEmpty()) {
-                    put("alts", org.json.JSONArray(publicAlts.toList()))
+                    put("alts", com.prism.core.json.JSONArray(publicAlts.toList()))
                 }
             })
         }
-        PrismSettings.getP2pHostedSites(PrismApp.instance).forEach { site ->
+        PrismSettings.getP2pHostedSites().forEach { site ->
             if (!dnsJson.has(site.domain)) {
                 dnsJson.put(site.domain, JSONObject().apply {
                     put("ip", myIp)
@@ -343,8 +349,8 @@ object PrismMeshService {
     }
 
     private fun getPeerListString(): String {
-        val myIp = MeshUtils.getLocalMeshIp(PrismApp.instance)
-        val myPort = try { PrismSettings.getMeshBootstrapPort(PrismApp.instance).toInt() } catch(e: Exception) { DEFAULT_MESH_PORT }
+        val myIp = MeshUtils.getLocalMeshIp()
+        val myPort = try { PrismSettings.getMeshBootstrapPort().toInt() } catch(e: Exception) { DEFAULT_MESH_PORT }
         val self = "$myIp:$myPort"
         val others = activePeers.entries.joinToString(",") { "${it.key}:${it.value.port}" }
         return if (others.isEmpty()) self else "$self,$others"

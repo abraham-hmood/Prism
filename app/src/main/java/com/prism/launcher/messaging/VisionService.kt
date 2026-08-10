@@ -12,7 +12,7 @@ import com.prism.launcher.PrismSettings
 object VisionService {
 
     fun analyzeImage(context: Context, uri: Uri): String {
-        val mode = PrismSettings.getAiMode(context)
+        val mode = PrismSettings.getAiMode()
         return if (mode == PrismSettings.AI_MODE_CLOUD) {
             analyzeViaCloud(context, uri)
         } else {

@@ -23,7 +23,10 @@ class VpnMultiplexer(
     private val user: String,
     private val pass: String
 ) {
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val scope = CoroutineScope(
+        Dispatchers.IO + SupervisorJob() +
+            com.prism.launcher.PrismLogger.coroutineHandler("VpnMultiplexer")
+    )
     private val channels = mutableListOf<DatagramChannel>()
     
     // Pass full credentials to engines

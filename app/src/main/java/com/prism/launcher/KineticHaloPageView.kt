@@ -67,7 +67,7 @@ class KineticHaloPageView(
         // Live-observes the DB so a newly installed/removed app is reflected immediately,
         // matching the same fix applied to DrawerPageView (was previously a one-shot load).
         observeJob = lifecycleOwner.lifecycleScope.launch {
-            AppDatabase.get(context).installedAppDao().observeAll().collectLatest { entities ->
+            AppDatabase.get().installedAppDao().observeAll().collectLatest { entities ->
                 allApps = withContext(Dispatchers.IO) { resolveDrawerEntries(entities) }
                 setupIcons()
             }

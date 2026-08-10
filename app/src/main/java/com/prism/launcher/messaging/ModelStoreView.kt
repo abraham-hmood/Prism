@@ -57,7 +57,7 @@ class ModelStoreView @JvmOverloads constructor(
         binding.modelStoreBackBtn.visibility = View.GONE
 
         binding.modelStoreSearchGlowContainer.background = NeonGlowDrawable(
-            color = PrismSettings.getGlowColor(context),
+            color = PrismSettings.getGlowColor(),
             cornerRadius = 24f * resources.displayMetrics.density,
             strokeWidth = 3f * resources.displayMetrics.density
         )
@@ -94,7 +94,7 @@ class ModelStoreView @JvmOverloads constructor(
                     android.graphics.drawable.GradientDrawable().apply {
                         shape = android.graphics.drawable.GradientDrawable.RECTANGLE
                         cornerRadius = dp(20).toFloat()
-                        setColor(PrismSettings.getGlowColor(context))
+                        setColor(PrismSettings.getGlowColor())
                     }
                 } else {
                     ContextCompat.getDrawable(context, R.drawable.tab_badge_bg)

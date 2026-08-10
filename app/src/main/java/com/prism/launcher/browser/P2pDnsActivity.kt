@@ -16,7 +16,7 @@ import com.prism.launcher.PrismDialogFactory
 import com.prism.launcher.R
 import com.prism.launcher.PrismSettings
 import com.prism.launcher.databinding.ActivityP2pDnsBinding
-import org.json.JSONObject
+import com.prism.core.json.JSONObject
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -29,7 +29,7 @@ class P2pDnsActivity : PrismBaseActivity() {
     private val activityScope = CoroutineScope(Dispatchers.Main + Job())
 
     private val activeServer: PrismSettings.PrismServer?
-        get() = PrismSettings.getActiveServer(this)
+        get() = PrismSettings.getActiveServer()
 
     private val isRemoteMode: Boolean
         get() = activeServer != null
@@ -149,7 +149,7 @@ class P2pDnsActivity : PrismBaseActivity() {
         override fun onBindViewHolder(holder: DnsVH, position: Int) {
             val (domain, record) = items[position]
             holder.t1.text = domain
-            holder.t1.setTextColor(if (record.isVerified) PrismSettings.getGlowColor(this@P2pDnsActivity) else androidx.core.content.ContextCompat.getColor(this@P2pDnsActivity, R.color.prism_text_primary))
+            holder.t1.setTextColor(if (record.isVerified) PrismSettings.getGlowColor() else androidx.core.content.ContextCompat.getColor(this@P2pDnsActivity, R.color.prism_text_primary))
             holder.t2.text = "${record.ip} • ${if (record.isVerified) "Verified" else "Auto-Seeded"}"
             holder.view.setOnLongClickListener {
                 onDelete(domain)

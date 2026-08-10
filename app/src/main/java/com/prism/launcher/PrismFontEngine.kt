@@ -28,8 +28,8 @@ object PrismFontEngine {
     private const val NASALIZATION_URL = "https://github.com/tyrel/nasalization-font/raw/master/nasalization-rg.otf"
 
     fun getTypeface(ctx: Context): Typeface? {
-        val style = PrismSettings.getFontStyle(ctx)
-        val path = PrismSettings.getCustomFontPath(ctx)
+        val style = PrismSettings.getFontStyle()
+        val path = PrismSettings.getCustomFontPath()
 
         if (style == cachedStyle && path == cachedPath && cachedTypeface != null) {
             return cachedTypeface
@@ -111,13 +111,13 @@ object PrismFontEngine {
      * Generates a CSS string to be injected into WebViews to force the custom font.
      */
     fun getWebViewCss(ctx: Context): String {
-        val style = PrismSettings.getFontStyle(ctx)
+        val style = PrismSettings.getFontStyle()
         if (style == PrismSettings.FONT_STYLE_DEFAULT) return ""
         
         // For WebViews, we use Base64 to ensure the font loads regardless of CSP or file permissions.
         val fontFile = when (style) {
             PrismSettings.FONT_STYLE_NASALIZATION -> File(ctx.filesDir, "nasalization.otf")
-            PrismSettings.FONT_STYLE_CUSTOM -> File(PrismSettings.getCustomFontPath(ctx))
+            PrismSettings.FONT_STYLE_CUSTOM -> File(PrismSettings.getCustomFontPath())
             else -> null
         }
 

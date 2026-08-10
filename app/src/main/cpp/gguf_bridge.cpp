@@ -1,5 +1,9 @@
 #include <jni.h>
+#ifdef __ANDROID__
 #include <android/log.h>
+#else
+#include <cstdio>
+#endif
 #include <algorithm>
 #include <cctype>
 #include <cstring>
@@ -10,8 +14,17 @@
 #include "ggml-backend.h"
 
 #define LOG_TAG "GgufBridge"
+
+// Android has logcat; a desktop JVM does not. Routing to stderr rather than dropping the
+// messages, because these lines are the only diagnostic when a model fails to load -- and a
+// model failing to load with no explanation is the single most likely thing to go wrong here.
+#ifdef __ANDROID__
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#else
+#define LOGI(...) do { std::fprintf(stderr, "[INFO] " LOG_TAG ": "); std::fprintf(stderr, __VA_ARGS__); std::fprintf(stderr, "\n"); } while (0)
+#define LOGE(...) do { std::fprintf(stderr, "[ERROR] " LOG_TAG ": "); std::fprintf(stderr, __VA_ARGS__); std::fprintf(stderr, "\n"); } while (0)
+#endif
 
 namespace {
 

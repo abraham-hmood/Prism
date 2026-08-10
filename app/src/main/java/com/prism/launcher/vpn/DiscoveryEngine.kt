@@ -1,7 +1,7 @@
 package com.prism.launcher.vpn
 
 import android.util.Log
-import org.json.JSONObject
+import com.prism.core.json.JSONObject
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -106,7 +106,10 @@ class DiscoveryEngine(private val context: android.content.Context, private val 
         try {
             val json = JSONObject(String(payload))
             val domain = json.getString("domain")
-            val ip = json.optString("ip", null)
+            // Was `optString("ip", null)`. The portable JSONObject types its fallback as
+            // non-null so the other 31 optString call sites keep returning String rather than
+            // String?; this spells out the same "absent means null" the null fallback meant.
+            val ip = if (json.isNull("ip")) null else json.optString("ip")
             val action = json.getString("action")
             
             Log.i("PrismDiscovery", "Remote DNS Write from $address: $action $domain")

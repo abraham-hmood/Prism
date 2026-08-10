@@ -36,24 +36,46 @@ object NoraStudio {
     fun brain(ctx: Context): NoraBrain {
         brainInstance?.let { return it }
         return synchronized(this) {
-            brainInstance ?: NoraBrain().also { b ->
-                connectomeLoaded = NoraPersistence.load(ctx, b)
-                if (connectomeLoaded) {
-                    PrismLogger.logInfo(
-                        "Nora", "Connectome loaded (${NoraPersistence.sizeBytes(ctx) / 1024} KB)"
-                    )
-                } else if (NoraPersistence.exists(ctx)) {
-                    PrismLogger.logInfo(
-                        "Nora",
-                        "A connectome file exists but was rejected -- wrong version, changed " +
-                            "geometry, or non-finite weights. Erase it and retrain."
-                    )
-                } else {
-                    PrismLogger.logInfo("Nora", "No connectome on disk -- starting from a naive brain")
-                }
-                brainInstance = b
-            }
+            brainInstance ?: buildBrain(ctx).also { brainInstance = it }
         }
+    }
+
+    private fun buildBrain(ctx: Context): NoraBrain {
+        NoraLog.info(NoraLog.Area.BRAIN, "Building a brain — ${NoraLog.describeGeometry()}")
+        // Swap regions from the previous brain are not reachable any more; reopening the
+        // file empty is what stops a rebuild from leaking the whole of the old connectome.
+        NoraSwap.reset()
+        val b = try {
+            NoraBrain()
+        } catch (e: OutOfMemoryError) {
+            // The size the user chose does not fit. Logged as fatal because the process is
+            // usually moments from death, and because this is the single most useful line to
+            // find afterwards when someone asks why Prism died opening a chat.
+            NoraLog.fatal(
+                NoraLog.Area.BRAIN,
+                "Out of memory constructing the brain at ${NoraConfig.geometry.signature()}. " +
+                    "Reduce Nora's size in Settings.",
+                e
+            )
+            throw e
+        }
+
+        connectomeLoaded = NoraPersistence.load(b)
+        when {
+            connectomeLoaded -> NoraLog.success(
+                NoraLog.Area.BRAIN,
+                "Connectome loaded (${NoraPersistence.sizeBytes() / 1024} KB)"
+            )
+            NoraPersistence.exists() -> NoraLog.warn(
+                NoraLog.Area.BRAIN,
+                "A connectome file exists but was rejected — wrong version, changed geometry, " +
+                    "or non-finite weights. Erase it and retrain."
+            )
+            else -> NoraLog.info(
+                NoraLog.Area.BRAIN, "No connectome on disk — starting from a naive brain"
+            )
+        }
+        return b
     }
 
     /**
@@ -90,13 +112,68 @@ object NoraStudio {
 
     fun status(ctx: Context): String = brain(ctx).status()
 
+    /**
+     * Drops the in-memory brain, keeping everything on disk.
+     *
+     * Used by the model test, which builds a second brain of its own: at a large geometry two
+     * resident brains is the difference between fitting and an OutOfMemoryError. Safe because
+     * the connectome is checkpointed every epoch and the service refuses overlapping jobs, so
+     * nothing is ever mid-write when this is called.
+     */
+    fun releaseBrain() {
+        synchronized(this) {
+            if (brainInstance != null) {
+                NoraLog.info(NoraLog.Area.BRAIN, "Released the in-memory brain to free heap")
+                // The spill file belongs to this brain's episode indices and means nothing
+                // without them, so it goes with it rather than lingering as dead bytes.
+                brainInstance?.hippocampus?.closeSpill()
+            }
+            brainInstance = null
+            connectomeLoaded = false
+        }
+    }
+
+    /**
+     * Changes the brain's size.
+     *
+     * Order matters and is the whole reason this exists rather than callers writing the setting
+     * directly. Every region, link and analytic model reads its dimensions from NoraConfig at
+     * CONSTRUCTION time, so the live brain must be dropped before the geometry moves under it --
+     * otherwise the next access returns an object whose sheets are the old size and whose
+     * config says otherwise, which would corrupt silently rather than fail.
+     *
+     * The connectome is not deleted. Files are keyed by geometry, so the brain trained at the
+     * previous size is parked and comes back if the user returns to it.
+     *
+     * @return false if Nora is busy; changing size mid-run would tear the connectome in half.
+     */
+    fun applyGeometry(ctx: Context, g: NoraGeometry): Boolean {
+        if (busy) {
+            NoraLog.warn(NoraLog.Area.GEOMETRY, "Refused a resize: Nora is busy")
+            return false
+        }
+        val before = NoraConfig.geometry.signature()
+        synchronized(this) {
+            brainInstance = null
+            connectomeLoaded = false
+            NoraHealth.reset()
+            NoraConfig.saveGeometry(g)
+            NoraConfig.install(g)
+        }
+        NoraLog.info(
+            NoraLog.Area.GEOMETRY,
+            "Resized $before -> ${NoraLog.describeGeometry()}"
+        )
+        return true
+    }
+
     /** Forgets everything. Deletes the connectome and drops the in-memory brain. */
     fun forget(ctx: Context) {
         synchronized(this) {
-            NoraPersistence.deleteConnectome(ctx)
+            NoraPersistence.deleteConnectome()
             // Feedback traces reference IT patterns from a connectome that no longer exists.
             // Applying one to a naive brain would reinforce noise, so they go with it.
-            NoraFeedback.clear(ctx)
+            NoraFeedback.clear()
             brainInstance = null
             connectomeLoaded = false
             NoraHealth.reset()
@@ -129,17 +206,38 @@ object NoraStudio {
             val b = brain(ctx)
             val grounding = b.groundingOf(prompt)
             val imagery = MentalImagery(b)
-            val bias = NoraFeedback.biasFor(ctx, prompt)
+            val bias = NoraFeedback.biasFor(prompt)
             val bitmap = imagery.generateStill(prompt, mode = mode, bias = bias, onProgress = onProgress)
 
-            val file = File(NoraConfig.outputDir(ctx), "nora_${System.currentTimeMillis()}.png")
-            FileOutputStream(file).use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
-            val uri = publishImage(ctx, bitmap)
-            bitmap.recycle()
+            // Written through the platform codec rather than Bitmap.compress: the model now
+            // produces a PrismImage, and the only reason to materialize a Bitmap at all is the
+            // gallery publish below, which is a genuinely Android-specific step.
+            val file = File(NoraConfig.outputDir(), "nora_${System.currentTimeMillis()}.png")
+            com.prism.core.PrismPlatform.images.encodePng(bitmap, file)
+            val uri = publishImage(ctx, com.prism.launcher.platform.AndroidImageCodec.toBitmap(bitmap))
 
+            if (b.lastSurfaceRange <= 1e-4f) {
+                NoraLog.warn(
+                    NoraLog.Area.GENERATE,
+                    "\"$prompt\" produced a constant (surface range %.6f) — blank image. "
+                        .format(b.lastSurfaceRange) +
+                        "V1->retina gain surface %.2f / contrast %.2f".format(
+                            b.surfacePathwayStrength(), b.contrastPathwayStrength()
+                        )
+                )
+            } else {
+                NoraLog.info(
+                    NoraLog.Area.GENERATE,
+                    "Generated \"$prompt\" (${mode.name.lowercase()}, grounding %.3f, range %.4f)"
+                        .format(grounding, b.lastSurfaceRange)
+                )
+            }
             Generated(uri, file, groundingNote(ctx, prompt, grounding, bias), traceFor(ctx, prompt, imagery, b))
+        } catch (e: OutOfMemoryError) {
+            NoraLog.fatal(NoraLog.Area.GENERATE, "Out of memory generating \"$prompt\"", e)
+            Generated(null, null, "Ran out of memory. Reduce Nora's size in Settings.")
         } catch (e: Exception) {
-            PrismLogger.logError("Nora", "Image generation failed: ${e.message}", e)
+            NoraLog.error(NoraLog.Area.GENERATE, "Image generation failed for \"$prompt\"", e)
             Generated(null, null, "Generation failed: ${e.message}")
         } finally {
             busy = false
@@ -162,7 +260,6 @@ object NoraStudio {
     ): String? {
         val concept = imagery.lastConcept ?: return null
         return NoraFeedback.record(
-            ctx,
             prompt = prompt,
             caption = prompt,
             semantic = b.semanticHub.encode(prompt),
@@ -182,14 +279,17 @@ object NoraStudio {
             val b = brain(ctx)
             val grounding = b.groundingOf(prompt)
             val imagery = MentalImagery(b)
-            val bias = NoraFeedback.biasFor(ctx, prompt)
+            val bias = NoraFeedback.biasFor(prompt)
             val bitmaps = imagery.generateVideo(prompt, frames, motion, bias, onProgress)
             if (bitmaps.isEmpty()) return@withContext Generated(null, null, "No frames were produced.")
 
-            val file = File(NoraConfig.outputDir(ctx), "nora_${System.currentTimeMillis()}.mp4")
-            val written = NoraVideoWriter.write(bitmaps, file)
+            val file = File(NoraConfig.outputDir(), "nora_${System.currentTimeMillis()}.mp4")
+            // The video encoder is MediaCodec, so frames are converted at that boundary and
+            // nowhere earlier.
+            val frameBitmaps = bitmaps.map { com.prism.launcher.platform.AndroidImageCodec.toBitmap(it) }
+            val written = NoraVideoWriter.write(frameBitmaps, file)
             val uri = written?.let { publishVideo(ctx, it) }
-            for (bm in bitmaps) bm.recycle()
+            for (bm in frameBitmaps) bm.recycle()
 
             if (written == null) {
                 Generated(null, null, "Frames generated but the encoder failed -- see diagnostics.")
@@ -200,8 +300,85 @@ object NoraStudio {
                     traceFor(ctx, prompt, imagery, b)
                 )
             }
+        } catch (e: OutOfMemoryError) {
+            NoraLog.fatal(NoraLog.Area.GENERATE, "Out of memory generating the clip \"$prompt\"", e)
+            Generated(null, null, "Ran out of memory. Reduce Nora's size in Settings.")
         } catch (e: Exception) {
-            PrismLogger.logError("Nora", "Video generation failed: ${e.message}", e)
+            NoraLog.error(NoraLog.Area.GENERATE, "Video generation failed for \"$prompt\"", e)
+            Generated(null, null, "Generation failed: ${e.message}")
+        } finally {
+            busy = false
+        }
+    }
+
+    /** Recursive video dreaming -- see [MentalImagery.generateHallucination]. Not saccadic. */
+    suspend fun generateHallucination(
+        ctx: Context,
+        prompt: String,
+        frames: Int = NoraConfig.HALLUCINATION_FRAMES,
+        onProgress: ((Int, Int) -> Unit)? = null
+    ): Generated = withContext(Dispatchers.Default) {
+        busy = true
+        try {
+            val b = brain(ctx)
+            val grounding = b.groundingOf(prompt)
+            val imagery = MentalImagery(b)
+            val bias = NoraFeedback.biasFor(prompt)
+            val bitmaps = imagery.generateHallucination(prompt, frames, bias, onProgress)
+            if (bitmaps.isEmpty()) return@withContext Generated(null, null, "No frames were produced.")
+
+            val file = File(NoraConfig.outputDir(), "nora_${System.currentTimeMillis()}.mp4")
+            val frameBitmaps = bitmaps.map { com.prism.launcher.platform.AndroidImageCodec.toBitmap(it) }
+            val written = NoraVideoWriter.write(frameBitmaps, file)
+            val uri = written?.let { publishVideo(ctx, it) }
+            for (bm in frameBitmaps) bm.recycle()
+
+            if (written == null) {
+                Generated(null, null, "Frames generated but the encoder failed -- see diagnostics.")
+            } else {
+                Generated(
+                    uri, written,
+                    groundingNote(ctx, prompt, grounding, bias),
+                    traceFor(ctx, prompt, imagery, b)
+                )
+            }
+        } catch (e: OutOfMemoryError) {
+            NoraLog.fatal(NoraLog.Area.GENERATE, "Out of memory hallucinating \"$prompt\"", e)
+            Generated(null, null, "Ran out of memory. Reduce Nora's size in Settings.")
+        } catch (e: Exception) {
+            NoraLog.error(NoraLog.Area.GENERATE, "Hallucination failed for \"$prompt\"", e)
+            Generated(null, null, "Generation failed: ${e.message}")
+        } finally {
+            busy = false
+        }
+    }
+
+    /** Deep latent exposure -- see [MentalImagery.generateDeepExposure]. Not saccadic. */
+    suspend fun generateDeepExposure(
+        ctx: Context,
+        prompt: String,
+        onProgress: ((Int, Int) -> Unit)? = null
+    ): Generated = withContext(Dispatchers.Default) {
+        busy = true
+        try {
+            val b = brain(ctx)
+            val grounding = b.groundingOf(prompt)
+            val imagery = MentalImagery(b)
+            val bias = NoraFeedback.biasFor(prompt)
+            val bitmap = imagery.generateDeepExposure(
+                prompt,
+                bias = bias,
+                onProgress = onProgress
+            )
+            val file = File(NoraConfig.outputDir(), "nora_${System.currentTimeMillis()}.png")
+            com.prism.core.PrismPlatform.images.encodePng(bitmap, file)
+            val uri = publishImage(ctx, com.prism.launcher.platform.AndroidImageCodec.toBitmap(bitmap))
+            Generated(uri, file, groundingNote(ctx, prompt, grounding, bias), traceFor(ctx, prompt, imagery, b))
+        } catch (e: OutOfMemoryError) {
+            NoraLog.fatal(NoraLog.Area.GENERATE, "Out of memory during deep exposure on \"$prompt\"", e)
+            Generated(null, null, "Ran out of memory. Reduce Nora's size in Settings.")
+        } catch (e: Exception) {
+            NoraLog.error(NoraLog.Area.GENERATE, "Deep exposure failed for \"$prompt\"", e)
             Generated(null, null, "Generation failed: ${e.message}")
         } finally {
             busy = false
@@ -216,6 +393,23 @@ object NoraStudio {
      * associate, so IT gets a near-empty pattern and generation runs off the priors alone.
      * Saying so is better than shipping noise and letting the user guess why.
      */
+    /**
+     * Says so when the image is blank because the generative pathway produced a constant.
+     *
+     * This is the difference between "she drew something bad" and "there is nothing coming out
+     * of V1", and those are indistinguishable by looking at a black rectangle. Reporting it is
+     * the same principle as NoraHealth: a numerical failure that produces clean-looking output
+     * is worse than a crash.
+     */
+    private fun collapseNote(b: NoraBrain): String {
+        if (b.lastSurfaceRange > 1e-4f) return ""
+        return "\n\nThat came out blank because my surface channels produced a constant " +
+            "(range %.6f), not because of the prompt. ".format(b.lastSurfaceRange) +
+            "The V1->retina brightness pathway has decayed relative to the contrast " +
+            "pathway — /status shows both. More training should pull it back now that each " +
+            "channel has its own weight budget; if it doesn't, /forget and retrain."
+    }
+
     private fun groundingNote(ctx: Context, prompt: String, grounding: Float, bias: Float): String {
         val feedbackNote = when {
             bias <= -0.15f ->
@@ -226,7 +420,7 @@ object NoraStudio {
                     "closer to what worked."
             else -> ""
         }
-        return groundingText(ctx, prompt, grounding) + feedbackNote
+        return groundingText(ctx, prompt, grounding) + feedbackNote + collapseNote(brain(ctx))
     }
 
     private fun groundingText(ctx: Context, prompt: String, grounding: Float): String {
@@ -267,13 +461,13 @@ object NoraStudio {
     ): String {
         busy = true
         return try {
-            NoraTrainer(brain(ctx)).train(ctx, epochs, focus, onProgress)
+            NoraTrainer(brain(ctx)).train(epochs, focus, onProgress = onProgress)
         } finally {
             busy = false
         }
     }
 
-    fun datasetSize(ctx: Context): Int = NoraTrainer.loadDataset(ctx).size
+    fun datasetSize(ctx: Context): Int = NoraTrainer.loadDataset().size
 
     // ── MediaStore publishing ───────────────────────────────────────────────
 

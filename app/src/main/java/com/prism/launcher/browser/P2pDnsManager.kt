@@ -4,10 +4,10 @@ import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import org.json.JSONObject
-import org.json.JSONArray
+import com.prism.core.json.JSONObject
+import com.prism.core.json.JSONArray
 import com.prism.launcher.PrismSettings
-import com.prism.launcher.MeshUtils
+import com.prism.core.MeshUtils
 import com.prism.launcher.PrismApp
 import kotlinx.coroutines.*
 import java.io.File
@@ -62,7 +62,7 @@ object P2pDnsManager {
         updateResolutionState(domain, ResolutionSource.P2P)
         
         if (!fromMesh) {
-            val publicIp = MeshUtils.getLocalMeshIp(context)
+            val publicIp = MeshUtils.getLocalMeshIp()
             val broadcastIp = if (ip == "127.0.0.1") publicIp else ip
             
             val payload = JSONObject().apply {
@@ -71,7 +71,7 @@ object P2pDnsManager {
                 put("ts", record.timestamp)
                 if (alts.isNotEmpty()) {
                     val publicAlts = alts.filter { it != "127.0.0.1" }
-                    if (publicAlts.isNotEmpty()) put("alts", org.json.JSONArray(publicAlts))
+                    if (publicAlts.isNotEmpty()) put("alts", com.prism.core.json.JSONArray(publicAlts))
                 }
             }.toString()
             com.prism.launcher.mesh.PrismMeshService.broadcastToOthers(0x05.toByte(), payload)
@@ -97,7 +97,7 @@ object P2pDnsManager {
 
         if (targetFile.exists()) {
             try {
-                val hostedDomains = PrismSettings.getP2pHostedSites(context).map { it.domain.lowercase() }.toSet()
+                val hostedDomains = PrismSettings.getP2pHostedSites().map { it.domain.lowercase() }.toSet()
                 val json = JSONObject(targetFile.readText())
                 json.keys().forEach { domain ->
                     val obj = json.getJSONObject(domain)
@@ -159,7 +159,7 @@ object P2pDnsManager {
 
         if (excludeLocal) {
             candidates.remove("127.0.0.1")
-            candidates.remove(MeshUtils.getLocalMeshIp(PrismApp.instance))
+            candidates.remove(MeshUtils.getLocalMeshIp())
         } else if (candidates.contains("127.0.0.1")) {
             // 1. Zero Latency: Local hosting/mirroring always wins for non-sync requests
             return "127.0.0.1"
@@ -279,7 +279,7 @@ object P2pDnsManager {
                     put("ts", record.timestamp)
                     put("v", record.isVerified)
                     put("src", record.source.name)
-                    if (record.alternates.isNotEmpty()) put("alts", org.json.JSONArray(record.alternates.toList()))
+                    if (record.alternates.isNotEmpty()) put("alts", com.prism.core.json.JSONArray(record.alternates.toList()))
                 }
                 json.put(domain, obj)
             }

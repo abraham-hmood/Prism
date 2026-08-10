@@ -26,7 +26,7 @@ object NebulaSocialManager {
      * @param manual If true, ignores the Idle/Charging check (user-initiated).
      */
     suspend fun generateNewContent(context: Context, manual: Boolean = false) = withContext(Dispatchers.IO) {
-        val mode = PrismSettings.getAiMode(context)
+        val mode = PrismSettings.getAiMode()
         val isCloud = mode == PrismSettings.AI_MODE_CLOUD
 
         // Check constraints for automatic background generation
@@ -45,7 +45,7 @@ object NebulaSocialManager {
 
         // 1. Make sure there's always someone around, and keep the community growing over time —
         // personas are invented by the AI model itself, never hardcoded.
-        val db = AppDatabase.get(context)
+        val db = AppDatabase.get()
         val existingBotCount = db.socialDao().getAllBots().size
         if (existingBotCount < MIN_BOT_FLOOR || Math.random() < NEW_BOT_CHANCE) {
             generateNewBot(context)
@@ -125,7 +125,7 @@ object NebulaSocialManager {
         parentComment: SocialCommentEntity? = null,
         visionTags: String = ""
     ): SocialCommentEntity = withContext(Dispatchers.IO) {
-        val db = AppDatabase.get(context)
+        val db = AppDatabase.get()
 
         val contextText = if (visionTags.isNotEmpty()) "The user posted an image. It contains: $visionTags. " else ""
         val prompt = if (parentComment == null) {
@@ -172,7 +172,7 @@ object NebulaSocialManager {
      * running the full [generateNewContent] cycle (which also invents new bots/posts).
      */
     suspend fun generateCommentOnPost(context: Context, post: SocialPostEntity): SocialCommentEntity? = withContext(Dispatchers.IO) {
-        val bots = AppDatabase.get(context).socialDao().getAllBots()
+        val bots = AppDatabase.get().socialDao().getAllBots()
         if (bots.isEmpty()) return@withContext null
         val pool = bots.filter { it.botId != post.authorId }.ifEmpty { bots }
         generateBotComment(context, pool.random(), post)
@@ -184,14 +184,14 @@ object NebulaSocialManager {
      * reply stays grounded in the whole thread, not just the immediate comment.
      */
     suspend fun generateReplyToComment(context: Context, post: SocialPostEntity, parentComment: SocialCommentEntity): SocialCommentEntity? = withContext(Dispatchers.IO) {
-        val bots = AppDatabase.get(context).socialDao().getAllBots()
+        val bots = AppDatabase.get().socialDao().getAllBots()
         if (bots.isEmpty()) return@withContext null
         val pool = bots.filter { it.botId != parentComment.authorId }.ifEmpty { bots }
         generateBotComment(context, pool.random(), post, parentComment)
     }
 
     suspend fun generateBotDM(context: Context, bot: SocialBotEntity) = withContext(Dispatchers.IO) {
-        val db = AppDatabase.get(context)
+        val db = AppDatabase.get()
         val prompt = personaVoiceBriefing(bot) +
                      " Send a short, casual direct message to the user to kick off a conversation — something in your own voice, not a generic greeting. Under 150 characters."
 
@@ -208,7 +208,7 @@ object NebulaSocialManager {
         context: Context, chatId: String, content: String,
         onToken: ((String) -> Unit)? = null, onReasoning: ((String) -> Unit)? = null
     ) = withContext(Dispatchers.IO) {
-        val db = AppDatabase.get(context)
+        val db = AppDatabase.get()
 
         // Always persist what the user typed first — never let a missing/stale bot record
         // silently swallow the message with no feedback.
@@ -258,7 +258,7 @@ object NebulaSocialManager {
      * pattern).
      */
     private suspend fun generateNewBot(context: Context): SocialBotEntity? {
-        val db = AppDatabase.get(context)
+        val db = AppDatabase.get()
         val existing = db.socialDao().getAllBots()
         val existingHandles = existing.map { it.handle.removePrefix("@").lowercase() }.toSet()
         val existingNames = existing.map { it.name.lowercase() }.toSet()
@@ -309,7 +309,7 @@ object NebulaSocialManager {
         val finalBio = bio?.takeIf { it.isNotBlank() } ?: "Synthesizing experiences as a $finalPersona in the Prism mesh."
 
         var avatarUri: android.net.Uri? = null
-        if (PrismSettings.isLocalImageModelImported(context) || PrismSettings.getAiMode(context) == PrismSettings.AI_MODE_CLOUD) {
+        if (PrismSettings.isLocalImageModelImported() || PrismSettings.getAiMode() == PrismSettings.AI_MODE_CLOUD) {
             avatarUri = ImageGenManager.generateImage(
                 context,
                 "A realistic, high-quality profile portrait of a person who is a $finalPersona, futuristic style, neon lighting, digital art."

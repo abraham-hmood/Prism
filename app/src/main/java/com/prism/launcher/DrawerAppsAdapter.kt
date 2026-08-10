@@ -82,7 +82,7 @@ class DrawerAppsAdapter(
     private fun bindApp(holder: AppVH, e: DrawerAppEntry) {
         holder.binding.drawerLabel.text = e.label
         val context = holder.itemView.context
-        val iconPack = PrismSettings.getIconPackPackage(context)
+        val iconPack = PrismSettings.getIconPackPackage()
         
         val customIcon = if (iconPack.isNotEmpty()) {
             IconPackEngine.getIconPackDrawable(context, e.component, iconPack)
@@ -94,7 +94,7 @@ class DrawerAppsAdapter(
         } else {
             holder.binding.drawerIcon.setImageDrawable(e.icon)
             holder.binding.iconWrapper.background = NeonGlowDrawable(
-                color = PrismSettings.getGlowColor(context),
+                color = PrismSettings.getGlowColor(),
                 cornerRadius = 24f * context.resources.displayMetrics.density,
                 strokeWidth = 3f * context.resources.displayMetrics.density
             )
@@ -137,7 +137,7 @@ class DrawerAppsAdapter(
             // Simple generic rendering for inner group nodes
             holder.binding.drawerIcon.setImageDrawable(e.icon)
             holder.binding.iconWrapper.background = NeonGlowDrawable(
-                color = PrismSettings.getGlowColor(context),
+                color = PrismSettings.getGlowColor(),
                 cornerRadius = 16f * context.resources.displayMetrics.density,
                 strokeWidth = 2f * context.resources.displayMetrics.density
             )

@@ -22,7 +22,7 @@ object LocalAiService {
     private var currentBackend: Int = -1
 
     private fun getOrInitSession(context: Context, modelPath: String): LlmInferenceSession? {
-        val backend = com.prism.launcher.PrismSettings.getAiBackend(context)
+        val backend = com.prism.launcher.PrismSettings.getAiBackend()
         if (llmInference != null && llmSession != null && currentModelPath == modelPath && currentBackend == backend) {
             return llmSession
         }
@@ -167,7 +167,7 @@ object LocalAiService {
         }
 
         if (GgufInferenceService.isGgufFile(modelPath)) {
-            return GgufInferenceService.generateResponse(context, modelPath, userText)
+            return GgufInferenceService.generateResponse(modelPath, userText)
         }
 
         return try {
@@ -209,7 +209,7 @@ object LocalAiService {
         }
 
         if (GgufInferenceService.isGgufFile(modelPath)) {
-            return GgufInferenceService.generateResponseStreaming(context, modelPath, userText, maxTokens, onToken, onReasoning)
+            return GgufInferenceService.generateResponseStreaming(modelPath, userText, maxTokens, onToken, onReasoning)
         }
 
         return try {

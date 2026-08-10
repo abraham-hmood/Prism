@@ -7,7 +7,7 @@ import com.prism.launcher.PrismSettings
 
 object PrismProxyClient {
     fun start(context: Context) {
-        val servers = PrismSettings.getPrismServers(context)
+        val servers = PrismSettings.getPrismServers()
         if (servers.isEmpty()) return
 
         val builder = ProxyConfig.Builder()

@@ -45,8 +45,8 @@ class CloudModelsActivity : PrismBaseActivity() {
     }
 
     private fun refreshList() {
-        val models = PrismSettings.getCloudModels(this)
-        val activeId = PrismSettings.getActiveCloudModelId(this)
+        val models = PrismSettings.getCloudModels()
+        val activeId = PrismSettings.getActiveCloudModelId()
         adapter.submit(models, activeId)
         binding.cloudModelsEmptyState.visibility = if (models.isEmpty()) View.VISIBLE else View.GONE
         binding.cloudModelsRecycler.visibility = if (models.isEmpty()) View.GONE else View.VISIBLE
@@ -109,12 +109,12 @@ class CloudModelsActivity : PrismBaseActivity() {
                         baseUrl = baseUrl,
                         modelId = modelId
                     )
-                    PrismSettings.addCloudModel(this, profile)
+                    PrismSettings.addCloudModel(profile)
                     // The very first saved profile becomes active automatically -- otherwise
                     // "Add Model" would silently do nothing until the user finds a separate
                     // activation step.
-                    if (PrismSettings.getActiveCloudModelId(this) == null) {
-                        PrismSettings.setActiveCloudModelId(this, profile.id)
+                    if (PrismSettings.getActiveCloudModelId() == null) {
+                        PrismSettings.setActiveCloudModelId(profile.id)
                     }
                     refreshList()
                 } else {
@@ -125,7 +125,7 @@ class CloudModelsActivity : PrismBaseActivity() {
         )
 
         deleteBtn?.setOnClickListener {
-            PrismSettings.removeCloudModel(this, existing!!.id)
+            PrismSettings.removeCloudModel(existing!!.id)
             dialog.dismiss()
             refreshList()
             Toast.makeText(this, "Deleted", Toast.LENGTH_SHORT).show()

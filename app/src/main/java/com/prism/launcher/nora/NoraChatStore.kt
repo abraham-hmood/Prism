@@ -2,8 +2,8 @@ package com.prism.launcher.nora
 
 import android.content.Context
 import com.prism.launcher.PrismLogger
-import org.json.JSONArray
-import org.json.JSONObject
+import com.prism.core.json.JSONArray
+import com.prism.core.json.JSONObject
 
 /**
  * Nora's conversation history, kept as a JSON file rather than a Room table.
@@ -39,7 +39,7 @@ object NoraChatStore {
 
     @Synchronized
     fun load(ctx: Context): List<Entry> {
-        val file = NoraConfig.chatFile(ctx)
+        val file = NoraConfig.chatFile()
         if (!file.exists()) return emptyList()
         return try {
             val arr = JSONArray(file.readText())
@@ -112,7 +112,7 @@ object NoraChatStore {
                     if (e.showFeedback) put("fbs", true)
                 })
             }
-            NoraConfig.chatFile(ctx).writeText(arr.toString())
+            NoraConfig.chatFile().writeText(arr.toString())
         } catch (e: Exception) {
             PrismLogger.logError("Nora", "Could not write conversation: ${e.message}")
         }

@@ -29,14 +29,14 @@ object AiManager {
      * indicator instead of dumping it into the answer.
      */
     suspend fun getResponse(context: Context, userText: String, imageUri: Uri? = null, onToken: ((String) -> Unit)? = null, onReasoning: ((String) -> Unit)? = null): Pair<String, Pair<String?, String?>> = withContext(Dispatchers.IO) {
-        val streaming = onToken != null && PrismSettings.getStreamingEnabled(context)
-        val maxTokens = PrismSettings.getMaxTokens(context)
-        val mode = PrismSettings.getAiMode(context)
+        val streaming = onToken != null && PrismSettings.getStreamingEnabled()
+        val maxTokens = PrismSettings.getMaxTokens()
+        val mode = PrismSettings.getAiMode()
 
         // A P2P model selection (Settings > AI Engine > P2P Models) always takes priority when
         // present — picking one is an explicit "use this" action, independent of the Local/Cloud/
         // Local Cloud mode toggle.
-        val p2pModel = PrismSettings.getSelectedP2pModel(context)
+        val p2pModel = PrismSettings.getSelectedP2pModel()
         if (p2pModel != null) {
             val textRaw = fetchP2pModelResponse(p2pModel.peerIp, userText, if (streaming) onToken else null)
             return@withContext Pair(textRaw, Pair(null, null))
@@ -47,8 +47,8 @@ object AiManager {
         // real tools and re-invoking the model until it reaches a plain answer. Not supported
         // together with an image attachment in v1 (multimodal + tool-calling in one turn adds a
         // lot of per-backend complexity for a combination that's rarely needed together).
-        if (PrismSettings.getAgenticToolsEnabled(context) && imageUri == null) {
-            return@withContext com.prism.launcher.agentic.AgenticEngine.run(context, userText, onToken, onReasoning)
+        if (PrismSettings.getAgenticToolsEnabled() && imageUri == null) {
+            return@withContext com.prism.launcher.agentic.AgenticEngine.run(userText, onToken, onReasoning)
         }
 
         if (mode == PrismSettings.AI_MODE_CLOUD) {
@@ -63,7 +63,7 @@ object AiManager {
             }
 
             // Priority 2: Real Cloud API call
-            val cloudModel = PrismSettings.getActiveCloudModel(context)
+            val cloudModel = PrismSettings.getActiveCloudModel()
                 ?: return@withContext Pair("Error: No cloud model selected. Add one in Settings > AI Engine > Manage Cloud Models.", Pair(null, null))
 
             val base64Image = imageUri?.let { encodeImageToBase64(context, it) }
@@ -75,7 +75,7 @@ object AiManager {
             }
             return@withContext Pair(textRaw, Pair(null, null))
         } else if (mode == PrismSettings.AI_MODE_LOCAL_CLOUD) {
-            val endpoint = PrismSettings.getSelectedOllamaEndpoint(context)
+            val endpoint = PrismSettings.getSelectedOllamaEndpoint()
                 ?: return@withContext Pair("No Ollama model selected — scan for servers and pick one in Settings > AI Engine.", Pair(null, null))
 
             val textRaw = if (streaming) {
@@ -85,7 +85,7 @@ object AiManager {
             }
             return@withContext Pair(textRaw, Pair(null, null))
         } else {
-            val modelPath = PrismSettings.getLocalAiModelPath(context)
+            val modelPath = PrismSettings.getLocalAiModelPath()
             if (modelPath.isBlank()) return@withContext Pair("Error: No local model selected. Please download or select one in Settings.", Pair(null, null))
 
             val response = if (streaming) {

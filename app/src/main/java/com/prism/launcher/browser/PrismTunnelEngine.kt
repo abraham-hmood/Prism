@@ -9,7 +9,7 @@ import com.prism.launcher.vpn.PrismProxyServer
 import com.prism.launcher.vpn.PrismSocket
 import com.prism.launcher.vpn.VpnMultiplexer
 import com.prism.launcher.vpn.WireguardController
-import com.prism.launcher.MeshUtils
+import com.prism.core.MeshUtils
 import okhttp3.Dns
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -171,13 +171,13 @@ class PrismTunnelEngine(private val context: Context) {
         if (routingActive) return
         routingActive = true
         
-        if (!PrismSettings.getVpnTunnelingEnabled(context)) {
+        if (!PrismSettings.getVpnTunnelingEnabled()) {
             Log.d("PrismTunnel", "Tunneling disabled in settings; Backbone idling.")
             return
         }
         
-        currentMode = PrismSettings.getVpnMode(context)
-        currentRole = PrismSettings.getPrismVpnRole(context)
+        currentMode = PrismSettings.getVpnMode()
+        currentRole = PrismSettings.getPrismVpnRole()
         
         com.prism.launcher.PrismLogger.logInfo("PrismTunnel", "Starting Mesh Backbone (Mode: $currentMode, Role: $currentRole)")
         
@@ -227,7 +227,7 @@ class PrismTunnelEngine(private val context: Context) {
     }
 
     fun resumeTunnel() {
-        if (!PrismSettings.getVpnTunnelingEnabled(context)) return
+        if (!PrismSettings.getVpnTunnelingEnabled()) return
         routingActive = true
         when (currentMode) {
             PrismSettings.VPN_MODE_PRISM -> {
@@ -270,17 +270,17 @@ class PrismTunnelEngine(private val context: Context) {
         
         try { Thread.sleep(200) } catch(e: InterruptedException) { }
 
-        var vpnPortStr = PrismSettings.getPrismVpnPort(context)
+        var vpnPortStr = PrismSettings.getPrismVpnPort()
         if (vpnPortStr == "8080" || vpnPortStr == "8081" || vpnPortStr == "") {
             val newPort = MeshUtils.findAvailablePort().toString()
-            PrismSettings.setPrismVpnPort(context, newPort)
+            PrismSettings.setPrismVpnPort(newPort)
             vpnPortStr = newPort
         }
         
         val port = vpnPortStr.toIntOrNull() ?: MeshUtils.findAvailablePort()
-        val user = PrismSettings.getPrismVpnUsername(context)
-        val pass = PrismSettings.getPrismVpnPassword(context)
-        val protoMode = PrismSettings.getVpnProtocolMode(context)
+        val user = PrismSettings.getPrismVpnUsername()
+        val pass = PrismSettings.getPrismVpnPassword()
+        val protoMode = PrismSettings.getVpnProtocolMode()
         
         hostingServer = PrismProxyServer(8080, "PrismHost", isProxyMode = false)
         hostingServer?.start()
@@ -292,7 +292,7 @@ class PrismTunnelEngine(private val context: Context) {
         }
 
         if (protoMode != PrismSettings.VPN_PROTOCOL_PROXY) {
-            val udpPort = try { (PrismSettings.getMeshBootstrapPort(context)).toInt() } catch(e: Exception) { 8081 }
+            val udpPort = try { (PrismSettings.getMeshBootstrapPort()).toInt() } catch(e: Exception) { 8081 }
             vpnMultiplexer = com.prism.launcher.vpn.VpnMultiplexer(context, udpPort, pass, user, pass)
             vpnMultiplexer?.start()
         }
@@ -304,7 +304,7 @@ class PrismTunnelEngine(private val context: Context) {
 
     private fun startExternalVpnTunnel() {
         WireguardController.init(context)
-        val confData = PrismSettings.getExternalVpnProfile(context)
+        val confData = PrismSettings.getExternalVpnProfile()
         if (confData.isNotEmpty()) {
             WireguardController.loadProfile(ByteArrayInputStream(confData.toByteArray()))
             WireguardController.start()

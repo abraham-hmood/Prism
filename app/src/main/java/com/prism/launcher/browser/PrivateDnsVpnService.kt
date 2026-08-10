@@ -38,7 +38,7 @@ class PrivateDnsVpnService : VpnService() {
     @Volatile
     private var serviceRunning = false
 
-    private val blocklist by lazy { PrismBlocklist.get(applicationContext) }
+    private val blocklist by lazy { PrismBlocklist.get() }
 
     override fun onCreate() {
         super.onCreate()
@@ -60,7 +60,7 @@ class PrivateDnsVpnService : VpnService() {
         }
 
         val tunnelRequested = intent?.getBooleanExtra("EXTRA_ESTABLISH_TUNNEL", false) ?: false
-        val alwaysOn = PrismSettings.getVpnServerAlwaysOn(this)
+        val alwaysOn = PrismSettings.getVpnServerAlwaysOn()
         
         if (!tunnelRequested && !alwaysOn) {
             shutdownTunnelAndThreads()
@@ -76,13 +76,13 @@ class PrivateDnsVpnService : VpnService() {
     private fun updateStatusNotification() {
         val nm = getSystemService(NotificationManager::class.java)
         
-        val mode = PrismSettings.getPrismVpnRole(this)
-        val port = PrismSettings.getPrismVpnPort(this)
+        val mode = PrismSettings.getPrismVpnRole()
+        val port = PrismSettings.getPrismVpnPort()
         
         val content = if (mode == PrismSettings.PRISM_ROLE_SERVER) {
             "P2P Host: Active @ ${getLocalIpAddress()}:$port"
         } else {
-            val servers = PrismSettings.getPrismServers(this)
+            val servers = PrismSettings.getPrismServers()
             val active = servers.find { it.isActive }
             if (active != null) {
                 "Client: Mesh Bridge -> ${active.name}"
@@ -139,7 +139,7 @@ class PrivateDnsVpnService : VpnService() {
     }
 
     private fun bootstrapTunnel(forceTunnel: Boolean) {
-        val alwaysOn = PrismSettings.getVpnServerAlwaysOn(this)
+        val alwaysOn = PrismSettings.getVpnServerAlwaysOn()
         val shouldTunnel = forceTunnel || alwaysOn
 
         synchronized(tunnelLock) {
@@ -189,8 +189,8 @@ class PrivateDnsVpnService : VpnService() {
     }
 
     private fun buildMinimalTunnel(): ParcelFileDescriptor? {
-        val dnsA = PrismSettings.getPrimaryDns(this)
-        val dnsB = PrismSettings.getSecondaryDns(this)
+        val dnsA = PrismSettings.getPrimaryDns()
+        val dnsB = PrismSettings.getSecondaryDns()
 
         return this.Builder()
             .setSession("Prism Private DNS")
@@ -230,8 +230,8 @@ class PrivateDnsVpnService : VpnService() {
     }
 
     private fun establishLocked(comp: RouteComputation): ParcelFileDescriptor? {
-        val dnsA = PrismSettings.getPrimaryDns(this)
-        val dnsB = PrismSettings.getSecondaryDns(this)
+        val dnsA = PrismSettings.getPrimaryDns()
+        val dnsB = PrismSettings.getSecondaryDns()
         
         val builder = this.Builder()
             .setSession("Prism Mesh Tunnel")
@@ -383,7 +383,7 @@ class PrivateDnsVpnService : VpnService() {
 
     private fun forwardDnsUdp(query: ByteArray): ByteArray? {
         val socket = getDnsSocket() ?: return null
-        val dnsA = PrismSettings.getPrimaryDns(this)
+        val dnsA = PrismSettings.getPrimaryDns()
         return try {
             val target = InetAddress.getByName(dnsA)
             socket.send(DatagramPacket(query, query.size, target, 53))

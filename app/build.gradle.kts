@@ -68,6 +68,8 @@ android {
 }
 
 dependencies {
+    implementation(project(":core"))
+
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("com.google.android.material:material:1.12.0")
@@ -77,9 +79,11 @@ dependencies {
     implementation("androidx.webkit:webkit:1.12.1")
     implementation("androidx.swiperefreshlayout:swiperefreshlayout:1.1.0")
 
-    // Room — local DB for installed app list
-    val roomVersion = "2.6.1"
-    implementation("androidx.room:room-runtime:$roomVersion")
+    // Room — the entities, DAOs and @Database now live in :core and come in transitively through
+    // its `api` dependency. What stays here is the Android variant of the runtime (resolved
+    // automatically from the same coordinate) and the compiler, which is still needed because
+    // AccessPointModel.kt keeps Room annotations on this side of the boundary.
+    val roomVersion: String by rootProject.extra
     implementation("androidx.room:room-ktx:$roomVersion")
     ksp("androidx.room:room-compiler:$roomVersion")
 

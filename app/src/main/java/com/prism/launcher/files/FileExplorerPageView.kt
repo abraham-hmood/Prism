@@ -101,7 +101,7 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
         // Apply Glow to Search Bar
         val glowContainer = root.findViewById<View>(R.id.fileSearchGlowContainer)
         glowContainer.background = com.prism.launcher.NeonGlowDrawable(
-            color = com.prism.launcher.PrismSettings.getGlowColor(context),
+            color = com.prism.launcher.PrismSettings.getGlowColor(),
             cornerRadius = 24f * resources.displayMetrics.density,
             strokeWidth = 3f * resources.displayMetrics.density
         )
@@ -223,11 +223,11 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
                     username = userIn.text.toString(),
                     password = passIn.text.toString()
                 )
-                com.prism.launcher.PrismSettings.addNetworkStorage(context, storage)
+                com.prism.launcher.PrismSettings.addNetworkStorage(storage)
                 
                 // Add to random desktop page as requested
                 val targetPage = (context as? LauncherActivity)?.findDesktopPosition() ?: 1
-                DesktopShortcutStore.add(context, DesktopItem.NetworkedFolder(storage.host, storage.name, storage.protocol), targetPage)
+                DesktopShortcutStore.add(DesktopItem.NetworkedFolder(storage.host, storage.name, storage.protocol), targetPage)
                 
                 Toast.makeText(context, "Connected and added to Desktop", Toast.LENGTH_SHORT).show()
                 navigateTo(currentPath) // Refresh view
@@ -311,7 +311,7 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
                 roots.add(FileEntry.AppStorageLink)
                 externalVolumeRoots = discoverExternalVolumes(context)
                 roots.addAll(externalVolumeRoots)
-                com.prism.launcher.PrismSettings.getNetworkStorages(context).forEach {
+                com.prism.launcher.PrismSettings.getNetworkStorages().forEach {
                     roots.add(FileEntry.Network(it))
                 }
                 allEntries = roots
@@ -533,7 +533,7 @@ class FileExplorerAdapter(
         val entry = items[position]
         holder.fileName.text = entry.name
         val ctx = holder.itemView.context
-        val glowColor = com.prism.launcher.PrismSettings.getGlowColor(ctx)
+        val glowColor = com.prism.launcher.PrismSettings.getGlowColor()
 
         // Reset state
         holder.fileIcon.colorFilter = null

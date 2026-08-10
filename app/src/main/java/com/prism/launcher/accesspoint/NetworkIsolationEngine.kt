@@ -13,7 +13,10 @@ import java.util.concurrent.ConcurrentHashMap
  */
 class NetworkIsolationEngine(private val context: Context) {
     
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val scope = CoroutineScope(
+        Dispatchers.IO + SupervisorJob() +
+            com.prism.launcher.PrismLogger.coroutineHandler("NetworkIsolation")
+    )
     private val activeRules = ConcurrentHashMap<Long, List<IsolationRule>>()
     
     companion object {

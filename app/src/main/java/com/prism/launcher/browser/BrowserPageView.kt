@@ -31,7 +31,7 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
 
     private val host: LauncherActivity = context as LauncherActivity
     private val binding: IncludeBrowserPageBinding
-    private val blocklist = PrismBlocklist.get(context.applicationContext)
+    private val blocklist = PrismBlocklist.get()
 
     private data class Tab(
         val id: Long,
@@ -67,7 +67,7 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
         binding.tabCategoryGroup.addOnButtonCheckedListener { _, checkedId, isChecked ->
             if (!isChecked) return@addOnButtonCheckedListener
             val targetIsPrivate = checkedId == R.id.privateCategoryBtn
-            if (targetIsPrivate && !privateAuthenticated && PrismSettings.getPrivateTabsLocked(context)) {
+            if (targetIsPrivate && !privateAuthenticated && PrismSettings.getPrivateTabsLocked()) {
                 requestBiometricUnlock {
                     activeCategoryIsPrivate = true
                     refreshTabsList()
@@ -89,7 +89,7 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
         }
 
         if (tabs.isEmpty()) {
-            val defaultPrivate = PrismSettings.getPrivateByDefault(context)
+            val defaultPrivate = PrismSettings.getPrivateByDefault()
             addTab(isPrivate = defaultPrivate, initialUrl = "https://duckduckgo.com/")
         }
 
@@ -215,7 +215,7 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
                         binding.urlField.setText(u)
                     }
                     // Auto-Mirror logic
-                    if (PrismSettings.getAutoMirror(context)) {
+                    if (PrismSettings.getAutoMirror()) {
                         val hostName = try { java.net.URL(u).host } catch (e: Exception) { null }
                         if (hostName != null && P2pDnsManager.isP2pDomain(hostName)) {
                             (context.applicationContext as? com.prism.launcher.PrismApp)?.tunnelEngine?.let { engine ->
@@ -282,7 +282,7 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
     }
 
     private fun refreshTabsList() {
-        val lockActive = PrismSettings.getPrivateTabsLocked(context) && !privateAuthenticated
+        val lockActive = PrismSettings.getPrivateTabsLocked() && !privateAuthenticated
         val displayed = tabs.filter { it.isPrivate == activeCategoryIsPrivate }
         
         val cards = displayed.map { tab ->
@@ -360,7 +360,7 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
         val looksLikeUrl = input.contains("://") || (input.contains(".") && !input.contains(" "))
 
         if (!looksLikeUrl) {
-            url = PrismSettings.buildSearchUrl(context, input)
+            url = PrismSettings.buildSearchUrl(input)
         } else if (!input.contains("://")) {
             // Default to https for standard browsing, but allow P2P resolution to handle the IP
             url = "https://$input"
@@ -377,7 +377,7 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
         lastVpnStateWants = wantsPrivateTunnel
 
         if (wantsPrivateTunnel) {
-            val autoStart = PrismSettings.getVpnAutoStart(context)
+            val autoStart = PrismSettings.getVpnAutoStart()
             if (!autoStart) return
             
             val prep = VpnService.prepare(host)
@@ -389,7 +389,7 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
             PrivateDnsVpnService.start(context, true)
         } else {
             // Downgrade to Backbone-Only Mode (Clears 'Key' icon and Ad-blocking)
-            val alwaysOn = PrismSettings.getVpnServerAlwaysOn(context)
+            val alwaysOn = PrismSettings.getVpnServerAlwaysOn()
             if (alwaysOn) {
                 PrivateDnsVpnService.start(context, true) // Maintain tunnel if persistent
             } else {

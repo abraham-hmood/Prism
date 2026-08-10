@@ -28,7 +28,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.json.JSONObject
+import com.prism.core.json.JSONObject
 
 /**
  * Desktop page for managing agentic tool-calling: built-in Prism tools, user-imported HTTP
@@ -42,10 +42,10 @@ class AgenticToolsPageView @JvmOverloads constructor(
 
     private val binding = PageAgenticToolsBinding.inflate(LayoutInflater.from(context), this, true)
     private val adapter = AgenticToolsAdapter(
-        onImportedToolClick = { showTestToolDialog(it.name, it.description, it.parametersJson) { args -> AgenticToolExecutor.execute(context, it.toDefinition(), args) } },
+        onImportedToolClick = { showTestToolDialog(it.name, it.description, it.parametersJson) { args -> AgenticToolExecutor.execute(it.toDefinition(), args) } },
         onImportedToolLongClick = { showImportToolDialog(it) },
         onImportedToolToggle = { entity, enabled -> toggleTool(entity, enabled) },
-        onBuiltinToolClick = { showTestToolDialog(it.name, it.description, it.parametersSchema.toString()) { args -> AgenticToolExecutor.execute(context, it, args) } },
+        onBuiltinToolClick = { showTestToolDialog(it.name, it.description, it.parametersSchema.toString()) { args -> AgenticToolExecutor.execute(it, args) } },
         onSyntaxClick = { showImportSyntaxDialog(it) }
     )
 
@@ -61,9 +61,9 @@ class AgenticToolsPageView @JvmOverloads constructor(
         // to hand scroll/fling momentum up to an ancestor anyway (different axis entirely).
         binding.agenticRecycler.isNestedScrollingEnabled = false
 
-        binding.agenticEnabledSwitch.isChecked = PrismSettings.getAgenticToolsEnabled(context)
+        binding.agenticEnabledSwitch.isChecked = PrismSettings.getAgenticToolsEnabled()
         binding.agenticEnabledSwitch.setOnCheckedChangeListener { _, checked ->
-            PrismSettings.setAgenticToolsEnabled(context, checked)
+            PrismSettings.setAgenticToolsEnabled(checked)
         }
 
         binding.agenticAddBtn.setOnClickListener { showAddPopup() }
@@ -81,13 +81,13 @@ class AgenticToolsPageView @JvmOverloads constructor(
         viewScope.cancel()
     }
 
-    private fun dao() = AppDatabase.get(context).agenticDao()
+    private fun dao() = AppDatabase.get().agenticDao()
 
     private fun refreshList() {
         viewScope.launch {
             val tools = withContext(Dispatchers.IO) { dao().getAllTools() }
             val syntaxes = withContext(Dispatchers.IO) { dao().getAllSyntaxes() }
-            val activeSyntaxId = PrismSettings.getActiveAgenticSyntaxId(context)
+            val activeSyntaxId = PrismSettings.getActiveAgenticSyntaxId()
 
             val items = mutableListOf<AgenticListItem>()
             items.add(AgenticListItem.Header("Built-in Tools"))
@@ -232,7 +232,7 @@ class AgenticToolsPageView @JvmOverloads constructor(
         val activeSwitch = android.widget.Switch(context).apply {
             text = "Use this syntax for tool-calling"
             setTextColor(resolveAttr(R.attr.prismTextPrimary))
-            isChecked = existing != null && PrismSettings.getActiveAgenticSyntaxId(context) == existing?.id
+            isChecked = existing != null && PrismSettings.getActiveAgenticSyntaxId() == existing?.id
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
                 topMargin = (12 * density).toInt()
             }
@@ -268,9 +268,9 @@ class AgenticToolsPageView @JvmOverloads constructor(
                     viewScope.launch {
                         withContext(Dispatchers.IO) { dao().upsertSyntax(entity) }
                         if (activeSwitch.isChecked) {
-                            PrismSettings.setActiveAgenticSyntaxId(context, entity.id)
-                        } else if (PrismSettings.getActiveAgenticSyntaxId(context) == entity.id) {
-                            PrismSettings.setActiveAgenticSyntaxId(context, null)
+                            PrismSettings.setActiveAgenticSyntaxId(entity.id)
+                        } else if (PrismSettings.getActiveAgenticSyntaxId() == entity.id) {
+                            PrismSettings.setActiveAgenticSyntaxId(null)
                         }
                         refreshList()
                     }
@@ -285,8 +285,8 @@ class AgenticToolsPageView @JvmOverloads constructor(
             val id = existing!!.id
             viewScope.launch {
                 withContext(Dispatchers.IO) { dao().deleteSyntax(id) }
-                if (PrismSettings.getActiveAgenticSyntaxId(context) == id) {
-                    PrismSettings.setActiveAgenticSyntaxId(context, null)
+                if (PrismSettings.getActiveAgenticSyntaxId() == id) {
+                    PrismSettings.setActiveAgenticSyntaxId(null)
                 }
                 refreshList()
             }

@@ -67,7 +67,7 @@ object PrismAiHost {
 
             writeOkHeader(output)
 
-            if (PrismSettings.getStreamingEnabled(context)) {
+            if (PrismSettings.getStreamingEnabled()) {
                 AiManager.getResponse(context, prompt, onToken = { delta ->
                     try {
                         output.write(delta.toByteArray())

@@ -5,7 +5,7 @@ import android.net.Uri
 import com.prism.launcher.PrismLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import org.json.JSONObject
+import com.prism.core.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.File
@@ -37,17 +37,17 @@ object NoraArchive {
     // ── Backup ──────────────────────────────────────────────────────────────
 
     suspend fun backup(ctx: Context, destination: Uri): Result = withContext(Dispatchers.IO) {
-        val root = NoraConfig.rootDir(ctx)
-        val connectome = NoraConfig.weightsDir(ctx)
-        val dataset = NoraConfig.datasetDir(ctx)
-        val chat = NoraConfig.chatFile(ctx)
+        val root = NoraConfig.rootDir()
+        val connectome = NoraConfig.weightsDir()
+        val dataset = NoraConfig.datasetDir()
+        val chat = NoraConfig.chatFile()
 
         val datasetFiles = dataset.listFiles()?.filter { it.isFile } ?: emptyList()
         val connectomeFiles = connectome.listFiles()?.filter { it.isFile } ?: emptyList()
         // Feedback goes in the archive because it is learned state, not cache. The bias map is
         // the accumulated record of what the user liked, and the traces are what make the thumbs
         // in a restored transcript still do something rather than reporting "too far back".
-        val feedbackFiles = NoraConfig.feedbackDir(ctx).listFiles()?.filter { it.isFile } ?: emptyList()
+        val feedbackFiles = NoraConfig.feedbackDir().listFiles()?.filter { it.isFile } ?: emptyList()
 
         if (datasetFiles.isEmpty() && connectomeFiles.isEmpty()) {
             return@withContext Result(
@@ -133,7 +133,7 @@ object NoraArchive {
     // ── Import ──────────────────────────────────────────────────────────────
 
     suspend fun import(ctx: Context, source: Uri): Result = withContext(Dispatchers.IO) {
-        val root = NoraConfig.rootDir(ctx)
+        val root = NoraConfig.rootDir()
         val rootPath = root.canonicalPath
 
         try {
@@ -188,7 +188,7 @@ object NoraArchive {
                             entry.name.startsWith("connectome/") -> connectomeFiles++
                             entry.name.startsWith("dataset/") -> datasetFiles++
                             entry.name.startsWith("feedback/") -> feedbackFiles++
-                            entry.name == NoraConfig.chatFile(ctx).name -> chatRestored = true
+                            entry.name == NoraConfig.chatFile().name -> chatRestored = true
                         }
                     }
                 }

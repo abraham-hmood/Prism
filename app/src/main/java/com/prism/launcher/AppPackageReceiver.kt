@@ -31,7 +31,7 @@ class AppPackageReceiver : BroadcastReceiver() {
         val action = intent.action ?: return
         Log.d(TAG, "Received $action for $pkg (replacing=$isReplacing)")
 
-        val dao = AppDatabase.get(context).installedAppDao()
+        val dao = AppDatabase.get().installedAppDao()
 
         GlobalScope.launch(Dispatchers.IO) {
             when (action) {

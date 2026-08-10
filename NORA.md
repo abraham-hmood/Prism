@@ -306,12 +306,61 @@ Two smaller contributors to the same symptom:
   was, quite literally, showing where she had looked. Floor raised to 1.4 px so foveal support
   always overlaps.
 
+### The fourth one: the fix for the second one caused it
+
+Black images again after a full ten-epoch run, in every imagery mode. Not overfitting — a
+collapse to a constant, produced by the weight-spectrum constraint that was added to cure the
+divergence above.
+
+`constrainSpectrum` capped the RMS of an entire link and rescaled the whole array when it was
+exceeded. That ceiling is reached inside the first epoch, and from then on the link runs under a
+fixed norm **budget its output channels have to compete for**. On V1→retina the contrast channels
+have large, consistent Hebbian products against rectified V1 energy; the surface channels carry
+smooth low-variance DC and produce much smaller ones. So on every learning step the contrast
+channels took a little more of the budget and the surface channels were rescaled toward zero —
+monotonically, for as long as training continued. Losing them means losing all brightness. Two
+epochs gave dim structured output; ten gave nothing.
+
+Three separate things then conspired to hide it:
+
+- **The contrast stretch guard fired backwards.** `if (hi - lo > 1e-4)` disabled the one
+  mechanism guaranteeing a well-exposed image *precisely* when the image was degenerate. Any
+  output with faint structure got stretched and looked fine; a collapsed one fell through
+  unstretched and rendered as `#000000`. A safety that fails closed on its own failure mode
+  hides the thing it was watching for.
+- **Rectify-before-stretch.** Every channel was rectified before the range was measured, so the
+  half of the signed prediction below zero was discarded before the stretch could use it.
+- **Nothing was ever protected from pruning.** Permanence accrued only above `dopamine > 1.2`,
+  and the trainer's curriculum boost was being destroyed before `learn()` could read it (below),
+  so in an unfocused run permanence stayed at zero and every synapse was fully exposed to
+  sleep-phase downscaling and pruning.
+
+Fixes: the spectrum constraint is now **per output channel**, which removes the competition
+entirely and is strictly tighter than the global bound it replaces (every channel bounded implies
+the whole link bounded), so the stability guarantee is unaffected. Surface channels stay signed
+until after the stretch. The stretch guard drops to `1e-6` and a genuinely flat result is
+*reported* — `/status` shows surface-vs-contrast pathway gain and warns when they diverge, and a
+blank generation says in the reply that it produced a constant rather than a picture. Sleep
+pruning is withheld from any channel already at or below its initialization strength.
+
+**Adjacent bug found while tracing it.** `Neuromodulators.update()` recomputed dopamine as
+`1 + phasic`, wiping any level `setDopamine` had established. The trainer sets a raised level for
+a focused curriculum item, then calls `perceive()` → `settle()` → `update()`, so by the time
+`learn()` read dopamine the boost was gone: the focus-word feature had never done anything. Now
+split into tonic and phasic, with the RPE riding on the tonic level instead of replacing it.
+
 ### The lesson
 
 **A numerical failure that produces clean-looking output is worse than a crash.** With no
 framework underneath, nothing watches for divergence unless it is written in on purpose — and
 in a recurrent generative model, the two things most worth bounding are the quantity inside the
 loop (activations) and the quantity that sets the loop's gain (the weight spectrum).
+
+**A bound that is shared is a bound that is competed for.** Three of the four failures here came
+from a fix for the previous one. Constraining an aggregate — one RMS over a whole link — silently
+creates a zero-sum game between the things inside it, and the loser is whichever signal has the
+weakest gradient rather than whichever matters least. Constrain per pathway, or expect the quiet
+one to be eliminated.
 
 ## 6b. Three diffusion-adjacent modes (and why they aren't diffusion)
 
@@ -449,6 +498,65 @@ overnight training needs anyway. Without it the start is refused, so the worker 
 than failing silently, and the Settings subtitle says so instead of leaving a switch that appears
 to work and never runs.
 
+## 6e. Two non-saccadic routes: `/hallucinate` and `/expose`
+
+Every route in §6b, and the default itself, keeps saccadic canvas integration -- several
+fixations, each independently settled, stitched onto one canvas. `/hallucinate` and `/expose`
+don't: both hold a single gaze at the canvas centre for their entire run and never call the
+fixation selector. This is not a fifth `NoraImageryMode` because it isn't a different settling
+dynamic for the same loop structure the way `/sample` and `/coarse` are -- it's a different loop
+structure, so each lives as its own top-level generation method on `MentalImagery` instead.
+
+**Provenance, stated plainly.** Both are translations of two generation modes from AetherCortex,
+a sibling brain-based project (`C:\Users\bremo\AetherCortex`, see its `main.py --biogen`). That
+project has no foveated retina and no concept of a fixation at all -- its decoder maps a flat
+spike-timing tensor straight to a full image every pass, so "no saccades" was already true of it
+by construction. Nora's whole rendering path goes through a log-polar retina, so the honest
+translation of "no saccadic drawing" here is "one fixation, never moved" rather than "no
+fixation" -- there is no code path in this file that produces a canvas without going through the
+retina model at least once.
+
+**`/hallucinate` -- recursive video, self-perception instead of optic flow.** `/video` gives a
+clip identity across frames by transporting V1/V2's representation forward through an
+MST-synthesized flow field (§6) -- the prior for frame *t+1* is frame *t*, moved. `/hallucinate`
+gives a clip continuity a different way: the prompt seeds frame 0, and every frame after that is
+produced by handing the previous frame back through
+[`NoraBrain.perceive`](core/src/main/kotlin/com/prism/launcher/nora/NoraBrain.kt) -- the same
+bottom-up pathway real vision uses -- so IT ends up holding whatever it recognised in its own last
+drawing, and THAT becomes what the next frame is imagined from. No motion field, no warp, no
+guarantee content stays put:
+recognising your own output and re-imagining from the recognition is a much looser coupling than
+transporting a representation, and drift toward a fixed point (or toward noise) is a real outcome
+of the mechanism, not a bug in it. This is the video-generation analogue of a webcam pointed at
+its own monitor.
+
+**`/expose` -- one long settle, the concept released partway through.** Every other imagery route
+holds IT clamped to the prompt for its entire settle, because letting go is exactly what the
+self-consistency loop would use to wander off the concept. `/expose` does that on purpose: after
+`exposure_prime` iterations (30 by default) the clamp releases, and IT starts taking the same
+ascending update ordinary perception gives it -- error propagated up from V4, pulled toward
+silence rather than toward the prompt -- for the remaining iterations up to `exposure_total` (300
+by default). The result reflects the prompt qualitatively, because it was the seed the free run
+started from, but it is not obligated to still resemble it by the time 270 unclamped iterations
+have run. `NoraBrain.imagine`'s `freeRunAfter` parameter is the whole mechanism; it is additive
+(default `null`, meaning "never release") and every existing caller is bit-identical without it.
+
+**Honesty flag on cost.** `/expose` is a single fixation settling for up to 300 iterations against
+the default's 20 iterations × 6 fixations = 120 -- more total settle work than any other route,
+paid serially rather than spread across saccades, which is why its progress narration warns it is
+slow before it starts.
+
+**Honesty flag on what "free-running" means here.** IT has nothing above it in the hierarchy, so
+there is no learned prior pulling its unclamped representation anywhere in particular -- the pull
+term in `CorticalRegion.updateRepresentation` contracts toward `topDown`, which for IT is always
+zero, so the released concept decays toward silence at a rate set by ascending V4 error fighting
+that decay. This is not "the model dreams up something new" in any richer sense; it is ordinary
+predictive-coding perception dynamics applied to a representation that happens to have been
+seeded by a prompt rather than by a photograph. Calling it "dreaming" is doing the same
+communicative work "hallucinate" and "expose" are doing elsewhere in this section -- useful
+shorthand for what the mechanism does, not a claim about what it's like to be the mechanism doing
+it.
+
 ## 7. Evaluation
 
 Both axes matter and they are not the same axis.
@@ -547,6 +655,39 @@ replay, down depresses it and makes her start somewhere else next time you ask.
 by default. When on, an idle phone triggers a short training run every N hours (1–24, default
 10). Needs the Messages page on a desktop slot and Prism exempted from battery optimization —
 see §6d.
+
+**Brain size** — Settings → Intelligence & Messaging → **Nora**, which is now her own screen
+rather than a block inside the AI options.
+
+Every box is in **neurons**, because that's the thing worth controlling; rings-times-wedges is an
+implementation detail. A typed number is a *request* — the geometry solver finds the nearest
+legal configuration and redraws every box from the result, so values often come back slightly
+different. That is not sloppiness: legal sizes are a discrete ladder (multiples of 8 on the
+sheet, 3 on V1's orientations, 2 on MT's directions), and accepting an off-ladder value would
+give a hierarchy whose halvings are inexact. That doesn't crash — it misaligns every prediction
+silently, which is worse.
+
+**Total neurons** rescales everything together. The **Max** button finds the largest size whose
+estimated footprint fits 35% of the app's heap. Per-region boxes: editing the **retina sheet**
+resizes V1, V2, V4, IT and MT with it, because they are *defined* as fractions of it; everything
+else changes only its own channel count. Solving those by resizing the sheet instead would be
+ambiguous — V2 could reach a given size by growing the retina or by growing its own channels, and
+there's no principled way to pick.
+
+Read the **training cost** figure, not the neuron count. Compute is `topC × botC × k² × topH ×
+topW`, so it scales as a *product*: doubling channels and resolution is ~16× the work, not 4×.
+The device maximum is bounded by memory, not by patience — it will happily suggest a size whose
+full training run takes days.
+
+Each size keeps **its own connectome file**, so changing this parks the brain trained at the
+previous size instead of deleting it, and changing back restores it.
+
+**Test this size** trains on nine procedurally-generated coloured shapes in a sandbox — its own
+brain, nothing loaded or saved — and reports three things the estimates can't: whether it
+actually allocates (an `OutOfMemoryError` is caught and reported rather than crashing), whether
+it trains without diverging, and whether it renders a non-degenerate dynamic range. Shapes rather
+than photographs because each caption word picks out exactly one visual property, so a failure is
+attributable to the size rather than to the data.
 
 **Training** — Settings → Intelligence & Messaging → Nora → Train Nora, or `/train` in her thread.
 

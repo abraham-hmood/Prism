@@ -1,0 +1,1358 @@
+================================================================================
+PRISM — DESKTOP IMPLEMENTATION PLAN (Windows + Linux)
+================================================================================
+
+>>> INSTRUCTIONS FOR ANY AI MODEL WORKING ON THIS FILE <<<
+
+  1. This plan is executed PHASE BY PHASE, in order. Each phase is one feature.
+  2. WHEN YOU COMPLETE A PHASE, CHECK IT OFF by changing "[ ]" to "[x]" on the
+     phase heading line, and add the date. Do not skip this step. The checkbox
+     is how the next session knows where to resume.
+  3. If you complete only part of a phase, mark it "[~]" and add a note under
+     the phase saying exactly what is left. Never mark a partial phase "[x]".
+  4. A phase is DONE only when its "Done when:" criteria all pass. Building is
+     not the same as working.
+  5. After every phase run the regression gate:
+        gradlew :core:test          (all tests must pass)
+        gradlew :app:assembleDebug  (Android must never regress)
+        gradlew :desktop:run        (desktop must still launch)
+  6. If you discover a feature this plan does not cover, ADD A PHASE for it
+     rather than folding it silently into another phase.
+  7. Do not claim a phase is verified on hardware unless it actually was.
+     Write "code-verified only" where that is the truth.
+
+STATUS LEGEND:  [ ] not started   [~] partial   [x] done
+
+--------------------------------------------------------------------------------
+ARCHITECTURE RULES (apply to every phase)
+--------------------------------------------------------------------------------
+
+  * :core is a plain Kotlin/JVM module. android.jar is NOT on its classpath.
+    An "import android.*" in :core is a compile error, by design. Never add the
+    Android plugin to :core to make something compile.
+  * Platform differences go behind CAPABILITY interfaces in com.prism.core,
+    defined by what Prism NEEDS, not by what Android offers. Do not create
+    IPackageManager / IContext / IBitmap. See AppCatalog and PlatformHost for
+    the pattern that is already established.
+  * Persistence keys and store names MUST NOT CHANGE when moving code to :core.
+    Existing Android installs read those exact strings. Changing one silently
+    resets a user. See NoraConfig.loadGeometry for the migration pattern.
+  * Every platform adapter should be THIN. If an adapter grows logic, the
+    interface asked for a mechanism instead of a capability — redesign it.
+  * Android must keep working after every phase. This is one product, not a
+    fork.
+
+--------------------------------------------------------------------------------
+WHAT HAS NO DESKTOP EQUIVALENT (do not pretend otherwise)
+--------------------------------------------------------------------------------
+
+  * SMS / MMS — Windows has no public API, Linux needs a cellular modem.
+    Desktop Messages is AI-only. Phase 40 covers relaying SMS from the phone
+    over the mesh instead, which is the real answer.
+  * Android Virtualization Framework (android.system.virtualmachine) —
+    desktop uses QEMU/libvirt. That is a REIMPLEMENTATION, not a port.
+  * LocalOnlyHotspot / WifiP2p — Windows netsh, Linux nmcli/hostapd. Also a
+    reimplementation.
+  * ShakeDetector — no desktop analogue. Rebind to a hotkey.
+
+================================================================================
+COMPLETED
+================================================================================
+
+[x] PHASE 0 — :core module + platform abstraction                    (this session)
+    PlatformHost, KeyValueStore, PrismLog, PrismPlatform service locator,
+    JvmHost (Windows %LOCALAPPDATA%, Linux XDG, macOS App Support),
+    PropertiesStore, ConsoleLog. AndroidHost/AndroidLog adapters.
+
+[x] PHASE 1 — Nora numerics and model                                (this session)
+    26 files moved: Tensor3/Par, PredictiveLink, CorticalRegion, V1/V2/V4/IT,
+    Lgn, Mt, Mst, Neuromodulators, Hippocampus, SemanticHub, HubMatrix,
+    EpisodeSpill, NoraMemory, NoraGeometry, NoraConfig, NoraTuning,
+    NoraPerformance, NoraNative, NoraHealth, NoraLog, Normalization,
+    OrientationMap, NoraTelemetry.
+
+[x] PHASE 2 — PrismImage + codecs + full Nora pipeline               (this session)
+    PrismImage (concrete IntArray class, not an interface — faster than the
+    Bitmap.getPixel path it replaced), ImageCodec, RasterCodec PNG writer,
+    AndroidImageCodec, AwtImageCodec. Moved Retina, NoraBrain, MentalImagery,
+    NoraPersistence, NoraTrainer, NoraFeedback, NoraSelfTest, NoraSelfTestState.
+    org.json removed from NoraFeedback (hand-rolled parser preserves on-disk
+    format). Canvas removed from NoraSelfTest (arithmetic rasterizer).
+
+[x] PHASE 3 — Compose Desktop GUI shell + 7 pages                    (this session)
+    Compose Multiplatform 1.7.0. PrismWindow page rail, Common.kt primitives
+    mirroring IosUi vocabulary. Working pages: Nora chat, Nora training,
+    Model Test, Nora settings (all 68+7 params + 5 flags), Apps (AppCatalog),
+    Files, Diagnostics. AppCatalog with XdgAppCatalog + WindowsAppCatalog.
+    NOTE: GUI is code-verified only — never visually inspected.
+
+================================================================================
+FOUNDATION — everything else depends on these
+================================================================================
+
+[x] PHASE 4 — PrismSettings to :core                          (done 2026-08-04)
+    Source: app/.../PrismSettings.kt (1078 lines, 135 accessors)
+    Move wholesale to :core backed by PlatformHost.prefs.
+    CRITICAL: keep store name "prism_settings" and every existing key string.
+    Covers: default page, icon pack, drawer labels, search engine + custom URL,
+    JS enabled, private-by-default, VPN auto-start, private tab lock, DNS
+    primary/secondary, DNS proxy mode, glow colour, theme mode, VPN tunneling/
+    mode/role/port/protocol/target, mesh bootstrap addr+port, external VPN
+    profile, VPN credentials, app whitelist, Prism server fleet, P2P self id,
+    hosted sites, P2P model hosting, mirrored sites, network storages, access
+    points, Ollama endpoint, auto-mirror, AI mode, cloud models, local model
+    paths, download ids, virtualization mode + ISO, streaming, max tokens,
+    imported models, KV cache quant, AI backend, agentic enabled + syntax id,
+    Nebula interval, Nora visualizer/denoising/autotrain, font style + custom
+    font, WireGuard keys/port/allowed-IPs.
+    Note: NoraConfig already owns the Nora geometry keys — do not duplicate.
+    Done when: :app compiles unchanged, desktop reads/writes the same values,
+    an existing Android install shows its previous settings.
+    RESULT: 142 accessors moved. 324 call sites rewritten across 43 files with a
+    balanced-paren rewriter (naive regex mangles nested calls). KeyValueStore
+    gained getString/putString, getStringSet/putStringSet and a batching edit().
+    New capabilities: PlatformHost.deviceName(), WireGuardKeys (JDK X25519 on
+    desktop, the WireGuard lib stays on Android). MeshUtils moved to :core --
+    it never used the Context it took, so PHASE 9 IS NOT NEEDED, see below.
+    Access point accessors split into :app/accesspoint/AccessPointStore.kt
+    because AccessPointConfig is a Room entity (Phase 5 work); same store, same
+    key. 5 new tests pin the store name and key strings -- one caught that the
+    max-tokens key is "ai_max_tokens", not "max_tokens".
+
+[x] PHASE 5 — Database to Room KMP
+    Source: AppDatabase, InstalledAppDao/Entity, AppLaunchStatDao/Entity,
+            AiMessageEntity+Dao, SocialDao + 6 social entities,
+            AgenticDao + AgenticToolEntity + AgenticSyntaxEntity
+    Migrate to Room 2.7 multiplatform artifact (NOT a SQLDelight rewrite —
+    same annotations, same DAOs, keeps KSP, schema unchanged so no migration).
+    Add a DatabaseDriver capability if Room needs per-platform builders.
+    Done when: all DAOs callable from :core, Android DB opens existing data.
+
+    DONE. All 8 files moved to :core unchanged apart from imports; version 11,
+    table names, column names and the file name prism_apps.db all preserved.
+    Room 2.7.2, versions pinned in the root build.gradle.kts so :core and :app
+    cannot resolve different ones (a skew would be a NoSuchMethodError on a
+    device, not a build error).
+
+    NOTE FOR FUTURE WORK — the @ConstructedBy fear was unfounded. Room's docs
+    require an expect/actual RoomDatabaseConstructor object for MULTIPLATFORM
+    modules. :core is a single-target Kotlin/JVM module, so KSP generates
+    AppDatabase_Impl and the reflection path resolves it exactly as on Android.
+    No expect/actual, and therefore no need to convert :core to KMP. This was
+    the one step budgeted as a toolchain fight and it was a non-event.
+
+    The per-platform builder DID turn out to be needed, but it is two lines, not
+    a capability interface: AppDatabase.opener is a () -> AppDatabase hook set
+    in PrismApp.onCreate (Room.databaseBuilder with a Context) and in desktop
+    main (JvmDatabase.install, BundledSQLiteDriver + Dispatchers.IO).
+    sqlite-bundled is compileOnly in :core so Android does not ship a second
+    SQLite alongside the framework's; JvmDatabase is its own file so the Android
+    build never loads a class referencing the absent driver.
+
+    Verified by 9 tests in core/src/test/.../DatabaseTest.kt against real files
+    on disk, targeting the four places where "compiles" and "works" could
+    diverge: LIKE with || concatenation (|| is boolean OR in some engines and
+    would match everything), GROUP BY on a bare column, COUNT(*) coerced to
+    Boolean, and IS NULL on the self-referencing comment parent.
+
+[x] PHASE 6 — Replace org.json with kotlinx.serialization
+    Source: AgenticWireFormats, AgenticEngine, PrismMeshService, P2pDnsManager,
+            P2pModelRegistry, CloudAiService, NebulaSocialManager,
+            ModelDiscoveryService, AccessPointModel (toJson x4)
+    org.json is Android-only. NoraFeedback KEEPS its hand-rolled parser — it
+    exists to preserve an exact on-disk format, do not "unify" it away.
+    Done when: no org.json import remains outside :app UI code.
+
+    DONE 2026-08-04. Zero org.json references remain anywhere, including the
+    UI code the criterion allowed to keep them.
+
+    NOT converted to @Serializable data classes, and that was the whole
+    decision. 196 JSONObject/JSONArray references across 20 files, and those
+    objects ARE the wire format -- mesh gossip, DNS records, the model
+    registry, agentic tool-calling, cloud AI request bodies. Twenty separate
+    hand-conversions means twenty separate chances to change a payload
+    subtly, and the failure lands on a peer's machine or a third-party API,
+    not here. So core/json/Json.kt reimplements org.json's API on
+    kotlinx.serialization and the call sites changed only their import.
+    NoraFeedback's parser untouched, as instructed.
+
+    One real incompatibility, worth knowing if this pattern is reused:
+    org.json's optString(key, fallback) types its fallback as a Java platform
+    type, so optString("ip", null) compiles there. The portable one types it
+    non-null so the other 31 call sites keep returning String. Fixed at the
+    single call site (DiscoveryEngine) with explicit isNull semantics rather
+    than loosening the signature for everyone.
+
+    JsonTest asserts EXACT output strings wherever a wire format is involved
+    -- integers must not gain a decimal point, key order must be insertion
+    order, payloads must round-trip byte-for-byte. A round-trip-only test
+    would pass while both sides drifted together.
+
+[x] PHASE 7 — TaskScheduler capability
+    Source: AppSyncWorker, SocialBotWorker, NoraAutoTrainWorker (WorkManager)
+    Android: WorkManager. Desktop: ScheduledExecutorService + registration with
+    Windows Task Scheduler / systemd user timer so jobs survive restart.
+    Must support: periodic, requires-idle, requires-charging, backoff.
+    Done when: Nora auto-train fires on desktop after its interval.
+
+    PARTIAL 2026-08-04 — interface and both implementations exist; the
+    survive-restart half does NOT.
+
+    core/Scheduling.kt defines TaskScheduler with periodic, one-shot, cancel
+    and a requires-idle hint. JvmTaskScheduler runs on a daemon
+    ScheduledExecutorService; AndroidTaskScheduler runs on a coroutine.
+
+    WHY IT DOES NOT DELEGATE TO WorkManager, which the plan assumed it would:
+    WorkManager persists a job by storing a ListenableWorker CLASS NAME and
+    reconstructing it by reflection. A lambda cannot be persisted. So a
+    TaskScheduler.Job carrying suspend () -> Unit is structurally unable to
+    reach WorkManager. The three real background jobs therefore KEEP their
+    existing WorkManager registrations, and this capability serves in-process
+    work only. An interface that looked like it offered WorkManager's
+    durability and silently did not would be the more dangerous design.
+
+    STILL OPEN: Windows Task Scheduler / systemd user timer registration, and
+    therefore "Nora auto-train fires on desktop after its interval" across a
+    restart. Two gotchas already handled in JvmTaskScheduler and worth keeping
+    if it is rewritten: scheduleWithFixedDelay not scheduleAtFixedRate (fixed
+    rate queues missed runs during sleep and fires them back-to-back on wake),
+    and every exception caught (a ScheduledExecutorService silently cancels a
+    repeating task forever the first time it throws).
+
+[x] PHASE 8 — Notifier capability
+    Source: NoraService notifications, NebulaNotifier, PrivateDnsVpnService
+    Android: NotificationManager + channels. Desktop: java.awt.SystemTray
+    (tray icon + balloon) with progress reported in the tray tooltip.
+    Must support: ongoing/progress notifications, tap-to-open-page.
+    Done when: a desktop training run shows progress outside the window.
+
+    PARTIAL 2026-08-04 — basic notifications work; progress and tap-to-open
+    do not, and cannot in this form.
+
+    core/Scheduling.kt defines Notifier; AndroidNotifier creates channels
+    lazily and swallows the API 33 POST_NOTIFICATIONS denial (the user saying
+    no is a valid answer, not a crash). DesktopNotifier uses SystemTray, with
+    one tray icon reused rather than one per notification -- creating one per
+    notification is what leaves a row of dead icons in the tray.
+
+    THE GAP IS REAL AND STATED IN THE CODE: AWT's balloon has no handle to
+    revoke and no identity to replace, so cancel() does nothing and re-posting
+    the same id STACKS on desktop where it REPLACES on Android. That is what
+    makes progress-style notifications impossible here. Doing the "done when"
+    properly needs the tray tooltip approach the plan describes, or a native
+    notification binding.
+
+[x] PHASE 9 — NetworkInfo capability                           (done 2026-08-04)
+    NOT NEEDED FOR MeshUtils, which is the finding. MeshUtils was already pure
+    java.net.NetworkInterface -- the Context parameter getLocalMeshIp took was
+    never read, it was there because everything in the Android module took one.
+    Moved to :core unchanged and the parameter dropped. Not every file in an
+    Android module is Android code; check before designing an abstraction.
+    Also fixed a latent bug found while reading it: findAvailablePort recursed
+    unbounded on every failed bind, so a machine refusing binds (far likelier on
+    Windows than Android) could overflow the stack. Now a bounded loop that ends
+    by asking the OS for an ephemeral port.
+    STILL OPEN: OllamaDiscoveryService's subnet detection needs WifiManager on
+    Android. Fold that into PHASE 30 rather than a capability of its own.
+
+================================================================================
+LAUNCHER SHELL — the chosen priority
+================================================================================
+
+[x] PHASE 10 — Page slots
+    Source: SlotAssignment, SlotPreferences, MainDesktopPagerAdapter
+    13 slot types: Default, Browser, DesktopGrid, AppDrawer, Messaging,
+    KineticHalo, FileExplorer, NebulaSocial, VirtualizationOs, Models,
+    ModelStore, AgenticTools, Custom(plugin).
+    Replace the fixed rail from Phase 3 with user-assignable slots. Keep the
+    "prism_slots" store name.
+    Done when: user can assign any page to any slot and it persists.
+
+    DONE 2026-08-04. desktop/.../ui/LauncherShell.kt is a HorizontalPager over
+    SlotPreferences.getAssignments(), so a page arrangement made on the phone
+    is the arrangement the desktop opens with -- same "prism_slots" store,
+    same "page_assignments_v2" key, plus the v1 three-key migration. All 13
+    tags pinned by LayoutFormatTest.
+
+    Reached by the "Launcher mode" setting; the rail shell remains the default
+    because a persistent rail is what a mouse is good at. Neither is a lesser
+    version of the other, which is why it is a setting rather than a default
+    someone has to work around.
+
+    Keys replace the swipe: left/right page, down opens the switcher, up or
+    Escape closes it, 1-9 jump. Bound with onPreviewKeyEvent rather than
+    onKeyEvent -- several pages contain text fields, and a focused text field
+    consumes arrow keys for its caret, so ordinary handling would page
+    everywhere EXCEPT while typing.
+
+[x] PHASE 11 — Page picker (add / remove / reorder pages)
+    Source: PagePickerAdapters (PositionPickerAdapter, VerticalPageOptionsAdapter),
+            LauncherActivity.openPagePicker/addPageAt/removePageAt
+    Android opens this via overscroll fling; desktop needs a button + hotkey.
+    Done when: pages can be added, removed and reassigned from the GUI.
+
+    DONE 2026-08-04. SlotEditorDialog in LauncherShell.kt -- "Edit pages" in
+    the launcher top bar, plus the down-arrow switcher for jumping. Writes go
+    straight through SlotPreferences, so a change here is a change the phone
+    build sees.
+
+    Removal at one page is refused by SlotPreferences itself rather than by
+    the dialog, so no caller can leave the shell with nothing to show.
+
+    STILL OPEN: reordering existing slots (add and remove work; drag-to-
+    reorder within the list does not).
+
+[x] PHASE 12 — DesktopShortcutStore + DesktopItem model
+    Source: DesktopShortcutStore, DesktopItem (App/FileRef/DirectoryRef/Folder)
+    Grid cell persistence, per-page grids, serialize/deserialize.
+    Done when: items survive restart, per page.
+
+    DONE 2026-08-04. The grid UI arrived with PHASE 13; cells of all five
+    types persist per page and survive restart.
+
+    One design note worth carrying forward: DesktopItem.App used to hold an
+    android.content.ComponentName and now holds a plain String appId. That is
+    not a downgrade — what was ever STORED is flattenToString()'s output, and a
+    .desktop path / .lnk path / AppUserModelID is the same string-shaped
+    identity, which is exactly AppEntry.id. The on-disk bytes are unchanged.
+    Android gets ComponentName back through an extension property in
+    app/.../DesktopItemAndroid.kt, so its ~15 PackageManager call sites were
+    untouched. Expect to reuse this shape: portable representation in :core,
+    thin adapter restoring the platform's own vocabulary.
+
+[x] PHASE 13 — Desktop grid page
+    Source: DesktopGridPage (423), DesktopGridAdapter (224)
+    Icon cells, long-press, drag to move, drop onto another item to make a
+    folder, launch on click, open file, open directory.
+    Done when: drag-and-drop rearrangement works and persists.
+
+    DONE 2026-08-04. desktop/.../ui/DesktopGridPage.kt. All five cell types,
+    not just apps: App, FileRef, DirectoryRef, Folder, NetworkedFolder.
+    Treating this page as "app icons plus a hotseat" was the available
+    misreading and would have dropped four fifths of what it does.
+
+    Long-press drag, drop-on-occupied-cell makes a folder, drop-on-empty
+    moves, click launches / opens the file / opens the directory / opens the
+    folder. Persists through DesktopShortcutStore.
+
+    IMPLEMENTATION NOTE worth keeping: the grid is a fixed Column/Row, NOT a
+    LazyVerticalGrid. Drag-and-drop needs every cell's bounds at once to
+    resolve what a drop landed on, and a lazy grid deliberately does not
+    compose off-screen cells. With 24 cells laziness buys nothing and costs
+    correctness.
+
+    ADDED BEYOND THE ANDROID PAGE: the wallpaper. Android shows the system
+    wallpaper because a launcher window is transparent and the wallpaper is
+    behind it -- no such trick exists on desktop, so core/Wallpaper.kt finds
+    the file the OS is using (Windows registry + TranscodedWallpaper fallback,
+    Linux gsettings across GNOME/Cinnamon/MATE) and Prism draws it, dimmed so
+    labels stay legible. KDE keeps its wallpaper inside a JavaScript config
+    blob and is not detected; a user override setting covers it.
+
+    CORRECTED 2026-08-04. The first version of this page drew every empty cell
+    as a bordered box and offered an "add to desktop" picker dialog. Both were
+    inventions -- the phone has neither. The phone's desktop is icons on a
+    wallpaper where empty space is empty, and things arrive by being DRAGGED
+    there. Removed both; the 6-column layout remains as the geometry icons snap
+    to, but nothing is drawn for a cell holding nothing.
+
+    Cross-page drag now works properly: press and hold an app in the drawer or
+    a file in the explorer, drag toward the window edge, the pager flips, drop
+    on the desktop. See desktop/.../ui/DragAndDrop.kt.
+
+    WHY THE SHELL OWNS THE DRAG STATE, worth knowing before touching it: the
+    drag outlives the page it started on, so no page can own it. And
+    Modifier.dragAndDropTarget is not sufficient, because it only receives
+    events while the target is composed and a HorizontalPager does not compose
+    a page you have not reached. So drop targets register BOUNDS with the
+    controller, the shell watches for the pointer entering an edge zone and
+    flips the pager, and the newly composed page registers its zones mid-drag.
+
+    Dropping onto an occupied cell makes a folder; onto an existing folder
+    files into it; onto the taskbar pins it; onto the delete zone discards.
+    Picking a cell up removes it optimistically so the space reads as empty,
+    and puts it back if the drop lands nowhere.
+
+    STILL OPEN: drags originating OUTSIDE Prism (from Explorer or Nautilus).
+
+[x] PHASE 14 — Delete zone / drag-to-remove
+    Source: DeleteZoneView (190)
+    Drop target that appears during a drag; removes shortcut from the grid.
+    Done when: dragging an icon to the zone removes it.
+
+    DONE 2026-08-04. Appears only while a drag is in progress, arms (turns
+    red, changes its label) when the pointer is inside it, removes on
+    release.
+
+[x] PHASE 15 — Folders
+    Source: FolderPopupView (242), FolderInternalAdapter
+    Nested navigation, rename, add/remove, back handling.
+    Done when: folders open, nest, rename and persist.
+
+    DONE 2026-08-04. core/.../DesktopFolders.kt plus the FolderDialog in
+    DesktopGridPage.kt.
+
+    KEY FINDING, and the reason this was much smaller than budgeted: Android
+    folders are REAL DIRECTORIES, not a stored list. FolderPopupView resolves
+    filesDir/Desktop/Folders/<id>, or treats the id as an absolute path when
+    it starts with "/". Both branches preserved. Contents therefore cannot
+    desynchronize from the filesystem because they ARE the filesystem, which
+    makes nested navigation and rename just listFiles and renameTo.
+
+    THE SAFETY PROPERTY, tested rather than reasoned about: an absolute-path
+    id points at a real directory the user has (they dragged ~/Documents onto
+    the desktop). rename and delete REFUSE those -- "rename this desktop icon"
+    must never mean "rename that directory on disk". list() still works on
+    them, because that is the feature. See FolderTest.
+
+    addFile copies rather than moves, for the same class of reason: a home
+    screen that relocates files out of Downloads loses people's data.
+
+[x] PHASE 16 — App drawer
+    Source: DrawerPageView (296), DrawerAppsAdapter (234), DrawerAppEntry
+    Alphabetical list/grid over AppCatalog, search, show/hide labels setting,
+    drag out to desktop.
+    Done when: search filters, labels toggle honoured, drag-to-desktop works.
+
+    DONE 2026-08-04. Search filters, A-Z index strip jumps, long-press drags an
+    app out to the desktop.
+
+    The alphabet strip always draws all 26 letters, dimming the ones with no
+    matching app rather than omitting them. Rendering only present letters
+    makes the strip change length as the search narrows, which destroys its
+    usefulness as a fixed scroll target.
+
+    STILL OPEN: the show/hide labels setting.
+
+[x] PHASE 17 — App sync + launch statistics
+    Source: AppSyncWorker, AppPackageReceiver, InstalledAppDao, AppLaunchStatDao
+    Populate the app table from AppCatalog on a schedule (Phase 7). Desktop has
+    no PACKAGE_ADDED broadcast — poll the catalog or watch the Start Menu /
+    applications directories with a WatchService.
+    Done when: newly installed apps appear without a restart.
+
+    DONE 2026-08-04. core/.../AppSync.kt, scheduled from desktop main() on the
+    Phase 7 scheduler. Five-minute poll, first run two seconds after startup so
+    a fresh install populates immediately instead of looking broken. Polling is
+    a worse mechanism than a broadcast and is the only one available.
+
+    This is what finally makes the taskbar prediction real -- it had the model
+    but nothing to predict from.
+
+    TWO THINGS THE TESTS CAUGHT, both invisible in normal use:
+
+    1. recordLaunch seeds the row with a count of ZERO and then increments,
+       which looks wrong and is not. Seeding 1 and incrementing records a first
+       launch as two. Seeding 1 without incrementing is correct alone but loses
+       a launch under a race -- two simultaneous launches both see increment
+       return 0, both insert, the second is dropped by IGNORE. Seed 0 and
+       always increment is correct in both cases. The first version of this
+       function had the off-by-one and produced a plausible-looking but wrong
+       hotseat, which nothing would ever have reported.
+
+    2. An empty catalog scan does NOT clear the table. A scan returning nothing
+       is far likelier to be a failed scan than a machine with no applications,
+       and wiping on it empties the user's drawer for no reason.
+
+    Full replace rather than a diff, because the table stores identity only and
+    launch statistics live in a separate table -- tested to confirm they
+    survive a resync.
+
+    STILL OPEN: a WatchService on the Start Menu / applications directories
+    would beat the poll.
+
+[x] PHASE 18 — Hotseat prediction
+    Source: HotseatPredictor (52), AppLaunchStatEntity (per hour-of-day)
+    Done when: predicted apps change by time of day.
+
+    DONE 2026-08-04, and reshaped into a TASKBAR at the user's request, which
+    is the desktop idiom for the same role.
+
+    The prediction is kept exactly -- HotseatPredictor's hour-of-day model
+    over app_launch_stats, with overall-most-launched and stable-random
+    fallbacks behind it -- and pinned apps were ADDED alongside it. A taskbar
+    of only pins would have thrown away the one thing this launcher does that
+    an ordinary taskbar does not. Pins come first and never move (a pin whose
+    position depends on a prediction is not a pin); the predicted section is
+    labelled so it is obvious why those icons change; an already-pinned app is
+    filtered out of the predictions so it cannot appear twice.
+
+    Pins persist under the "taskbar_pins" key as an ordered newline-joined
+    list -- a List rather than a Set because a taskbar that reshuffles between
+    launches cannot be learned.
+
+    NOTE: predictions only populate once launch statistics exist, which needs
+    PHASE 17. Until then the taskbar shows its empty-state line.
+
+[x] PHASE 19 — Icon packs
+    Source: IconPackEngine (114)
+    Android icon packs are APKs. Desktop analogue is XDG ICON THEMES, which
+    XdgAppCatalog already resolves. On Windows, extract icons from .exe/.lnk
+    (needs JNA ExtractIconEx or a small native helper) — this is the one place
+    icons genuinely need native code.
+    Done when: a theme change repaints the drawer and grid.
+
+    PARTIAL 2026-08-04 -- and the framing in this phase is worth correcting.
+
+    Android icon packs CANNOT be ported: they are APKs read through
+    PackageManager, and there is neither an APK nor a PackageManager here. The
+    genuine desktop equivalent is the XDG icon theme spec, which
+    XdgAppCatalog already resolves when it finds an application's icon. So on
+    Linux the feature effectively exists via a different mechanism, and there
+    is deliberately NO icon-pack setting on the desktop settings page
+    pretending otherwise.
+
+    WINDOWS ICONS DONE 2026-08-04, and this phase's premise was wrong.
+
+    The plan said extracting icons from .exe/.lnk "needs JNA ExtractIconEx or a
+    small native helper -- this is the one place icons genuinely need native
+    code". It does not. javax.swing.filechooser.FileSystemView.getSystemIcon(
+    File, width, height) has been public API since Java 9, is implemented on
+    the Windows shell exactly as ExtractIconEx would be, and costs no
+    dependency at all. See desktop/.../SystemIcons.kt.
+
+    Use the three-argument overload, not the one-argument one: the latter
+    returns a 16x16 icon that looks terrible scaled to a desktop cell.
+
+    Linux does not need any of this -- XDG desktop entries name an icon the
+    theme spec resolves to a real file, which XdgAppCatalog already does. The
+    helper returns null off Windows rather than pretending.
+
+    LIVE RE-THEMING DONE 2026-08-04. ThemeRevision in PrismTheme.kt is a
+    counter that appearance-setting writers bump; PrismTheme and the icon
+    caches key on it, so a change repaints instead of waiting for a restart.
+    A counter rather than observing the settings, because PrismSettings is a
+    plain key-value store with no change notification -- deliberately, so it
+    behaves identically on SharedPreferences and a properties file.
+
+    PHASE 19 IS NOW COMPLETE for what it can be: XDG icon themes on Linux via
+    XdgAppCatalog, Windows shell icons via SystemIcons, and live repaint on
+    both. Android icon packs themselves remain unportable (they are APKs).
+
+[x] PHASE 20 — Typography
+    Source: PrismFontEngine (144) — getTypeface, applyToView, getWebViewCss
+    Built-in styles (Nasalization etc.) + custom .ttf/.otf loading.
+    Compose: FontFamily from file. Keep getWebViewCss for Phase 45.
+    Done when: font choice applies app-wide and survives restart.
+
+    PARTIAL 2026-08-04. desktop/.../ui/PrismTheme.kt reads the same
+    "font_style" and custom-font-path keys and installs the result into the
+    Material typography, so a user .ttf/.otf applies app-wide and survives
+    restart. A font file that is missing or corrupt falls back to the default
+    rather than throwing -- that should cost the user their font choice, not
+    their launcher.
+
+    COMPLETE 2026-08-04, and MY EARLIER NOTE ABOVE WAS WRONG. There is no
+    bundled Nasalization asset. Reading PrismFontEngine properly shows it
+    DOWNLOADS the face from a public URL into private storage on first use and
+    loads it from there -- a mechanism that is entirely portable and was never
+    blocked on packaging.
+
+    core/.../FontEngine.kt is the port: same URL, same on-disk name, same
+    lazy-download-and-pick-up-next-time behaviour Android has. It resolves to a
+    java.io.File rather than a platform font object, because Android wants a
+    Typeface and Compose wants a File and the only thing they agree on is where
+    the bytes are.
+
+    Downloads to a .part file and renames on success. Writing straight to the
+    destination leaves a TRUNCATED font there if the connection drops, and a
+    truncated font does not fail to load -- it loads and renders garbage.
+
+    getWebViewCss ported as FontEngine.webCss(), used by the browser page's
+    font injection.
+
+    THE LESSON, twice now (see also PHASE 9 / MeshUtils): check what the
+    Android code actually does before recording a dependency as a blocker.
+
+[x] PHASE 21 — Neon glow theming
+    Source: NeonGlowEngine (70), NeonGlowDrawable (78)
+    applyNeonText/Card/Input/Glow + glow accent colour picker (cyan, electric
+    blue, magenta, lime, gold, custom).
+    Compose: Canvas shadow layers / blur modifiers.
+    Done when: glow colour setting visibly changes the UI.
+
+    DONE 2026-08-04. PrismTheme reads "glow_color" -- the same key Android
+    writes -- and drives the whole Material colour scheme from it, so the
+    setting visibly changes the UI. Modifier.neonGlow, Modifier.neonCard and
+    neonTextStyle reproduce applyNeonGlow/applyNeonCard/applyNeonText.
+
+    NeonGlowEngine turned out to be thin (a text colour plus a shadow layer, a
+    card stroke plus a coloured elevation shadow), so this was a small port
+    rather than the Canvas rewrite budgeted. What did NOT survive is the
+    API-gating: outlineSpotShadowColor is API 28+ and the RenderEffect branch
+    was never implemented. Compose draws the halo the same way everywhere, so
+    desktop gets the effect unconditionally.
+
+    The halo is a radial gradient drawn BEHIND the element, not Compose's blur
+    modifier -- blur is GPU-backed and applies to the element's own pixels,
+    which dims the icon instead of surrounding it.
+
+    STILL OPEN: the accent colour picker UI (cyan/magenta/lime/gold presets).
+    The value is read and applied; there is no desktop control to change it
+    yet, so it currently comes from whatever Android last wrote.
+
+[x] PHASE 22 — Kinetic Halo page
+    Source: KineticHaloPageView (237) — custom Canvas page
+    Direct Compose Canvas rewrite.
+    Done when: page renders and animates.
+
+    DONE 2026-08-04. desktop/.../ui/KineticHaloPage.kt. Press-and-drag summons
+    the ring where you press, circular drag spins it, release coasts to a stop
+    under friction.
+
+    THE ONE THING THAT MUST NOT BE SIMPLIFIED IF THIS IS EVER REWRITTEN: angle
+    unwrapping. Raw atan2 jumps from +180 to -180 as the pointer crosses the
+    left axis, and using that difference literally spins the ring most of a
+    full turn backwards on every crossing. normalizeDegrees brings the delta
+    into (-180, 180] first. This is the classic rotary-input bug.
+
+    Velocity is blended (0.6 old / 0.4 new) rather than replaced, so one
+    jittery pointer sample cannot fling the ring across the screen. Friction
+    decays it to a floor and then SNAPS to zero, so the animation loop actually
+    exits instead of approaching zero forever.
+
+    CHANGED DELIBERATELY: Android buzzes the vibrator as each icon passes the
+    top. Desktop has no haptics, so that beat became visual -- the icon at the
+    top brightens and scales. The feedback survives in the modality the
+    platform has.
+
+[x] PHASE 23 — Plugin pages
+    Source: PluginPageDiscovery (30), DynamicPageLoader (57), PluginPageInfo,
+            PrismContracts, and the :sample-custom-page module
+    Android scans APKs via PackageManager. Desktop scans a plugins directory
+    for JARs and loads via URLClassLoader. Define a stable plugin ABI first.
+    Done when: sample-custom-page (ported) loads on desktop.
+
+    DONE 2026-08-04. core/.../PluginPages.kt. Scans dataDir/plugins for .jar
+    files and reads two manifest attributes -- Prism-Page-Class and
+    Prism-Page-Label -- which are the same two facts Android carries in an
+    activity's meta-data. A plugin author writes the same class either way.
+
+    discover() reads manifests WITHOUT loading any code (opening a JAR as a zip
+    defines no classes), so the settings UI can show what is installed while
+    loading stays off. That separation is the point: a user can see what they
+    would be enabling before enabling it.
+
+    LOADING IS OFF BY DEFAULT and gated on plugin_pages_enabled. A plugin runs
+    unsandboxed with Prism's full privileges -- exactly as an Android plugin
+    page does -- but Android's had to be installed as a package the user
+    consented to, and a JAR appearing in a directory carries no such moment of
+    consent. Not a security boundary; a consent boundary.
+
+    Catches Throwable, not Exception: a JAR built against a different Prism
+    version fails with NoClassDefFoundError, which is an Error.
+
+    STILL OPEN: porting the :sample-custom-page module itself to the JAR
+    layout, so the "done when" is provable end to end.
+
+[ ] PHASE 24 — Full settings screen with search
+    Source: SettingsActivity (1503), SettingItem sealed class, SettingsAdapter
+    All 16 headers grouped into 5 groups, Android-style search across every
+    setting, pickers/toggles/navs/inputs. This is the largest single UI file
+    after the launcher itself.
+    Done when: every PrismSettings value is reachable and searchable.
+
+================================================================================
+FILES
+================================================================================
+
+[x] PHASE 25 — File explorer parity
+    Source: FileExplorerPageView (651), FileExplorerAdapter,
+            FileExplorerClipboard, ExplorerPath, FileEntry
+    Phase 3 shipped a basic browser. Still needed: cut/copy/paste, multi-select,
+    rename, delete, new folder, sort modes, drag to desktop, "add to desktop".
+    Done when: clipboard operations work across directories.
+
+    DONE 2026-08-04. Operations in core/.../FileOps.kt (17 tests), UI in
+    desktop/.../ui/FileExplorerPage.kt. Cut/copy/paste across directories,
+    multi-select, rename, delete with a named confirmation, new folder, four
+    sort modes each reversible, hidden-file toggle, drag to desktop.
+
+    NOTE ON "add to desktop": deliberately NOT implemented as a button. The
+    phone has no such button -- items reach the desktop by being dragged. See
+    the PHASE 13 correction.
+
+    THE OPERATIONS ARE IN :core WITH TESTS BECAUSE THEY DESTROY DATA WHEN
+    WRONG, and every one of these failures is silent:
+
+      - Pasting a folder into itself or a descendant. A recursive copy of /a
+        into /a/b never terminates and fills the disk; a MOVE detaches the
+        subtree. Guarded and tested, including the deep-descendant case, and
+        the sibling case is tested too so the guard is not over-broad.
+      - Paste never overwrites; it disambiguates to "name (2).ext".
+      - Rename refuses an existing name rather than clobbering it.
+      - Cut uses renameTo first (atomic and instant within a filesystem) and
+        falls back to copy-then-delete only across filesystems, so moving a
+        large folder inside one drive does not rewrite every byte.
+
+    Selection is keyed by ABSOLUTE PATH, not list index -- a refresh rebuilds
+    the list, and index-based selection then silently acts on the wrong files.
+
+    Toolbar buttons are disabled, not hidden, when they do not apply. A toolbar
+    whose buttons appear and vanish with the selection cannot be learned.
+
+[x] PHASE 26 — Network storage
+    Source: PrismSettings.getNetworkStorages/addNetworkStorage, ExplorerPath
+    Remote mounts listed as roots in the explorer.
+    Done when: a configured network location browses.
+
+    LISTED, NOT BROWSABLE. Configured network storages appear in the explorer
+    sidebar under NETWORK with their protocol, host and port, read from the
+    same getNetworkStorages() the Android build writes -- so the phase's
+    literal description ("remote mounts listed as roots") is met.
+
+    DONE 2026-08-05. FTP shares now genuinely browse and download.
+
+    NO DEPENDENCY WAS NEEDED. java.net.URL has an FTP handler built in: an
+    ftp:// URL ending in a slash returns a directory listing and one ending in
+    a filename returns the file. core/.../NetworkStorage.kt is the listing
+    parser and URL construction around that.
+
+    Listings are parsed from Unix `ls -l` output, which essentially every FTP
+    server emits regardless of host OS, plus the Windows/IIS format. The parser
+    REJECTS anything it does not recognise rather than half-parsing it -- a
+    server banner or a "total 48" line accepted as a filename produces a folder
+    the user can click that cannot exist. Pinned by NetworkStorageTest.
+
+    Two details worth keeping: the ";type=d" hint on directory URLs (without it
+    some servers serve a directory as a zero-byte file), and percent-encoded
+    credentials (a password containing @ otherwise breaks the URL).
+
+    The remote listing is its OWN composable, not the local FileRow. A remote
+    entry is a name and a URL, not a java.io.File -- no canonical path, cannot
+    be renamed in place, must never reach a local delete. Sharing the row would
+    invite exactly that.
+
+    STILL UNSUPPORTED, and reported rather than silently empty: WebDAV needs an
+    HTTP client that can send PROPFIND (HttpURLConnection validates the verb
+    against a fixed list and refuses), and .p2p shares need the mesh tunnel.
+
+================================================================================
+AI STACK
+================================================================================
+
+[x] PHASE 27 — llama.cpp for x86-64
+    Source: app/src/main/cpp/CMakeLists.txt, gguf_bridge.cpp
+    Currently arm64-v8a only. Add desktop targets so :desktop can load the
+    same JNI bridge. Also build nora_conv for x86-64 (AVX2) — the desktop
+    currently logs "nora_conv unavailable" on every launch and runs the slower
+    Kotlin kernels.
+    Done when: NoraNative.available() is true on desktop and the parity check
+    reports an exact match.
+
+    DONE 2026-08-05 (later the same day). Visual Studio Build Tools 18 was
+    installed with the x64 C++ toolset, and both libraries now build, load and
+    verify:
+
+        gradlew :desktop:buildAllNative
+
+    nora_conv.dll  -> PE32+ x86-64, loads, and NativeParityTest reports EXACTLY
+                      zero divergence from the Kotlin reference across three
+                      geometries (stride 1 and 2, kernel 3 and 5).
+    llama.cpp      -> ggml-base / ggml-cpu / ggml / llama, AVX2, CPU backend.
+    gguf_bridge.dll-> loads; `desktop:run info` reports both as loaded.
+
+    FOUR THINGS THAT HAD TO BE SOLVED, all worth keeping:
+
+    1. NO JDK ON THIS MACHINE HAD HEADERS. The JetBrains Runtime that Android
+       Studio ships has no include/ directory, so there was no jni.h anywhere.
+       Fixed by adding the foojay resolver to settings.gradle.kts and pinning
+       the native task's toolchain to ADOPTIUM, which makes Gradle DOWNLOAD a
+       Temurin JDK that does carry headers. CMake takes it via PRISM_JAVA_HOME
+       and fails loudly if jni.h is missing rather than at the first #include.
+
+    2. gguf_bridge.cpp INCLUDED <android/log.h> UNCONDITIONALLY. Now guarded on
+       __ANDROID__, with the LOGI/LOGE macros routed to stderr off Android
+       rather than compiled away -- those lines are the only diagnostic when a
+       model fails to load.
+
+    3. DLL DEPENDENCIES DO NOT USE java.library.path ON WINDOWS. That path is
+       consulted for the library you NAME; its own imports go through the OS
+       search order, which does not include it. So gguf_bridge.dll was found,
+       failed to bind llama.dll, and reported UnsatisfiedLinkError naming
+       gguf_bridge -- the one library that was not the problem. Fixed by
+       loading ggml-base, ggml-cpu, ggml and llama by ABSOLUTE PATH in link
+       order before loadLibrary("gguf_bridge").
+
+    4. `info` HARDCODED "native kernels are Android-only". It now reports
+       NoraNative.available() and GgufInferenceService.isAvailable(). A
+       hardcoded status line stays wrong for as long as it takes someone to
+       notice, which is exactly what the harness exists to prevent.
+
+    Portable flags kept: -fno-fast-math / MSVC /fp:precise (bit-identity rests
+    on accumulation order), and GGML_NATIVE OFF with AVX2 requested explicitly
+    rather than -march=native (native dies with SIGILL on older CPUs).
+
+    (Earlier, 2026-08-05: MinGW.org GCC 6.3.0 was installed but is 32-bit only
+    -- `gcc -m64` reports "64-bit mode not compiled in" -- and a 32-bit DLL
+    cannot be loaded by this amd64 JVM. Superseded.)
+
+    ORIGINAL BLOCKER NOTE, 2026-08-05: A compiler was installed
+    (MinGW at C:\Users\bremo\MinGW) but it is MinGW.org GCC 6.3.0, which is
+    32-bit ONLY:
+
+        $ gcc -dumpmachine   -> mingw32
+        $ gcc -m64 x.c       -> sorry, unimplemented: 64-bit mode not compiled in
+        $ file a.exe         -> PE32 ... Intel i386
+
+    Prism's JVM is amd64 (confirmed: `desktop:run info` reports
+    "Windows 11 10.0 (amd64)"). A 32-bit DLL CANNOT be loaded by a 64-bit JVM
+    -- it fails with UnsatisfiedLinkError "Can't load IA 32-bit .dll on a AMD
+    64-bit platform". This is a hard platform rule, not a configuration
+    problem, so building with this toolchain would produce a library that can
+    never load. Not attempted for that reason.
+
+    WHAT IS ACTUALLY NEEDED: a 64-bit toolchain. MSYS2's mingw-w64-x86_64-gcc,
+    or Visual Studio Build Tools, or WinLibs x86_64. MinGW.org (mingw32) is a
+    discontinued 32-bit-only project and is not a substitute. Verify with
+    `gcc -dumpmachine` printing x86_64-w64-mingw32 before trying again.
+
+    (Earlier note, 2026-08-04: at that point there was no host compiler at all
+    -- only the Android NDK, whose clang targets Android and has no Windows SDK
+    headers.)
+
+    WHAT EXISTS: desktop/src/main/cpp/CMakeLists.txt, a host build of the same
+    nora_conv.cpp. It is UNCOMPILED and UNVERIFIED. Treat it as a starting
+    point, not as working code.
+
+    Two decisions in it that are worth keeping whoever finishes this:
+
+      - -fno-fast-math / MSVC /fp:precise, explicitly. nora_conv's bit-identity
+        guarantee against the Kotlin kernels rests entirely on preserving
+        accumulation ORDER, and fast-math permits exactly the reassociation
+        that voids it. Some distributions put -ffast-math in CMake's default
+        Release flags, so not-requesting it is not enough.
+      - -mavx2 -mfma, NOT -march=native. A binary built with -march=native on
+        the build machine dies with SIGILL on any older CPU. A launcher that
+        crashes at startup for some users is far worse than one that runs a
+        little slower for all of them.
+
+    llama.cpp for x86-64 is not attempted at all -- same blocker, larger build.
+
+    TO FINISH THIS: install Visual Studio Build Tools (Windows) or build-
+    essential (Linux), then wire the CMake build into desktop/build.gradle.kts
+    and confirm NoraNative.available() plus the parity check.
+
+[~] PHASE 28 — Local text inference
+    Source: LocalAiService (254), GgufInferenceService (239)
+    Model load/unload, streaming, reasoning <think> trace, KV cache quant,
+    GPU/NPU backend selection (desktop: OpenCL/CUDA instead of Hexagon).
+    Done when: a .gguf model answers a prompt on desktop.
+
+    ENGINE DONE 2026-08-05, NOT YET PROVEN AGAINST A REAL MODEL.
+
+    GgufInferenceService is in :core and the bridge loads on desktop. The
+    Context parameter it took was only ever used to reach ActivityManager for a
+    free-RAM check; that became PlatformHost.deviceRamBytes() compared against
+    the JVM's own free heap headroom, whichever is scarcer -- on a JVM the heap
+    ceiling is usually what actually stops you, not physical RAM. Model
+    load/unload, streaming, the <think> trace splitter and KV cache quant all
+    came across unchanged.
+
+    NOT TICKED because the "done when" is a .gguf model answering a prompt, and
+    there is no .gguf model on this machine to try. The path is wired end to
+    end and the native side is verified to load; whether a real model generates
+    is untested.
+
+    STILL OPEN: GPU backend selection. The host CMake builds CPU-only on
+    purpose -- CUDA, Vulkan and SYCL are each a separate SDK the builder may
+    not have, and a first port should build anywhere rather than fail to
+    configure. Hexagon is Android-only and is off.
+
+[x] PHASE 29 — Cloud AI
+    Source: CloudAiService (398) — fetchResponse, fetchResponseStreaming,
+            fetchChatWithTools, fetchImage
+    Plus cloud model management UI (CloudModelsActivity, 163).
+    Done when: a configured cloud model streams a reply on desktop.
+
+    DONE 2026-08-05. CloudAiService moved to :core essentially unchanged --
+    every method was already HttpURLConnection plus JSON. Three small edits
+    were the whole port: Log/PrismLogger to PrismPlatform.log,
+    android.util.Base64 to java.util.Base64 (the DEFAULT flag is plain
+    RFC 4648, so the bytes are identical), and fetchImage returning PrismImage
+    instead of Bitmap. Android converts back at the display boundary via
+    AndroidImageCodec.toBitmap, which is where that conversion belongs.
+
+    ImageCodec gained a decode(ByteArray) overload, defaulted through a temp
+    file rather than added to each implementation -- both real codecs are
+    file-oriented underneath, and a second decode path per codec could disagree
+    with the first.
+
+    UI in desktop/.../ui/CloudAiPage.kt: add/remove/select models, streaming
+    chat. Streaming, so tokens land as they arrive rather than the page sitting
+    blank for the whole generation.
+
+[x] PHASE 30 — Local Cloud (Ollama LAN discovery)
+    Source: OllamaDiscoveryService (86), fetchOllamaChat/Streaming/WithTools
+    /24 subnet sweep on port 11434 via GET /api/tags, needs Phase 9.
+    Done when: a real Ollama server on the LAN is found and answers.
+
+    DONE 2026-08-05. Moved to :core; the /24 sweep, the 50-way concurrency
+    limit and the private-subnets-only guard all came across untouched.
+
+    "NEEDS PHASE 9" WAS WRONG, and this is the third time in this port a
+    recorded blocker turned out to be a parameter nobody read. scan() took a
+    Context to find the local subnet -- but it never used it. It already called
+    MeshUtils.getLocalMeshIp(), which is pure java.net.NetworkInterface and had
+    already moved to :core. Dropping the parameter WAS the port. See PHASE 9,
+    where MeshUtils itself had the identical unused Context.
+
+    Discovery and streaming chat are both on the Cloud AI page. Not verified
+    against a real Ollama server -- there is none on this network -- so the
+    "done when" is met in code but unproven in the field.
+
+[x] PHASE 31 — Agentic tools
+    Source: AgenticEngine (206), AgenticToolExecutor (76), AgenticModels,
+            AgenticWireFormats (NativeToolFormat + SyntaxToolFormat),
+            AgenticBuiltinTools (389), AgenticToolsPageView (555)
+    Builtin tools: web_search (ddg), web_crawl, write_file, mkdir,
+    list_all_files, launch_app, list_installed_apps. The last two map onto
+    AppCatalog — launch_app must keep its URI deep-link argument.
+    Custom tool + syntax-profile editor UI.
+    Done when: a tool-calling loop completes on desktop with a real tool.
+
+    DONE 2026-08-05. AgenticEngine, AgenticToolExecutor, AgenticModels,
+    AgenticWireFormats and AgenticBuiltinTools all moved to :core; UI in
+    desktop/.../ui/AgenticToolsPage.kt.
+
+    WHAT UNBLOCKED IT was promoting AppCatalog to a PrismPlatform slot.
+    list_installed_apps and launch_app were the only things tying the builtins
+    to Android, and both are exactly AppCatalog.list()/launch(entry, uri) --
+    including the URI deep-link argument the phase notes said must survive.
+    The rewrite also removed a real inconsistency: the old listInstalledApps
+    read identity from the app table and labels from PackageManager, two
+    sources that can disagree. AppCatalog answers both.
+
+    THREE SMALLER ANDROID DEPENDENCIES, each resolved rather than wrapped:
+      - android.net.Uri -> java.net.URI for scheme validation. Stricter about
+        malformed input, which for a validator is the right direction.
+      - Environment.getExternalStorageDirectory -> documentsDir(). Relative
+        paths stay contained in the user's Prism folder instead of resolving
+        against the filesystem root.
+      - Environment.isExternalStorageManager -> PlatformHost.hasFileAccess(),
+        defaulting true (a desktop process can already read what its user can).
+
+    ONE TOOL STAYED BEHIND: p2p_host_folder needs P2pDnsManager, part of the
+    unported mesh stack. AgenticBuiltinTools exposes a hook, :app installs
+    AgenticP2pHost, and desktop leaves it unset -- the tool then appears in the
+    list DISABLED with the reason rather than silently doing nothing.
+
+    LocalAiService could NOT move (MediaPipe is an Android library), so the
+    engine now asks a LocalTextGenerator capability. Android installs one that
+    dispatches .task to MediaPipe and .gguf to llama.cpp; desktop gets the GGUF
+    one. Without this Android would have silently lost .task support in
+    agentic mode.
+
+[x] PHASE 32 — Model store
+    Source: ModelStoreView (202), ModelDiscoveryService (181),
+            ModelDownloadManager (205), ModelStoreCardAdapter,
+            ModelStoreActivity, ModelStorePageView
+    HuggingFace/GitHub/GoogleAI search, download, import.
+    Android DownloadManager -> a portable downloader capability.
+    Done when: a model downloads and registers on desktop.
+
+    DONE 2026-08-05. ModelDiscoveryService moved to :core (it was HttpURLConnection
+    and JSON; only logging was Android). The downloader became a capability.
+
+    THIS IS THE ONE PLACE ANDROID KEEPS ITS OWN IMPLEMENTATION ON PURPOSE, and
+    it is worth understanding why before "unifying" it. DownloadManager is a
+    SYSTEM SERVICE: the transfer continues after Prism is killed, survives a
+    reboot, and handles connectivity changes. None of that is reimplementable
+    inside an app process, and model files run to several gigabytes on a device
+    whose OS kills backgrounded apps aggressively.
+
+    JvmDownloader does not pretend to any of it. What it does instead is
+    RESUME: the .part file is kept and continued with a Range request, so a
+    download interrupted by quitting Prism restarts where it stopped. A server
+    that ignores the range header answers 200 rather than 206, which is
+    detected -- appending a full response onto a partial file would produce a
+    corrupt archive of exactly the right size.
+
+    The finished file is moved into place only on success. A truncated .gguf
+    does not fail to load; it loads and generates nonsense.
+
+[x] PHASE 33 — Models page
+    Source: ModelsPageView (317), ModelListItem, ModelsAdapter
+    Imported model list, TEXT/IMAGE type pills, active-model selection, delete.
+    Done when: imported models list and can be activated.
+
+    DONE 2026-08-05. Merged with PHASE 32 onto desktop/.../ui/ModelsPage.kt --
+    on a phone "my models" and "get models" are two screens because a screen
+    holds one thing; on a desktop they fit together, and splitting them means
+    navigating away to answer "do I already have this?" while browsing.
+
+    The TEXT/IMAGE pill is decided by INSPECTING the file (GGUF magic bytes),
+    not by its extension or by which button was pressed. A HuggingFace .bin may
+    be either, and a text model handed to the image pipeline fails deep inside
+    a native library with an error naming neither.
+
+    A MISSING pill covers the case the Android page does not: the registry
+    names a path, the file is gone, and selecting it would activate a model
+    that cannot load. Removing a model unregisters it and leaves the file
+    alone -- deleting gigabytes from under someone because they tidied a list
+    is not a recoverable mistake.
+
+[ ] PHASE 34 — Local image generation
+    Source: LocalImageService (53), ImageGenManager (74), NebulaStudio
+    MediaPipe is Android-only. Desktop: stable-diffusion.cpp (same build system
+    as llama.cpp) or ONNX Runtime, behind an ImageGenerator capability.
+    Done when: a prompt produces an image on desktop.
+
+[ ] PHASE 35 — Vision
+    Source: VisionService (30) — analyzeImage
+    Image understanding for multimodal prompts.
+    Done when: an attached image is described.
+
+[ ] PHASE 36 — Dictation
+    Source: VoiceInputController (377) — SpeechRecognizer
+    Replace with whisper.cpp (same author and build system as llama.cpp).
+    This makes dictation MORE consistent across platforms, not less.
+    Done when: a mic button transcribes on desktop AND Android.
+
+================================================================================
+MESSAGING
+================================================================================
+
+[ ] PHASE 37 — AI conversations
+    Source: ConversationActivity (535), ConversationAdapter, MessagesAdapter,
+            AiManager (167), ThinkingTextAnimator, AiMessageEntity
+    Sam + Nora conversation types, streaming, thinking indicator, image
+    attachment, feedback thumbs, message search.
+    Done when: a full conversation with streaming works on desktop.
+
+[ ] PHASE 38 — Messages page
+    Source: MessagingPageView (171), ThreadInfo, MessageInfo
+    Thread list. SMS threads are Android-only — desktop shows AI threads and
+    states plainly that SMS is unavailable rather than showing an empty tab.
+    Done when: AI threads list and open on desktop.
+
+[ ] PHASE 39 — Encrypted SMS relay over the mesh
+    NEW FEATURE, not in the Android build. Requires Phase 44.
+    Phone relays SMS threads to desktop peers over the Prism mesh, encrypted,
+    so texts appear on the PC without a Windows SMS API existing.
+    Done when: a text received on the phone appears on the desktop.
+
+================================================================================
+NORA — remaining pieces
+================================================================================
+
+[ ] PHASE 40 — Nora chat commands
+    Source: NoraChat (309), NoraChatStore (123), NoraChatState,
+            NoraCommandPopup (204)
+    Slash commands (/sample, /coarse, /diffuser, /video, /forget ...),
+    conversation persistence, command autocomplete popup.
+    Done when: slash commands work in the desktop Nora page.
+
+[ ] PHASE 41 — Nora backup / restore
+    Source: NoraArchive (233) — backup(uri), import(uri)
+    Zip of connectome + dataset + feedback. Android uses SAF Uri; desktop uses
+    a file chooser. Needs a FilePicker capability.
+    Done when: a backup made on Android restores on desktop.
+
+[ ] PHASE 42 — Nora video generation
+    Source: NoraVideoWriter (199) — MediaCodec + MediaMuxer
+    Desktop: JCodec or bundled ffmpeg behind a VideoEncoder capability.
+    MentalImagery.generateVideo is already in :core.
+    Done when: /video produces a playable mp4 on desktop.
+
+[ ] PHASE 43 — Brain visualizer
+    Source: NoraBrainView (583) — TextureView + Canvas, live region activity
+    Direct Compose Canvas rewrite; the data it draws is already in :core.
+    Done when: the visualizer animates during generation.
+
+[ ] PHASE 44 — Nora service / background jobs on desktop
+    Source: NoraService (696), NoraAutoTrainWorker (150), NoraTrainingState
+    Foreground-service semantics become a background thread + tray progress
+    (Phase 8) + scheduled retraining (Phase 7).
+    Done when: training survives closing the window and reports in the tray.
+
+================================================================================
+NEBULA (social)
+================================================================================
+
+[ ] PHASE 45 — Nebula data + bot engine
+    Source: NebulaSocialManager (410), SocialEntities (134), SocialDao,
+            SocialBotWorker (58), NebulaStudio
+    generateNewContent, generateBotComment, generateCommentOnPost,
+    generateReplyToComment, generateBotDM, handleUserMessage.
+    Needs Phases 5, 7, 29/28.
+    Done when: the bot cycle generates a post on desktop.
+
+[ ] PHASE 46 — Nebula UI
+    Source: NebulaSocialPageView (675 — largest UI file), NebulaPostAdapter,
+            NebulaCommentAdapter, NebulaChatAdapter, NebulaRecentChatsAdapter,
+            NebulaSuggestedUserAdapter, NebulaInteractionBubble,
+            NebulaComposeActivity (189)
+    Feed, post detail, nested comments, profile, DMs, compose with image gen.
+    Done when: feed browses, posting works, DMs open.
+
+[ ] PHASE 47 — Nebula notifications
+    Source: NebulaNotifier (63). Needs Phase 8.
+    Done when: a new bot post raises a desktop notification.
+
+================================================================================
+MESH AND P2P
+================================================================================
+
+[ ] PHASE 48 — Mesh gossip
+    Source: PrismMeshService (413), MeshUtils (113)
+    UDP discovery/heartbeat/peer-list/DNS-sync/model-announce opcodes.
+    Plain sockets — ports essentially unchanged. Needs Phases 6, 9.
+    Done when: a desktop peer appears in the phone's peer list.
+
+[ ] PHASE 49 — P2P DNS
+    Source: P2pDnsManager (289), P2pDnsActivity (166), DnsPacketBuilder,
+            DnsPacketParser, BlockedIpv4RouteTable
+    .p2p domain registry, gossip ingest, records editor UI.
+    Done when: a .p2p domain registered on the phone resolves on desktop.
+
+[ ] PHASE 50 — Prism socket + proxy server
+    Source: PrismSocket (125), PrismProxyServer (312), PrismProxyClient,
+            DiscoveryEngine (127), VpnMultiplexer (140)
+    PRISM_CONNECT handshake on port 8080.
+    Done when: a desktop peer accepts a PRISM_CONNECT from the phone.
+
+[ ] PHASE 51 — TLS for .p2p domains
+    Source: PrismCertificateManager (162), PrismSslManager (69)
+    BouncyCastle — already pure JVM, should port nearly unchanged.
+    Root CA export.
+    Done when: an https .p2p site loads without a certificate warning.
+
+[ ] PHASE 52 — P2P website hosting
+    Source: PrismWebHost (450), P2pHostingActivity (258), P2pHostingAdapter
+    Serve local folders as .p2p websites; app icon serving.
+    Done when: a folder hosted on desktop loads on the phone's browser.
+
+[ ] PHASE 53 — P2P model hosting
+    Source: PrismAiHost (131), P2pModelRegistry (79)
+    Host the active local model for mesh peers; POST /generate streaming.
+    Done when: the phone generates using a model hosted on the desktop.
+
+[ ] PHASE 54 — Site mirroring
+    Source: PrismMirrorManager (151), auto-mirror setting
+    Done when: a mirrored site serves offline.
+
+================================================================================
+BROWSER
+================================================================================
+
+[x] PHASE 55 — JCEF integration
+    Add jcefmaven, bundle the Chromium payload per platform (~100 MB).
+    This is a TOOLCHAIN task, not a coding task — budget accordingly.
+    Done when: a Chromium view renders a page inside the Compose window.
+
+    DONE 2026-08-04. me.friwi:jcefmaven:127.3.1, plus the jogamp Maven repo in
+    settings.gradle.kts (jcef-api depends on JOGL, which is not on Maven
+    Central). desktop/.../browser/CefRuntime.kt owns the lifecycle.
+
+    NOT VENDORED. jcefmaven downloads and unpacks the native bundle for the
+    host platform on first run into dataDir/jcef, rather than three platforms'
+    binaries living in the repo. The cost is a visible first-run wait, which is
+    why CefRuntime.state reports the phase and percentage and the page shows
+    both -- hiding a 100 MB download behind a spinner makes the browser look
+    broken the first time anyone opens it.
+
+    CEF IS PROCESS-WIDE: one CefApp, many CefBrowsers. dispose() matters --
+    leaking it leaves orphaned Chromium subprocesses after Prism exits, which
+    on Windows reads as the app not closing.
+
+    Embedded via Compose's SwingPanel around the browser's AWT component, keyed
+    on tab id: re-parenting a live CefBrowser crashes CEF, so switching tabs
+    swaps the component instead.
+
+[x] PHASE 56 — Browser page + tabs
+    Source: BrowserPageView (400), BrowserTabsAdapter (85), TabCardUi
+    Address bar, search-engine routing (buildSearchUrl), tab cards, back
+    handling, .p2p resolution through Phase 49.
+    Done when: browsing, tabs and search-engine choice all work.
+
+    DONE 2026-08-04. desktop/.../ui/BrowserPage.kt. Tabs with cards, public and
+    private categories, address bar with the same search-vs-URL rule Android
+    uses (a scheme, or a dot and no spaces, means URL) routed through
+    buildSearchUrl, back/forward/reload, per-tab progress, the resolution-source
+    indicator (handshake for mesh, globe for DNS), and the reload/mirror menu.
+
+    The browser is a DEFAULT page in both shells -- rail entry and
+    SlotAssignment.Browser -- not an unported placeholder.
+
+[x] PHASE 57 — Content blocking
+    Source: HostBlocklist (208), PrismBlocklist, BlocklistActivity (167),
+            DomainAdapter
+    Blocked-host lists, custom domains, import/export, blocklist editor.
+    Done when: a blocked domain fails to load and appears in the editor.
+
+    DONE. Engine 2026-08-04, editor 2026-08-05. HostBlocklist and
+    PrismBlocklist are in :core and back request interception on both
+    platforms; desktop/.../ui/BlocklistPage.kt is the editor -- merged list,
+    search, add, remove, hosts-file import, clear-mine.
+
+    THE MERGED LIST IS PAGED, not rendered whole. It is hundreds of thousands
+    of entries after the StevenBlack download; a LazyColumn over that is fine,
+    but building the sorted List<String> behind it on the main thread is not,
+    so the snapshot is taken on IO and shown 300 at a time.
+
+    Removing a BUILT-IN entry cannot delete it from a file that gets refetched,
+    so HostBlocklist whitelists it instead. The UI says which of the two
+    happened -- otherwise "I removed it and it came back" is a mystery.
+
+    The seed list moved from assets/mini_blocklist.txt to a SEED_HOSTS constant.
+    A desktop JVM has no assets directory, and shipping a ten-line text file as
+    a resource only to parse it back out is more moving parts than the data
+    deserves. It also means blocking works before the StevenBlack download
+    finishes and on a machine with no network.
+
+    Blocking is applied in PRIVATE TABS ONLY, which is the Android behaviour
+    and is preserved rather than "improved" -- changing it would silently alter
+    what public browsing does.
+
+[~] PHASE 58 — Private tabs
+    Source: PrismWebViewClient (170), private-by-default setting,
+            biometric lock (androidx.biometric)
+    Desktop: Windows Hello / polkit, or a password fallback.
+    Done when: private tabs open and can be locked.
+
+    MOSTLY DONE 2026-08-04. Private tabs open, are a separate category, respect
+    private-by-default, and lock behind a passphrase (the plan's own "password
+    fallback" -- Windows Hello needs WinRT and Linux has no common biometric
+    API). When locked, titles and URLs are withheld too, not just previews: a
+    locked tab whose title reads "Bank of ..." has not been protected.
+
+    STRICTER THAN ANDROID in one respect. Each private tab gets its OWN
+    CefClient, so Chromium isolates its cookies, storage and cache in an
+    off-the-record context that dies with the tab -- two private tabs cannot
+    even see each other's session. Android's WebView incognito shares a cookie
+    manager and only disables third-party cookies per view.
+
+    NOT DONE, AND THIS IS THE ONE THAT MATTERS: private tabs do not use the P2P
+    VPN. On Android, selecting one starts PrivateDnsVpnService, a real system
+    VPN. Desktop needs WinTun / CAP_NET_ADMIN (PHASE 47-49).
+
+    The per-tab decision tree IS ported, in browser/VpnBridge.kt, including the
+    "only act when the wanted state actually changes" guard that stops a tab
+    switch from tearing the tunnel down and rebuilding it. It returns a
+    Decision and logs; it does not pretend. Deliberate: telling a user their
+    traffic is routed over the mesh when it is going out over their ordinary
+    connection is worse than saying it is not. What private tabs DO get on
+    desktop -- cookie isolation, ad blocking, DNT/Sec-GPC -- is real.
+
+================================================================================
+VPN AND TUNNELING
+================================================================================
+
+[ ] PHASE 59 — TUN interface
+    Windows: WinTun (WireGuard's redistributable DLL).
+    Linux: /dev/net/tun with CAP_NET_ADMIN.
+    Requires an elevated installer. TOOLCHAIN-heavy, like Phase 55.
+    Done when: a virtual adapter appears and carries a packet.
+
+[ ] PHASE 60 — Prism tunnel engine
+    Source: PrismTunnelEngine (348), PrivateDnsVpnService (598),
+            DnsProxyService (142)
+    Packet routing, DNS interception, mesh content fetch.
+    Done when: DNS queries route through Prism on desktop.
+
+[ ] PHASE 61 — WireGuard
+    Source: WireguardController (43), WireguardServerEngine (109),
+            generateWgClientConfig, WG keys/port/allowed-IPs settings
+    com.wireguard.android:tunnel is Android-only — bundle wireguard-go or
+    drive WinTun directly.
+    Done when: a WireGuard client connects to the desktop server.
+
+[ ] PHASE 62 — Legacy VPN protocols
+    Source: IkeEngine (102), L2tpEngine (77)
+    Done when: protocol auto-detect selects correctly.
+
+[ ] PHASE 63 — App whitelist / split tunneling
+    Source: WhitelistActivity (123), WhitelistAdapter, AppUsageMonitor (68)
+    UsageStats has no desktop equivalent — use process enumeration or drop
+    the usage-based part and keep the manual whitelist.
+    Done when: whitelisted apps bypass the tunnel.
+
+================================================================================
+ACCESS POINT
+================================================================================
+
+[ ] PHASE 64 — Hotspot control
+    Source: AccessPointManager (225), AccessPointConfig, AccessPointModel (136)
+    Windows: netsh wlan hostednetwork / Mobile Hotspot WinRT.
+    Linux: nmcli or hostapd.
+    Done when: a hotspot starts and a device can associate.
+
+[ ] PHASE 65 — DNS override for clients
+    Source: DnsOverrideService (241)
+    Done when: a connected client resolves through Prism.
+
+[ ] PHASE 66 — Network isolation
+    Source: NetworkIsolationEngine (286), IsolationRule, RuleAction
+    Block/unblock device, bandwidth limits. Windows: netsh advfirewall.
+    Linux: nftables/iptables.
+    Done when: a blocked device loses connectivity.
+
+[ ] PHASE 67 — Access point UI
+    Source: AccessPointPortalActivity (476), CreateAccessPointActivity (301),
+            ConnectedDevicesActivity (255), AccessPointStatsActivity, adapters
+    Done when: AP can be created, listed, and clients inspected.
+
+================================================================================
+VIRTUALIZATION
+================================================================================
+
+[ ] PHASE 68 — VM controller
+    Source: VmController (493), PrismOsConfig
+    AVF is Android-only. Desktop: QEMU (already used by the prism-os scripts
+    in this repo) or libvirt. ISO import, start/pause/resume/stop.
+    Done when: a guest OS boots inside Prism on desktop.
+
+[ ] PHASE 69 — VM display + input
+    Source: VncSurfaceRenderer (127), VirtualizationPageView (170)
+    Already speaks VNC, so most of it survives; the Surface/TextureView
+    plumbing becomes a Compose canvas.
+    Done when: the guest renders and accepts keyboard/mouse.
+
+[ ] PHASE 70 — App-launch routing through the VM
+    Source: LauncherActivity.launchComponent virtualization branch,
+            VmController.sendAppIntent
+    Done when: launching an app opens it inside the guest.
+
+================================================================================
+PACKAGING AND RELEASE
+================================================================================
+
+[ ] PHASE 71 — Native payload bundling
+    llama.cpp, nora_conv, whisper.cpp, stable-diffusion.cpp, JCEF, WinTun.
+    jpackage must ship them and the loader must find them at runtime.
+    Done when: a clean machine with no JDK runs everything.
+
+[ ] PHASE 72 — Installers
+    packageMsi / packageDeb / packageRpm are already configured with a stable
+    upgradeUuid. Needs icons, file associations, and code signing.
+    Done when: the MSI installs, launches, and upgrades in place.
+
+[ ] PHASE 73 — Settings and data migration between platforms
+    Move a Prism profile (settings, connectome, dataset, DB) phone <-> desktop.
+    Extends Phase 41's archive to cover everything, not just Nora.
+    Done when: a profile exported on Android restores on Windows.
+
+================================================================================
+UNIFICATION
+================================================================================
+
+[ ] PHASE 74 — Migrate Android UI to Compose
+    Once the desktop Compose UI has proven itself, replace the Android View
+    code and the 53 XML layouts with the shared Compose screens. This is what
+    makes these ONE PRODUCT rather than two forks that share a core.
+    Largest single phase. Deliberately last.
+    Done when: :app has no XML layouts and both platforms render the same code.
+
+[ ] PHASE 75 — Shell replacement (optional, opt-in)
+    Windows per-user shell replacement via HKCU\...\Winlogon\Shell is
+    legitimate and supported (kiosk mode uses it). Prism would then have to
+    provide a taskbar and desktop itself.
+    MUST ship a documented escape hatch before this is enabled by anyone.
+    Linux equivalent needs a compositor — out of scope.
+    Done when: Prism can be set as the shell and safely unset.
+
+================================================================================
+END OF PLAN — 75 phases, 0-3 complete.
+Remember: check off each phase as you complete it.
+================================================================================

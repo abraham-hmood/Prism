@@ -1,5 +1,6 @@
 package com.prism.launcher.accesspoint
 
+import com.prism.launcher.accesspoint.AccessPointStore
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -201,7 +202,7 @@ class AccessPointPortalActivity : PrismBaseActivity() {
                 statusText.text = "Initializing Access Point System..."
                 
                 // Load existing access points from storage
-                val existingAps = PrismSettings.getAccessPoints(this@AccessPointPortalActivity)
+                val existingAps = AccessPointStore.getAccessPoints()
                 
                 // Update UI
                 updateAccessPointsList(existingAps)
@@ -327,7 +328,7 @@ class AccessPointPortalActivity : PrismBaseActivity() {
         lifecycleScope.launch {
             try {
                 accessPointManager.stopAccessPoint(ap.id)
-                PrismSettings.removeAccessPoint(this@AccessPointPortalActivity, ap.id)
+                AccessPointStore.removeAccessPoint(ap.id)
                 statusText.text = "✓ Access Point deleted"
                 initializeAccessPointSystem()
             } catch (e: Exception) {

@@ -42,7 +42,13 @@ import kotlinx.coroutines.launch
  */
 class NoraService : Service() {
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    // The exception handler is not decoration. A SupervisorJob scope routes an unhandled
+    // coroutine failure to its CoroutineExceptionHandler, and with none installed the failure
+    // can be dropped without ever reaching the global uncaught-exception handler -- so an
+    // overnight training run could die at 3am and leave nothing in the diagnostics log at all.
+    private val scope = CoroutineScope(
+        SupervisorJob() + Dispatchers.Default + PrismLogger.coroutineHandler(NoraLog.Area.SERVICE)
+    )
     private var job: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
@@ -79,6 +85,24 @@ class NoraService : Service() {
                 val prompt = intent.getStringExtra(EXTRA_TEXT).orEmpty()
                 if (isWorking) return START_NOT_STICKY
                 startTestImage(prompt)
+                return START_NOT_STICKY
+            }
+
+            ACTION_SELF_TEST -> {
+                if (isWorking) return START_NOT_STICKY
+                val mode = NoraImageryMode.entries.getOrElse(
+                    intent.getIntExtra(EXTRA_MODE, 0)
+                ) { NoraImageryMode.DETERMINISTIC }
+                startSelfTest(mode)
+                return START_NOT_STICKY
+            }
+
+            ACTION_REGENERATE -> {
+                if (isWorking) return START_NOT_STICKY
+                val mode = NoraImageryMode.entries.getOrElse(
+                    intent.getIntExtra(EXTRA_MODE, 0)
+                ) { NoraImageryMode.DETERMINISTIC }
+                startRegenerate(mode)
                 return START_NOT_STICKY
             }
 
@@ -130,11 +154,16 @@ class NoraService : Service() {
                     updateTrainingNotification(p)
                 }
             } catch (e: CancellationException) {
+                NoraLog.info(NoraLog.Area.SERVICE, "Training cancelled")
                 throw e
+            } catch (e: OutOfMemoryError) {
+                NoraLog.fatal(NoraLog.Area.SERVICE, "Training ran out of memory", e)
+                "Training ran out of memory. Reduce Nora's size in Settings."
             } catch (e: Exception) {
-                PrismLogger.logError("Nora", "Training failed: ${e.message}", e)
+                NoraLog.error(NoraLog.Area.SERVICE, "Training failed", e)
                 "Training failed: ${e.message}"
             }
+            NoraLog.info(NoraLog.Area.SERVICE, "Training run finished: ${summary.lineSequence().first()}")
             NoraTrainingState.emitLog(summary)
             NoraTrainingState.markFinished(summary)
             finishWork()
@@ -155,8 +184,11 @@ class NoraService : Service() {
                 }
             } catch (e: CancellationException) {
                 throw e
+            } catch (e: OutOfMemoryError) {
+                NoraLog.fatal(NoraLog.Area.CHAT, "Out of memory on a chat turn", e)
+                NoraChat.Reply("I ran out of memory. Reduce my size in Settings.")
             } catch (e: Exception) {
-                PrismLogger.logError("Nora", "Chat turn failed: ${e.message}", e)
+                NoraLog.error(NoraLog.Area.CHAT, "Chat turn failed", e)
                 NoraChat.Reply("Something went wrong: ${e.message}")
             }
 
@@ -182,6 +214,129 @@ class NoraService : Service() {
         }
     }
 
+    // ── Model test ──────────────────────────────────────────────────────────
+
+    /**
+     * Runs the model test as a foreground job.
+     *
+     * Held here rather than in the activity for the same reason training is: the test exists to
+     * measure how long a size takes to train, which is precisely the sort of wait a user
+     * navigates away from. The notification targets the test screen rather than the training
+     * screen, so tapping it returns to the run in progress.
+     */
+    private fun startSelfTest(mode: NoraImageryMode) {
+        beginForeground("Testing…", indeterminate = true)
+        NoraSelfTestState.markStarted(NoraConfig.geometry.signature())
+        NoraSelfTestState.emit(
+            "Model test started, route ${NoraSelfTest.routeName(mode)}. ${NoraLog.describeGeometry()}"
+        )
+        if (NoraTuning.changedCount() > 0) {
+            NoraSelfTestState.emit("${NoraTuning.changedCount()} tuning value(s) differ from default.")
+        }
+
+        // Mirrors published progress into the notification. A sibling collector rather than a
+        // callback threaded through the runner, so the runner stays a plain suspend function
+        // with no notion of notifications.
+        val notifier = scope.launch {
+            NoraSelfTestState.progress.collect { p -> p?.let { updateSelfTestNotification(it) } }
+        }
+
+        job = scope.launch {
+            val outcome = try {
+                NoraSelfTest.run(mode = mode)
+            } catch (e: CancellationException) {
+                notifier.cancel()
+                NoraSelfTestState.markCancelled()
+                throw e
+            } catch (e: OutOfMemoryError) {
+                NoraLog.fatal(NoraLog.Area.SELFTEST, "Model test ran out of memory", e)
+                NoraSelfTestState.Outcome(
+                    "Out of memory",
+                    "This size does not fit on this device.",
+                    emptyList()
+                )
+            } catch (e: Throwable) {
+                NoraLog.error(NoraLog.Area.SELFTEST, "Model test failed", e)
+                NoraSelfTestState.Outcome(
+                    "Test failed",
+                    "${e.javaClass.simpleName}: ${e.message}",
+                    emptyList()
+                )
+            }
+
+            notifier.cancel()
+            NoraSelfTestState.emit("", alsoDiagnostics = false)
+            NoraSelfTestState.emit(outcome.report)
+            NoraSelfTestState.markFinished(outcome)
+            if (outcome.headline == "Passed") {
+                NoraLog.success(
+                    NoraLog.Area.SELFTEST, "Model test passed at ${NoraSelfTestState.testedGeometry}"
+                )
+            } else {
+                NoraLog.warn(
+                    NoraLog.Area.SELFTEST,
+                    "Model test result \"${outcome.headline}\" at ${NoraSelfTestState.testedGeometry}"
+                )
+            }
+            finishWork()
+        }
+    }
+
+    /**
+     * Regenerates from the retained brain on a different route.
+     *
+     * Shares the foreground-service treatment with a full test even though it is far shorter,
+     * because /diffuser at a large geometry is not short at all -- and a job that can take
+     * minutes must not be killable by the user switching apps, which is the entire reason the
+     * test moved into a service in the first place.
+     */
+    private fun startRegenerate(mode: NoraImageryMode) {
+        beginForeground("Regenerating…", indeterminate = true)
+        NoraSelfTestState.markRegenerating()
+
+        job = scope.launch {
+            val outcome = try {
+                NoraSelfTest.regenerate(mode)
+            } catch (e: CancellationException) {
+                NoraSelfTestState.markCancelled()
+                throw e
+            } catch (e: OutOfMemoryError) {
+                NoraLog.fatal(NoraLog.Area.SELFTEST, "Regeneration ran out of memory", e)
+                NoraSelfTestState.Outcome(
+                    "Out of memory",
+                    "This route needs more memory than the trained brain left free.",
+                    emptyList()
+                )
+            } catch (e: Throwable) {
+                NoraLog.error(NoraLog.Area.SELFTEST, "Regeneration failed", e)
+                NoraSelfTestState.Outcome(
+                    "Regeneration failed",
+                    "${e.javaClass.simpleName}: ${e.message}",
+                    emptyList()
+                )
+            }
+
+            NoraSelfTestState.emit("", alsoDiagnostics = false)
+            NoraSelfTestState.emit(outcome.report)
+            NoraSelfTestState.markFinished(outcome)
+            NoraLog.info(
+                NoraLog.Area.SELFTEST,
+                "Regeneration result \"${outcome.headline}\" at ${NoraSelfTestState.testedGeometry}"
+            )
+            finishWork()
+        }
+    }
+
+    private fun updateSelfTestNotification(p: NoraSelfTestState.Progress) {
+        if (!throttle()) return
+        notify(
+            buildNotification(
+                "Testing Nora's size", p.summary(), p.percent, false,
+                NoraSelfTestActivity::class.java
+            )
+        )
+    }
+
     // ── User feedback ───────────────────────────────────────────────────────
 
     /**
@@ -197,11 +352,15 @@ class NoraService : Service() {
 
         job = scope.launch {
             val note: String? = try {
-                val primary = NoraFeedback.apply(applicationContext, token)
+                // The brain is fetched here rather than reached for from inside NoraFeedback.
+                // Feedback is applied TO a brain, so taking it as a parameter is both the
+                // honest signature and what let the class leave the Android module.
+                val brain = NoraStudio.brain(applicationContext)
+                val primary = NoraFeedback.apply(brain, token)
                 // Sweep up anything rated while the brain was busy. Doing it here rather than
                 // only at the start of a training run means a backlog clears the next time the
                 // user touches a thumb, not hours later.
-                val backlog = NoraFeedback.applyPending(applicationContext)
+                val backlog = NoraFeedback.applyPending(brain)
                 when {
                     primary == null -> null
                     backlog > 0 -> "$primary\n\n(Also applied $backlog rating" +
@@ -284,6 +443,10 @@ class NoraService : Service() {
             NoraTrainingState.emitLog(message)
             NoraTrainingState.markFinished(message)
         }
+        // Every state holder has to be released, not just the one for the job we think is
+        // running: whichever one is left marked busy leaves its screen showing a spinner for
+        // work that no longer exists.
+        if (NoraSelfTestState.running.value) NoraSelfTestState.markCancelled()
         NoraChatState.markIdle()
         releaseWakeLock()
         stopForegroundCompat()
@@ -299,6 +462,7 @@ class NoraService : Service() {
         if (NoraTrainingState.running.value) {
             NoraTrainingState.markFinished("Training stopped — the service was shut down.")
         }
+        if (NoraSelfTestState.running.value) NoraSelfTestState.markCancelled()
         NoraChatState.markIdle()
         super.onDestroy()
     }
@@ -392,17 +556,27 @@ class NoraService : Service() {
         }
     }
 
+    /**
+     * @param target which screen tapping the notification returns to. Training and generation
+     *        go to the training page; a model test goes to the test page, because returning a
+     *        user to a different screen than the one they were watching is worse than not
+     *        making the notification tappable at all.
+     */
     private fun buildNotification(
         title: String,
         text: String,
         percent: Int,
-        indeterminate: Boolean
+        indeterminate: Boolean,
+        target: Class<*> = NoraTrainingActivity::class.java
     ): Notification {
         val pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
 
         val openIntent = PendingIntent.getActivity(
-            this, 0,
-            Intent(this, NoraTrainingActivity::class.java).setFlags(
+            this,
+            // Distinct request codes per target: FLAG_UPDATE_CURRENT matches on request code,
+            // so sharing one would leave a stale target on the reused PendingIntent.
+            if (target == NoraTrainingActivity::class.java) 0 else 2,
+            Intent(this, target).setFlags(
                 // SINGLE_TOP plus the activity's launchMode means tapping returns to the
                 // existing screen rather than stacking a second copy of it.
                 Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
@@ -449,11 +623,14 @@ class NoraService : Service() {
         private const val ACTION_CHAT = "com.prism.launcher.nora.CHAT"
         private const val ACTION_TEST_IMAGE = "com.prism.launcher.nora.TEST_IMAGE"
         private const val ACTION_FEEDBACK = "com.prism.launcher.nora.FEEDBACK"
+        private const val ACTION_SELF_TEST = "com.prism.launcher.nora.SELF_TEST"
+        private const val ACTION_REGENERATE = "com.prism.launcher.nora.REGENERATE"
 
         private const val EXTRA_EPOCHS = "epochs"
         private const val EXTRA_FOCUS = "focus"
         private const val EXTRA_TEXT = "text"
         private const val EXTRA_TOKEN = "token"
+        private const val EXTRA_MODE = "mode"
         private const val EXTRA_POSITIVE = "positive"
 
         fun startTraining(ctx: Context, epochs: Int, focus: String?) = launch(
@@ -468,6 +645,21 @@ class NoraService : Service() {
             Intent(ctx, NoraService::class.java)
                 .setAction(ACTION_CHAT)
                 .putExtra(EXTRA_TEXT, text)
+        )
+
+        /** Regenerates from the brain the last test trained, without retraining it. */
+        fun regenerate(ctx: Context, mode: NoraImageryMode) = launch(
+            ctx,
+            Intent(ctx, NoraService::class.java)
+                .setAction(ACTION_REGENERATE)
+                .putExtra(EXTRA_MODE, mode.ordinal)
+        )
+
+        fun runSelfTest(ctx: Context, mode: NoraImageryMode) = launch(
+            ctx,
+            Intent(ctx, NoraService::class.java)
+                .setAction(ACTION_SELF_TEST)
+                .putExtra(EXTRA_MODE, mode.ordinal)
         )
 
         fun sendFeedback(ctx: Context, token: String, positive: Boolean) = launch(

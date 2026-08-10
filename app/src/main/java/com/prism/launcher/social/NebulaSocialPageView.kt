@@ -32,7 +32,7 @@ class NebulaSocialPageView @JvmOverloads constructor(
 ) : FrameLayout(context, attrs, defStyleAttr) {
 
     private val binding = PageSocialNebulaBinding.inflate(LayoutInflater.from(context), this, true)
-    private val db = AppDatabase.get(context)
+    private val db = AppDatabase.get()
     
     private lateinit var feedAdapter: NebulaPostAdapter
     private lateinit var suggestedAdapter: NebulaSuggestedUserAdapter

@@ -95,7 +95,7 @@ class NebulaComposeActivity : AppCompatActivity() {
             Toast.makeText(this, "Type what you want the image to show first.", Toast.LENGTH_SHORT).show()
             return
         }
-        if (!PrismSettings.isLocalImageModelImported(this) && PrismSettings.getAiMode(this) != PrismSettings.AI_MODE_CLOUD) {
+        if (!PrismSettings.isLocalImageModelImported() && PrismSettings.getAiMode() != PrismSettings.AI_MODE_CLOUD) {
             Toast.makeText(this, "No image model loaded — import one from the Model Store first.", Toast.LENGTH_LONG).show()
             return
         }
@@ -133,7 +133,7 @@ class NebulaComposeActivity : AppCompatActivity() {
         binding.btnPost.isEnabled = false
         
         lifecycleScope.launch {
-            val db = AppDatabase.get(this@NebulaComposeActivity)
+            val db = AppDatabase.get()
             
             // Analyze image for AI bots to "see" it
             var visionTags = ""
@@ -170,7 +170,7 @@ class NebulaComposeActivity : AppCompatActivity() {
 
     private suspend fun triggerBotReactions(post: SocialPostEntity, visionTags: String) {
         // Find 1-2 random bots to comment
-        val db = AppDatabase.get(this)
+        val db = AppDatabase.get()
         val bots = db.socialDao().getAllBots()
         if (bots.isEmpty()) return
         

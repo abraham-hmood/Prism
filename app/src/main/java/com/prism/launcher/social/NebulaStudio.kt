@@ -9,7 +9,7 @@ import com.prism.launcher.PrismSettings
 object NebulaStudio {
 
     suspend fun generateImage(context: Context, prompt: String): String? {
-        val mode = PrismSettings.getAiMode(context)
+        val mode = PrismSettings.getAiMode()
         
         return if (mode == PrismSettings.AI_MODE_CLOUD) {
             // In a real implementation, this would call OpenAI DALL-E or similar.

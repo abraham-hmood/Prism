@@ -26,7 +26,7 @@ class DesktopGridPage(
     private val acceptDrawerDrops: () -> Boolean,
 ) : android.widget.LinearLayout(context) {
 
-    private val store = DesktopShortcutStore(context, gridIndex)
+    private val store = DesktopShortcutStore(gridIndex)
     private val binding: PageDesktopRootBinding
     private val adapter: DesktopGridAdapter
     private val cellCount: Int = 24
@@ -216,7 +216,7 @@ class DesktopGridPage(
         if (!desc.hasMimeType(android.content.ClipDescription.MIMETYPE_TEXT_PLAIN)) return null
 
         return when (desc.label?.toString()) {
-            "prism_app"          -> ComponentName.unflattenFromString(payload)?.let { DesktopItem.App(it) }
+            "prism_app"          -> ComponentName.unflattenFromString(payload)?.let { desktopApp(it) }
             "prism_file"         -> DesktopItem.FileRef(payload)
             "prism_dir"          -> DesktopItem.DirectoryRef(payload, File(payload).name)
             "prism_desktop_item" -> DesktopItem.deserialize(payload)
@@ -394,7 +394,7 @@ class DesktopGridPage(
     private fun updateHotseat() {
         val lifecycleOwner = context as? LifecycleOwner ?: return
         lifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
-            val predictions = HotseatPredictor.getPredictions(context)
+            val predictions = HotseatPredictor.getPredictions()
             withContext(Dispatchers.Main) {
                 binding.hotseatContainer.removeAllViews()
                 val pm = context.packageManager

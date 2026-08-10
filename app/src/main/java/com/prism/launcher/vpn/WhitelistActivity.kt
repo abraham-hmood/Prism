@@ -40,12 +40,12 @@ class WhitelistActivity : AppCompatActivity() {
 
         adapter = WhitelistAdapter(packageManager) { pkg, isChecked ->
             if (isChecked) whitelisted.add(pkg) else whitelisted.remove(pkg)
-            PrismSettings.setAppWhitelist(this, whitelisted)
+            PrismSettings.setAppWhitelist(whitelisted)
         }
         binding.blocklistRecycler.layoutManager = LinearLayoutManager(this)
         binding.blocklistRecycler.adapter = adapter
 
-        whitelisted = PrismSettings.getAppWhitelist(this).toMutableSet()
+        whitelisted = PrismSettings.getAppWhitelist().toMutableSet()
 
         GlobalScope.launch(Dispatchers.IO) {
             val pm = packageManager
