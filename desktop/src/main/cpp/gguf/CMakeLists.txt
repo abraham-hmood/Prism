@@ -57,7 +57,13 @@ endif()
 add_subdirectory("${PRISM_CPP}/llama.cpp" "${CMAKE_CURRENT_BINARY_DIR}/llama.cpp")
 
 add_library(gguf_bridge SHARED "${PRISM_CPP}/gguf_bridge.cpp")
-target_include_directories(gguf_bridge PRIVATE ${JNI_INCLUDE_DIRS})
+target_include_directories(gguf_bridge PRIVATE
+    ${JNI_INCLUDE_DIRS}
+    # ggml-backend-impl.h/ggml-cpu.h -- internal ggml headers, not part of the llama/ggml targets'
+    # own public include interface. Needed only for the Prism Swap pseudo-device (Tier 2 of the
+    # RAM/swap fix) -- see gguf_bridge.cpp's "Prism Swap pseudo-device" block.
+    "${PRISM_CPP}/llama.cpp/ggml/src"
+)
 target_link_libraries(gguf_bridge PRIVATE llama)
 
 set_target_properties(gguf_bridge PROPERTIES OUTPUT_NAME "gguf_bridge" PREFIX "")

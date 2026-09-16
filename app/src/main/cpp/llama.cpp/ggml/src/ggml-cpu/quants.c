@@ -174,6 +174,55 @@ void ggml_vec_dot_q1_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     *s = sumf;
 }
 
+
+void quantize_row_q5_q0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q5_q0_ref(x, y, k);
+}
+
+// Quinary weights against Q8_0 activations.
+//
+// ONE SUM PER ACTIVATION BLOCK, not one per weight block. A 64-weight quinary block spans two
+// 32-element Q8_0 blocks, and those carry different scales -- accumulating across both and applying
+// either scale afterwards would silently mis-weight half of every block. The base-5 packing also
+// straddles that boundary (weight 32 lives in the same byte as weights 30 and 31), so the loop runs
+// over weights rather than over bytes.
+void ggml_vec_dot_q5_q0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK5_Q0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q5_q0 * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    static const int pow5[3] = { 1, 5, 25 };
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+
+        int sumi[2] = { 0, 0 };
+
+        for (int j = 0; j < qk; ++j) {
+            const int q = (x[i].qs[j / 3] / pow5[j % 3]) % 5 - 2;
+
+            const int half = j / 32;
+            sumi[half] += q * y[i*2 + half].qs[j % 32];
+        }
+
+        sumf += d0 * (GGML_CPU_FP16_TO_FP32(y[i*2 + 0].d) * (float) sumi[0] +
+                      GGML_CPU_FP16_TO_FP32(y[i*2 + 1].d) * (float) sumi[1]);
+    }
+
+    *s = sumf;
+}
+
 void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK2_0;
     const int nb = n / qk;

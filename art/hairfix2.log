@@ -1,0 +1,16 @@
+00:03.250  blend            | Read blend: "C:\Users\bremo\Downloads\blender file.blend"
+Blender 5.2.0 LTS (hash fbe6228777e7 built 2026-07-14 01:35:40)
+scripts disabled for "C:\Users\bremo\Downloads\blender file.blend", skipping 'rig_ui.py'
+export aborted: 2 problem(s); see above
+<<< character meshes: ['Body', 'Eye', 'Hair', 'Teeth', 'Tongue']
+<<< Hair is bone-parented to 'head', which is not a deform bone; riding DEF-spine.006 instead (rest poses agree to 1.79e-07)
+<<< muted external constraints for this bake: HeadTrack x2, NeckTrack x2, PelvisTrack x2, SpineTrack x2, StomachTrack x2
+<<< elbow.L roll +44.0 deg -> (0.195, -0.040, 1.173)  [swept x 0.011..0.209]
+<<< elbow.R roll -46.0 deg -> (-0.176, -0.019, 1.164)  [swept x -0.189..-0.019]
+<<< lid.L closes on local axis 1, offset -0.0181 (probe drop 0.0147 -> target 0.0267)
+<<< lid.R closes on local axis 1, offset -0.0182 (probe drop 0.0147 -> target 0.0267)
+<<< baked 435 frames (75 intro + 360 loop) over 67 bones
+<<< bones: 171 weighted -> 159 moving (+1 shared static slot)
+<<< rigid bind Hair: 'head' -> DEF-spine.006 reproduces the parent to 0.0001 cm
+<<< INVALID Hair_Transparency_Transparency is 0.307 away from the body (bbox x -1.162..-1.031 z 0.325..0.457); its object transform is probably wrong
+<<< INVALID Scalp_Transparency_Transparency is 0.349 away from the body (bbox x -1.114..-1.072 z 0.389..0.450); its object transform is probably wrong

@@ -70,15 +70,25 @@ fun captureWebPreview(webView: android.webkit.WebView, maxW: Int, maxH: Int): Bi
     return try {
         val w = webView.width.coerceAtLeast(1)
         val h = webView.height.coerceAtLeast(1)
-        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bmp)
-        webView.draw(canvas)
         val scale = minOf(maxW.toFloat() / w, maxH.toFloat() / h, 1f)
         val tw = (w * scale).toInt().coerceAtLeast(1)
         val th = (h * scale).toInt().coerceAtLeast(1)
-        Bitmap.createScaledBitmap(bmp, tw, th, true).also {
-            if (it != bmp) bmp.recycle()
-        }
+
+        // DRAWN STRAIGHT INTO THE THUMBNAIL, not captured full-size and shrunk afterwards.
+        //
+        // The old path allocated a bitmap the size of the WebView first -- 1080x1920 in ARGB_8888 is
+        // 8 MB -- then made a second, smaller one and threw the big one away. That 8 MB spike
+        // happened once per open tab every time the tab list was rebuilt, which on a device already
+        // short of memory is a good way to be killed while merely looking at your tabs. Scaling the
+        // canvas instead means the large bitmap never exists.
+        //
+        // RGB_565 because a thumbnail has nothing to be transparent against: it halves what each
+        // retained preview costs, and these are held for as long as the tab is open.
+        val bmp = Bitmap.createBitmap(tw, th, Bitmap.Config.RGB_565)
+        val canvas = Canvas(bmp)
+        canvas.scale(scale, scale)
+        webView.draw(canvas)
+        bmp
     } catch (_: Throwable) {
         null
     }

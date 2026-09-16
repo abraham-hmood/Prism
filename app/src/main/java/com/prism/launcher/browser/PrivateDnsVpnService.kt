@@ -341,6 +341,23 @@ class PrivateDnsVpnService : VpnService() {
         val qtype = if (dnsPayload.size >= 16) u16(dnsPayload, 14) else 1
         val qname = parseDnsQueryName(dnsPayload) ?: return null
 
+        // 0. A cached site this device holds, answered from the cache itself.
+        //
+        // DELIBERATELY NOT VIA THE DNS LEDGER. Writing a record would make caching a page leak the
+        // NAME of that page to peers even with sharing off, because PrismMeshService answers a sync
+        // request with the whole ledger. Answering here keeps the resolution entirely inside this
+        // device: nothing is stored, so nothing can be gossiped.
+        //
+        // This is what makes the cache usable from OTHER apps -- an ordinary browser resolves
+        // <site>.cache.p2p to loopback and reads it from the hosting listener, which only serves an
+        // unpublished cache to loopback (see PrismWebHost).
+        val cachedHost = com.prism.launcher.browser.PrismWebCache.hostForMeshDomain(qname)
+        if (cachedHost != null && PrismWebCache.dirFor(cachedHost).isDirectory) {
+            val answer = if (qtype == 28) buildNoDataResponse(dnsPayload)
+                         else buildAStaticResponse(dnsPayload, "127.0.0.1")
+            return buildIpv4UdpResponse(dstIp, srcIp, 53, srcPort, answer)
+        }
+
         // 1. Check P2P DNS Shadow Index (Only return hit for P2P-verified domains)
         val p2pIp = P2pDnsManager.resolve(qname, onlyP2p = true)
         if (p2pIp != null) {
@@ -495,6 +512,16 @@ class PrivateDnsVpnService : VpnService() {
         private const val NOTIFICATION_ID = 7101
         private const val ROUTE_REFRESH_INTERVAL_MS = 5L * 60L * 1000L
         const val ACTION_STOP = "com.prism.launcher.vpn.STOP"
+
+        /**
+         * Whether the VPN service is up.
+         *
+         * True from the moment [bootstrapTunnel] has taken the service live, whether or not a TUN
+         * interface was established -- "the Prism VPN is running" and "traffic is being captured
+         * into a tunnel" are different questions, and callers asking about connectivity want the
+         * first one.
+         */
+        fun isRunning(): Boolean = instance?.serviceRunning == true
 
         fun protectSocket(socket: java.net.Socket) { instance?.protect(socket) }
         fun protectSocket(socket: java.net.DatagramSocket) { instance?.protect(socket) }

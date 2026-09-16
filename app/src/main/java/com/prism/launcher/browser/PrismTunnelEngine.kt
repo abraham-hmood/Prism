@@ -167,18 +167,50 @@ class PrismTunnelEngine(private val context: Context) {
             .build()
     }
 
+    /**
+     * Brings the backbone up for whatever the settings currently say, reconfiguring if they have
+     * changed since the last call.
+     *
+     * THE GUARD USED TO BE `if (routingActive) return`, AND IT MADE THE ENGINE A ONE-SHOT. This runs
+     * from `PrismApp.onCreate`, so it fires once per process before the user has touched anything.
+     * With tunnelling off at that moment it set `routingActive = true` and returned BEFORE recording
+     * a mode -- and every later call, including the one the VPN service makes when the user finally
+     * switches tunnelling on, hit the guard and returned immediately. The result was an engine that
+     * reported itself active while holding no configuration at all: no proxy, no hosting listener,
+     * no client proxy override, until the app was restarted. Changing role or mode at runtime was
+     * equally inert for the same reason.
+     *
+     * So the question is no longer "has start() ever run" but "is the live configuration the one
+     * that is running". Same-configuration calls are still cheap no-ops, which is what the original
+     * guard was there for.
+     */
     fun start() {
-        if (routingActive) return
-        routingActive = true
-        
         if (!PrismSettings.getVpnTunnelingEnabled()) {
+            // Say so honestly rather than sitting on routingActive = true. A flag claiming we route
+            // while nothing is configured is what hid the bug above, and anything asking this
+            // engine whether the tunnel is up deserves a truthful answer.
+            if (routingActive) pauseTunnel()
+            routingActive = false
+            currentMode = null
+            currentRole = null
             Log.d("PrismTunnel", "Tunneling disabled in settings; Backbone idling.")
             return
         }
-        
-        currentMode = PrismSettings.getVpnMode()
-        currentRole = PrismSettings.getPrismVpnRole()
-        
+
+        val mode = PrismSettings.getVpnMode()
+        val role = PrismSettings.getPrismVpnRole()
+
+        // Already running exactly this.
+        if (routingActive && mode == currentMode && role == currentRole) return
+
+        // Running something else: tear that down first, so switching role does not leave the old
+        // role's listeners bound to their ports.
+        if (routingActive) pauseTunnel()
+
+        routingActive = true
+        currentMode = mode
+        currentRole = role
+
         com.prism.launcher.PrismLogger.logInfo("PrismTunnel", "Starting Mesh Backbone (Mode: $currentMode, Role: $currentRole)")
         
         // ALWAYS start the Local Hosting Listener regardless of Server/Client role.
@@ -226,15 +258,55 @@ class PrismTunnelEngine(private val context: Context) {
         WireguardController.stop()
     }
 
+    /**
+     * Rebuilds the backbone after [pauseTunnel].
+     *
+     * DELEGATED TO [start] rather than re-dispatching on the remembered mode, which fixes two things
+     * at once. A resume after the user had changed role or mode restored the OLD configuration,
+     * because it read this engine's fields instead of the settings. And it never rebuilt the local
+     * hosting listener for a client -- only the server path did that -- so a client that paused once
+     * lost port 8080 for the rest of the process, and with it every peer request for a hosted or
+     * cached site.
+     *
+     * The flag is cleared first so [start]'s same-configuration guard does not mistake a torn-down
+     * engine for a running one and return without rebuilding anything.
+     */
     fun resumeTunnel() {
-        if (!PrismSettings.getVpnTunnelingEnabled()) return
-        routingActive = true
-        when (currentMode) {
-            PrismSettings.VPN_MODE_PRISM -> {
-                if (currentRole == PrismSettings.PRISM_ROLE_SERVER) startP2pServerMode() else startP2pClientMode()
-            }
-            PrismSettings.VPN_MODE_EXTERNAL -> startExternalVpnTunnel()
-        }
+        routingActive = false
+        start()
+    }
+
+    /**
+     * Whether the Prism P2P VPN is actually carrying traffic right now.
+     *
+     * ROLE-AGNOSTIC BY CONSTRUCTION: [start] sets [routingActive] for both branches of the
+     * server/client split, so a device serving the tunnel and a device connected to somebody
+     * else's both answer true. Anything gated on "is the user on the Prism VPN" wants exactly that
+     * and should not have to ask which end it is.
+     *
+     * MODE AND ROLE ARE READ FROM SETTINGS, NOT FROM THIS ENGINE'S FIELDS. They are the user's
+     * configuration and are always current, whereas [currentMode] is only as fresh as the last
+     * [start] -- and this question gets asked from the settings screen, which is exactly where the
+     * user is in the middle of changing them.
+     *
+     * Liveness is either the VPN service running or this engine routing, because both are real and
+     * neither covers the other: a private-browsing tunnel or a persistent server brings the service
+     * up, while a server node whose listeners were started at boot is serving peers whether or not
+     * the VpnService itself was ever established.
+     */
+    fun isPrismVpnActive(): Boolean {
+        if (!PrismSettings.getVpnTunnelingEnabled()) return false
+        if (PrismSettings.getVpnMode() != PrismSettings.VPN_MODE_PRISM) return false
+
+        val live = routingActive ||
+            runCatching { PrivateDnsVpnService.isRunning() }.getOrDefault(false)
+        if (!live) return false
+
+        // A server IS the VPN once its listeners are up; a client is only on one if it has a server
+        // to reach. Without that check a client that has never been given an address would report
+        // itself connected, because PrismProxyClient.start() returns quietly when the list is empty.
+        return PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_SERVER ||
+            PrismSettings.getPrismServers().isNotEmpty()
     }
 
     fun routeOutboundPacket(packet: ByteArray): ByteArray? {
@@ -282,8 +354,15 @@ class PrismTunnelEngine(private val context: Context) {
         val pass = PrismSettings.getPrismVpnPassword()
         val protoMode = PrismSettings.getVpnProtocolMode()
         
-        hostingServer = PrismProxyServer(8080, "PrismHost", isProxyMode = false)
-        hostingServer?.start()
+        // THROUGH startHostingServer, WHICH STOPS THE OLD ONE FIRST. This used to assign a new
+        // PrismProxyServer straight over `hostingServer`, which leaked the previous listener: it
+        // kept port 8080 bound while the only reference to it was overwritten, so nothing could
+        // ever close it. The replacement then failed to bind with "address already in use", and no
+        // amount of SO_REUSEADDR helps -- that option lets a socket rebind a port left in
+        // TIME_WAIT, not share one with a listener that is still very much alive. With the host
+        // listener down, every mesh request into 8080 -- model transfers and peer inference alike
+        // -- had nothing to answer it.
+        startHostingServer()
 
         if (protoMode == PrismSettings.VPN_PROTOCOL_AUTO || protoMode == PrismSettings.VPN_PROTOCOL_PROXY) {
             proxyServer = PrismProxyServer(port, "PrismVPN", isProxyMode = true)

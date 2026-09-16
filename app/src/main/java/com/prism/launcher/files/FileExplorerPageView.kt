@@ -16,7 +16,9 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
 import com.prism.launcher.R
 import java.io.File
@@ -27,6 +29,10 @@ import com.prism.launcher.LauncherActivity
 import com.prism.launcher.DesktopShortcutStore
 import com.prism.launcher.DesktopItem
 import com.prism.launcher.PrismSettings
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 sealed class ExplorerPath {
     data object Root : ExplorerPath()
@@ -325,10 +331,21 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
                     return
                 }
                 pathText.text = dir.absolutePath
-                val files = dir.listFiles()?.toList() ?: emptyList()
-                allEntries = files.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
-                    .map { FileEntry.Local(it) }
-                filterEntries(searchBar.text.toString())
+                // listFiles()+sort ran synchronously on whatever thread called navigateTo,
+                // which is a real block for large directories (Downloads, DCIM, ...). Listed
+                // off-thread and applied back on Main, guarded against a stale result landing
+                // after the user has already navigated elsewhere while this was still running.
+                GlobalScope.launch(Dispatchers.Main) {
+                    val sorted = withContext(Dispatchers.IO) {
+                        val files = dir.listFiles()?.toList() ?: emptyList()
+                        files.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
+                            .map { FileEntry.Local(it) }
+                    }
+                    if (currentPath == path) {
+                        allEntries = sorted
+                        filterEntries(searchBar.text.toString())
+                    }
+                }
             }
             is ExplorerPath.Network -> {
                 pathText.text = "${path.storage.protocol.uppercase()} // ${path.storage.name}"
@@ -382,6 +399,15 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
     }
 
     private fun openFile(file: File) {
+        // Name and path both go in the searchable text: people look for a file by either, and the
+        // path is often the only thing they remember ("it was in that downloads folder").
+        com.prism.launcher.history.PrismHistory.record(
+            kind = com.prism.launcher.history.PrismHistory.Kind.FILE,
+            title = file.name,
+            uri = file.absolutePath,
+            text = file.parent.orEmpty(),
+            source = "Files",
+        )
         try {
             val policy = StrictMode.VmPolicy.Builder().build()
             StrictMode.setVmPolicy(policy)
@@ -508,21 +534,27 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
     }
 }
 
+private object FileEntryDiff : DiffUtil.ItemCallback<FileEntry>() {
+    private fun key(e: FileEntry): String = when (e) {
+        is FileEntry.Local -> "local:${e.file.absolutePath}"
+        is FileEntry.Network -> "network:${e.storage.name}"
+        is FileEntry.InternalStorageLink -> "internal"
+        is FileEntry.AppStorageLink -> "appstorage"
+        is FileEntry.ExternalStorageLink -> "external:${e.root.absolutePath}"
+    }
+
+    override fun areItemsTheSame(old: FileEntry, new: FileEntry) = key(old) == key(new)
+    override fun areContentsTheSame(old: FileEntry, new: FileEntry) = old == new
+}
+
 class FileExplorerAdapter(
     private val onEntryClick: (FileEntry) -> Unit,
     private val onDragStarted: () -> Unit,
     private val onDragEnded: () -> Unit,
     private val showOptions: (FileEntry) -> Unit
-) : RecyclerView.Adapter<FileExplorerAdapter.VH>() {
+) : ListAdapter<FileEntry, FileExplorerAdapter.VH>(FileEntryDiff) {
 
-    private var items: List<FileEntry> = emptyList()
-
-    fun submitList(newItems: List<FileEntry>) {
-        items = newItems
-        notifyDataSetChanged()
-    }
-
-    override fun getItemCount(): Int = items.size
+    private val items: List<FileEntry> get() = currentList
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
         val view = LayoutInflater.from(parent.context).inflate(R.layout.item_file_grid, parent, false)
@@ -587,11 +619,13 @@ class FileExplorerAdapter(
 
         holder.fileIcon.setColorFilter(typeColor)
         
-        holder.glassView.background = com.prism.launcher.NeonGlowDrawable(
+        val glow = holder.glowDrawable ?: com.prism.launcher.NeonGlowDrawable(
             color = glowColor,
             cornerRadius = 16f * ctx.resources.displayMetrics.density,
             strokeWidth = 2f * ctx.resources.displayMetrics.density
-        )
+        ).also { holder.glowDrawable = it }
+        glow.color = glowColor
+        holder.glassView.background = glow
 
         val handler = android.os.Handler(android.os.Looper.getMainLooper())
         var isDragging = false
@@ -647,5 +681,12 @@ class FileExplorerAdapter(
         val fileIcon: ImageView = view.findViewById(R.id.fileIcon)
         val fileName: TextView = view.findViewById(R.id.fileName)
         val glassView: View = view.findViewById(R.id.glassBackground)
+        /** Reused across rebinds of this holder instead of allocated fresh every bind. */
+        var glowDrawable: com.prism.launcher.NeonGlowDrawable? = null
+
+        init {
+            // NeonGlowDrawable's BlurMaskFilter isn't supported by hardware-accelerated Canvas.
+            glassView.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+        }
     }
 }

@@ -380,6 +380,13 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_IQ3_XXS:
             case GGML_TYPE_IQ3_S:   // types on the right: block size 32
             case GGML_TYPE_IQ4_XS:  return_type = GGML_TYPE_IQ4_NL; break;
+            // Q1_0 has 128-element blocks and Q5_Q0 has 64, so both meet tensors they cannot
+            // divide -- and reaching the `default` below throws, which aborts the entire
+            // quantisation over one awkwardly shaped tensor. Q1_0 was already missing here before
+            // Prism added anything; the low-bit file types are simply new enough upstream that
+            // nothing had driven a model through this path yet.
+            case GGML_TYPE_Q1_0:
+            case GGML_TYPE_Q5_Q0:
             case GGML_TYPE_Q2_0:
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q3_K:
@@ -481,7 +488,7 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             else if (ftype == LLAMA_FTYPE_MOSTLY_IQ3_XXS) {
                 new_type = GGML_TYPE_IQ3_S;
             }
-            else if (ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0 || ftype == LLAMA_FTYPE_MOSTLY_Q2_0) {
+            else if (ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0 || ftype == LLAMA_FTYPE_MOSTLY_Q2_0 || ftype == LLAMA_FTYPE_MOSTLY_Q5_Q0) {
                 new_type = GGML_TYPE_Q4_K;
             }
         }
@@ -802,6 +809,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_ALL_F32:     return GGML_TYPE_F32;
         case LLAMA_FTYPE_MOSTLY_Q1_0: return GGML_TYPE_Q1_0;
         case LLAMA_FTYPE_MOSTLY_Q2_0: return GGML_TYPE_Q2_0;
+        case LLAMA_FTYPE_MOSTLY_Q5_Q0: return GGML_TYPE_Q5_Q0;
 
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
 

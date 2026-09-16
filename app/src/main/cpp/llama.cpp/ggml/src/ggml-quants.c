@@ -109,6 +109,78 @@ void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_REST
     }
 }
 
+
+// Quinary quantisation. See block_q5_q0 in ggml-common.h for the packing.
+//
+// THE SCALE IS amax/2, NOT amax. The five levels are {-2,-1,0,1,2}, so the largest weight in a
+// block has to land on +-2 rather than +-1; dividing by amax would map everything into {-1,0,1}
+// and silently produce a ternary model wearing a quinary label.
+void quantize_row_q5_q0_ref(const float * GGML_RESTRICT x, block_q5_q0 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK5_Q0;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            const float a = fabsf(x[i*qk + j]);
+            if (a > amax) amax = a;
+        }
+
+        const float d  = amax / 2.0f;
+        const float id = d > 0.0f ? 1.0f / d : 0.0f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        for (int j = 0; j < (int) sizeof(y[i].qs); ++j) {
+            y[i].qs[j] = 0;
+        }
+
+        // Digits are written least-significant first, which is what the dot product's repeated
+        // division by five unpacks them in.
+        for (int j = 0; j < qk; ++j) {
+            int q = (int) roundf(x[i*qk + j] * id) + 2;
+            if (q < 0) q = 0;
+            if (q > 4) q = 4;
+
+            const int byte = j / 3;
+            const int slot = j % 3;
+            static const int pow5[3] = { 1, 5, 25 };
+            y[i].qs[byte] += (uint8_t) (q * pow5[slot]);
+        }
+    }
+}
+
+void dequantize_row_q5_q0(const block_q5_q0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK5_Q0;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        for (int j = 0; j < qk; ++j) {
+            const int byte = j / 3;
+            const int slot = j % 3;
+            static const int pow5[3] = { 1, 5, 25 };
+            const int q = (x[i].qs[byte] / pow5[slot]) % 5;
+            y[i*qk + j] = (float) (q - 2) * d;
+        }
+    }
+}
+
+size_t quantize_q5_q0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    // No imatrix path: the five levels are fixed and symmetric, so there is no per-column choice an
+    // importance matrix could influence. Ignoring it is honest; pretending to use it would not be.
+    (void) quant_weights;
+    quantize_row_q5_q0_ref(src, dst, (int64_t) nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_Q5_Q0, n_per_row);
+}
+
 // reference implementation for deterministic creation of model files
 void quantize_row_q4_0_ref(const float * GGML_RESTRICT x, block_q4_0 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK4_0;

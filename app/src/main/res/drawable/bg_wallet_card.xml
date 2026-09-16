@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The rounded surface behind wallet rows and the balance panel. Theme-aware through
+     ?attr/prismSurface, so it follows the launcher's own light/dark treatment. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="?attr/prismSurface" />
+    <corners android:radius="20dp" />
+    <stroke
+        android:width="1dp"
+        android:color="#22FFFFFF" />
+</shape>

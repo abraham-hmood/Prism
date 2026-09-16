@@ -86,11 +86,20 @@ object P2pDnsManager {
         _resolutionState.value = current
     }
 
+    /**
+     * Loads the on-disk DNS ledger. Called from `PrismApp.onCreate()`, so the file read and JSON
+     * parse run off the calling thread -- otherwise every cold start blocks the launcher UI on
+     * disk I/O before it's even up.
+     */
     fun init(context: Context) {
+        GlobalScope.launch(Dispatchers.IO) { initBlocking(context) }
+    }
+
+    private fun initBlocking(context: Context) {
         val storage = android.os.Environment.getExternalStorageDirectory()
         val prismDir = File(storage, "Prism")
         if (!prismDir.exists()) prismDir.mkdirs()
-        
+
         val file = File(prismDir, STORAGE_FILE)
         val internalFile = File(context.filesDir, STORAGE_FILE)
         val targetFile = if (file.exists()) file else if (internalFile.exists()) internalFile else file

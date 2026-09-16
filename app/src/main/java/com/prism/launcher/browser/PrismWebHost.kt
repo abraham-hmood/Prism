@@ -32,8 +32,28 @@ object PrismWebHost {
 
     private const val TAG = "PrismWebHost"
     
-    // Structure: domain -> (path -> File or DocumentFile)
-    private val siteCache = mutableMapOf<String, MutableMap<String, Any>>()
+    /**
+     * Structure: domain -> (path -> File or DocumentFile).
+     *
+     * BOTH LEVELS ARE BOUNDED. This is a long-lived object in a process that is also a launcher, and
+     * the inner map gains an entry for every path ever requested -- including one per miss, since
+     * misses are cached too. Serving a mirrored site of a few thousand files, or any site at all to
+     * a peer that probes for paths, grew it without limit for the life of the process. The entries
+     * are small; there are simply no longer an unbounded number of them.
+     */
+    private const val MAX_CACHED_DOMAINS = 16
+    private const val MAX_CACHED_PATHS_PER_DOMAIN = 512
+
+    private val siteCache = object : LinkedHashMap<String, MutableMap<String, Any>>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, MutableMap<String, Any>>?) =
+            size > MAX_CACHED_DOMAINS
+    }
+
+    private fun newPathCache(): MutableMap<String, Any> =
+        object : LinkedHashMap<String, Any>(64, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Any>?) =
+                size > MAX_CACHED_PATHS_PER_DOMAIN
+        }
     private val cacheMutex = Any()
 
     suspend fun serve(context: Context, socket: Socket, domain: String, preReadHeader: String? = null) = withContext(Dispatchers.IO) {
@@ -51,6 +71,31 @@ object PrismWebHost {
                 val mirror = mirrors.find { it.domain.equals(domain, ignoreCase = true) && it.isActive }
                 
                 if (mirror == null) {
+                    // Third: the web cache -- but ONLY for a request that originated on this
+                    // device.
+                    //
+                    // This is what lets other apps read the cache while it is private. A cached
+                    // site is not in the hosted list until the user shares it, so the lookups above
+                    // both miss, and a 404 here would mean the only way to read your own cache was
+                    // to publish it to every peer first -- trading the whole point of the private
+                    // setting for offline access.
+                    //
+                    // The loopback condition is what keeps that honest. A peer arrives over the mesh
+                    // from a real address and still gets the 404 it should; only 127.0.0.1, which no
+                    // other machine can forge a route from, sees an unpublished cache. Once the user
+                    // does share it, the hosted-site lookup above answers first and this never runs.
+                    val cachedHost = PrismWebCache.hostForMeshDomain(domain)
+                    val cacheDir = cachedHost?.let { PrismWebCache.dirFor(it) }
+                    val fromThisDevice = socket.inetAddress?.isLoopbackAddress == true
+
+                    if (cacheDir != null && cacheDir.isDirectory && fromThisDevice) {
+                        serveContent(
+                            context, socket, input, output, domain,
+                            cacheDir.absolutePath, preReadHeader
+                        )
+                        return@withContext
+                    }
+
                     sendError(output, 404, "Site Not Found: $domain")
                     return@withContext
                 }
@@ -82,6 +127,10 @@ object PrismWebHost {
         
         val lines = header.lines()
         val requestLine = lines[0]
+        // Present only when the caller pre-read the whole head, which is the path every non-Prism
+        // client arrives on -- and those are the ones that play video.
+        val rangeHeader = lines.firstOrNull { it.startsWith("Range:", ignoreCase = true) }
+            ?.substringAfter(':')?.trim()
         val parts = requestLine.split(" ")
         if (parts.size < 2) return
         
@@ -108,12 +157,12 @@ object PrismWebHost {
         
         // Cache Check: Fast-path for repeated requests (icons, CSS, etc)
         val domainCache = synchronized(cacheMutex) {
-            siteCache.getOrPut(domain) { mutableMapOf() }
+            siteCache.getOrPut(domain) { newPathCache() }
         }
         
         val cachedResult = domainCache[path]
         if (cachedResult != null) {
-            handleFileResult(context, output, cachedResult, path)
+            handleFileResult(context, output, cachedResult, path, rangeHeader)
             return
         }
         
@@ -122,7 +171,7 @@ object PrismWebHost {
         
         if (fileResult != null) {
             synchronized(cacheMutex) { domainCache[path] = fileResult }
-            handleFileResult(context, output, fileResult, path)
+            handleFileResult(context, output, fileResult, path, rangeHeader)
         } else {
             // Negative cache to prevent repeated scanning of missing files
             synchronized(cacheMutex) { domainCache[path] = "NULL_MARKER" }
@@ -130,13 +179,19 @@ object PrismWebHost {
         }
     }
 
-    private suspend fun handleFileResult(context: Context, output: OutputStream, result: Any, path: String) {
+    private suspend fun handleFileResult(
+        context: Context,
+        output: OutputStream,
+        result: Any,
+        path: String,
+        rangeHeader: String? = null,
+    ) {
         when {
             result is File -> {
                 if (result.name.endsWith(".prism")) {
                     sendAiTemplate(context, output, result)
                 } else {
-                    sendFile(output, result)
+                    sendFile(output, result, rangeHeader)
                 }
             }
             result is DocumentFile -> {
@@ -166,12 +221,35 @@ object PrismWebHost {
     }
     
     /**
+     * Drops every site's resolved-path cache.
+     *
+     * Called under memory pressure. Everything here is a filesystem lookup that costs one stat to
+     * redo, so there is nothing to lose by letting it go and nothing to rebuild eagerly.
+     */
+    fun trimCaches() {
+        synchronized(cacheMutex) { siteCache.clear() }
+    }
+
+    /**
      * Clear the cache for a specific site (e.g. if the user updates the source folder)
      */
     fun clearCache(domain: String) {
         synchronized(cacheMutex) {
             siteCache.remove(domain)
         }
+    }
+
+    /**
+     * The on-disk spellings a request path may correspond to, in preference order.
+     *
+     * Only ever ADDS candidates for an extensionless path, so a request that names a real file
+     * still resolves to exactly that file and nothing about hosting a hand-made folder changes.
+     */
+    private fun candidatePaths(cleanPath: String): List<String> {
+        if (cleanPath.isEmpty()) return listOf("index.html")
+        if (cleanPath.substringAfterLast('/').contains('.')) return listOf(cleanPath)
+        val stem = cleanPath.trimEnd('/')
+        return listOf(cleanPath, "$stem.html", "$stem/index.html")
     }
 
     private fun resolveFile(context: Context, rootUri: Uri, reqPath: String): Any? {
@@ -184,11 +262,20 @@ object PrismWebHost {
             baseDir = baseDir.replace("/document/primary:", "/storage/emulated/0/")
         }
         
-        val file = File(baseDir, cleanPath)
-        if (file.exists() && !file.isDirectory) {
-            return file
+        // The literal path first, then the two shapes a saved page may have taken.
+        //
+        // A crawled or captured page has to be stored with an extension -- content type is derived
+        // from it, and without one a perfectly good page is served as octet-stream and offered as a
+        // download instead of rendered. That means a site linking to `/about` has its page on disk
+        // as `about.html`, and a link to `/docs` as `docs/index.html`. Without these fallbacks
+        // every such link 404s for the peer even though the file is right there.
+        for (candidate in candidatePaths(cleanPath)) {
+            val file = File(baseDir, candidate)
+            if (file.exists() && !file.isDirectory) {
+                return file
+            }
         }
-        
+
         try {
             val rootDoc = DocumentFile.fromTreeUri(context, rootUri)
             if (rootDoc != null && rootDoc.exists()) {
@@ -305,29 +392,95 @@ object PrismWebHost {
         output.flush()
     }
 
-    private fun sendFile(output: OutputStream, file: File) {
+    /**
+     * Sends a file, honouring a single `Range` header.
+     *
+     * RANGE IS WHAT MAKES VIDEO WORK. Every media player -- Android's own, a browser's `<video>`, VLC
+     * -- opens a clip by asking for a byte range, and many ask for the last few kilobytes first to
+     * read the container's index. A server that answers each of those with the whole file from byte
+     * zero and a 200 leaves the player either unable to seek or unable to start at all. Advertising
+     * `Accept-Ranges` and answering 206 with the slice asked for costs a seek and fixes both.
+     *
+     * Only a single `bytes=start-end` range is handled, which is all any player in practice sends;
+     * a multipart range request falls back to the whole file, which is a correct if unhelpful answer.
+     */
+    private fun sendFile(output: OutputStream, file: File, rangeHeader: String? = null) {
         val ext = MimeTypeMap.getFileExtensionFromUrl(file.absolutePath)
         val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "application/octet-stream"
+        val total = file.length()
+
+        val range = parseSingleRange(rangeHeader, total)
 
         val response = StringBuilder()
-        response.append("HTTP/1.1 200 OK\r\n")
+        if (range != null) {
+            response.append("HTTP/1.1 206 Partial Content\r\n")
+            response.append("Content-Range: bytes ${range.first}-${range.last}/$total\r\n")
+        } else {
+            response.append("HTTP/1.1 200 OK\r\n")
+        }
         response.append("Content-Type: $mime\r\n")
-        response.append("Content-Length: ${file.length()}\r\n")
+        response.append("Content-Length: ${range?.let { it.last - it.first + 1 } ?: total}\r\n")
+        // Told unconditionally: a player that does not know ranges are available will not ask, and
+        // then cannot seek even though the file on disk is perfectly seekable.
+        response.append("Accept-Ranges: bytes\r\n")
         response.append("Date: ${getServerTime()}\r\n")
         response.append("Server: PrismMesh/1.0\r\n")
         response.append("Connection: close\r\n")
         response.append("\r\n")
 
         output.write(response.toString().toByteArray())
-        
+
         file.inputStream().use { input ->
-            val buffer = ByteArray(16 * 1024)
-            var read: Int
-            while (input.read(buffer).also { read = it } != -1) {
+            var remaining = if (range != null) {
+                input.skip(range.first)
+                range.last - range.first + 1
+            } else {
+                total
+            }
+            val buffer = ByteArray(64 * 1024)
+            while (remaining > 0) {
+                val want = minOf(remaining, buffer.size.toLong()).toInt()
+                val read = input.read(buffer, 0, want)
+                if (read <= 0) break
                 output.write(buffer, 0, read)
+                remaining -= read
             }
         }
         output.flush()
+    }
+
+    /**
+     * `bytes=start-end` as an inclusive range, or null when there is nothing usable to honour.
+     *
+     * Both halves are optional in the header and mean different things: `bytes=500-` is "from 500 to
+     * the end", `bytes=-500` is "the LAST 500 bytes" -- not "up to 500", which is the easy mistake
+     * and the one that breaks players reading a container index from the tail. A range starting past
+     * the end of the file is unsatisfiable and returns null so the caller sends the whole file rather
+     * than an empty 206.
+     */
+    private fun parseSingleRange(header: String?, total: Long): LongRange? {
+        if (header.isNullOrBlank() || total <= 0L) return null
+        val spec = header.substringAfter("bytes=", "").trim()
+        if (spec.isEmpty() || spec.contains(',')) return null
+
+        val dash = spec.indexOf('-')
+        if (dash < 0) return null
+        val startText = spec.substring(0, dash).trim()
+        val endText = spec.substring(dash + 1).trim()
+
+        return runCatching {
+            if (startText.isEmpty()) {
+                val lastN = endText.toLong()
+                if (lastN <= 0L) return null
+                LongRange(maxOf(0L, total - lastN), total - 1)
+            } else {
+                val start = startText.toLong()
+                if (start >= total) return null
+                val end = if (endText.isEmpty()) total - 1 else minOf(endText.toLong(), total - 1)
+                if (end < start) return null
+                LongRange(start, end)
+            }
+        }.getOrNull()
     }
 
     private suspend fun sendManifest(context: Context, output: OutputStream, domain: String, localPath: String) {

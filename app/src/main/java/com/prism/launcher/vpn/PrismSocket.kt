@@ -99,27 +99,42 @@ class PrismSocket : Socket() {
         }
     }
 
+    /**
+     * Exchanges PRISM_CONNECT/PRISM_ACK before the caller's own protocol starts.
+     *
+     * THE HANDSHAKE TIMEOUT IS RESTORED AFTERWARDS, and that restore is the whole point of the
+     * finally block. Five seconds is right for an ack that either arrives at once or is never
+     * coming -- and wrong for everything that follows, because soTimeout is a property of the
+     * SOCKET, not of the read that set it. Leaving it in place capped every later read on the same
+     * connection at five seconds, which is how model transfers died with
+     * "SocketTimeoutException: Read timed out" inside readHeadersAndLength: the seller merely had
+     * to take longer than that to locate and open a multi-gigabyte file, which on a phone is the
+     * normal case rather than the exceptional one.
+     */
     private fun performHandshake(hostName: String) {
         val out = getOutputStream()
         val inp = getInputStream()
-        
-        // Set a timeout for the handshake phase specifically
+
+        val callerTimeout = soTimeout
         soTimeout = 5000
-        
-        val handshake = "PRISM_CONNECT $hostName\n"
-        out.write(handshake.toByteArray())
-        out.flush()
-        
-        val sb = StringBuilder()
-        while (true) {
-            val c = inp.read()
-            if (c == -1 || c == '\n'.code) break
-            if (c != '\r'.code) sb.append(c.toChar())
-        }
-        
-        val ack = sb.toString().trim()
-        if (ack != "PRISM_ACK") {
-            throw java.io.IOException("Handshake mismatch: Expected PRISM_ACK, got '$ack'")
+        try {
+            val handshake = "PRISM_CONNECT $hostName\n"
+            out.write(handshake.toByteArray())
+            out.flush()
+
+            val sb = StringBuilder()
+            while (true) {
+                val c = inp.read()
+                if (c == -1 || c == '\n'.code) break
+                if (c != '\r'.code) sb.append(c.toChar())
+            }
+
+            val ack = sb.toString().trim()
+            if (ack != "PRISM_ACK") {
+                throw java.io.IOException("Handshake mismatch: Expected PRISM_ACK, got '$ack'")
+            }
+        } finally {
+            soTimeout = callerTimeout
         }
     }
 }

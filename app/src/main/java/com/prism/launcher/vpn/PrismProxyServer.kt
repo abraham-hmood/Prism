@@ -142,6 +142,9 @@ class PrismProxyServer(
                     val read = bis.read(buffer)
                     
                     var finalSocket = clientSocket
+                    // Filled on the plain-HTTP branch below; see the comment there for why
+                    // the request head cannot simply be left in the socket for the host.
+                    var sniffedHead: String? = null
                     if (read > 0) {
                         bis.unread(buffer, 0, read)
                         
@@ -169,20 +172,50 @@ class PrismProxyServer(
                                 clientSocket.close()
                                 return@withContext
                             }
+                        } else {
+                            // PLAIN HTTP. The TLS sniff above pulled 5 bytes off the socket
+                            // and pushed them back into `bis` -- a wrapper, not the socket.
+                            // The TLS branch survives that because its peeking socket reads
+                            // THROUGH `bis`; this branch handed over the bare socket, whose
+                            // stream no longer holds those bytes. "GET /" lost its first five
+                            // characters, so the host parsed "HTTP/1.1" as the method and
+                            // answered every mesh request with 405 Method Not Allowed --
+                            // while the identical handler served localhost perfectly, because
+                            // nothing sniffs there.
+                            //
+                            // Reading the head out of `bis` and passing it on keeps the bytes:
+                            // the host receives the request it would have read for itself.
+                            sniffedHead = readHeadFrom(bis)
                         }
                     }
                     if (domain.equals(com.prism.launcher.mesh.P2pModelRegistry.MODEL_HOST_DOMAIN, ignoreCase = true)) {
-                        PrismAiHost.serve(PrismApp.instance, finalSocket)
+                        // sniffedHead AND the buffered stream, for the reasons in PrismAiHost.serve:
+                        // the head has already been consumed here, and `bis` may be holding body
+                        // bytes that never reach a reader using the raw socket.
+                        PrismAiHost.serve(PrismApp.instance, finalSocket, sniffedHead, bis)
+                    } else if (domain.equals(com.prism.launcher.aether.AetherMeshSync.AETHER_HOST_DOMAIN, ignoreCase = true)) {
+                        com.prism.launcher.aether.AetherConnectomeHost.serve(PrismApp.instance, finalSocket, sniffedHead)
+                    } else if (domain.equals(com.prism.launcher.social.NebulaMeshSync.NEBULA_HOST_DOMAIN, ignoreCase = true)) {
+                        com.prism.launcher.social.NebulaSocialHost.serve(PrismApp.instance, finalSocket, sniffedHead)
+                    } else if (domain.equals(com.prism.launcher.PrismSettings.PRISM_SEARCH_DOMAIN, ignoreCase = true)) {
+                        com.prism.launcher.search.PrismSearchHost.serve(PrismApp.instance, finalSocket, sniffedHead)
                     } else {
-                        PrismWebHost.serve(PrismApp.instance, finalSocket, domain)
+                        PrismWebHost.serve(PrismApp.instance, finalSocket, domain, preReadHeader = sniffedHead)
                     }
                 }
                 return@withContext
             }
 
             // 2. Standard Browser / Proxy Handling
+            //
+            // THE HOSTING LISTENER ANSWERS PLAIN HTTP TOO, not only the PRISM_CONNECT handshake.
+            // Without that, the only clients that could ever read a hosted or cached site were
+            // Prism's own WebView and mesh peers -- an ordinary browser or app on this device, which
+            // knows nothing about the handshake, got a socket that read its request and closed. The
+            // dispatch below needs nothing but a Host header, which every HTTP client sends.
+            val header = if (firstLine.contains(" HTTP/")) firstLine else firstLine + "\n" + readHeader(input)
+
             if (isProxyMode) {
-                val header = if (firstLine.contains(" HTTP/")) firstLine else firstLine + "\n" + readHeader(input)
                 if (authHeaderExpected != null) {
                     if (!header.contains(authHeaderExpected!!)) {
                         output.write("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Prism\"\r\n\r\n".toByteArray())
@@ -202,15 +235,27 @@ class PrismProxyServer(
                         }
                     }
                 }
-                if (header.contains("Host:", ignoreCase = true)) {
-                    // Loopback hosting via standard browser GET + Host header
-                    val fullHeader = header + "\n" + readHeader(input)
-                    val hostLine = fullHeader.lines().find { it.startsWith("Host:", ignoreCase = true) }
-                    val domain = hostLine?.substringAfter(":")?.trim()?.substringBefore(":") ?: ""
-                    if (domain.isNotEmpty()) {
+            }
+
+            if (header.contains("Host:", ignoreCase = true)) {
+                // Any HTTP client: Prism's WebView, another browser, or an app on this device.
+                val fullHeader = header + "\n" + readHeader(input)
+                val hostLine = fullHeader.lines().find { it.startsWith("Host:", ignoreCase = true) }
+                val domain = hostLine?.substringAfter(":")?.trim()?.substringBefore(":") ?: ""
+                if (domain.isNotEmpty()) {
+                    // fullHeader is handed on: this branch has ALREADY read the request line
+                    // and headers off the socket in order to find the Host: it dispatches on,
+                    // so a host that tries to read them again finds an empty stream.
+                    if (domain.equals(com.prism.launcher.aether.AetherMeshSync.AETHER_HOST_DOMAIN, ignoreCase = true)) {
+                        com.prism.launcher.aether.AetherConnectomeHost.serve(PrismApp.instance, clientSocket, fullHeader)
+                    } else if (domain.equals(com.prism.launcher.social.NebulaMeshSync.NEBULA_HOST_DOMAIN, ignoreCase = true)) {
+                        com.prism.launcher.social.NebulaSocialHost.serve(PrismApp.instance, clientSocket, fullHeader)
+                    } else if (domain.equals(com.prism.launcher.PrismSettings.PRISM_SEARCH_DOMAIN, ignoreCase = true)) {
+                        com.prism.launcher.search.PrismSearchHost.serve(PrismApp.instance, clientSocket, fullHeader)
+                    } else {
                         PrismWebHost.serve(PrismApp.instance, clientSocket, domain, preReadHeader = fullHeader)
-                        return@withContext
                     }
+                    return@withContext
                 }
             }
 
@@ -221,6 +266,25 @@ class PrismProxyServer(
         }
     }
     
+    /**
+     * Reads a full HTTP request head (request line + headers, through the blank line) from a
+     * stream that may hold pushed-back bytes.
+     *
+     * Used only where the socket's own stream can no longer produce them -- see the plain-HTTP
+     * branch of the PRISM_CONNECT handler. Returns null on an empty stream so callers fall back
+     * to reading the socket themselves rather than being handed a bogus empty request.
+     */
+    private fun readHeadFrom(input: java.io.InputStream): String? {
+        val head = StringBuilder()
+        while (true) {
+            val line = readLine(input) ?: break
+            if (line.isEmpty()) break
+            head.append(line).append('\n')
+            if (head.length > 16 * 1024) break     // a head this large is not one we serve
+        }
+        return head.toString().takeIf { it.isNotBlank() }
+    }
+
     private suspend fun connectToTarget(host: String, targetPort: Int, clientSocket: Socket, clientIn: InputStream, clientOut: OutputStream) = withContext(Dispatchers.IO) {
         var targetSocket: Socket? = null
         try {
@@ -239,7 +303,15 @@ class PrismProxyServer(
             
             if (isP2p && isLocal) {
                 com.prism.launcher.PrismLogger.logInfo("PrismProxy", "Domestic Mesh Request: Serving $host directly from local host.")
-                PrismWebHost.serve(com.prism.launcher.PrismApp.instance, clientSocket, host)
+                if (host.equals(com.prism.launcher.aether.AetherMeshSync.AETHER_HOST_DOMAIN, ignoreCase = true)) {
+                    com.prism.launcher.aether.AetherConnectomeHost.serve(com.prism.launcher.PrismApp.instance, clientSocket)
+                } else if (host.equals(com.prism.launcher.social.NebulaMeshSync.NEBULA_HOST_DOMAIN, ignoreCase = true)) {
+                    com.prism.launcher.social.NebulaSocialHost.serve(com.prism.launcher.PrismApp.instance, clientSocket)
+                } else if (host.equals(com.prism.launcher.PrismSettings.PRISM_SEARCH_DOMAIN, ignoreCase = true)) {
+                    com.prism.launcher.search.PrismSearchHost.serve(com.prism.launcher.PrismApp.instance, clientSocket)
+                } else {
+                    PrismWebHost.serve(com.prism.launcher.PrismApp.instance, clientSocket, host)
+                }
                 return@withContext
             }
             // ----------------------

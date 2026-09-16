@@ -14,23 +14,33 @@ abstract class PrismBaseActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         val mode = PrismSettings.getThemeMode()
-        androidx.appcompat.app.AppCompatDelegate.setDefaultNightMode(
-            when (mode) {
-                PrismSettings.THEME_LIGHT -> androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_NO
-                PrismSettings.THEME_DARK -> androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_YES
-                else -> androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM
-            }
-        )
+        val desiredNightMode = when (mode) {
+            PrismSettings.THEME_LIGHT -> androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_NO
+            PrismSettings.THEME_DARK -> androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_YES
+            else -> androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM
+        }
+        // ONLY WHEN IT DIFFERS. setDefaultNightMode recreates every started activity, so calling it
+        // unconditionally from the base onCreate meant each screen kicked off another recreation as
+        // it opened -- harmless when the value already matched, and a recreation loop that ate taps
+        // while the theme was mid-change.
+        if (androidx.appcompat.app.AppCompatDelegate.getDefaultNightMode() != desiredNightMode) {
+            androidx.appcompat.app.AppCompatDelegate.setDefaultNightMode(desiredNightMode)
+        }
         
         super.onCreate(savedInstanceState)
         
-        // Dynamic Status Bar logic
-        if (mode == PrismSettings.THEME_LIGHT) {
-            window.statusBarColor = android.graphics.Color.WHITE
-            window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
-        } else {
+        // The status bar follows what is ACTUALLY on screen rather than the stored preference.
+        // Under "follow system" the preference says neither light nor dark, so reading it gave
+        // those devices a black status bar sitting over a light screen.
+        val nightNow = (resources.configuration.uiMode and
+            android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+            android.content.res.Configuration.UI_MODE_NIGHT_YES
+        if (nightNow) {
             window.statusBarColor = android.graphics.Color.BLACK
             window.decorView.systemUiVisibility = 0
+        } else {
+            window.statusBarColor = android.graphics.Color.WHITE
+            window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
         }
     }
 

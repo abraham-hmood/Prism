@@ -12,6 +12,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import androidx.recyclerview.widget.LinearLayoutManager
+import com.prism.launcher.R
 import com.prism.launcher.databinding.ActivityConversationBinding
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -22,6 +23,9 @@ class ConversationActivity : AppCompatActivity() {
     companion object {
         /** Sam's pseudo-thread. Nora's lives on NoraChat.THREAD_ID for the same reason. */
         const val SAM_THREAD_ID = -100L
+
+        /** Only reached if a theme somehow declares no prismAccent; matches @color/prism_accent. */
+        private const val FALLBACK_ACCENT = 0xFF7C9EFF.toInt()
     }
 
     private lateinit var binding: ActivityConversationBinding
@@ -47,6 +51,24 @@ class ConversationActivity : AppCompatActivity() {
 
     /** Nora's slash-command palette. Created lazily, only in her thread. */
     private var commandPopup: com.prism.launcher.nora.NoraCommandPopup? = null
+
+    /** Aether's slash-command palette. Created lazily, only in her thread. */
+    private var aetherCommandPopup: com.prism.launcher.aether.AetherCommandPopup? = null
+
+    /** Aether's 3D backdrop. Non-null only in her thread; every other thread leaves it GONE. */
+    private var aetherModel: com.prism.launcher.aether.AetherModelView? = null
+
+    /** True while the model has the screen to itself and the transcript is hidden. */
+    private var modelStageVisible = false
+
+    /**
+     * Back leaves the model stage before it leaves the conversation. Hiding the transcript is a
+     * mode, and backing straight out of a screen the user cannot currently see would feel like the
+     * button did something other than what it did.
+     */
+    private val exitModelStage = object : androidx.activity.OnBackPressedCallback(false) {
+        override fun handleOnBackPressed() = setModelStageVisible(false)
+    }
 
     private var voice: com.prism.launcher.voice.VoiceInputController? = null
 
@@ -107,6 +129,14 @@ class ConversationActivity : AppCompatActivity() {
             stackFromEnd = true
         }
         binding.conversationMessagesList.adapter = adapter
+        // A streaming reply's row grows taller with every token (more text -> more wrapped
+        // lines), which is itself enough to make DefaultItemAnimator run its "change" cross-fade
+        // on every single token even once the row has a stable identity (see the timestamp fix
+        // in sendToSam). That subtle fade-per-token still reads as jittery for something meant to
+        // flow continuously, so changes are applied instantly here -- inserts/removals (a new
+        // message arriving, one being deleted) keep their normal animation either way.
+        (binding.conversationMessagesList.itemAnimator as? androidx.recyclerview.widget.SimpleItemAnimator)
+            ?.supportsChangeAnimations = false
 
         binding.conversationAttachBtn.setOnClickListener {
             mediaPicker.launch(arrayOf("image/*", "video/*"))
@@ -146,6 +176,73 @@ class ConversationActivity : AppCompatActivity() {
 
         loadMessages()
         if (threadId == com.prism.launcher.nora.NoraChat.THREAD_ID) observeNora()
+        if (threadId == com.prism.launcher.aether.AetherChat.THREAD_ID) {
+            observeAether()
+            setUpAetherBackdrop()
+        }
+    }
+
+    /**
+     * Puts Aether behind her own conversation.
+     *
+     * Her thread only. The model view is inflated into the layout every thread shares but stays
+     * GONE and unloaded elsewhere, so an SMS conversation never pays for the mesh.
+     */
+    private fun setUpAetherBackdrop() {
+        val stage = binding.conversationModelView
+        stage.setBackgroundTint(themeColor(R.attr.prismBackground, android.graphics.Color.WHITE))
+        stage.setAccent(themeColor(R.attr.prismAccent, FALLBACK_ACCENT))
+        stage.activate()
+        aetherModel = stage
+
+        // The column paints ?attr/prismBackground across the entire screen, and that is drawn
+        // after -- so on top of -- the surface she renders into. Clearing it is the one thing that
+        // lets her show through at all. The header and compose row keep their own ?attr/prismSurface,
+        // so the chrome stays legible over her instead of floating on a portrait.
+        binding.conversationColumn.setBackgroundColor(android.graphics.Color.TRANSPARENT)
+
+        binding.conversationModelToggle.visibility = android.view.View.VISIBLE
+        binding.conversationModelToggle.setOnClickListener {
+            setModelStageVisible(!modelStageVisible)
+        }
+        onBackPressedDispatcher.addCallback(this, exitModelStage)
+    }
+
+    /**
+     * Swaps between the screen's two states: a conversation with her standing behind it, and her
+     * alone with the conversation put away.
+     *
+     * THE MESSAGE LIST GOES INVISIBLE, NOT GONE, and that is not interchangeable here. It carries
+     * `layout_weight="1"`, so removing it from the layout would collapse the column and drag the
+     * compose row -- which holds the very button used to get back -- up underneath the header.
+     * INVISIBLE keeps every bound in place and only stops it drawing.
+     */
+    private fun setModelStageVisible(visible: Boolean) {
+        modelStageVisible = visible
+        binding.conversationMessagesList.visibility =
+            if (visible) android.view.View.INVISIBLE else android.view.View.VISIBLE
+        aetherModel?.setInteractive(visible)
+        exitModelStage.isEnabled = visible
+
+        binding.conversationModelToggle.imageTintList = android.content.res.ColorStateList.valueOf(
+            if (visible) themeColor(R.attr.prismAccent, FALLBACK_ACCENT)
+            else themeColor(R.attr.prismTextPrimary, android.graphics.Color.DKGRAY)
+        )
+        binding.conversationModelToggle.contentDescription =
+            if (visible) "Show the conversation" else "View Aether"
+
+        if (visible) {
+            // An open keyboard eats half the screen under adjustResize, which is half of her.
+            aetherCommandPopup?.dismiss()
+            (getSystemService(INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager)
+                ?.hideSoftInputFromWindow(binding.conversationInput.windowToken, 0)
+        }
+    }
+
+    private fun themeColor(attr: Int, fallback: Int): Int {
+        val value = android.util.TypedValue()
+        if (!theme.resolveAttribute(attr, value, true)) return fallback
+        return if (value.resourceId != 0) ContextCompat.getColor(this, value.resourceId) else value.data
     }
 
     /**
@@ -163,7 +260,8 @@ class ConversationActivity : AppCompatActivity() {
      */
     private fun setUpDictation() {
         val isAiThread = threadId == SAM_THREAD_ID ||
-            threadId == com.prism.launcher.nora.NoraChat.THREAD_ID
+            threadId == com.prism.launcher.nora.NoraChat.THREAD_ID ||
+            threadId == com.prism.launcher.aether.AetherChat.THREAD_ID
 
         voice = com.prism.launcher.voice.VoiceInputController(
             micButton = binding.conversationMicBtn,
@@ -188,11 +286,37 @@ class ConversationActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
+    override fun onResume() {
+        super.onResume()
+        // GLSurfaceView parks its render thread and (without preserveEGLContextOnPause) its
+        // context on pause; it will not draw again until this pairing is honoured.
+        aetherModel?.onResume()
+    }
+
     override fun onPause() {
         // A PopupWindow outlives its activity's visibility and leaks the window token if it is
         // still showing when the activity goes away.
         commandPopup?.dismiss()
+        aetherCommandPopup?.dismiss()
+        aetherModel?.onPause()
         super.onPause()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // AetherService now runs in its own process -- see AetherIpcProtocol's doc comment for
+        // why this conversation otherwise would not see AetherChatState updates at all. Only
+        // bound for the Aether thread; every other thread type has nothing to do with it.
+        if (threadId == com.prism.launcher.aether.AetherChat.THREAD_ID) {
+            com.prism.launcher.aether.AetherIpcClient.bind(this)
+        }
+    }
+
+    override fun onStop() {
+        if (threadId == com.prism.launcher.aether.AetherChat.THREAD_ID) {
+            com.prism.launcher.aether.AetherIpcClient.unbind(this)
+        }
+        super.onStop()
     }
 
     private fun loadMessages() {
@@ -200,6 +324,7 @@ class ConversationActivity : AppCompatActivity() {
             when (threadId) {
                 SAM_THREAD_ID -> loadAiMessages()
                 com.prism.launcher.nora.NoraChat.THREAD_ID -> loadNoraMessages()
+                com.prism.launcher.aether.AetherChat.THREAD_ID -> loadAetherMessages()
                 else -> loadSmsMessages()
             }
         }
@@ -231,6 +356,22 @@ class ConversationActivity : AppCompatActivity() {
                         isSent = false
                     )
                 )
+            } else {
+                messages
+            }
+            renderMessages()
+        }
+    }
+
+    /** Same rationale as [loadNoraMessages] -- a flat JSON transcript, re-read on change rather than a reactive Flow. */
+    private suspend fun loadAetherMessages() {
+        val entries = com.prism.launcher.aether.AetherChatStore.load(this@ConversationActivity)
+        val messages = entries.map {
+            MessageInfo(it.text, it.isSent, it.attachmentUri?.let { u -> Uri.parse(u) }, it.attachmentType, timestamp = it.timestamp)
+        }
+        withContext(Dispatchers.Main) {
+            dbMessages = if (messages.isEmpty()) {
+                listOf(MessageInfo(com.prism.launcher.aether.AetherChat.greeting(this@ConversationActivity), isSent = false))
             } else {
                 messages
             }
@@ -279,9 +420,23 @@ class ConversationActivity : AppCompatActivity() {
     }
 
     private fun sendMessage(text: String) {
+        // The message itself is the searchable body -- for a message, what was said IS the content,
+        // unlike a page where the title stands in for it. The conversation is the uri so that every
+        // message in one thread collapses onto that thread when the history is compacted.
+        if (text.isNotBlank()) {
+            com.prism.launcher.history.PrismHistory.record(
+                kind = com.prism.launcher.history.PrismHistory.Kind.MESSAGE,
+                title = text.take(120),
+                uri = "conversation:" + address,
+                text = text,
+                source = address,
+            )
+        }
+
         val uri = selectedMediaUri
         val type = selectedMediaType
         commandPopup?.dismiss()
+        aetherCommandPopup?.dismiss()
 
         // Reset UI
         binding.conversationInput.text.clear()
@@ -291,6 +446,7 @@ class ConversationActivity : AppCompatActivity() {
         when (threadId) {
             SAM_THREAD_ID -> sendToSam(text, uri, type)
             com.prism.launcher.nora.NoraChat.THREAD_ID -> sendToNora(text)
+            com.prism.launcher.aether.AetherChat.THREAD_ID -> sendToAether(text)
             else -> sendSms(text, uri)
         }
     }
@@ -318,6 +474,49 @@ class ConversationActivity : AppCompatActivity() {
             loadNoraMessages()
             withContext(Dispatchers.Main) {
                 com.prism.launcher.nora.NoraService.sendChat(ctx, text)
+            }
+        }
+    }
+
+    /** Hands the turn to [com.prism.launcher.aether.AetherService] -- same rationale as [sendToNora]. */
+    private fun sendToAether(text: String) {
+        val ctx = this@ConversationActivity
+        lifecycleScope.launch(Dispatchers.IO) {
+            com.prism.launcher.aether.AetherChatStore.append(
+                ctx,
+                com.prism.launcher.aether.AetherChatStore.Entry(text, isSent = true)
+            )
+            loadAetherMessages()
+            withContext(Dispatchers.Main) {
+                com.prism.launcher.aether.AetherService.sendChat(ctx, text)
+            }
+        }
+    }
+
+    /** Mirrors the service's generation state into the live bubble -- same shape as [observeNora]. */
+    private fun observeAether() {
+        lifecycleScope.launch {
+            lifecycle.repeatOnLifecycle(androidx.lifecycle.Lifecycle.State.STARTED) {
+                launch {
+                    com.prism.launcher.aether.AetherChatState.status.collect { status ->
+                        liveBubble = when {
+                            !com.prism.launcher.aether.AetherChatState.busy.value -> null
+                            status.isBlank() -> MessageInfo(
+                                "Aether is thinking",
+                                isSent = false,
+                                isThinking = true,
+                                thinkingLabel = com.prism.launcher.aether.AetherChat.DISPLAY_NAME
+                            )
+                            else -> MessageInfo(status, isSent = false)
+                        }
+                        renderMessages()
+                    }
+                }
+                launch {
+                    com.prism.launcher.aether.AetherChatState.revision.collect {
+                        withContext(Dispatchers.IO) { loadAetherMessages() }
+                    }
+                }
             }
         }
     }
@@ -392,22 +591,38 @@ class ConversationActivity : AppCompatActivity() {
     /**
      * Shows the slash-command palette while the user is typing a command.
      *
-     * Only in Nora's thread: an SMS conversation has no commands, and a menu popping up over a
-     * message that happens to start with a slash would be an obstruction rather than a help.
+     * Only in Nora's and Aether's threads: an SMS conversation has no commands, and a menu
+     * popping up over a message that happens to start with a slash would be an obstruction
+     * rather than a help.
      */
     private fun updateCommandPopup(text: String) {
-        if (threadId != com.prism.launcher.nora.NoraChat.THREAD_ID) return
-        val popup = commandPopup ?: com.prism.launcher.nora.NoraCommandPopup(this).also {
-            it.onCommandChosen = { command ->
-                // Commands that take a prompt get a trailing space so the user can keep typing;
-                // the rest are complete as they stand.
-                val insert = if (command.takesPrompt) "${command.trigger} " else command.trigger
-                binding.conversationInput.setText(insert)
-                binding.conversationInput.setSelection(insert.length)
+        when (threadId) {
+            com.prism.launcher.nora.NoraChat.THREAD_ID -> {
+                val popup = commandPopup ?: com.prism.launcher.nora.NoraCommandPopup(this).also {
+                    it.onCommandChosen = { command ->
+                        // Commands that take a prompt get a trailing space so the user can keep
+                        // typing; the rest are complete as they stand.
+                        val insert = if (command.takesPrompt) "${command.trigger} " else command.trigger
+                        binding.conversationInput.setText(insert)
+                        binding.conversationInput.setSelection(insert.length)
+                    }
+                    commandPopup = it
+                }
+                popup.update(binding.conversationInputRow, text)
             }
-            commandPopup = it
+            com.prism.launcher.aether.AetherChat.THREAD_ID -> {
+                val popup = aetherCommandPopup ?: com.prism.launcher.aether.AetherCommandPopup(this).also {
+                    it.onCommandChosen = { command ->
+                        val insert = if (command.takesPrompt) "${command.trigger} " else command.trigger
+                        binding.conversationInput.setText(insert)
+                        binding.conversationInput.setSelection(insert.length)
+                    }
+                    aetherCommandPopup = it
+                }
+                popup.update(binding.conversationInputRow, text)
+            }
+            else -> return
         }
-        popup.update(binding.conversationInputRow, text)
     }
 
     /** Mirrors the service's generation state into the live bubble. */
@@ -449,8 +664,18 @@ class ConversationActivity : AppCompatActivity() {
             dao.insert(AiMessageEntity(text = text, isSent = true, attachmentUri = uri?.toString(), attachmentType = mime))
 
             // 2. Show a live "thinking" placeholder until the first token streams back
+            //
+            // One timestamp for this whole reply's live bubble (thinking -> reasoning -> answer),
+            // reused on every MessageInfo built below instead of each picking up its own default
+            // System.currentTimeMillis(). MessagesAdapter's DiffUtil keys identity on
+            // MessageInfo.timestamp (see its own doc comment); a fresh timestamp per token made
+            // every single token look like a brand-new message, so RecyclerView removed the old
+            // bubble and inserted a new one on every token instead of updating the text in place
+            // -- the visible "clear, then reappear" flicker. A stable timestamp makes every token
+            // a content update on the SAME row, which streams smoothly instead.
+            val liveBubbleTimestamp = System.currentTimeMillis()
             withContext(Dispatchers.Main) {
-                liveBubble = MessageInfo("Sam is thinking", isSent = false, isThinking = true)
+                liveBubble = MessageInfo("Sam is thinking", isSent = false, isThinking = true, timestamp = liveBubbleTimestamp)
                 renderMessages()
             }
 
@@ -459,24 +684,48 @@ class ConversationActivity : AppCompatActivity() {
             // replacing the "is thinking" placeholder — then the real answer replaces that in turn.
             val accumulatedAnswer = StringBuilder()
             val accumulatedReasoning = StringBuilder()
+            // DERIVED FROM THE STORED MESSAGES rather than accumulated separately. The conversation
+            // is already persisted, already ordered and already marks who spoke, so a second copy
+            // kept alongside it could only ever disagree with it -- and would start empty after a
+            // restart, which is exactly when remembering matters.
+            //
+            // The live bubble is excluded: it holds the placeholder or a half-streamed reply, and
+            // the model must not be given its own unfinished sentence as context.
+            val dialogSoFar = dbMessages.filterNot { it.isThinking }.map { it.text }
+
             val (aiText, aiMedia) = AiManager.getResponse(
                 this@ConversationActivity, text, uri,
                 onToken = { delta ->
                     accumulatedAnswer.append(delta)
                     runOnUiThread {
-                        liveBubble = MessageInfo(accumulatedAnswer.toString(), isSent = false)
+                        liveBubble = MessageInfo(accumulatedAnswer.toString(), isSent = false, timestamp = liveBubbleTimestamp)
                         renderMessages()
                     }
                 },
                 onReasoning = { delta ->
                     accumulatedReasoning.append(delta)
                     runOnUiThread {
-                        liveBubble = MessageInfo(accumulatedReasoning.toString(), isSent = false)
+                        liveBubble = MessageInfo(accumulatedReasoning.toString(), isSent = false, timestamp = liveBubbleTimestamp)
                         renderMessages()
                     }
-                }
+                },
+                history = dialogSoFar,
             )
             val (mediaUrl, mediaType) = aiMedia
+
+            // 3b. GgufInferenceService.lastLoadDegradedMode reflects whatever load just happened
+            // (or was reused) to produce this response — accurate here, not before step 3, since
+            // loading itself happens inside AiManager.getResponse. A one-shot Toast rather than
+            // annotating aiText itself, so a transient "this reply came from swap" note never
+            // gets baked into persisted chat history.
+            val degradedMode = GgufInferenceService.lastLoadDegradedMode
+            if (degradedMode != GgufInferenceService.DegradedMode.NONE) {
+                val note = if (degradedMode == GgufInferenceService.DegradedMode.FULL_SWAP)
+                    "Sam is running fully from Prism Swap (not enough free RAM) — responses will be slower."
+                else
+                    "Sam is running in a reduced-memory mode (Prism Swap mitigation) — responses may be slower."
+                runOnUiThread { Toast.makeText(this@ConversationActivity, note, Toast.LENGTH_LONG).show() }
+            }
 
             // 4. Save AI Response, then drop the live bubble — the DB Flow picks up the real row
             dao.insert(AiMessageEntity(

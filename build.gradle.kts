@@ -6,6 +6,9 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
     id("org.jetbrains.compose") version "1.7.0" apply false
     id("org.jetbrains.kotlin.plugin.serialization") version "2.0.21" apply false
+    // Python on device, for CakeChat. 16.1 is the version that spans AGP 8.7 (7.0 - 8.13);
+    // free and open source since 12.0.1, so there is no licence gate on shipping it.
+    id("com.chaquo.python") version "16.1.0" apply false
 }
 
 // Shared in one place because :core and :app must resolve the SAME Room. They pull different

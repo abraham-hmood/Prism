@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  An isometric cube: the "put the conversation away and look at the model" affordance.
+  Stroked rather than filled so the three faces read as a wireframe rather than a solid block,
+  which keeps it legible at 20dp inside the compose row.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M12,2.7L20.3,7.35L20.3,16.65L12,21.3L3.7,16.65L3.7,7.35Z"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.7"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M12,12L20.3,7.35M12,12L3.7,7.35M12,12L12,21.3"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.7"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>

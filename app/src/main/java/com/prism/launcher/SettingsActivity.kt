@@ -29,6 +29,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import android.provider.OpenableColumns
 import com.prism.launcher.browser.P2pDnsManager
+import com.prism.launcher.stremio.StremioStore
 
 class SettingsActivity : PrismBaseActivity() {
 
@@ -62,6 +63,9 @@ class SettingsActivity : PrismBaseActivity() {
                 "Tunnelling, hotspot gateway, WireGuard and decentralized DNS",
                 listOf(
                     "Privacy & VPN",
+                    // Claimed here rather than left to fall through to "Other": history sits with
+                    // the other privacy controls, which is where someone looking for it will go.
+                    "Privacy & History",
                     "Mesh Bootstrap Server",
                     "Access Points (Hotspot Gateway)",
                     "Native VPN Server (WireGuard)",
@@ -70,12 +74,13 @@ class SettingsActivity : PrismBaseActivity() {
             ),
             Group(
                 "Intelligence & Messaging",
-                "AI engine, models, image generation, Nora and response behaviour",
+                "AI engine, models, image generation, Nora, Aether and response behaviour",
                 listOf(
                     "Intelligence & Messaging",
                     "Available LLM Models",
                     "Visual Intelligence (Diffusion)",
                     "Nora (Brain-Based Generation)",
+                    "Aether (Second Brain-Based AI)",
                     "Response Behavior"
                 )
             ),
@@ -121,6 +126,29 @@ class SettingsActivity : PrismBaseActivity() {
         return out
     }
 
+    /**
+     * The Prism search engine's current address, pinned to the top of the root settings page and
+     * copied to the clipboard on tap.
+     *
+     * The address is not a fixed string: on a mesh server node the engine is published at the
+     * reserved domain so every peer can reach it, and anywhere else it is a loopback server for
+     * this device only. Which of those is live depends on mesh state that can change while
+     * Settings is open, so this reads it fresh on every refresh rather than caching it.
+     */
+    private fun searchAddressRow(): SettingItem {
+        val address = com.prism.launcher.search.PrismSearchServer.address()
+        val where = if (PrismSettings.isPrismSearchOnMesh())
+            "Published on the mesh · tap to copy"
+        else
+            "Running locally on this device · tap to copy"
+        return SettingItem.Nav("Prism Search · $address", where, {
+            val clipboard = getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                as android.content.ClipboardManager
+            clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Prism Search", address))
+            android.widget.Toast.makeText(this, "Copied $address", android.widget.Toast.LENGTH_SHORT).show()
+        })
+    }
+
     /** Which group a header belongs to, falling back so nothing is orphaned. */
     private fun groupOf(header: String): String =
         GROUPS.firstOrNull { header in it.headers }?.title ?: "Other"
@@ -137,10 +165,11 @@ class SettingsActivity : PrismBaseActivity() {
                 .flatMap { listOf(SettingItem.Header(it.header)) + it.items }
         }
 
-        // Root: one row per group, plus "Other" if anything fell outside the map.
+        // Root: the search-engine address, then one row per group, plus "Other" if anything fell
+        // outside the map.
         val present = all.groupBy { groupOf(it.header) }
         val ordered = GROUPS.map { it.title } + listOf("Other")
-        return ordered.mapNotNull { title ->
+        return listOf(searchAddressRow()) + ordered.mapNotNull { title ->
             val members = present[title] ?: return@mapNotNull null
             if (members.all { it.items.isEmpty() }) return@mapNotNull null
             val summary = GROUPS.firstOrNull { it.title == title }?.summary
@@ -187,6 +216,7 @@ class SettingsActivity : PrismBaseActivity() {
         is SettingItem.Picker -> item.title
         is SettingItem.TextInput -> item.title
         is SettingItem.Nav -> item.title
+        is SettingItem.Custom -> ""
     }
 
     private fun subtitleOf(item: SettingItem): String = when (item) {
@@ -195,6 +225,7 @@ class SettingsActivity : PrismBaseActivity() {
         is SettingItem.Picker -> item.subtitle
         is SettingItem.TextInput -> item.subtitle
         is SettingItem.Nav -> item.subtitle
+        is SettingItem.Custom -> ""
     }
 
     /** Same setting, same behaviour, with its description replaced by where it lives. */
@@ -204,9 +235,166 @@ class SettingsActivity : PrismBaseActivity() {
         is SettingItem.TextInput -> item.copy(subtitle = path)
         is SettingItem.Nav -> item.copy(subtitle = path)
         is SettingItem.Header -> item
+        is SettingItem.Custom -> item
     }
 
     /** Rebuilds whatever the screen is currently showing. */
+    /**
+     * Brings the Prism tunnel up, asking for VPN consent first when Android has not granted it.
+     *
+     * Android refuses to let an app open a VPN interface without an explicit one-time
+     * confirmation, so a settings toggle cannot simply start one. Without this the switch would
+     * flip and nothing would happen.
+     */
+    /** "3 sites · 12.4 MB", or "1 site · 0.4 MB". Shared by every row that reports cache size. */
+    private fun webCacheSummary(): String {
+        val sites = com.prism.launcher.browser.PrismWebCache.sites()
+        val mb = sites.sumOf { it.bytes } / (1024.0 * 1024.0)
+        return String.format(
+            java.util.Locale.US, "%d site%s · %.1f MB",
+            sites.size, if (sites.size == 1) "" else "s", mb
+        )
+    }
+
+    /**
+     * Turns mesh sharing of the web cache on or off.
+     *
+     * ASKS FIRST, BUT ONLY WHEN THERE IS SOMETHING TO HAND OVER. Switching this on publishes pages
+     * the user has already visited, which is a fact about their browsing rather than a file they
+     * chose -- so when a cache already exists the dialog says how much of it is about to leave the
+     * device. With an empty cache there is nothing to disclose and nothing to confirm, so the
+     * switch just takes effect: the checkbox is the decision, and a modal about zero sites would be
+     * noise.
+     *
+     * The preference is written only once the user has agreed, so a cancelled dialog leaves nothing
+     * half-applied; [refresh] then puts the switch back where it was.
+     */
+    private fun onWebCacheSharingChanged(enabled: Boolean) {
+        if (!enabled) {
+            PrismSettings.setWebCacheMeshSharing(false)
+            com.prism.launcher.browser.PrismWebCache.unpublishAll(this)
+            refresh()
+            return
+        }
+
+        val cached = com.prism.launcher.browser.PrismWebCache.sites()
+        if (cached.isEmpty()) {
+            PrismSettings.setWebCacheMeshSharing(true)
+            refresh()
+            return
+        }
+
+        PrismDialogFactory.show(
+            this,
+            "Share your cached pages?",
+            "${webCacheSummary()} will be served to every peer on the mesh, under " +
+                "<site>${com.prism.launcher.browser.PrismWebCache.MESH_SUFFIX}.\n\n" +
+                "These are pages you visited, so treat this as publishing part of your browsing " +
+                "history. You can stop at any time, and peers keep no copy unless they mirror one.",
+            positiveText = "Share",
+            negativeText = "Cancel",
+            onPositive = {
+                PrismSettings.setWebCacheMeshSharing(true)
+                com.prism.launcher.browser.PrismWebCache.publishAll(this)
+                refresh()
+            },
+            onNegative = { refresh() }
+        )
+    }
+
+    /** Lists what has been cached, with one way out: delete all of it. */
+    private fun showCachedSites() {
+        val sites = com.prism.launcher.browser.PrismWebCache.sites()
+        if (sites.isEmpty()) return
+
+        val labels = sites.map { site ->
+            val mb = site.bytes / (1024.0 * 1024.0)
+            String.format(
+                java.util.Locale.US, "%s — %d page%s, %.1f MB",
+                site.host, site.pages, if (site.pages == 1) "" else "s", mb
+            )
+        }
+
+        val list = android.widget.ListView(this).apply {
+            adapter = android.widget.ArrayAdapter(
+                this@SettingsActivity, android.R.layout.simple_list_item_1, labels
+            )
+        }
+
+        PrismDialogFactory.show(
+            this,
+            "Cached sites",
+            "Individual sites can be opened or removed from the browser's Downloads list.",
+            positiveText = "Delete all",
+            negativeText = "Close",
+            onPositive = {
+                com.prism.launcher.browser.PrismWebCache.clearAll(this)
+                Toast.makeText(this, "Web cache deleted", Toast.LENGTH_SHORT).show()
+                refresh()
+            },
+            customView = list
+        )
+    }
+
+    /** Asks before wiping, and says plainly that it cannot be undone. */
+    private fun confirmClearHistory() {
+        PrismDialogFactory.show(
+            this,
+            "Clear personal history?",
+            "${com.prism.launcher.history.PrismHistory.count()} recorded entries will be deleted " +
+                "from this device. This cannot be undone, and the assistant will no longer be able " +
+                "to answer questions about your past activity.",
+            positiveText = "Delete",
+            negativeText = "Cancel",
+            onPositive = {
+                com.prism.launcher.history.PrismHistory.clear()
+                Toast.makeText(this, "Personal history cleared", Toast.LENGTH_SHORT).show()
+                refresh()
+            }
+        )
+    }
+
+    /**
+     * Turns Prism's .exe handler on or off in the package manager.
+     *
+     * The intent filter is declared disabled in the manifest and enabled here, so Prism only shows
+     * up in "Open with" for Windows executables when the user has actually asked for that. A
+     * launcher that volunteers for file types it cannot open is a nuisance to everyone who installed
+     * it for the other twenty features.
+     */
+    private fun setExeHandlerEnabled(enabled: Boolean) {
+        runCatching {
+            packageManager.setComponentEnabledSetting(
+                android.content.ComponentName(
+                    this, com.prism.launcher.virtualization.ExeLaunchActivity::class.java
+                ),
+                if (enabled) android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+                else android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                android.content.pm.PackageManager.DONT_KILL_APP,
+            )
+        }.onFailure {
+            PrismLogger.logWarning("Prism", "Could not change the .exe handler: ${it.message}")
+        }
+    }
+
+    private fun startPrismVpnTunnel() {
+        val consent = android.net.VpnService.prepare(this)
+        if (consent != null) {
+            startActivity(consent)
+            return
+        }
+        com.prism.launcher.browser.PrivateDnsVpnService.start(this)
+
+        // The service comes up on its own thread, so rows gated on a LIVE tunnel are still reading
+        // "not connected" when the caller's refresh() runs a microsecond from now. One delayed
+        // re-read lets them enable themselves, instead of the user having to leave the screen and
+        // come back to discover the state changed.
+        if (::binding.isInitialized) {
+            binding.root.postDelayed({ if (!isFinishing) refresh() }, 1500L)
+        }
+    }
+
+
     private fun refresh() {
         if (::adapter.isInitialized) adapter.setItems(displayItems())
     }
@@ -236,6 +424,29 @@ class SettingsActivity : PrismBaseActivity() {
         }
     }
 
+    /**
+     * Picks a keyboard background.
+     *
+     * OpenDocument rather than GetContent, because the keyboard reads this URI again every time it
+     * is shown — possibly weeks later, from a different process. GetContent hands out a grant that
+     * dies with the activity; only OpenDocument's can be persisted.
+     */
+    private val writerBackgroundPicker =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            uri ?: return@registerForActivityResult
+            runCatching {
+                contentResolver.takePersistableUriPermission(
+                    uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            }
+            PrismSettings.addWriterBackground(uri.toString())
+            writerBackgroundGrid?.refresh()
+            refresh()
+        }
+
+    /** Held so the picker callback and the settings list share one instance, with its own state. */
+    private var writerBackgroundGrid: com.prism.launcher.writer.WriterBackgroundGrid? = null
+
     private val fontPicker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) {
             copyFontToInternal(uri)
@@ -245,7 +456,23 @@ class SettingsActivity : PrismBaseActivity() {
     private val modelPicker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) {
             val fileName = getFileNameFromUri(uri)
-            com.prism.launcher.messaging.ModelDownloadManager.copyUriToInternal(this, uri, fileName, isPickingImageModel) { success, error ->
+            val progressDialog = com.prism.launcher.messaging.ModelLoadProgressDialog(this)
+            progressDialog.show()
+            com.prism.launcher.messaging.ModelDownloadManager.copyUriToInternal(
+                this, uri, fileName, isPickingImageModel,
+                onProgress = { copied, total ->
+                    if (total > 0) {
+                        val pct = ((copied * 100) / total).toInt()
+                        progressDialog.update("Copying $fileName… %.1f/%.1f MB".format(
+                            copied / (1024.0 * 1024.0), total / (1024.0 * 1024.0)
+                        ), pct)
+                    } else {
+                        progressDialog.update("Copying $fileName…")
+                    }
+                },
+                onStage = { stage -> progressDialog.update(stage) }
+            ) { success, error ->
+                progressDialog.dismiss()
                 if (success) {
                     refresh()
                 } else {
@@ -356,6 +583,42 @@ class SettingsActivity : PrismBaseActivity() {
         }
     }
 
+    /**
+     * CakeChat's entry point, which does something different depending on what is on disk.
+     *
+     * ABSENT downloads the repository. Anything else opens the trainer -- including TRAINED, since
+     * retraining on a new corpus is the only thing left to do with it. There is deliberately no
+     * "download weights" branch: the upstream bucket that served them died with the project, so a
+     * fresh install genuinely has nothing to answer with until it has been trained.
+     */
+    private fun openCakeChat() {
+        val install = com.prism.launcher.cakechat.CakeChatInstall
+        if (install.state(this) != com.prism.launcher.cakechat.CakeChatInstall.State.ABSENT) {
+            startActivity(
+                android.content.Intent(
+                    this, com.prism.launcher.cakechat.CakeChatTrainingActivity::class.java
+                )
+            )
+            return
+        }
+
+        android.widget.Toast.makeText(
+            this, "Downloading CakeChat from GitHub…", android.widget.Toast.LENGTH_SHORT
+        ).show()
+        Thread({
+            val ok = install.install(applicationContext)
+            runOnUiThread {
+                android.widget.Toast.makeText(
+                    this,
+                    if (ok) "CakeChat installed. Open it again to train."
+                    else "CakeChat download failed — see diagnostics.",
+                    android.widget.Toast.LENGTH_LONG,
+                ).show()
+                refresh()
+            }
+        }, "cakechat-install").start()
+    }
+
     private fun downloadModel(name: String, url: String, isImageModel: Boolean = false) {
         com.prism.launcher.messaging.ModelDownloadManager.download(this, name, url, isImageModel)
         refresh()
@@ -421,19 +684,39 @@ class SettingsActivity : PrismBaseActivity() {
         binding.settingsToolbar.setNavigationOnClickListener { finish() }
 
         // Setup Theme Toggle
-        val currentMode = PrismSettings.getThemeMode()
-        binding.themeToggle.setImageResource(
-            if (currentMode == PrismSettings.THEME_LIGHT) R.drawable.ic_theme_moon 
-            else R.drawable.ic_theme_sun
-        )
+        //
+        // THE MODE IS READ ON EVERY TAP, not captured once. It used to be read into a local before
+        // the listener was built, so the closure kept the value the screen was created with and
+        // every tap computed its target from that stale copy -- which is why switching the theme
+        // took several presses before anything happened.
+        //
+        // The switch is also left to AppCompat now. Changing the default night mode already
+        // recreates every started activity; the old code ALSO did finish() + startActivity() on top
+        // of that, so two recreations raced and whichever lost re-read the setting at the wrong
+        // moment.
+        fun paintThemeToggle() {
+            binding.themeToggle.setImageResource(
+                if (PrismSettings.getThemeMode() == PrismSettings.THEME_LIGHT)
+                    R.drawable.ic_theme_moon
+                else
+                    R.drawable.ic_theme_sun
+            )
+        }
+        paintThemeToggle()
         binding.themeToggle.setOnClickListener {
-            val nextMode = if (currentMode == PrismSettings.THEME_LIGHT) PrismSettings.THEME_DARK else PrismSettings.THEME_LIGHT
+            val nextMode =
+                if (PrismSettings.getThemeMode() == PrismSettings.THEME_LIGHT)
+                    PrismSettings.THEME_DARK
+                else
+                    PrismSettings.THEME_LIGHT
             PrismSettings.setThemeMode(nextMode)
-            
-            // Restart with fade
-            finish()
-            overridePendingTransition(android.R.anim.fade_in, android.R.anim.fade_out)
-            startActivity(intent)
+            paintThemeToggle()
+            androidx.appcompat.app.AppCompatDelegate.setDefaultNightMode(
+                if (nextMode == PrismSettings.THEME_LIGHT)
+                    androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_NO
+                else
+                    androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_YES
+            )
         }
 
         // Root screen or one group's screen — same activity either way, so every
@@ -483,6 +766,12 @@ class SettingsActivity : PrismBaseActivity() {
     }
 
     private fun buildItems(): List<SettingItem> {
+        // MINIMUM_INTERVAL_HOURS is the floor the scanner enforces, so the shortest option here
+        // matches it rather than offering something it would silently clamp.
+        val scannerIntervals = listOf(
+            ModelListingScanner.MINIMUM_INTERVAL_HOURS, 2, 4, 6, 12, 24
+        ).distinct()
+
         return listOf(
             SettingItem.Header("Launcher"),
             SettingItem.Picker(
@@ -548,22 +837,118 @@ class SettingsActivity : PrismBaseActivity() {
             SettingItem.Picker(
                 "Search engine",
                 "Default engine for the address bar",
-                listOf("DuckDuckGo", "Google", "Bing", "Custom"),
+                listOf("Prism", "DuckDuckGo", "Google", "Bing", "Custom"),
                 when (PrismSettings.getSearchEngine()) {
-                    "google" -> 1
-                    "bing" -> 2
-                    "custom" -> 3
-                    else -> 0
+                    "prism" -> 0
+                    "google" -> 2
+                    "bing" -> 3
+                    "custom" -> 4
+                    else -> 1
                 },
                 { idx ->
                     val engine = when (idx) {
-                        1 -> "google"
-                        2 -> "bing"
-                        3 -> "custom"
+                        0 -> "prism"
+                        2 -> "google"
+                        3 -> "bing"
+                        4 -> "custom"
                         else -> "ddg"
                     }
                     PrismSettings.setSearchEngine(engine)
                     if (engine == "custom") promptCustomSearchUrl()
+                    refresh()
+                }
+            ),
+            SettingItem.Picker(
+                "Prism search crawl interval",
+                "How often the crawler rebuilds the index",
+                listOf("Off", "Every hour", "Every 2 hours", "Every 6 hours", "Every 12 hours", "Daily"),
+                when (PrismSettings.getSearchCrawlIntervalHours()) {
+                    0 -> 0; 1 -> 1; 6 -> 3; 12 -> 4; 24 -> 5; else -> 2
+                },
+                { idx ->
+                    PrismSettings.setSearchCrawlIntervalHours(
+                        when (idx) { 0 -> 0; 1 -> 1; 3 -> 6; 4 -> 12; 5 -> 24; else -> 2 }
+                    )
+                }
+            ),
+            SettingItem.TextInput(
+                "Search seeds",
+                "Where crawls start. One URL per line",
+                PrismSettings.getUserSearchSeedsRaw(),
+                { PrismSettings.setSearchSeeds(it); refresh() }
+            ),
+            SettingItem.Nav(
+                "View all seeds",
+                run {
+                    val u = PrismSettings.getUserSearchSeeds().size
+                    val d = PrismSettings.getDiscoveredSearchSeeds().size
+                    "$u yours + $d found + ${PrismSettings.DEFAULT_SEARCH_SEEDS.size} built-in"
+                },
+                { showSeedList() }
+            ),
+            SettingItem.TextInput(
+                "Maximum discovered seeds",
+                "How many found sites to keep. -1 for no limit",
+                PrismSettings.getMaxDiscoveredSeeds().toString(),
+                { raw ->
+                    val parsed = raw.trim().toIntOrNull()
+                    if (parsed == null) {
+                        android.widget.Toast.makeText(this, "Enter a number, or -1 for no limit", android.widget.Toast.LENGTH_SHORT).show()
+                    } else {
+                        PrismSettings.setMaxDiscoveredSeeds(parsed)
+                    }
+                    refresh()
+                },
+                isSingleLine = true
+            ),
+            SettingItem.Nav(
+                "Add a seed",
+                "Add one site to the crawl without editing the list",
+                { promptAddSearchSeed() }
+            ),
+            SettingItem.Nav(
+                "Sites found by the crawler",
+                run {
+                    val n = PrismSettings.getDiscoveredSearchSeeds().size
+                    if (n == 0) "None yet - they appear here after a crawl"
+                    else "$n site(s) discovered automatically - tap to clear"
+                },
+                {
+                    if (PrismSettings.getDiscoveredSearchSeeds().isEmpty()) {
+                        android.widget.Toast.makeText(
+                            this, "Nothing discovered yet", android.widget.Toast.LENGTH_SHORT
+                        ).show()
+                    } else {
+                        androidx.appcompat.app.AlertDialog.Builder(this)
+                            .setTitle("Clear discovered sites?")
+                            .setMessage(
+                                "The crawler will rediscover them on its next run. Your own seeds " +
+                                    "are not affected."
+                            )
+                            .setPositiveButton("Clear") { _, _ ->
+                                PrismSettings.clearDiscoveredSearchSeeds()
+                                refresh()
+                            }
+                            .setNegativeButton("Cancel", null)
+                            .show()
+                    }
+                }
+            ),
+            SettingItem.Nav(
+                "Diagnose search & browser",
+                "Runs connection checks and opens the log",
+                {
+                    startActivity(android.content.Intent(this, DiagnosticsActivity::class.java))
+                }
+            ),
+            SettingItem.Nav(
+                "Rebuild search index now",
+                if (com.prism.launcher.search.PrismSearchServer.isCrawling()) "Crawling…"
+                else com.prism.launcher.search.PrismSearchServer.lastCrawlSummary,
+                {
+                    com.prism.launcher.search.PrismSearchServer.crawlNow()
+                    android.widget.Toast.makeText(this, "Crawl started", android.widget.Toast.LENGTH_SHORT).show()
+                    refresh()
                 }
             ),
             SettingItem.Toggle(
@@ -584,8 +969,21 @@ class SettingsActivity : PrismBaseActivity() {
                 "Enable VPN Tunneling",
                 "Route traffic through Prism or an external VPN",
                 PrismSettings.getVpnTunnelingEnabled(),
-                { 
-                    PrismSettings.setVpnTunnelingEnabled(it) 
+                {
+                    PrismSettings.setVpnTunnelingEnabled(it)
+                    // The mesh cannot outlive its transport. Without this the toggle above would
+                    // grey out while the gossip loop kept running over a tunnel that no longer
+                    // exists.
+                    if (!it && PrismSettings.getMeshEnabled()) {
+                        PrismSettings.setMeshEnabled(false)
+                        com.prism.launcher.mesh.PrismMeshService.stop()
+                    }
+                    // TELL THE ENGINE, rather than only recording the preference. This used to do
+                    // neither -- it wrote the setting and nothing brought the backbone up, so
+                    // enabling tunnelling did nothing observable until the app was restarted, and
+                    // every feature gated on a live tunnel stayed unavailable in the meantime.
+                    // start() reads the setting itself and idles the backbone when it is off.
+                    runCatching { (application as PrismApp).tunnelEngine.start() }
                     refresh()
                 }
             ),
@@ -603,6 +1001,8 @@ class SettingsActivity : PrismBaseActivity() {
                 if (PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_EXTERNAL) 1 else 0,
                 {
                     PrismSettings.setVpnMode(if (it == 1) PrismSettings.VPN_MODE_EXTERNAL else PrismSettings.VPN_MODE_PRISM)
+                    // Reconfigures for the new mode; without this the old one kept running.
+                    runCatching { (application as PrismApp).tunnelEngine.start() }
                     refresh()
                 },
                 isEnabled = PrismSettings.getVpnTunnelingEnabled()
@@ -611,10 +1011,19 @@ class SettingsActivity : PrismBaseActivity() {
                 "Persistent VPN Server",
                 "Keep Prism Server running even outside of private browsing (Backbone mode)",
                 PrismSettings.getVpnServerAlwaysOn(),
-                { 
-                    PrismSettings.setVpnServerAlwaysOn(it) 
+                { enabled ->
+                    PrismSettings.setVpnServerAlwaysOn(enabled)
+                    if (enabled) {
+                        // Switching this on now BRINGS THE SERVER UP, rather than only recording a
+                        // preference and hoping something else starts the service later. Turning on
+                        // a thing called "Persistent VPN Server" and finding no server running is
+                        // the wrong outcome, and it was the previous one whenever the service was
+                        // not already alive: start() was called, but nothing put the device into
+                        // the server role or established the tunnel.
+                        PrismSettings.setPrismVpnRole(PrismSettings.PRISM_ROLE_SERVER)
+                        startPrismVpnTunnel()
+                    }
                     refresh()
-                    // Start or let service re-evaluate
                     com.prism.launcher.browser.PrivateDnsVpnService.start(this)
                 },
                 isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM
@@ -626,6 +1035,9 @@ class SettingsActivity : PrismBaseActivity() {
                 if (PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_SERVER) 1 else 0,
                 {
                     PrismSettings.setPrismVpnRole(if (it == 1) PrismSettings.PRISM_ROLE_SERVER else PrismSettings.PRISM_ROLE_CLIENT)
+                    // Swapping role swaps which listeners should be bound, so the engine has to be
+                    // told; it tears the old role down before building the new one.
+                    runCatching { (application as PrismApp).tunnelEngine.start() }
                     refresh()
                 },
                 isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM
@@ -686,6 +1098,28 @@ class SettingsActivity : PrismBaseActivity() {
                 isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM && PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_CLIENT
             ),
             SettingItem.Header("Mesh Bootstrap Server"),
+            SettingItem.Toggle(
+                "Enable Mesh",
+                if (PrismSettings.getVpnTunnelingEnabled())
+                    "Background discovery/gossip for P2P DNS, hosting and model sharing. Off stops the always-on listener and gossip loop."
+                else
+                    "Needs VPN tunnelling \u2014 the mesh runs over the Prism tunnel, so it cannot reach a single peer without it.",
+                PrismSettings.getMeshEnabled() && PrismSettings.getVpnTunnelingEnabled(),
+                { enabled ->
+                    PrismSettings.setMeshEnabled(enabled)
+                    if (enabled) {
+                        com.prism.launcher.mesh.PrismMeshService.start()
+                    } else {
+                        com.prism.launcher.mesh.PrismMeshService.stop()
+                    }
+                    refresh()
+                },
+                // GATED ON THE TUNNEL because every mesh packet rides it. Left switchable, the mesh
+                // could be turned on with no transport underneath, and the symptom -- a mesh that
+                // finds nobody, a model shop that is always empty -- gives no hint that the missing
+                // piece is the tunnel.
+                isEnabled = PrismSettings.getVpnTunnelingEnabled()
+            ),
             SettingItem.TextInput(
                 "Bootstrap Address",
                 "Primary entry point for P2P DNS & Mesh search",
@@ -716,13 +1150,147 @@ class SettingsActivity : PrismBaseActivity() {
                 },
                 isEnabled = PrismSettings.getVpnTunnelingEnabled()
             ),
+            SettingItem.Header("Privacy & History"),
+            SettingItem.Toggle(
+                "Keep a personal history",
+                if (PrismSettings.getHistoryEnabled())
+                    "Recording the pages you read, videos you watch, messages you send and files " +
+                        "you open — ${com.prism.launcher.history.PrismHistory.count()} entries, " +
+                        "on this device only. Private tabs are never recorded."
+                else
+                    "Keep a searchable record of what you have read, watched and opened. Stays on " +
+                        "this device; private tabs are never recorded.",
+                PrismSettings.getHistoryEnabled(),
+                { enabled ->
+                    PrismSettings.setHistoryEnabled(enabled)
+                    // Switching it off also revokes the AI's access: leaving that on would mean a
+                    // model could still read everything recorded up to the moment the user said stop.
+                    if (!enabled) PrismSettings.setHistoryToolEnabled(false)
+                    refresh()
+                }
+            ),
+            SettingItem.Toggle(
+                "Let AI search your history",
+                when {
+                    !PrismSettings.getHistoryEnabled() ->
+                        "Turn on personal history first — there is nothing to search."
+                    PrismSettings.getHistoryToolEnabled() ->
+                        "The assistant can answer questions about your own past using the " +
+                            "search_personal_history tool."
+                    else ->
+                        "Gives the assistant a tool for questions like “that article I read " +
+                            "last month”. Note that a cloud AI engine would receive whatever " +
+                            "it searches."
+                },
+                PrismSettings.getHistoryToolEnabled() && PrismSettings.getHistoryEnabled(),
+                { enabled -> PrismSettings.setHistoryToolEnabled(enabled); refresh() },
+                isEnabled = PrismSettings.getHistoryEnabled()
+            ),
+            SettingItem.Nav(
+                "Clear personal history",
+                if (com.prism.launcher.history.PrismHistory.count() == 0)
+                    "Nothing recorded yet"
+                else
+                    "${com.prism.launcher.history.PrismHistory.count()} entries · deletes the file, not just the list",
+                { confirmClearHistory() },
+                isEnabled = com.prism.launcher.history.PrismHistory.count() > 0
+            ),
+
             SettingItem.Toggle(
                 "Locked private tabs",
                 "Require biometric unlock to access private tabs",
                 PrismSettings.getPrivateTabsLocked(),
                 { PrismSettings.setPrivateTabsLocked(it) }
             ),
-            
+
+            // ── Web cache ──────────────────────────────────────────────────
+            //
+            // Two rows, in dependency order, each greyed out until what it needs is true. The
+            // gating conditions are read from PrismWebCache rather than restated here, so a row
+            // that looks available cannot disagree with what the next page load actually does.
+            SettingItem.Toggle(
+                "Allow web caching",
+                when {
+                    // Says which condition is missing, rather than leaving a greyed row unexplained.
+                    com.prism.launcher.browser.PrismWebCache.cachingUnavailableReason() != null ->
+                        com.prism.launcher.browser.PrismWebCache.cachingUnavailableReason()!!
+                    PrismSettings.getWebCacheEnabled() ->
+                        "Keeping a copy of the pages you visit · ${webCacheSummary()}. " +
+                            "Private to this device unless you share it below."
+                    else ->
+                        "Keep a copy of each page you visit so it can be re-opened later without " +
+                            "the original site. Private tabs are never cached."
+                },
+                // ANDed with availability, the way "Enable Mesh" is: a preference left on from a
+                // session when the tunnel was up must not read as active once it is down.
+                PrismSettings.getWebCacheEnabled() &&
+                    com.prism.launcher.browser.PrismWebCache.cachingAvailable(),
+                { enabled ->
+                    PrismSettings.setWebCacheEnabled(enabled)
+                    if (!enabled) {
+                        // Sharing cannot outlive caching. Left latently true, re-enabling the cache
+                        // later would silently start publishing again -- a decision the user made
+                        // about a cache that no longer existed.
+                        PrismSettings.setWebCacheMeshSharing(false)
+                        com.prism.launcher.browser.PrismWebCache.unpublishAll(this)
+                    }
+                    refresh()
+                },
+                isEnabled = com.prism.launcher.browser.PrismWebCache.cachingAvailable()
+            ),
+            SettingItem.Toggle(
+                "Make cached sites available on the Meshnet",
+                when {
+                    com.prism.launcher.browser.PrismWebCache.cachingUnavailableReason() != null ->
+                        com.prism.launcher.browser.PrismWebCache.cachingUnavailableReason()!!
+                    !PrismSettings.getWebCacheEnabled() ->
+                        "Turn on web caching first — there is nothing to share until pages " +
+                            "are being kept."
+                    PrismSettings.getWebCacheMeshSharing() ->
+                        "Serving ${webCacheSummary()} to peers as " +
+                            "<site>${com.prism.launcher.browser.PrismWebCache.MESH_SUFFIX}"
+                    else ->
+                        "Let mesh peers open your cached pages. Published under " +
+                            "${com.prism.launcher.browser.PrismWebCache.MESH_SUFFIX} — never " +
+                            "as the real domain, so the live site keeps resolving normally."
+                },
+                PrismSettings.getWebCacheMeshSharing() &&
+                    com.prism.launcher.browser.PrismWebCache.meshSharingAvailable(),
+                { enabled -> onWebCacheSharingChanged(enabled) },
+                isEnabled = com.prism.launcher.browser.PrismWebCache.meshSharingAvailable()
+            ),
+            SettingItem.Toggle(
+                "Add cached videos to Lyke",
+                when {
+                    com.prism.launcher.browser.PrismWebCache.cachingUnavailableReason() != null ->
+                        com.prism.launcher.browser.PrismWebCache.cachingUnavailableReason()!!
+                    !PrismSettings.getWebCacheEnabled() ->
+                        "Turn on web caching first — there are no videos to post until pages " +
+                            "are being kept."
+                    PrismSettings.getWebCacheLykeUpload() ->
+                        "Every video cached from a page is posted to your Lyke feed, captioned " +
+                            "with where it came from."
+                    else ->
+                        "Post each cached video to your Lyke feed. These are other people's " +
+                            "videos and a Lyke post syncs to peers, so it publishes under your name."
+                },
+                PrismSettings.getWebCacheLykeUpload() &&
+                    com.prism.launcher.browser.PrismWebCache.meshSharingAvailable(),
+                { enabled -> PrismSettings.setWebCacheLykeUpload(enabled); refresh() },
+                // Same gate as sharing: a live tunnel and caching switched on. Not gated on mesh
+                // sharing of the CACHE, which is a different question -- Lyke has its own feed.
+                isEnabled = com.prism.launcher.browser.PrismWebCache.meshSharingAvailable()
+            ),
+            SettingItem.Nav(
+                "Cached sites",
+                if (com.prism.launcher.browser.PrismWebCache.sites().isEmpty())
+                    "Nothing cached yet"
+                else
+                    "${webCacheSummary()} · tap to review or delete",
+                { showCachedSites() },
+                isEnabled = com.prism.launcher.browser.PrismWebCache.sites().isNotEmpty()
+            ),
+
             SettingItem.Header("Access Points (Hotspot Gateway)"),
             SettingItem.Nav(
                 "Manage Access Points",
@@ -811,6 +1379,10 @@ class SettingsActivity : PrismBaseActivity() {
                         } else {
                             val m = hostedModels[idx - 1]
                             PrismSettings.setSelectedP2pModel(m.peerIp, m.modelName)
+                            // The other half of the same exclusivity: a peer model outranks every
+                            // local engine, so leaving CakeChat marked active would show two
+                            // different models as the chosen one in two different screens.
+                            PrismSettings.setUseCakeChat(false)
                         }
                         refresh()
                     },
@@ -959,15 +1531,45 @@ class SettingsActivity : PrismBaseActivity() {
 
             SettingItem.Header("Available LLM Models"),
             SettingItem.Nav(
-                "Falcon-1B RefinedWeb",
-                "Fast & efficient (1B params, ~600MB)",
-                { downloadModel("Falcon-1B", PrismSettings.MODEL_FALCON_1B) },
+                "Falcon3-1B-Instruct",
+                "Pick a quantisation — the dialog lists what the repo actually publishes",
+                {
+                    QuantPickerDialog.show(
+                        this, "Falcon3-1B-Instruct", PrismSettings.MODEL_FALCON_1B_REPO
+                    )
+                },
                 isEnabled = PrismSettings.getAiMode() == PrismSettings.AI_MODE_LOCAL
             ),
             SettingItem.Nav(
                 "Qwen2.5-1.5B (Expert)",
                 "User-preferred high performance task bundle",
                 { downloadModel("Qwen-1.5B", PrismSettings.MODEL_QWEN_1_5) },
+                isEnabled = PrismSettings.getAiMode() == PrismSettings.AI_MODE_LOCAL
+            ),
+            SettingItem.Toggle(
+                "Answer With CakeChat",
+                if (com.prism.launcher.cakechat.CakeChatInstall.state(this) ==
+                    com.prism.launcher.cakechat.CakeChatInstall.State.TRAINED
+                )
+                    "Sam's local replies come from your trained CakeChat instead of the GGUF model"
+                else
+                    "Train CakeChat first — there are no pretrained weights to fall back on",
+                PrismSettings.getUseCakeChat(),
+                { PrismSettings.setUseCakeChat(it); refresh() },
+                isEnabled = com.prism.launcher.cakechat.CakeChatInstall.state(this) ==
+                    com.prism.launcher.cakechat.CakeChatInstall.State.TRAINED
+            ),
+            SettingItem.Nav(
+                "CakeChat (Replika)",
+                when (com.prism.launcher.cakechat.CakeChatInstall.state(this)) {
+                    com.prism.launcher.cakechat.CakeChatInstall.State.ABSENT ->
+                        "Download the source from GitHub — a conditioned seq2seq, trained on your own corpus"
+                    com.prism.launcher.cakechat.CakeChatInstall.State.INSTALLED ->
+                        "Installed but untrained — tap to supply a corpus and train it"
+                    com.prism.launcher.cakechat.CakeChatInstall.State.TRAINED ->
+                        "Trained and ready — tap to train again on a new corpus"
+                },
+                { openCakeChat() },
                 isEnabled = PrismSettings.getAiMode() == PrismSettings.AI_MODE_LOCAL
             ),
             SettingItem.Nav(
@@ -1003,6 +1605,13 @@ class SettingsActivity : PrismBaseActivity() {
                     { startActivity(android.content.Intent(this, com.prism.launcher.nora.NoraSettingsActivity::class.java)) }
                 )
             },
+
+            SettingItem.Header("Aether (Second Brain-Based AI)"),
+            SettingItem.Nav(
+                "Aether",
+                "Spiking neurons, not predictive coding — training, biotrain/biogen toggles",
+                { startActivity(android.content.Intent(this, com.prism.launcher.aether.AetherSettingsActivity::class.java)) }
+            ),
 
             SettingItem.Header("Response Behavior"),
             SettingItem.Toggle(
@@ -1065,6 +1674,18 @@ class SettingsActivity : PrismBaseActivity() {
                     PrismSettings.setAiBackend(idx)
                     refresh()
                 }
+            ),
+            SettingItem.Nav(
+                "Prism Swap",
+                "Lets Sam's local .gguf models spill onto disk when they don't fit in free RAM -- swap file size and activation thresholds" +
+                    if (PrismSettings.getPrismSwapEnabled()) " (on)" else " (off)",
+                { startActivity(android.content.Intent(this, com.prism.launcher.messaging.PrismSwapSettingsActivity::class.java)) }
+            ),
+            SettingItem.Nav(
+                "Dataset Downloads",
+                "Find and download training datasets from Hugging Face/GitHub for Nora and Aether" +
+                    if (PrismSettings.getDatasetAutoDownloadEnabled()) " (automatic downloads on)" else "",
+                { startActivity(android.content.Intent(this, com.prism.launcher.messaging.DatasetDownloadSettingsActivity::class.java)) }
             ),
             run {
                 val intervalHours = listOf(1, 2, 4, 6, 12, 24)
@@ -1150,8 +1771,380 @@ class SettingsActivity : PrismBaseActivity() {
                 isEnabled = PrismSettings.getFontStyle() == PrismSettings.FONT_STYLE_CUSTOM
             ),
 
+            SettingItem.Toggle(
+                "AI Search Summaries",
+                "Summarise Prism search results with a model you run yourself. Needs an imported " +
+                    "local model or an Ollama server — cloud models are deliberately not used.",
+                PrismSettings.getSearchAiSummary(),
+                { PrismSettings.setSearchAiSummary(it); refresh() }
+            ),
+            SettingItem.Nav(
+                "Summary Status",
+                com.prism.launcher.search.PrismSearchSummary.unavailableReason(),
+                { refresh() },
+                isEnabled = PrismSettings.getSearchAiSummary()
+            ),
+
+            // ── Prism Writer ─────────────────────────────────────────────────
+            SettingItem.Header("Prism Writer (Keyboard)"),
+            SettingItem.Nav(
+                "Enable Prism Writer",
+                "Opens Android's keyboard settings — a keyboard can only be enabled by the system",
+                {
+                    runCatching {
+                        startActivity(
+                            android.content.Intent(android.provider.Settings.ACTION_INPUT_METHOD_SETTINGS)
+                        )
+                    }
+                }
+            ),
+            SettingItem.Picker(
+                "Keyboard Theme",
+                "Follows the app you are typing in unless set explicitly",
+                listOf("Follow system", "Always light", "Always dark"),
+                when (PrismSettings.getWriterTheme()) {
+                    PrismSettings.WRITER_THEME_LIGHT -> 1
+                    PrismSettings.WRITER_THEME_DARK -> 2
+                    else -> 0
+                },
+                { idx ->
+                    PrismSettings.setWriterTheme(
+                        when (idx) {
+                            1 -> PrismSettings.WRITER_THEME_LIGHT
+                            2 -> PrismSettings.WRITER_THEME_DARK
+                            else -> PrismSettings.WRITER_THEME_SYSTEM
+                        }
+                    )
+                    refresh()
+                }
+            ),
+            SettingItem.Custom(
+                (writerBackgroundGrid ?: com.prism.launcher.writer.WriterBackgroundGrid(this).also {
+                    writerBackgroundGrid = it
+                    it.onAddRequested = { writerBackgroundPicker.launch(arrayOf("image/*")) }
+                    // Colour rows are enabled from this same flag, so the list has to be rebuilt
+                    // when the active image changes -- otherwise they stay greyed out until the
+                    // screen is reopened.
+                    it.onActiveChanged = { _ -> refresh() }
+                })
+            ),
+            SettingItem.Picker(
+                "Keyboard Background Dim",
+                "How much a background image is darkened so key labels stay readable",
+                listOf("None", "Light", "Medium", "Heavy"),
+                when (PrismSettings.getWriterBackgroundDim()) {
+                    0 -> 0
+                    in 1..25 -> 1
+                    in 26..50 -> 2
+                    else -> 3
+                },
+                { index ->
+                    PrismSettings.setWriterBackgroundDim(
+                        when (index) { 0 -> 0; 1 -> 20; 2 -> 40; else -> 65 }
+                    )
+                    writerBackgroundGrid?.refresh()
+                    refresh()
+                },
+                isEnabled = PrismSettings.getWriterBackgroundImage().isNotBlank(),
+            ),
+            SettingItem.Nav(
+                "Dictionary",
+                "Your word lists and redefinitions",
+                {
+                    startActivity(
+                        android.content.Intent(
+                            this, com.prism.launcher.writer.WriterDictionaryActivity::class.java
+                        )
+                    )
+                }
+            ),
+            SettingItem.Toggle(
+                "Suggestion Strip",
+                "Three candidates while you type, the likeliest in the middle",
+                PrismSettings.getWriterSuggestions(),
+                { PrismSettings.setWriterSuggestions(it); refresh() }
+            ),
+            hexColour(
+                "Keyboard Colour",
+                "The panel behind the keys. Blank follows the theme.",
+                PrismSettings.getWriterPanelColor(),
+                { PrismSettings.setWriterPanelColor(it) },
+                enabled = PrismSettings.getWriterBackgroundImage().isBlank(),
+            ),
+            hexColour(
+                "Key Colour",
+                "The keys themselves. Blank follows the theme.",
+                PrismSettings.getWriterKeyColor(),
+                { PrismSettings.setWriterKeyColor(it) },
+            ),
+            hexColour(
+                "Key Text Colour",
+                "Letters and icons. Blank follows the theme.",
+                PrismSettings.getWriterKeyTextColor(),
+                { PrismSettings.setWriterKeyTextColor(it) },
+            ),
+            hexColour(
+                "Accent Colour",
+                "Return key, and the highlight on long-press alternates.",
+                PrismSettings.getWriterAccentColor(),
+                { PrismSettings.setWriterAccentColor(it) },
+            ),
+            hexColour(
+                "Swipe Trail Colour",
+                "The glide path. Blank uses the default red.",
+                PrismSettings.getWriterTrailColor(),
+                { PrismSettings.setWriterTrailColor(it) },
+            ),
+            SettingItem.Toggle(
+                "Glowing Swipe Trail",
+                "Draws the glide path with a soft glow",
+                PrismSettings.getWriterTrailGlow(),
+                { PrismSettings.setWriterTrailGlow(it); refresh() }
+            ),
+            SettingItem.Toggle(
+                "Swipe Typing",
+                "Glide across letters to write a whole word",
+                PrismSettings.getWriterSwipeEnabled(),
+                { PrismSettings.setWriterSwipeEnabled(it); refresh() }
+            ),
+            SettingItem.Toggle(
+                "Autocorrect",
+                "Fixes a word when it is finished, never while it is being typed",
+                PrismSettings.getWriterAutocorrect(),
+                { PrismSettings.setWriterAutocorrect(it); refresh() }
+            ),
+            SettingItem.Picker(
+                "Key Vibration",
+                "Strength of the tick under each key",
+                listOf("Off", "Light", "Medium", "Strong"),
+                when (PrismSettings.getWriterHapticsMs()) {
+                    0 -> 0
+                    in 1..10 -> 1
+                    in 11..20 -> 2
+                    else -> 3
+                },
+                { idx ->
+                    PrismSettings.setWriterHapticsMs(listOf(0, 8, 14, 25)[idx])
+                    refresh()
+                }
+            ),
+            SettingItem.Toggle(
+                "AI Assisted Typing",
+                "Needs an active model. Also enables the live-translate key on the keyboard.",
+                PrismSettings.getWriterAiAssist(),
+                { PrismSettings.setWriterAiAssist(it); refresh() }
+            ),
+            SettingItem.TextInput(
+                "Translate Into",
+                PrismSettings.getWriterTranslateTarget(),
+                PrismSettings.getWriterTranslateTarget(),
+                { PrismSettings.setWriterTranslateTarget(it); refresh() },
+                isEnabled = PrismSettings.getWriterAiAssist(),
+                isSingleLine = true
+            ),
+            SettingItem.Toggle(
+                "Speak Translations",
+                "Reads the translation aloud in the target language as well as typing it",
+                PrismSettings.getWriterSpeakTranslation(),
+                { PrismSettings.setWriterSpeakTranslation(it); refresh() },
+                isEnabled = PrismSettings.getWriterAiAssist()
+            ),
+
+            // ── Mining ───────────────────────────────────────────────────────
+            SettingItem.Header("Wallet Mining"),
+            SettingItem.Picker(
+                "Mining Mode",
+                when (PrismSettings.getMiningMode()) {
+                    PrismSettings.MINING_MODE_SOLO ->
+                        "Solo: whole blocks only, and it needs your own full node"
+                    PrismSettings.MINING_MODE_MESH ->
+                        com.prism.launcher.wallet.MeshPool.unavailableReason()
+                            ?: ("Mesh pool: this device holds the pool connection and shares the " +
+                                "work with " + com.prism.launcher.wallet.MeshPool.memberCount() +
+                                " peer(s)")
+                    else ->
+                        "Pool: paid per share, which is the only mode where anything happens on a phone"
+                },
+                // The mesh entry is listed whatever the mesh is doing, and refused on selection
+                // instead of being hidden. A mode that vanishes gives a user nothing to act on;
+                // one that explains what it needs tells them to turn the mesh on.
+                listOf("Pool (Stratum)", "Solo (your own node)", "Mesh pool (share the connection)"),
+                when (PrismSettings.getMiningMode()) {
+                    PrismSettings.MINING_MODE_SOLO -> 1
+                    PrismSettings.MINING_MODE_MESH -> 2
+                    else -> 0
+                },
+                { idx ->
+                    if (idx == 2 && !com.prism.launcher.wallet.MeshPool.isAvailable()) {
+                        android.widget.Toast.makeText(
+                            this,
+                            com.prism.launcher.wallet.MeshPool.unavailableReason()
+                                ?: "Mesh pooling is unavailable.",
+                            android.widget.Toast.LENGTH_LONG,
+                        ).show()
+                    } else {
+                        PrismSettings.setMiningMode(
+                            when (idx) {
+                                1 -> PrismSettings.MINING_MODE_SOLO
+                                2 -> PrismSettings.MINING_MODE_MESH
+                                else -> PrismSettings.MINING_MODE_POOL
+                            }
+                        )
+                        // A device in mesh mode answers other people's coordinators even when it
+                        // is not mining itself; that is what makes it a pool rather than a list of
+                        // devices that happen to be mining.
+                        com.prism.launcher.wallet.MeshPool.setMemberEnabled(idx == 2)
+                    }
+                    refresh()
+                }
+            ),
+            SettingItem.Toggle(
+                "Host Prism's Own Node",
+                "Run the node on this device instead of connecting to one you already have. " +
+                    "Forces pruned mode on every chain that supports it; chains that cannot " +
+                    "prune need a 1-2 TB USB-C drive.",
+                PrismSettings.getSelfHostNode(),
+                { PrismSettings.setSelfHostNode(it); refresh() },
+                isEnabled = PrismSettings.getMiningMode() == PrismSettings.MINING_MODE_SOLO
+            ),
+            SettingItem.TextInput(
+                "Solo Node RPC URL",
+                // Disabled rather than hidden when Prism hosts its own node: a field that vanishes
+                // reads as a bug, whereas a greyed one with this subtitle explains itself.
+                if (PrismSettings.getSelfHostNode())
+                    "Not used — Prism is hosting its own node on 127.0.0.1"
+                else PrismSettings.getSoloNodeUrl().ifBlank { "e.g. http://192.168.1.10:8332" },
+                PrismSettings.getSoloNodeUrl(),
+                { PrismSettings.setSoloNodeUrl(it); refresh() },
+                isEnabled = PrismSettings.getMiningMode() == PrismSettings.MINING_MODE_SOLO &&
+                    !PrismSettings.getSelfHostNode(),
+                isSingleLine = true
+            ),
+            // ── Selling models ───────────────────────────────────────────────
+            SettingItem.Header("Selling Models"),
+            SettingItem.Toggle(
+                "Check On Every Sale",
+                "Check GitHub and Hugging Face the moment somebody buys, instead of waiting for " +
+                    "the periodic sweep. If the model is not publicly downloadable the sale is " +
+                    "approved and the buyer's payment is taken immediately. If it is, the listing " +
+                    "is removed and you are told why — Prism only allows selling models you made.",
+                ModelListingScanner.verifyOnSale(this),
+                { ModelListingScanner.setVerifyOnSale(this, it); refresh() }
+            ),
+            SettingItem.Picker(
+                "Check Interval",
+                // DISABLED RATHER THAN HIDDEN when checking on every sale. A control that
+                // disappears reads as a bug and hides what the fallback cadence would be; a greyed
+                // one with this subtitle says why it is not in use and what it would do if it were.
+                if (ModelListingScanner.verifyOnSale(this))
+                    "Not used — every sale is checked as it happens"
+                else
+                    "How often your listings are re-checked against GitHub and Hugging Face",
+                scannerIntervals.map { "$it hour${if (it == 1) "" else "s"}" },
+                scannerIntervals.indexOf(ModelListingScanner.intervalHours(this))
+                    .coerceAtLeast(0),
+                { idx -> ModelListingScanner.setIntervalHours(this, scannerIntervals[idx]); refresh() },
+                isEnabled = !ModelListingScanner.verifyOnSale(this)
+            ),
+
+            SettingItem.TextInput(
+                "Solo Node Credentials",
+                // The same field means two different things depending on the toggle above, so the
+                // subtitle has to say which one is in force.
+                if (PrismSettings.getSelfHostNode())
+                    "Credentials Prism's own node will be configured with (blank generates one)"
+                else if (PrismSettings.getSoloNodeCredentials().isBlank()) "rpcuser:rpcpassword"
+                else "Set",
+                PrismSettings.getSoloNodeCredentials(),
+                { PrismSettings.setSoloNodeCredentials(it); refresh() },
+                isEnabled = PrismSettings.getMiningMode() == PrismSettings.MINING_MODE_SOLO,
+                isSingleLine = true
+            ),
+            SettingItem.Toggle(
+                "Compile Missing Libraries On Device",
+                "EXPERIMENTAL. Lets Prism build mining libraries it does not ship, then load them " +
+                    "into its own process.",
+                PrismSettings.getExperimentalCompiler(),
+                { wanted ->
+                    // Enabling ALWAYS warns, every single time -- this is the largest trust
+                    // decision the app makes, and a toggle that goes quiet after the first
+                    // acceptance is how people forget it is on.
+                    if (wanted) {
+                        PrismDialogFactory.show(
+                            this@SettingsActivity,
+                            "This is highly experimental",
+                            "Prism will download source code, compile it on this device, and load " +
+                                "the result into its own process. Compiled code runs with EVERY " +
+                                "permission Prism has — storage, network, notifications, the " +
+                                "wallet.\n\n" +
+                                "Source archives are checked against a pinned hash before " +
+                                "anything is compiled, but you are still choosing to run code " +
+                                "that was not reviewed or signed by anyone.\n\n" +
+                                "Builds take a long time, run the CPU at full load, and may fail " +
+                                "for reasons that are not obvious.",
+                            positiveText = "I understand, enable it",
+                            negativeText = "Leave it off",
+                            onPositive = { PrismSettings.setExperimentalCompiler(true); refresh() },
+                            onNegative = { refresh() },
+                        )
+                    } else {
+                        PrismSettings.setExperimentalCompiler(false)
+                        refresh()
+                    }
+                }
+            ),
+            SettingItem.TextInput(
+                "Toolchain Pack URL",
+                PrismSettings.getToolchainUrl().ifBlank {
+                    "Not set — no clang pack is bundled or hosted yet"
+                },
+                PrismSettings.getToolchainUrl(),
+                { PrismSettings.setToolchainUrl(it); refresh() },
+                isEnabled = PrismSettings.getExperimentalCompiler(),
+                isSingleLine = true
+            ),
+            SettingItem.Picker(
+                "Mining Threads",
+                "0 lets Prism pick from the core count, leaving one core for everything else",
+                listOf("Automatic", "1", "2", "3", "4", "6", "8"),
+                listOf(0, 1, 2, 3, 4, 6, 8).indexOf(PrismSettings.getMiningThreads()).coerceAtLeast(0),
+                { idx -> PrismSettings.setMiningThreads(listOf(0, 1, 2, 3, 4, 6, 8)[idx]); refresh() }
+            ),
+
             // ── OS Virtualization ────────────────────────────────────────────
             SettingItem.Header("OS Virtualization"),
+            SettingItem.Toggle(
+                "Switch to running Windows executables",
+                when {
+                    !PrismSettings.getWindowsMode() ->
+                        "Turns the Virtualization page into a Windows runtime (Wine + box64) and " +
+                            "lets Prism open .exe files. Replaces the guest-OS view while on."
+                    com.prism.launcher.virtualization.WineInstaller.isInstalled(this) ->
+                        "Windows mode is on — the Virtualization page runs .exe files, and " +
+                            "Prism appears in the chooser for them."
+                    else ->
+                        "Windows mode is on, but the compatibility layer is not installed yet. " +
+                            "Open the Virtualization page to install it."
+                },
+                PrismSettings.getWindowsMode(),
+                { enabled ->
+                    PrismSettings.setWindowsMode(enabled)
+                    // The .exe chooser entry is a manifest component, toggled at runtime: leaving
+                    // Prism in the Open-with list for a mode the user switched off would offer to
+                    // open files it would then refuse.
+                    setExeHandlerEnabled(enabled)
+                    refresh()
+                }
+            ),
+            SettingItem.TextInput(
+                "Windows layer source",
+                PrismSettings.getWindowsLayerUrl().ifBlank {
+                    "Not set — a URL to a Wine + box64 + rootfs archive"
+                },
+                PrismSettings.getWindowsLayerUrl(),
+                { PrismSettings.setWindowsLayerUrl(it) },
+                isEnabled = PrismSettings.getWindowsMode()
+            ),
             SettingItem.Toggle(
                 "Enable Virtualization",
                 "Route app launches through the virtualization page",
@@ -1178,6 +2171,166 @@ class SettingsActivity : PrismBaseActivity() {
                 { isoPicker.launch(arrayOf("application/octet-stream", "*/*")) },
                 isEnabled = PrismSettings.getVirtualizationEnabled() &&
                     PrismSettings.getVirtualizationMode() == PrismSettings.VIRT_MODE_CUSTOM_ISO
+            ),
+
+            // ── Medical ──────────────────────────────────────────────────────
+            //
+            // Everything here is shown on the lock screen to whoever is holding the phone. That is
+            // the point -- the reader is a stranger giving first aid -- but it means the section
+            // says so before the first field rather than after.
+            SettingItem.Header("Medical"),
+            SettingItem.Nav(
+                "Lock screen",
+                when {
+                    !com.prism.launcher.lock.LockStore.isConfigured(this) ->
+                        "Off — set a PIN, password or pattern"
+                    com.prism.launcher.lock.LockStore.hasDuress(this) ->
+                        "On, with an emergency code set"
+                    else -> "On — no emergency code yet"
+                },
+                { startActivity(Intent(this, com.prism.launcher.lock.LockSetupActivity::class.java)) }
+            ),
+            SettingItem.Toggle(
+                "Show the medical card on the lock screen",
+                "Readable without unlocking, which is the point — a paramedic cannot unlock it. " +
+                    "Nothing is shown while every field below is empty.",
+                PrismSettings.getMedicalOnLock(),
+                { PrismSettings.setMedicalOnLock(it); refresh() },
+                isEnabled = com.prism.launcher.lock.LockStore.isConfigured(this)
+            ),
+            SettingItem.Picker(
+                "Blood type",
+                com.prism.launcher.lock.MedicalRecord.get(this).bloodType.ifBlank { "Not set" },
+                com.prism.launcher.lock.MedicalRecord.BLOOD_TYPES.map { it.ifBlank { "Not set" } },
+                com.prism.launcher.lock.MedicalRecord.BLOOD_TYPES
+                    .indexOf(com.prism.launcher.lock.MedicalRecord.get(this).bloodType)
+                    .coerceAtLeast(0),
+                { index ->
+                    val record = com.prism.launcher.lock.MedicalRecord.get(this)
+                    com.prism.launcher.lock.MedicalRecord.save(
+                        this,
+                        record.copy(bloodType = com.prism.launcher.lock.MedicalRecord.BLOOD_TYPES[index])
+                    )
+                    refresh()
+                }
+            ),
+            SettingItem.TextInput(
+                "Severe allergies",
+                com.prism.launcher.lock.MedicalRecord.get(this).allergies
+                    .ifBlank { "Penicillin, peanuts, latex…" },
+                com.prism.launcher.lock.MedicalRecord.get(this).allergies,
+                { value ->
+                    val record = com.prism.launcher.lock.MedicalRecord.get(this)
+                    com.prism.launcher.lock.MedicalRecord.save(this, record.copy(allergies = value))
+                    refresh()
+                }
+            ),
+            SettingItem.TextInput(
+                "Conditions",
+                com.prism.launcher.lock.MedicalRecord.get(this).conditions
+                    .ifBlank { "Epilepsy, diabetes, anticoagulants…" },
+                com.prism.launcher.lock.MedicalRecord.get(this).conditions,
+                { value ->
+                    val record = com.prism.launcher.lock.MedicalRecord.get(this)
+                    com.prism.launcher.lock.MedicalRecord.save(this, record.copy(conditions = value))
+                    refresh()
+                }
+            ),
+            SettingItem.TextInput(
+                "Medications",
+                com.prism.launcher.lock.MedicalRecord.get(this).medications.ifBlank { "None recorded" },
+                com.prism.launcher.lock.MedicalRecord.get(this).medications,
+                { value ->
+                    val record = com.prism.launcher.lock.MedicalRecord.get(this)
+                    com.prism.launcher.lock.MedicalRecord.save(this, record.copy(medications = value))
+                    refresh()
+                }
+            ),
+            SettingItem.Toggle(
+                "Do not resuscitate",
+                "Shown on the lock card as your stated wish. A phone screen is not an advance " +
+                    "directive and clinicians will treat it as information, not instruction.",
+                com.prism.launcher.lock.MedicalRecord.get(this).dnr,
+                { value ->
+                    val record = com.prism.launcher.lock.MedicalRecord.get(this)
+                    com.prism.launcher.lock.MedicalRecord.save(this, record.copy(dnr = value))
+                    refresh()
+                }
+            ),
+            SettingItem.Toggle(
+                "Organ donor",
+                "Shown alongside the rest of the card.",
+                com.prism.launcher.lock.MedicalRecord.get(this).organDonor,
+                { value ->
+                    val record = com.prism.launcher.lock.MedicalRecord.get(this)
+                    com.prism.launcher.lock.MedicalRecord.save(this, record.copy(organDonor = value))
+                    refresh()
+                }
+            ),
+            SettingItem.TextInput(
+                "Notes for a first responder",
+                com.prism.launcher.lock.MedicalRecord.get(this).notes.ifBlank { "Anything else that changes treatment" },
+                com.prism.launcher.lock.MedicalRecord.get(this).notes,
+                { value ->
+                    val record = com.prism.launcher.lock.MedicalRecord.get(this)
+                    com.prism.launcher.lock.MedicalRecord.save(this, record.copy(notes = value))
+                    refresh()
+                }
+            ),
+            SettingItem.Nav(
+                "Emergency contacts",
+                com.prism.launcher.lock.EmergencyContacts.all(this).let { list ->
+                    when (list.size) {
+                        0 -> "None — add them from Messaging > Contacts"
+                        1 -> list.first().name
+                        else -> "${list.size} people"
+                    }
+                },
+                {
+                    android.widget.Toast.makeText(
+                        this,
+                        "Open Messaging, switch to Contacts, and choose someone.",
+                        android.widget.Toast.LENGTH_LONG
+                    ).show()
+                }
+            ),
+
+            // ── Stremio ──────────────────────────────────────────────────────
+            //
+            // Deliberately NOT in any group in GROUPS, so groupOf() drops it into "Other" -- which
+            // is where it was asked for. Two rows rather than one screen with tabs: adding a
+            // repository and installing an add-on are separate decisions, and a user who has not
+            // added a repository has nothing to install.
+            SettingItem.Header("Stremio"),
+            SettingItem.Nav(
+                "Stremio repositories",
+                StremioStore.repositories(this).size.let { count ->
+                    when (count) {
+                        0 -> "None yet — a repository is a list of add-ons"
+                        1 -> "1 repository"
+                        else -> "$count repositories"
+                    }
+                },
+                {
+                    startActivity(
+                        Intent(this, com.prism.launcher.stremio.StremioRepositoriesActivity::class.java)
+                    )
+                }
+            ),
+            SettingItem.Nav(
+                "Stremio add-ons",
+                StremioStore.installed(this).size.let { count ->
+                    when (count) {
+                        0 -> "None installed — their catalogs appear in Lyke's search"
+                        1 -> "1 add-on installed"
+                        else -> "$count add-ons installed"
+                    }
+                },
+                {
+                    startActivity(
+                        Intent(this, com.prism.launcher.stremio.StremioAddonsActivity::class.java)
+                    )
+                }
             )
         )
     }
@@ -1225,8 +2378,51 @@ class SettingsActivity : PrismBaseActivity() {
         }.toTypedArray()
     }
 
+    /**
+     * A colour as a hex code.
+     *
+     * TEXT RATHER THAN A LIST OF PRESETS, because a preset list can only ever offer the handful of
+     * colours somebody thought of. Blank means "unset", which is how every one of these falls back
+     * to the light/dark palette — see PrismSettings, where 0 carries that meaning.
+     *
+     * Accepts `#RRGGBB`, `RRGGBB`, `#AARRGGBB`, with or without the hash. Anything unparseable is
+     * REJECTED RATHER THAN GUESSED AT: silently keeping the old colour after the user typed a new
+     * one looks like the setting is broken, so a bad code clears back to "follow the theme" and
+     * says so in the subtitle.
+     */
+    private fun hexColour(
+        title: String,
+        subtitle: String,
+        current: Int,
+        onChanged: (Int) -> Unit,
+        enabled: Boolean = true,
+    ): SettingItem = SettingItem.TextInput(
+        title,
+        if (enabled) subtitle else "Turned off while a background image is active",
+        if (current == 0) "" else String.format("#%06X", current and 0xFFFFFF),
+        { typed ->
+            val cleaned = typed.trim().removePrefix("#")
+            val parsed = when {
+                cleaned.isEmpty() -> 0
+                cleaned.length == 6 || cleaned.length == 8 ->
+                    cleaned.toLongOrNull(16)?.let { value ->
+                        // A six-digit code has no alpha; opaque is the only sensible reading.
+                        if (cleaned.length == 6) (0xFF000000L or value).toInt() else value.toInt()
+                    } ?: 0
+                else -> 0
+            }
+            onChanged(parsed)
+            refresh()
+        },
+        isEnabled = enabled,
+        isSingleLine = true,
+    )
+
     private fun onItemClick(item: SettingItem, position: Int) {
         when (item) {
+            // Hosted views handle their own touches; listed so the compiler keeps
+            // checking that every other case is covered.
+            is SettingItem.Custom -> Unit
             is SettingItem.Toggle -> {
                 item.value = !item.value
                 item.onChanged(item.value)
@@ -1396,6 +2592,81 @@ class SettingsActivity : PrismBaseActivity() {
         }, customView = layout)
     }
 
+    /**
+     * Adds a single seed without making the user hand-edit the whole list.
+     *
+     * Prefixes a bare host with https:// rather than rejecting it: someone adding a seed types
+     * "example.com", and refusing that on a technicality is the kind of thing that makes a
+     * feature feel broken when it is merely pedantic.
+     */
+    /**
+     * Shows every seed a crawl would start from, grouped by where it came from.
+     *
+     * Grouped rather than merged because the three sources behave differently: the user's are
+     * permanent and hand-edited, the crawler's are automatic and subject to the retention cap, and
+     * the built-ins are a floor that cannot be removed. A flat list would hide which of those an
+     * entry belongs to, and therefore whether clearing discoveries would remove it.
+     *
+     * Scrollable by construction (AlertDialog scrolls its message), and capped at a readable
+     * number per section with a count of the remainder -- an unlimited retention setting can make
+     * this list tens of thousands of lines long.
+     */
+    private fun showSeedList() {
+        val shown = 200
+        fun section(title: String, items: List<String>): String {
+            if (items.isEmpty()) return "$title\n  (none)\n\n"
+            val head = items.take(shown).joinToString("\n") { "  $it" }
+            val rest = items.size - shown
+            return "$title (${items.size})\n" + head + (if (rest > 0) "\n  ...and $rest more" else "") + "\n\n"
+        }
+
+        val body = StringBuilder()
+            .append(section("YOUR SEEDS", PrismSettings.getUserSearchSeeds()))
+            .append(section("FOUND BY THE CRAWLER", PrismSettings.getDiscoveredSearchSeeds()))
+            .append(section("BUILT IN", PrismSettings.DEFAULT_SEARCH_SEEDS))
+            .toString()
+            .trimEnd()
+
+        val limit = PrismSettings.getMaxDiscoveredSeeds()
+        val cap = if (limit < 0) "no limit" else "keeping up to $limit found sites"
+
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Search seeds - $cap")
+            .setMessage(body)
+            .setPositiveButton("Close", null)
+            .setNeutralButton("Copy") { _, _ ->
+                val clipboard = getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                    as android.content.ClipboardManager
+                clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Prism search seeds", body))
+                android.widget.Toast.makeText(this, "Seed list copied", android.widget.Toast.LENGTH_SHORT).show()
+            }
+            .show()
+    }
+
+    private fun promptAddSearchSeed() {
+        val input = android.widget.EditText(this).apply {
+            hint = "https://example.com"
+            setSingleLine(true)
+        }
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Add search seed")
+            .setMessage("Crawls will start from this address as well.")
+            .setView(input)
+            .setPositiveButton("Add") { _, _ ->
+                var value = input.text.toString().trim()
+                if (value.isNotEmpty() && !value.startsWith("http")) value = "https://" + value
+                val added = PrismSettings.addUserSearchSeed(value)
+                android.widget.Toast.makeText(
+                    this,
+                    if (added) "Added $value" else "Not added - already listed, or not a URL",
+                    android.widget.Toast.LENGTH_SHORT
+                ).show()
+                refresh()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     private fun promptCustomSearchUrl() {
         val input = EditText(this).apply {
             inputType = InputType.TYPE_CLASS_TEXT
@@ -1555,6 +2826,16 @@ sealed class SettingItem(open val isEnabled: Boolean = true) {
     data class Picker(val title: String, val subtitle: String, val options: List<String>, var currentSelection: Int, val onChanged: (Int) -> Unit, override val isEnabled: Boolean = true) : SettingItem(isEnabled)
     data class TextInput(val title: String, val subtitle: String, var value: String, val onChanged: (String) -> Unit, override val isEnabled: Boolean = true, val isSingleLine: Boolean = false, val isEncoded: Boolean = false) : SettingItem(isEnabled)
     data class Nav(val title: String, val subtitle: String, val onClick: () -> Unit, override val isEnabled: Boolean = true) : SettingItem(isEnabled)
+
+    /**
+     * A row that hosts an arbitrary view.
+     *
+     * The list is otherwise made of titles and controls, which cannot express a grid of pictures.
+     * The view is BUILT BY THE CALLER and supplied here rather than constructed by the adapter,
+     * because it owns state -- which image is active, which one is mid-delete -- that a recycled
+     * holder would lose.
+     */
+    data class Custom(val view: android.view.View) : SettingItem(true)
 }
 
 class SettingsAdapter(
@@ -1567,9 +2848,12 @@ class SettingsAdapter(
         notifyDataSetChanged()
     }
 
+    class CustomVH(val host: android.widget.FrameLayout) : RecyclerView.ViewHolder(host)
+
     override fun getItemViewType(position: Int): Int = when (items[position]) {
         is SettingItem.Header -> 0
         is SettingItem.Toggle -> 1
+        is SettingItem.Custom -> 2
         else -> 3
     }
 
@@ -1578,6 +2862,12 @@ class SettingsAdapter(
         return when (viewType) {
             0 -> HeaderVH(ItemSettingHeaderBinding.inflate(inflater, parent, false))
             1 -> ToggleVH(ItemSettingToggleBinding.inflate(inflater, parent, false))
+            2 -> CustomVH(android.widget.FrameLayout(parent.context).apply {
+                layoutParams = RecyclerView.LayoutParams(
+                    RecyclerView.LayoutParams.MATCH_PARENT,
+                    RecyclerView.LayoutParams.WRAP_CONTENT,
+                )
+            })
             else -> NavVH(ItemSettingNavBinding.inflate(inflater, parent, false))
         }
     }
@@ -1590,8 +2880,23 @@ class SettingsAdapter(
 
         applyCardBackground(holder, position)
 
+        if (item is SettingItem.Custom && holder is CustomVH) {
+            holder.host.removeAllViews()
+            // Re-parented rather than copied: the view carries its own state (which image is
+            // active, which tile is mid-delete) that a fresh instance would lose on every scroll.
+            (item.view.parent as? android.view.ViewGroup)?.removeView(item.view)
+            holder.host.addView(item.view)
+            // Not clickable as a row: the hosted view handles its own touches, and a row click
+            // would swallow taps meant for individual tiles.
+            holder.itemView.setOnClickListener(null)
+            return
+        }
+
         when (item) {
             is SettingItem.Header -> (holder as HeaderVH).binding.headerTitle.text = item.title
+            // Hosted views handle their own touches; listed so the compiler keeps
+            // checking that every other case is covered.
+            is SettingItem.Custom -> Unit
             is SettingItem.Toggle -> {
                 val h = holder as ToggleVH
                 h.binding.itemTitle.text = item.title

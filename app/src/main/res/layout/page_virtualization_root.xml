@@ -1,65 +1,28 @@
 <?xml version="1.0" encoding="utf-8"?>
-<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<!--
+  A COLUMN, NOT A STACK. The control bar used to float over the VM surface as a sibling in a
+  FrameLayout, which put the power button directly on top of the OS options underneath it —
+  reaching for "Linux" hit "power off" instead. Laying the page out vertically means the bar
+  reserves its own space and the VM view begins below it, so nothing overlaps and no tap is
+  ambiguous.
+
+  The bar is `gone` until the VM runs, and a gone child of a LinearLayout occupies no space at
+  all, so the stopped state still fills the whole page exactly as before.
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:fitsSystemWindows="true">
+    android:fitsSystemWindows="true"
+    android:orientation="vertical">
 
-    <!-- VM display surface — fills the entire page. Must stay VISIBLE for its whole lifetime:
-         SurfaceView only allocates its underlying Surface (firing surfaceCreated()) while its own
-         visibility is VISIBLE, so toggling this off — which the boot overlay below made
-         unnecessary anyway, since it opaquely covers this surface whenever the VM isn't running —
-         previously meant surfaceCreated() (and therefore the whole boot sequence) never fired at
-         all. -->
-    <SurfaceView
-        android:id="@+id/vmSurface"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent" />
-
-    <!-- Boot / stopped overlay — shown when VM is not yet running. Opaque background so it fully
-         covers vmSurface (which stays visible underneath) instead of just the centered spinner. -->
-    <FrameLayout
-        android:id="@+id/bootOverlay"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:background="@android:color/black"
-        android:gravity="center">
-
-        <LinearLayout
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_gravity="center"
-            android:gravity="center"
-            android:orientation="vertical"
-            android:padding="32dp">
-
-            <ProgressBar
-                android:id="@+id/bootProgress"
-                android:layout_width="48dp"
-                android:layout_height="48dp"
-                android:layout_marginBottom="16dp"
-                android:visibility="visible" />
-
-            <TextView
-                android:id="@+id/tvBootLabel"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:maxWidth="320dp"
-                android:gravity="center"
-                android:text="@string/virt_status_booting"
-                android:textSize="14sp"
-                android:alpha="0.7" />
-
-        </LinearLayout>
-    </FrameLayout>
-
-    <!-- Control bar — pinned to top, shown over the VM surface -->
+    <!-- Control bar — its own row at the top, above the VM rather than on top of it. -->
     <LinearLayout
         android:id="@+id/controlBar"
         android:layout_width="match_parent"
         android:layout_height="52dp"
-        android:layout_gravity="top"
         android:layout_marginTop="8dp"
         android:layout_marginHorizontal="16dp"
+        android:layout_marginBottom="8dp"
         android:background="@drawable/hotseat_glass_bg"
         android:gravity="center_vertical"
         android:orientation="horizontal"
@@ -80,10 +43,10 @@
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
+            android:alpha="0.85"
             android:gravity="center"
             android:text="@string/virt_status_running"
-            android:textSize="13sp"
-            android:alpha="0.85" />
+            android:textSize="13sp" />
 
         <ImageButton
             android:id="@+id/btnVmKeyboard"
@@ -96,4 +59,81 @@
 
     </LinearLayout>
 
-</FrameLayout>
+    <!-- Terminal keys a soft keyboard does not have.
+         Esc, Tab, Ctrl and the arrows are how anyone actually drives a shell, and no phone
+         keyboard offers them. Enter is here too because IMEs disagree about whether their return
+         key sends a key event, an editor action, or a committed newline. This one is unambiguous. -->
+    <HorizontalScrollView
+        android:id="@+id/termKeyRow"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="12dp"
+        android:layout_marginEnd="12dp"
+        android:layout_marginBottom="6dp"
+        android:scrollbars="none"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:id="@+id/termKeys"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal" />
+    </HorizontalScrollView>
+
+    <!-- Everything below the bar. The surface and the overlay still share this space, because the
+         overlay's whole job is to cover the surface while the VM is not rendering. -->
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
+
+        <!-- VM display surface. Must stay VISIBLE for its whole lifetime: SurfaceView only
+             allocates its underlying Surface (firing surfaceCreated()) while its own visibility is
+             VISIBLE, so toggling this off — which the boot overlay below makes unnecessary anyway,
+             since it opaquely covers this surface whenever the VM isn't running — previously meant
+             surfaceCreated() (and therefore the whole boot sequence) never fired at all. -->
+        <SurfaceView
+            android:id="@+id/vmSurface"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+
+        <!-- Boot / stopped overlay — shown when the VM is not yet running. Opaque background so it
+             fully covers vmSurface (which stays visible underneath) instead of just the centered
+             spinner. -->
+        <FrameLayout
+            android:id="@+id/bootOverlay"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="@android:color/black"
+            android:gravity="center">
+
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center"
+                android:gravity="center"
+                android:orientation="vertical"
+                android:padding="32dp">
+
+                <ProgressBar
+                    android:id="@+id/bootProgress"
+                    android:layout_width="48dp"
+                    android:layout_height="48dp"
+                    android:layout_marginBottom="16dp"
+                    android:visibility="visible" />
+
+                <TextView
+                    android:id="@+id/tvBootLabel"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:alpha="0.7"
+                    android:gravity="center"
+                    android:maxWidth="320dp"
+                    android:text="@string/virt_status_booting"
+                    android:textSize="14sp" />
+
+            </LinearLayout>
+        </FrameLayout>
+    </FrameLayout>
+
+</LinearLayout>

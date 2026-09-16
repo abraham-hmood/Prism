@@ -61,6 +61,13 @@ class NoraSettingsActivity : PrismBaseActivity() {
     /** Guards the slider against reacting to its own programmatic repositioning. */
     private var suppressSlider = false
 
+    /**
+     * Set while the system's All Files Access screen is on top of us, so [onResume] knows the
+     * user just came back from it and can tell them import is unblocked rather than saying
+     * nothing and leaving them to guess whether tapping "Import Nora" again will work.
+     */
+    private var awaitingImportAccess = false
+
     private companion object {
         /** Slider resolution. Fine enough that a drag feels continuous in megabytes. */
         const val SLIDER_STEPS = 1000
@@ -961,7 +968,11 @@ class NoraSettingsActivity : PrismBaseActivity() {
         })
         card.addView(IosUi.hairline(ctx))
         card.addView(navRow("Import Nora", "Restore everything from a backup zip") {
-            importPicker.launch(arrayOf("application/zip", "application/octet-stream", "*/*"))
+            if (!hasStorageAccess()) {
+                requestStorageAccessForImport()
+            } else {
+                importPicker.launch(arrayOf("application/zip", "application/octet-stream", "*/*"))
+            }
         })
         card.addView(IosUi.hairline(ctx))
         card.addView(
@@ -986,6 +997,62 @@ class NoraSettingsActivity : PrismBaseActivity() {
                 ViewGroup.LayoutParams.MATCH_PARENT, IosUi.dp(ctx, 28f)
             )
         })
+    }
+
+    /**
+     * Whether this process can write files outside its own sandbox.
+     *
+     * Import unzips straight into [NoraConfig.rootDir], which resolves under `/sdcard/Prism`,
+     * not app-internal storage. Below API 30 that only needed the (now-legacy) storage
+     * permissions granted at install; from API 30 it needs All Files Access specifically, and
+     * without it every write in the import loop fails silently entry by entry -- the archive
+     * looks like it imported and nothing was actually restored.
+     */
+    private fun hasStorageAccess(): Boolean =
+        android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R ||
+            android.os.Environment.isExternalStorageManager()
+
+    private fun requestStorageAccessForImport() {
+        AlertDialog.Builder(this)
+            .setTitle("Storage access needed")
+            .setMessage(
+                "Restoring a backup writes her connectome and dataset to " +
+                    "${NoraConfig.rootDir().absolutePath}, which needs All Files Access on this " +
+                    "version of Android. On the next screen, find Prism in the list and check it."
+            )
+            .setPositiveButton("Open settings") { _, _ ->
+                awaitingImportAccess = true
+                try {
+                    startActivity(
+                        Intent(
+                            android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                            android.net.Uri.parse("package:$packageName")
+                        )
+                    )
+                } catch (e: Exception) {
+                    startActivity(
+                        Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                    )
+                }
+            }
+            .setNegativeButton("Not now", null)
+            .show()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (awaitingImportAccess) {
+            awaitingImportAccess = false
+            if (hasStorageAccess()) {
+                dialog(
+                    "Access granted",
+                    "Prism can now read and write Nora's files. You can import Nora."
+                )
+            }
+            // Silently returning with access still refused isn't treated as a failure to
+            // report: "Not now" and backing out of the settings screen look identical from
+            // here, and the former isn't an error.
+        }
     }
 
     // ── Row builders ────────────────────────────────────────────────────────

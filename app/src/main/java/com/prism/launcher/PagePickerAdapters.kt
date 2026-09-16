@@ -21,6 +21,9 @@ sealed interface PagePickChoice {
     data object Models : PagePickChoice
     data object ModelStore : PagePickChoice
     data object AgenticTools : PagePickChoice
+    data object Wallet : PagePickChoice
+    data object Editor : PagePickChoice
+    data object Science : PagePickChoice
 }
 
 class PositionPickerAdapter(
@@ -123,6 +126,16 @@ class PositionPickerAdapter(
     class VH(val binding: ItemPickerPositionBinding) : RecyclerView.ViewHolder(binding.root)
 }
 
+/**
+ * The list of things a desktop slot can become.
+ *
+ * ## Why this is a list rather than a position chain
+ *
+ * It used to bind by index -- `position == 0` is Browser, `position == 1` is Desktop, and so on
+ * down to a plugin range starting at twelve. That works exactly until something needs to reorder or
+ * FILTER it, at which point every branch is wrong by however many entries the filter removed.
+ * Building the options once and searching over them keeps the mapping in one place.
+ */
 class VerticalPageOptionsAdapter(
     private val context: Context,
     private val slotPageIndex: Int,
@@ -130,7 +143,42 @@ class VerticalPageOptionsAdapter(
     private val onApply: (PagePickChoice) -> Unit,
 ) : RecyclerView.Adapter<VerticalPageOptionsAdapter.VH>() {
 
-    override fun getItemCount(): Int = 11 + plugins.size
+    private data class Option(
+        val title: String,
+        val subtitle: String,
+        val choice: PagePickChoice,
+    )
+
+    private val allOptions: List<Option> = buildList {
+        add(Option(context.getString(R.string.slot_browser), "Built-in private web browser", PagePickChoice.Browser))
+        add(Option(context.getString(R.string.slot_desktop), "Built-in app grid and folders", PagePickChoice.DesktopGrid))
+        add(Option(context.getString(R.string.slot_drawer), "Built-in alphabetical app drawer", PagePickChoice.AppDrawer))
+        add(Option("Messaging", "Built-in SMS/MMS messages", PagePickChoice.Messaging))
+        add(Option("Kinetic Halo", "Physics-based blind navigation", PagePickChoice.KineticHalo))
+        add(Option("File Explorer", "Local files and directories", PagePickChoice.FileExplorer))
+        add(Option("Nebula Social", "AI-powered social media graph", PagePickChoice.NebulaSocial))
+        add(Option(context.getString(R.string.slot_virtualization_os), "Run PrismOS or a custom ISO", PagePickChoice.VirtualizationOs))
+        add(Option("Models", "Manage imported AI models", PagePickChoice.Models))
+        add(Option("Editor", "VS Code, with extensions, running on this device", PagePickChoice.Editor))
+        add(Option("Science", "Cosmic rays, lab notebook, RF survey, lung and hearing tests", PagePickChoice.Science))
+        add(Option("Model Store", "Browse, search, and download AI models", PagePickChoice.ModelStore))
+        add(Option("Agentic Tools", "Manage AI tool-calling and custom syntaxes", PagePickChoice.AgenticTools))
+        add(Option("Wallet", "Local crypto wallet and miner", PagePickChoice.Wallet))
+        for (p in plugins) add(Option(p.label, p.packageName, PagePickChoice.PluginPage(p)))
+    }
+
+    private var options: List<Option> = allOptions
+
+    /** Narrows the list; an empty query restores all of it. Matches title and subtitle. */
+    fun filter(query: String) {
+        val needle = query.trim().lowercase()
+        options = if (needle.isEmpty()) allOptions else allOptions.filter {
+            it.title.lowercase().contains(needle) || it.subtitle.lowercase().contains(needle)
+        }
+        notifyDataSetChanged()
+    }
+
+    override fun getItemCount(): Int = options.size
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
         val binding = ItemPageOptionBinding.inflate(LayoutInflater.from(parent.context), parent, false)
@@ -138,56 +186,10 @@ class VerticalPageOptionsAdapter(
     }
 
     override fun onBindViewHolder(holder: VH, position: Int) {
-        if (position == 0) {
-            holder.binding.optionTitle.text = context.getString(R.string.slot_browser)
-            holder.binding.optionSubtitle.text = "Built-in private web browser"
-            holder.binding.optionApply.setOnClickListener { onApply(PagePickChoice.Browser) }
-        } else if (position == 1) {
-            holder.binding.optionTitle.text = context.getString(R.string.slot_desktop)
-            holder.binding.optionSubtitle.text = "Built-in app grid and folders"
-            holder.binding.optionApply.setOnClickListener { onApply(PagePickChoice.DesktopGrid) }
-        } else if (position == 2) {
-            holder.binding.optionTitle.text = context.getString(R.string.slot_drawer)
-            holder.binding.optionSubtitle.text = "Built-in alphabetical app drawer"
-            holder.binding.optionApply.setOnClickListener { onApply(PagePickChoice.AppDrawer) }
-        } else if (position == 3) {
-            holder.binding.optionTitle.text = "Messaging"
-            holder.binding.optionSubtitle.text = "Built-in SMS/MMS messages"
-            holder.binding.optionApply.setOnClickListener { onApply(PagePickChoice.Messaging) }
-        } else if (position == 4) {
-            holder.binding.optionTitle.text = "Kinetic Halo"
-            holder.binding.optionSubtitle.text = "Physics-based blind navigation"
-            holder.binding.optionApply.setOnClickListener { onApply(PagePickChoice.KineticHalo) }
-        } else if (position == 5) {
-            holder.binding.optionTitle.text = "File Explorer"
-            holder.binding.optionSubtitle.text = "Local files and directories"
-            holder.binding.optionApply.setOnClickListener { onApply(PagePickChoice.FileExplorer) }
-        } else if (position == 6) {
-            holder.binding.optionTitle.text = "Nebula Social"
-            holder.binding.optionSubtitle.text = "AI-powered social media graph"
-            holder.binding.optionApply.setOnClickListener { onApply(PagePickChoice.NebulaSocial) }
-        } else if (position == 7) {
-            holder.binding.optionTitle.text = context.getString(R.string.slot_virtualization_os)
-            holder.binding.optionSubtitle.text = "Run PrismOS or a custom ISO"
-            holder.binding.optionApply.setOnClickListener { onApply(PagePickChoice.VirtualizationOs) }
-        } else if (position == 8) {
-            holder.binding.optionTitle.text = "Models"
-            holder.binding.optionSubtitle.text = "Manage imported AI models"
-            holder.binding.optionApply.setOnClickListener { onApply(PagePickChoice.Models) }
-        } else if (position == 9) {
-            holder.binding.optionTitle.text = "Model Store"
-            holder.binding.optionSubtitle.text = "Browse, search, and download AI models"
-            holder.binding.optionApply.setOnClickListener { onApply(PagePickChoice.ModelStore) }
-        } else if (position == 10) {
-            holder.binding.optionTitle.text = "Agentic Tools"
-            holder.binding.optionSubtitle.text = "Manage AI tool-calling and custom syntaxes"
-            holder.binding.optionApply.setOnClickListener { onApply(PagePickChoice.AgenticTools) }
-        } else {
-            val p = plugins[position - 11]
-            holder.binding.optionTitle.text = p.label
-            holder.binding.optionSubtitle.text = p.packageName
-            holder.binding.optionApply.setOnClickListener { onApply(PagePickChoice.PluginPage(p)) }
-        }
+        val option = options[position]
+        holder.binding.optionTitle.text = option.title
+        holder.binding.optionSubtitle.text = option.subtitle
+        holder.binding.optionApply.setOnClickListener { onApply(option.choice) }
     }
 
     class VH(val binding: ItemPageOptionBinding) : RecyclerView.ViewHolder(binding.root)

@@ -41,6 +41,34 @@
         app:iconPadding="16dp"
         app:iconTint="?attr/prismTextPrimary" />
 
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/menuBookmarks"
+        style="@style/Widget.Material3.Button.TonalButton"
+        android:layout_width="match_parent"
+        android:layout_height="64dp"
+        android:layout_marginBottom="8dp"
+        android:gravity="start|center_vertical"
+        android:text="Bookmarks"
+        android:textColor="?attr/prismTextPrimary"
+        app:icon="@drawable/ic_bookmarks_24"
+        app:iconGravity="textStart"
+        app:iconPadding="16dp"
+        app:iconTint="?attr/prismTextPrimary" />
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/menuDownloads"
+        style="@style/Widget.Material3.Button.TonalButton"
+        android:layout_width="match_parent"
+        android:layout_height="64dp"
+        android:layout_marginBottom="8dp"
+        android:gravity="start|center_vertical"
+        android:text="Downloads"
+        android:textColor="?attr/prismTextPrimary"
+        app:icon="@drawable/ic_download_24"
+        app:iconGravity="textStart"
+        app:iconPadding="16dp"
+        app:iconTint="?attr/prismTextPrimary" />
+
     <!-- Mirror Button -->
     <com.google.android.material.button.MaterialButton
         android:id="@+id/menuMirror"

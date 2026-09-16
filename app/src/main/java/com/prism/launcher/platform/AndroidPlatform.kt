@@ -4,6 +4,8 @@ import android.app.ActivityManager
 import android.content.Context
 import android.os.Environment
 import android.os.StatFs
+import android.telephony.SubscriptionManager
+import android.telephony.TelephonyManager
 import com.prism.core.KeyValueStore
 import com.prism.core.PlatformHost
 import com.prism.core.PrismLog
@@ -55,11 +57,39 @@ class AndroidHost(context: Context) : PlatformHost {
         0L
     }
 
+    /** `ActivityManager.MemoryInfo.availMem` -- the same call [deviceRamBytes] makes, the live field instead. */
+    override fun availableRamBytes(): Long = try {
+        val am = app.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }.availMem
+    } catch (t: Throwable) {
+        deviceRamBytes()
+    }
+
     override fun freeStorageBytes(dir: File): Long = try {
         val stat = StatFs(dir.absolutePath)
         stat.availableBlocksLong * stat.blockSizeLong
     } catch (t: Throwable) {
         0L
+    }
+
+    /**
+     * `SubscriptionManager.getActiveSubscriptionInfoList()` is the reliable answer for "is there
+     * an active line" -- it covers eSIM and dual-SIM correctly, unlike [TelephonyManager.simState]
+     * (single-slot, physical-SIM-only). Falls back to `simState` when READ_PHONE_STATE hasn't
+     * been granted (the subscription list throws/returns null without it on many OEM builds) or
+     * on very old API levels, since a ready physical SIM is still a real, if narrower, signal.
+     */
+    override fun hasActiveCellularLine(): Boolean = try {
+        val subscriptionManager = app.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as? SubscriptionManager
+        val hasActiveSubscription = try {
+            !subscriptionManager?.activeSubscriptionInfoList.isNullOrEmpty()
+        } catch (e: SecurityException) {
+            false
+        }
+        val telephonyManager = app.getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager
+        hasActiveSubscription || telephonyManager?.simState == TelephonyManager.SIM_STATE_READY
+    } catch (t: Throwable) {
+        false
     }
 
     /**

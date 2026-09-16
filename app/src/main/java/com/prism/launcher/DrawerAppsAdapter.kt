@@ -93,11 +93,16 @@ class DrawerAppsAdapter(
             holder.binding.iconWrapper.background = null
         } else {
             holder.binding.drawerIcon.setImageDrawable(e.icon)
-            holder.binding.iconWrapper.background = NeonGlowDrawable(
+            // Reused across rebinds of this ViewHolder rather than allocated fresh every bind --
+            // it's never shared between two Views at once (bounds are reset by the layout pass
+            // each time this same View is measured), so this is safe, just not-per-bind.
+            val glow = holder.glowDrawable ?: NeonGlowDrawable(
                 color = PrismSettings.getGlowColor(),
                 cornerRadius = 24f * context.resources.displayMetrics.density,
                 strokeWidth = 3f * context.resources.displayMetrics.density
-            )
+            ).also { holder.glowDrawable = it }
+            glow.color = PrismSettings.getGlowColor()
+            holder.binding.iconWrapper.background = glow
         }
         holder.itemView.setTag(R.id.tag_prism_launcher_app_target, true)
         holder.binding.drawerIcon.setTag(R.id.tag_prism_launcher_app_target, true)
@@ -116,7 +121,16 @@ class DrawerAppsAdapter(
         }
     }
 
-    class AppVH(val binding: ItemDrawerAppBinding) : RecyclerView.ViewHolder(binding.root)
+    class AppVH(val binding: ItemDrawerAppBinding) : RecyclerView.ViewHolder(binding.root) {
+        /** Reused across rebinds of this holder -- see [bindApp] and [InnerGroupAdapter.onBindViewHolder]. */
+        var glowDrawable: NeonGlowDrawable? = null
+
+        init {
+            // NeonGlowDrawable's BlurMaskFilter isn't supported by hardware-accelerated Canvas.
+            // Set once here, not per-bind -- same reasoning as IosSegmentedControl's init block.
+            binding.iconWrapper.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+        }
+    }
     class GroupVH(val binding: ItemDrawerGroupBinding) : RecyclerView.ViewHolder(binding.root)
 
     class InnerGroupAdapter(
@@ -136,11 +150,13 @@ class DrawerAppsAdapter(
             val context = holder.itemView.context
             // Simple generic rendering for inner group nodes
             holder.binding.drawerIcon.setImageDrawable(e.icon)
-            holder.binding.iconWrapper.background = NeonGlowDrawable(
+            val glow = holder.glowDrawable ?: NeonGlowDrawable(
                 color = PrismSettings.getGlowColor(),
                 cornerRadius = 16f * context.resources.displayMetrics.density,
                 strokeWidth = 2f * context.resources.displayMetrics.density
-            )
+            ).also { holder.glowDrawable = it }
+            glow.color = PrismSettings.getGlowColor()
+            holder.binding.iconWrapper.background = glow
             holder.itemView.setOnClickListener { onLaunch(e.component) }
             holder.itemView.setOnLongClickListener {
                 if (!allowDragToDesktop()) return@setOnLongClickListener false

@@ -2,11 +2,26 @@ package com.prism.launcher.messaging
 
 import android.view.LayoutInflater
 import android.view.ViewGroup
+import androidx.recyclerview.widget.DiffUtil
+import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
 import com.prism.launcher.databinding.ItemMessageReceivedBinding
 import com.prism.launcher.databinding.ItemMessageSentBinding
 import java.text.SimpleDateFormat
 import java.util.Locale
+
+/**
+ * Identity key is [MessageInfo.timestamp] -- the closest thing to a stable id this type has.
+ * Callers that stream a reply token by token (see `ConversationActivity.sendToSam`) must reuse
+ * ONE timestamp across every [MessageInfo] they build for that live bubble rather than letting
+ * each pick up its own default `System.currentTimeMillis()` -- otherwise every token looks like a
+ * brand-new message to [areItemsTheSame] and this diffs it as remove-then-insert instead of an
+ * in-place update, which is what used to make streaming text visibly clear and reappear.
+ */
+private object MessageInfoDiff : DiffUtil.ItemCallback<MessageInfo>() {
+    override fun areItemsTheSame(old: MessageInfo, new: MessageInfo) = old.timestamp == new.timestamp
+    override fun areContentsTheSame(old: MessageInfo, new: MessageInfo) = old == new
+}
 
 /**
  * @param onFeedback a thumb was pressed. `positive` is which one.
@@ -19,27 +34,24 @@ import java.util.Locale
  * and the row is never shown.
  */
 class MessagesAdapter(
-    private var messages: List<MessageInfo>,
+    initialMessages: List<MessageInfo>,
     private val onFeedback: (MessageInfo, Boolean) -> Unit = { _, _ -> },
     private val onBubbleTap: (MessageInfo) -> Unit = {},
     private val onBubbleLongPress: (MessageInfo) -> Unit = {}
-) : RecyclerView.Adapter<MessagesAdapter.VH>() {
+) : ListAdapter<MessageInfo, MessagesAdapter.VH>(MessageInfoDiff) {
+
+    init { submitList(initialMessages) }
 
     companion object {
         const val TYPE_RECEIVED = 1
         const val TYPE_SENT = 2
     }
 
-    fun update(newMessages: List<MessageInfo>) {
-        messages = newMessages
-        notifyDataSetChanged()
-    }
+    fun update(newMessages: List<MessageInfo>) = submitList(newMessages)
 
     override fun getItemViewType(position: Int): Int {
-        return if (messages[position].isSent) TYPE_SENT else TYPE_RECEIVED
+        return if (getItem(position).isSent) TYPE_SENT else TYPE_RECEIVED
     }
-
-    override fun getItemCount(): Int = messages.size
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
         return if (viewType == TYPE_SENT) {
@@ -54,7 +66,7 @@ class MessagesAdapter(
     private val timeFormat = SimpleDateFormat("h:mm a", Locale.getDefault())
 
     override fun onBindViewHolder(holder: VH, position: Int) {
-        val msg = messages[position]
+        val msg = getItem(position)
 
         when (holder) {
             is VH.Sent -> {

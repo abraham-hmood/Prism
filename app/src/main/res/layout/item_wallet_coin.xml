@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- One coin in the wallets list: symbol, name, holdings and their fiat value. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:layout_marginBottom="10dp"
+    android:background="@drawable/bg_wallet_card"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:padding="18dp">
+
+    <TextView
+        android:id="@+id/coinBadge"
+        android:layout_width="46dp"
+        android:layout_height="46dp"
+        android:background="@drawable/bg_avatar_circle"
+        android:gravity="center"
+        android:text="BTC"
+        android:textColor="?attr/prismTextPrimary"
+        android:textSize="11sp"
+        android:textStyle="bold" />
+
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="14dp"
+        android:layout_weight="1"
+        android:orientation="vertical">
+
+        <TextView
+            android:id="@+id/coinName"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:singleLine="true"
+            android:text="Bitcoin"
+            android:textColor="?attr/prismTextPrimary"
+            android:textSize="16sp" />
+
+        <TextView
+            android:id="@+id/coinAddress"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:ellipsize="middle"
+            android:singleLine="true"
+            android:textColor="?attr/prismTextSecondary"
+            android:textSize="11sp" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:gravity="end"
+        android:orientation="vertical">
+
+        <TextView
+            android:id="@+id/coinBalance"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="—"
+            android:textColor="?attr/prismTextPrimary"
+            android:textSize="15sp" />
+
+        <TextView
+            android:id="@+id/coinFiat"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:textColor="?attr/prismTextSecondary"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+    <!-- UITableViewCell's disclosure indicator: the strongest single signal that a row opens
+         something rather than toggling it. -->
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="10dp"
+        android:alpha="0.35"
+        android:text="›"
+        android:textColor="?attr/prismTextSecondary"
+        android:textSize="20sp" />
+</LinearLayout>

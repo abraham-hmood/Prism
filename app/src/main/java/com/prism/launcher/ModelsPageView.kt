@@ -13,7 +13,11 @@ import com.prism.launcher.databinding.ItemCloudModelBinding
 import com.prism.launcher.databinding.ItemModelCardBinding
 import com.prism.launcher.databinding.ItemSettingHeaderBinding
 import com.prism.launcher.databinding.PageModelsBinding
+import com.prism.launcher.cakechat.CakeChatInstall
+import com.prism.launcher.messaging.AiManager
 import com.prism.launcher.messaging.GgufInferenceService
+import com.prism.launcher.messaging.LocalImageService
+import com.prism.launcher.messaging.ModelLoadProgressDialog
 import com.prism.launcher.messaging.OllamaDiscoveryService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -35,32 +39,137 @@ class ModelsPageView @JvmOverloads constructor(
 ) : FrameLayout(context, attrs, defStyleAttr) {
 
     private val binding = PageModelsBinding.inflate(LayoutInflater.from(context), this, true)
-    private val adapter = ModelsAdapter(this::setActive, this::confirmDelete, this::setActiveCloud, this::setActiveOllama)
+    private val adapter = ModelsAdapter(
+        this::setActive, this::confirmDelete, this::setActiveCloud, this::setActiveOllama,
+        this::setActiveCakeChat,
+    )
+
+    /** Null when this page is previewed outside the launcher; only the export action needs it. */
+    private val host: LauncherActivity? = context as? LauncherActivity
 
     private val viewScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var ollamaServers: List<OllamaDiscoveryService.OllamaServer> = emptyList()
     private var ollamaScanJob: Job? = null
 
+    /**
+     * The quantisation section, built only if it is opened.
+     *
+     * Lazily, because most sessions never touch it and it reads the whole imported-model list to
+     * build its radio buttons -- work with no purpose on a page the user is swiping past.
+     */
+    private var quantView: com.prism.launcher.quant.QuantizationView? = null
+    private var showingQuant = false
+
     init {
         binding.modelsRecycler.layoutManager = LinearLayoutManager(context)
         binding.modelsRecycler.adapter = adapter
+        binding.modelsSectionSwitch.setOnClickListener { openSectionMenu(it) }
         refreshList()
+
+        // Mirrors the service's state into the section whenever it changes. Collected by the page
+        // rather than the section so a run that finishes while the user is on the Models side still
+        // updates the list -- a finished quantisation adds a model to it.
+        viewScope.launch {
+            com.prism.launcher.quant.QuantizationService.state.collect { state ->
+                quantView?.render(state)
+                if (state.finished && state.error == null) {
+                    refreshList()
+                    quantView?.refreshModels()
+                }
+            }
+        }
     }
+
+    /**
+     * Last aggregated visibility acted on.
+     *
+     * ONLY TRANSITIONS COUNT. Android calls [onVisibilityAggregated] far more often than the view
+     * actually appears or disappears -- attach, window-visibility changes, and any ancestor's
+     * visibility churn all land here with the same value. That did not matter while this callback
+     * only re-read a list, but it rebuilds the view hierarchy, and mutating views from a callback
+     * the layout pass itself can trigger is a loop: the rebuild schedules layout, layout re-delivers
+     * the callback, the callback rebuilds. Measured at ~200 rebuilds a second, which is why the
+     * quantisation list rendered as an empty box -- its radio buttons were being removed and re-added
+     * faster than they could ever be laid out.
+     */
+    private var lastAggregatedVisible: Boolean? = null
 
     override fun onVisibilityAggregated(isVisible: Boolean) {
         super.onVisibilityAggregated(isVisible)
         // Models can be imported/deleted/activated elsewhere (Settings, CloudModelsActivity)
         // while this page sits idle in the pager, so re-scan whenever the user swipes back to
         // it rather than only once at init. Ollama servers are LAN-discovered, so re-sweep too.
-        if (isVisible) {
-            refreshList()
-            scanOllama()
-        }
+        if (isVisible == lastAggregatedVisible) return
+        lastAggregatedVisible = isVisible
+        if (!isVisible) return
+
+        refreshList()
+        scanOllama()
+        quantView?.refreshModels()
     }
 
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
         viewScope.cancel()
+    }
+
+    /**
+     * The chevron's menu: the two halves of this page.
+     *
+     * A PopupMenu for the same reason Nebula uses one -- two options do not justify a bar of tabs,
+     * and the title doubling as the current selection is what makes the chevron legible as a
+     * switcher rather than decoration.
+     */
+    private fun openSectionMenu(anchor: View) {
+        val menu = android.widget.PopupMenu(context, anchor)
+        menu.menu.add("Models")
+        menu.menu.add("Quant")
+        menu.setOnMenuItemClickListener { item ->
+            showSection(quant = item.title?.toString() == "Quant")
+            true
+        }
+        menu.show()
+    }
+
+    /** Switches between the model list and quantisation. Public so the notification can land here. */
+    fun showSection(quant: Boolean) {
+        showingQuant = quant
+
+        if (quant) {
+            val view = quantView ?: com.prism.launcher.quant.QuantizationView(context).also { built ->
+                built.onExportRequested = { file -> host?.exportQuantisedModel(file) }
+                // The same reconciled list the Models section shows, so the two cannot disagree
+                // about which models exist. Text models only -- a diffusion checkpoint is not
+                // something llama.cpp's quantiser can read.
+                built.modelSource = {
+                    loadModels().filter { it.type == PrismSettings.MODEL_TYPE_TEXT }
+                }
+                built.render(com.prism.launcher.quant.QuantizationService.state.value)
+                quantView = built
+                binding.modelsQuantContainer.addView(
+                    built,
+                    FrameLayout.LayoutParams(
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+                    ),
+                )
+            }
+            view.refreshModels()
+            view.render(com.prism.launcher.quant.QuantizationService.state.value)
+        }
+
+        binding.modelsQuantContainer.visibility = if (quant) View.VISIBLE else View.GONE
+        binding.modelsRecycler.visibility =
+            if (quant) View.GONE else if (adapter.itemCount == 0) View.GONE else View.VISIBLE
+        binding.modelsEmptyState.visibility =
+            if (!quant && adapter.itemCount == 0) View.VISIBLE else View.GONE
+
+        binding.modelsTitle.text = if (quant) "Quant" else "Models"
+        binding.modelsSubtitle.text = if (quant) {
+            "Quantise a local model to a smaller format"
+        } else {
+            "Models imported to this device"
+        }
     }
 
     private fun scanOllama() {
@@ -137,15 +246,33 @@ class ModelsPageView @JvmOverloads constructor(
                 }
             }
         }
+        // Listed only once it can actually answer. An entry that is present but unusable invites
+        // the user to select it and then wonder why Sam keeps replying with the other model.
+        val cakeChatTrained =
+            CakeChatInstall.state(context) == CakeChatInstall.State.TRAINED
+        if (cakeChatTrained) {
+            items.add(ModelListItem.Header("CakeChat"))
+            items.add(
+                ModelListItem.CakeChat(
+                    currentMode == PrismSettings.AI_MODE_LOCAL && PrismSettings.getUseCakeChat()
+                )
+            )
+        }
+
         if (imageModels.isNotEmpty()) {
             items.add(ModelListItem.Header("Image Generation Models"))
             imageModels.forEach { items.add(ModelListItem.Model(it, it.path == activeImage)) }
         }
 
         adapter.setItems(items)
-        val allEmpty = models.isEmpty() && cloudModels.isEmpty() && ollamaServers.isEmpty()
-        binding.modelsEmptyState.visibility = if (allEmpty) View.VISIBLE else View.GONE
-        binding.modelsRecycler.visibility = if (allEmpty) View.GONE else View.VISIBLE
+        val allEmpty =
+            models.isEmpty() && cloudModels.isEmpty() && ollamaServers.isEmpty() && !cakeChatTrained
+        // The quantisation section owns the page while it is showing: letting the list's own
+        // empty-state logic run here would pop the "no models imported" message over the top of it.
+        if (!showingQuant) {
+            binding.modelsEmptyState.visibility = if (allEmpty) View.VISIBLE else View.GONE
+            binding.modelsRecycler.visibility = if (allEmpty) View.GONE else View.VISIBLE
+        }
     }
 
     private fun setActive(model: PrismSettings.ImportedModel) {
@@ -154,19 +281,72 @@ class ModelsPageView @JvmOverloads constructor(
         } else {
             PrismSettings.setLocalAiModelPath(model.path)
             PrismSettings.setAiMode(PrismSettings.AI_MODE_LOCAL)
+            // RELEASED HERE, or picking a GGUF model would appear to do nothing: Sam checks
+            // CakeChat first within local mode, so leaving the flag set means the newly chosen
+            // model is never reached.
+            PrismSettings.setUseCakeChat(false)
+            PrismSettings.clearSelectedP2pModel()
+            AiManager.onLocalTextModelActivated(context, model.path)
         }
-        Toast.makeText(context, "${model.displayName} is now active", Toast.LENGTH_SHORT).show()
+        refreshList()
+
+        // Switching the active model is itself a real load (a different context/handle than
+        // whatever was loaded before, if anything) -- warm it up now with visible progress
+        // instead of leaving it to load lazily and silently on the first chat message.
+        val progressDialog = ModelLoadProgressDialog(context)
+        progressDialog.show()
+        viewScope.launch(Dispatchers.IO) {
+            val error = try {
+                if (model.type == PrismSettings.MODEL_TYPE_IMAGE) {
+                    LocalImageService.preload(context, model.path) { stage -> progressDialog.update(stage) }
+                    null
+                } else {
+                    GgufInferenceService.preload(model.path) { stage -> progressDialog.update(stage) }
+                }
+            } catch (e: Exception) {
+                e.message ?: "Unknown error"
+            }
+            kotlinx.coroutines.withContext(Dispatchers.Main) {
+                progressDialog.dismiss()
+                if (error == null) {
+                    Toast.makeText(context, "${model.displayName} is now active", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(context, "${model.displayName} activated, but couldn't be loaded yet: $error", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    /**
+     * Routes Sam -- and any character backed by Sam -- to CakeChat.
+     *
+     * Sets local mode as well as the flag: CakeChat is a local engine, and selecting it while the
+     * mode still pointed at a cloud endpoint would leave the selection visibly active while every
+     * reply still came from the cloud.
+     */
+    private fun setActiveCakeChat() {
+        PrismSettings.setUseCakeChat(true)
+        PrismSettings.setAiMode(PrismSettings.AI_MODE_LOCAL)
+        // AND RELEASES ANY P2P SELECTION. A hosted peer model is checked before every local
+        // engine in AiManager and returns unconditionally, so one left selected silently outranks
+        // whatever is picked here -- the row shows as active while every reply comes from the
+        // peer. Two explicit choices cannot both be in force; the newer one wins.
+        PrismSettings.clearSelectedP2pModel()
+
+        Toast.makeText(context, "CakeChat is now active", Toast.LENGTH_SHORT).show()
         refreshList()
     }
 
     private fun setActiveCloud(model: PrismSettings.CloudModelProfile) {
         PrismSettings.setActiveCloudModelId(model.id)
+        PrismSettings.clearSelectedP2pModel()
         PrismSettings.setAiMode(PrismSettings.AI_MODE_CLOUD)
         Toast.makeText(context, "${model.modelId} is now the active cloud model", Toast.LENGTH_SHORT).show()
         refreshList()
     }
 
     private fun setActiveOllama(host: String, port: Int, modelName: String) {
+        PrismSettings.clearSelectedP2pModel()
         PrismSettings.setSelectedOllamaEndpoint(PrismSettings.OllamaEndpoint(host, port, modelName))
         PrismSettings.setAiMode(PrismSettings.AI_MODE_LOCAL_CLOUD)
         Toast.makeText(context, "$modelName is now the active model", Toast.LENGTH_SHORT).show()
@@ -209,13 +389,23 @@ sealed class ModelListItem {
     data class Model(val model: PrismSettings.ImportedModel, val isActive: Boolean) : ModelListItem()
     data class CloudModel(val model: PrismSettings.CloudModelProfile, val isActive: Boolean) : ModelListItem()
     data class OllamaModel(val host: String, val port: Int, val modelName: String, val isActive: Boolean) : ModelListItem()
+
+    /**
+     * A trained CakeChat.
+     *
+     * Carries no path, unlike every other entry here, because there is nothing to point at: its
+     * weights are Keras HDF5 driven by its own Python rather than a GGUF file handed to llama.cpp.
+     * Selecting it switches which engine Sam dispatches to, not which file it loads.
+     */
+    data class CakeChat(val isActive: Boolean) : ModelListItem()
 }
 
 class ModelsAdapter(
     private val onSetActive: (PrismSettings.ImportedModel) -> Unit,
     private val onDelete: (PrismSettings.ImportedModel) -> Unit,
     private val onCloudClick: (PrismSettings.CloudModelProfile) -> Unit,
-    private val onOllamaClick: (String, Int, String) -> Unit
+    private val onOllamaClick: (String, Int, String) -> Unit,
+    private val onCakeChatClick: () -> Unit
 ) : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
 
     private var items: List<ModelListItem> = emptyList()
@@ -225,6 +415,7 @@ class ModelsAdapter(
         private const val TYPE_MODEL = 1
         private const val TYPE_CLOUD = 2
         private const val TYPE_OLLAMA = 3
+        private const val TYPE_CAKECHAT = 4
     }
 
     fun setItems(newItems: List<ModelListItem>) {
@@ -239,6 +430,7 @@ class ModelsAdapter(
         is ModelListItem.Model -> TYPE_MODEL
         is ModelListItem.CloudModel -> TYPE_CLOUD
         is ModelListItem.OllamaModel -> TYPE_OLLAMA
+        is ModelListItem.CakeChat -> TYPE_CAKECHAT
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
@@ -256,6 +448,7 @@ class ModelsAdapter(
             is ModelListItem.Model -> bindModel(holder as ModelVH, item)
             is ModelListItem.CloudModel -> bindCloud(holder as SelectableVH, item)
             is ModelListItem.OllamaModel -> bindOllama(holder as SelectableVH, item)
+            is ModelListItem.CakeChat -> bindCakeChat(holder as SelectableVH, item)
         }
     }
 
@@ -287,6 +480,18 @@ class ModelsAdapter(
             b.modelSetActiveBtn.setOnClickListener { onSetActive(model) }
         }
         b.modelDeleteBtn.setOnClickListener { onDelete(model) }
+    }
+
+    /**
+     * Reuses the cloud row, whose shape -- title, subtitle, active pill, whole row tappable -- is
+     * exactly what this needs. A dedicated layout would be a third copy of the same three views.
+     */
+    private fun bindCakeChat(holder: SelectableVH, item: ModelListItem.CakeChat) {
+        val b = holder.binding
+        b.cloudModelId.text = "CakeChat"
+        b.cloudModelBaseUrl.text = "On-device · emotion-conditioned"
+        b.cloudModelActivePill.visibility = if (item.isActive) View.VISIBLE else View.GONE
+        b.cloudModelRoot.setOnClickListener { onCakeChatClick() }
     }
 
     private fun bindCloud(holder: SelectableVH, item: ModelListItem.CloudModel) {

@@ -1,134 +1,172 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<!--
+  The root is a FrameLayout purely so Aether's 3D backdrop has somewhere to sit BEHIND the
+  conversation. Order matters: conversationModelView is declared first so every later sibling
+  draws on top of it, which is what puts the messages in front of her. See AetherModelView for
+  why that ordering is the whole mechanism.
+
+  Every other thread (SMS, Sam, Nora) leaves the model view GONE and is laid out exactly as
+  it was before, as a plain vertical column.
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
-    android:layout_height="match_parent"
-    android:background="?attr/prismBackground"
-    android:orientation="vertical">
+    android:layout_height="match_parent">
 
-    <!-- Header (iOS nav bar) -->
-    <RelativeLayout
+    <com.prism.launcher.aether.AetherModelView
+        android:id="@+id/conversationModelView"
         android:layout_width="match_parent"
-        android:layout_height="56dp"
-        android:background="?attr/prismSurface"
-        android:paddingHorizontal="4dp">
+        android:layout_height="match_parent"
+        android:visibility="gone" />
 
-        <ImageButton
-            android:id="@+id/conversationBackBtn"
-            android:layout_width="44dp"
-            android:layout_height="44dp"
-            android:layout_centerVertical="true"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:src="@drawable/ic_back_24"
-            app:tint="@color/imessage_blue" />
-
-        <TextView
-            android:id="@+id/conversationHeaderName"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_centerInParent="true"
-            android:ellipsize="end"
-            android:maxLines="1"
-            android:text="Contact Name"
-            android:textColor="?attr/prismTextPrimary"
-            android:textSize="17sp"
-            android:textStyle="bold" />
-
-        <View
-            android:layout_width="match_parent"
-            android:layout_height="1px"
-            android:layout_alignParentBottom="true"
-            android:background="?attr/prismDivider" />
-    </RelativeLayout>
-
-    <!-- Messages List -->
-    <androidx.recyclerview.widget.RecyclerView
-        android:id="@+id/conversationMessagesList"
-        android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1"
-        android:clipToPadding="false"
-        android:paddingHorizontal="10dp"
-        android:paddingVertical="8dp" />
-
-    <!-- Attachment Preview Area -->
-    <FrameLayout
-        android:id="@+id/attachmentPreviewFrame"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:padding="8dp"
-        android:visibility="gone">
-        <ImageView
-            android:id="@+id/attachmentPreviewImage"
-            android:layout_width="100dp"
-            android:layout_height="100dp"
-            android:scaleType="centerCrop" />
-        <ImageButton
-            android:id="@+id/attachmentRemoveBtn"
-            android:layout_width="24dp"
-            android:layout_height="24dp"
-            android:layout_gravity="top|end"
-            android:background="@android:color/black"
-            android:src="@android:drawable/ic_menu_close_clear_cancel"
-            app:tint="@android:color/white" />
-    </FrameLayout>
-
-    <!-- Input Area. Has an id so the Nora slash-command palette can anchor above it. -->
     <LinearLayout
-        android:id="@+id/conversationInputRow"
+        android:id="@+id/conversationColumn"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:background="?attr/prismSurface"
-        android:gravity="center_vertical"
-        android:orientation="horizontal"
-        android:padding="8dp">
+        android:layout_height="match_parent"
+        android:background="?attr/prismBackground"
+        android:orientation="vertical">
 
-        <ImageButton
-            android:id="@+id/conversationAttachBtn"
-            android:layout_width="36dp"
-            android:layout_height="36dp"
-            android:layout_marginEnd="6dp"
-            android:background="@drawable/bg_round_icon_btn"
-            android:padding="8dp"
-            android:src="@android:drawable/ic_input_add"
-            app:tint="?attr/prismTextPrimary" />
+        <!-- Header (iOS nav bar) -->
+        <RelativeLayout
+            android:layout_width="match_parent"
+            android:layout_height="56dp"
+            android:background="?attr/prismSurface"
+            android:paddingHorizontal="4dp">
 
-        <EditText
-            android:id="@+id/conversationInput"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
+            <ImageButton
+                android:id="@+id/conversationBackBtn"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:layout_centerVertical="true"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:src="@drawable/ic_back_24"
+                app:tint="@color/imessage_blue" />
+
+            <TextView
+                android:id="@+id/conversationHeaderName"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_centerInParent="true"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:text="Contact Name"
+                android:textColor="?attr/prismTextPrimary"
+                android:textSize="17sp"
+                android:textStyle="bold" />
+
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="1px"
+                android:layout_alignParentBottom="true"
+                android:background="?attr/prismDivider" />
+        </RelativeLayout>
+
+        <!-- Messages List -->
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/conversationMessagesList"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
             android:layout_weight="1"
-            android:background="@drawable/bg_ios_pill"
-            android:hint="Text Message"
-            android:inputType="textLongMessage|textMultiLine"
-            android:maxLines="4"
-            android:paddingHorizontal="14dp"
-            android:paddingVertical="9dp"
-            android:textColor="?attr/prismTextPrimary"
-            android:textColorHint="?attr/prismTextSecondary"
-            android:textSize="15sp" />
+            android:clipToPadding="false"
+            android:paddingHorizontal="10dp"
+            android:paddingVertical="8dp" />
 
-        <ImageButton
-            android:id="@+id/conversationMicBtn"
-            android:layout_width="36dp"
-            android:layout_height="36dp"
-            android:layout_marginStart="6dp"
-            android:background="@drawable/bg_round_icon_btn"
-            android:contentDescription="Dictate"
+        <!-- Attachment Preview Area -->
+        <FrameLayout
+            android:id="@+id/attachmentPreviewFrame"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
             android:padding="8dp"
-            android:src="@drawable/ic_mic_24"
-            app:tint="?attr/prismTextPrimary" />
+            android:visibility="gone">
+            <ImageView
+                android:id="@+id/attachmentPreviewImage"
+                android:layout_width="100dp"
+                android:layout_height="100dp"
+                android:scaleType="centerCrop" />
+            <ImageButton
+                android:id="@+id/attachmentRemoveBtn"
+                android:layout_width="24dp"
+                android:layout_height="24dp"
+                android:layout_gravity="top|end"
+                android:background="@android:color/black"
+                android:src="@android:drawable/ic_menu_close_clear_cancel"
+                app:tint="@android:color/white" />
+        </FrameLayout>
 
-        <ImageButton
-            android:id="@+id/conversationSendBtn"
-            android:layout_width="36dp"
-            android:layout_height="36dp"
-            android:layout_marginStart="6dp"
-            android:background="@drawable/bg_round_send_btn"
-            android:padding="8dp"
-            android:src="@android:drawable/ic_menu_send"
-            android:visibility="gone"
-            app:tint="@android:color/white" />
+        <!-- Input Area. Has an id so the Nora slash-command palette can anchor above it. -->
+        <LinearLayout
+            android:id="@+id/conversationInputRow"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="?attr/prismSurface"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:padding="8dp">
+
+            <ImageButton
+                android:id="@+id/conversationAttachBtn"
+                android:layout_width="36dp"
+                android:layout_height="36dp"
+                android:layout_marginEnd="6dp"
+                android:background="@drawable/bg_round_icon_btn"
+                android:padding="8dp"
+                android:src="@android:drawable/ic_input_add"
+                app:tint="?attr/prismTextPrimary" />
+
+            <!--
+              Aether's thread only; GONE everywhere else. Toggles between "she is the backdrop
+              behind the conversation" and "she is the subject and can be turned".
+            -->
+            <ImageButton
+                android:id="@+id/conversationModelToggle"
+                android:layout_width="36dp"
+                android:layout_height="36dp"
+                android:layout_marginEnd="6dp"
+                android:background="@drawable/bg_round_icon_btn"
+                android:contentDescription="View Aether"
+                android:padding="8dp"
+                android:src="@drawable/ic_model_3d_24"
+                android:visibility="gone"
+                app:tint="?attr/prismTextPrimary" />
+
+            <EditText
+                android:id="@+id/conversationInput"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:background="@drawable/bg_ios_pill"
+                android:hint="Text Message"
+                android:inputType="textLongMessage|textMultiLine"
+                android:maxLines="4"
+                android:paddingHorizontal="14dp"
+                android:paddingVertical="9dp"
+                android:textColor="?attr/prismTextPrimary"
+                android:textColorHint="?attr/prismTextSecondary"
+                android:textSize="15sp" />
+
+            <ImageButton
+                android:id="@+id/conversationMicBtn"
+                android:layout_width="36dp"
+                android:layout_height="36dp"
+                android:layout_marginStart="6dp"
+                android:background="@drawable/bg_round_icon_btn"
+                android:contentDescription="Dictate"
+                android:padding="8dp"
+                android:src="@drawable/ic_mic_24"
+                app:tint="?attr/prismTextPrimary" />
+
+            <ImageButton
+                android:id="@+id/conversationSendBtn"
+                android:layout_width="36dp"
+                android:layout_height="36dp"
+                android:layout_marginStart="6dp"
+                android:background="@drawable/bg_round_send_btn"
+                android:padding="8dp"
+                android:src="@android:drawable/ic_menu_send"
+                android:visibility="gone"
+                app:tint="@android:color/white" />
+        </LinearLayout>
+
     </LinearLayout>
 
-</LinearLayout>
+</FrameLayout>

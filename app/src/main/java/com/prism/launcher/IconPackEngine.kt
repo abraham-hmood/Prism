@@ -17,6 +17,17 @@ object IconPackEngine {
     private var currentLoadedPack: String? = null
 
     /**
+     * Drops the cached component->drawable-name mapping and forces the next lookup to reparse
+     * the pack's `appfilter.xml`. Called under system memory pressure (see
+     * `PrismApp.onTrimMemory`) -- cheap to rebuild, so there's no reason to hold it once the
+     * system is asking for memory back.
+     */
+    fun trimCache() {
+        iconCache.clear()
+        currentLoadedPack = null
+    }
+
+    /**
      * Finds all installed icon packs that support ADW/Nova standard intents.
      * Returns a list of Pair(Label, PackageName).
      */

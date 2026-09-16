@@ -18,10 +18,13 @@
         android:minSdkVersion="33" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Required on Android 14+ for the dataSync foreground type CakeChat training runs under. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Nora's training runs for hours. The wake lock keeps the CPU alive once the screen
          turns off; without it a foreground service still pauses when the device suspends. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"
         tools:ignore="BatteryLife" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
@@ -29,8 +32,24 @@
     <uses-permission android:name="android.permission.SEND_SMS" />
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
     <uses-permission android:name="android.permission.READ_CONTACTS" />
+
+    <!-- Fingerprint/face unlock on Prism's own lock screen, and the consent check before changing
+         who receives an emergency alert. USE_FINGERPRINT is the pre-28 spelling and is kept so the
+         prompt works on the oldest devices Prism supports. -->
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <uses-permission android:name="android.permission.USE_FINGERPRINT" />
+    <!-- Agentic read_text/send_text/make_call tools (AgenticMessagingTools) -->
+    <uses-permission android:name="android.permission.CALL_PHONE" />
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
     <!-- Dictation in Messages and Nebula. Requested at the moment the mic is first tapped. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!-- The Science page uses the camera sensor as a particle detector: a covered lens taking
+         long exposures, where the only bright pixels left are particle hits or sensor noise.
+         No image is ever stored or shown - the frames are scanned for bright pixels and
+         discarded. Optional hardware, so a device without a camera still installs. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />
     <uses-permission android:name="android.permission.DOWNLOAD_WITHOUT_NOTIFICATION" />
     <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" tools:ignore="ProtectedPermissions" />
@@ -194,8 +213,142 @@
                 android:value="Long-running on-device neural network training and image generation, initiated and monitored by the user." />
         </service>
 
+        <!-- Aether: a second, separate brain-inspired AI (spiking neurons, not predictive coding) -->
+        <activity
+            android:name=".aether.AetherTrainingActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.PrismSettings"
+            android:windowSoftInputMode="adjustResize" />
+
+        <activity
+            android:name=".aether.AetherSettingsActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings"
+            android:windowSoftInputMode="adjustResize" />
+
+        <activity
+            android:name=".messaging.PrismSwapSettingsActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings"
+            android:windowSoftInputMode="adjustResize" />
+
+        <activity
+            android:name=".messaging.DatasetDownloadSettingsActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- Own OS process (":aether"), a hard heap-ceiling reset independent of the main
+             process's own ART heap cap, first non-default-process component in this app. See
+             PrismApp.onCreate()'s per-process guard, which skips main-process-only init (mesh,
+             DNS proxy, WorkManager schedulers) when running here, and AetherIpcClient/
+             AetherService.onBind() for how the main process still talks to this one. -->
+        <service
+            android:name=".aether.AetherService"
+            android:process=":aether"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Long-running on-device neural network training and image generation, initiated and monitored by the user." />
+        </service>
+
+        <!-- Prism Writer: the keyboard.
+             BIND_INPUT_METHOD is a signature-level permission the SYSTEM holds, not Prism. It is
+             declared here so that only the system may bind this service, which is what stops
+             another app impersonating a keyboard and reading everything typed. -->
+        <!--
+            Asks for the microphone on the keyboard's behalf. An InputMethodService cannot request a
+            runtime permission itself, so without this dictation fails with
+            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS (9) no matter what the manifest declares.
+            Transparent and finishes immediately; it is a dialog host, not a screen.
+        -->
+        <!--
+            Lets the keyboard hand a GIF to another app. commitContent needs a content:// URI this
+            app can grant, and a remote https:// URL cannot be granted to anyone.
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/writer_file_paths" />
+        </provider>
+
+        <activity
+            android:name=".writer.WriterDictionaryActivity"
+            android:exported="false"
+            android:label="Dictionary" />
+
+        <activity
+            android:name=".writer.WriterPermissionActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <service
+            android:name=".writer.PrismWriterService"
+            android:label="@string/writer_ime_label"
+            android:permission="android.permission.BIND_INPUT_METHOD"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.view.InputMethod" />
+            </intent-filter>
+            <meta-data
+                android:name="android.view.im"
+                android:resource="@xml/prism_writer_method" />
+        </service>
+
+        <!-- On-device compilation of native mining libraries. Its own activity because a build
+             runs for a long time and needs a console, and because the notification reopens it. -->
+        <activity
+            android:name=".wallet.NativeCompilerActivity"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.PrismSettings" />
+
+        <!-- Mining. Runs indefinitely by design and must survive the app being backgrounded or
+             swiped away, so it is a foreground service with a persistent notification and
+             restarts itself in onTaskRemoved. See MiningService for what "unkillable" can and
+             cannot mean on Android. -->
+        <service
+            android:name=".wallet.MiningService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Long-running user-initiated cryptocurrency mining, shown continuously in a notification the user can stop at any time." />
+        </service>
+
         <!-- Auto-captioning. A foreground service rather than WorkManager: this is work the
              user just requested and is waiting on, not deferrable background work. -->
+        <!--
+            Quantisation. specialUse for the same reason as the training and captioning services:
+            long-running compute the user started and is watching, which is not any of the narrow
+            types Android enumerates.
+        -->
+        <service
+            android:name=".quant.QuantizationService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Long-running on-device quantisation of a user-selected AI model, initiated and monitored by the user." />
+        </service>
+
         <service
             android:name=".nora.CaptionForegroundService"
             android:exported="false"
@@ -206,13 +359,171 @@
         </service>
 
         <!-- Messaging Conversation -->
+                <activity
+            android:name=".ModelCheckoutActivity"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
+
         <activity
+            android:name=".ModelUploadActivity"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
+
+        <activity
+            android:name=".characters.CharacterCreatorActivity"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
+
+        <activity
+            android:name=".cakechat.CakeChatTrainingActivity"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:theme="@style/Theme.PrismSettings" />
+
+        <!-- dataSync: a training run is long work the user started and expects to keep running
+             while they are elsewhere in the app. -->
+        <service
+            android:name=".cakechat.CakeChatTrainingService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"
+            android:process=":cakechat" />
+
+        <activity
+            android:name=".characters.CharacterConversationActivity"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.PrismSettings" />
+
+        <activity
+            android:name=".WalletReceiveShim"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
+
+<activity
             android:name=".messaging.ConversationActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
             android:screenOrientation="fullUser"
             android:exported="false"
             android:theme="@style/Theme.PrismSettings"
             android:windowSoftInputMode="adjustResize" />
+
+        <!--
+            Opens Windows executables. android:enabled="false" is load-bearing: the component is
+            switched on only when the user turns Windows mode on, so Prism does not appear in the
+            "Open with" list for .exe files it would refuse to run.
+
+            Both a MIME type and a path pattern, because file managers disagree about what a .exe
+            is: some report application/x-msdownload, many report nothing useful at all.
+        -->
+        <activity
+            android:name=".virtualization.ExeLaunchActivity"
+            android:enabled="false"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:label="Run with Prism"
+            android:theme="@style/Theme.PrismSettings">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:mimeType="application/x-msdownload" />
+                <data android:mimeType="application/vnd.microsoft.portable-executable" />
+                <data android:mimeType="application/x-msi" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="file" />
+                <data android:scheme="content" />
+                <data android:host="*" />
+                <data android:pathPattern=".*\.exe" />
+                <data android:pathPattern=".*\..*\.exe" />
+                <data android:pathPattern=".*\.msi" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".editor.MarketplaceActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- Stremio add-on management. Both reached from Settings > Other; neither is exported,
+             because a repository list is a user's own configuration and no other app has business
+             adding to it. -->
+        <!-- The lock screen. showWhenLocked is set in code as well, because the flag has to apply
+             on the pre-O_MR1 path too. excludeFromRecents and noHistory keep it out of the recents
+             list, where a screenshot of a lock screen would be an odd thing to leave lying around.
+             Not exported: nothing outside Prism has any business launching it. -->
+        <activity
+            android:name=".lock.PrismLockActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:showOnLockScreen="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.PrismLauncher"
+            android:windowSoftInputMode="adjustResize" />
+
+        <activity
+            android:name=".lock.LockSetupActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- The decoy. Its own task, so the real launcher is not sitting behind it in recents. -->
+        <activity
+            android:name=".lock.DummyLauncherActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:taskAffinity=""
+            android:theme="@style/Theme.PrismLauncher" />
+
+        <activity
+            android:name=".lock.ContactDetailActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings"
+            android:windowSoftInputMode="adjustResize" />
+
+        <activity
+            android:name=".stremio.StremioRepositoriesActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings"
+            android:windowSoftInputMode="adjustResize" />
+
+        <activity
+            android:name=".stremio.StremioAddonsActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- Every Stremio add-on's website has an Install button, and what it produces is a
+             stremio:// link. Claiming the scheme is how Stremio's own clients receive those, and it
+             is the route that needs no account and no repository. Exported by necessity: the whole
+             point is that a browser can hand it a link. The activity fetches the manifest and asks
+             before storing anything, because a link from a web page is a stranger's instruction. -->
+        <activity
+            android:name=".stremio.StremioInstallActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTask"
+            android:theme="@style/Theme.PrismSettings">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="stremio" />
+            </intent-filter>
+        </activity>
 
         <activity
             android:name=".social.NebulaComposeActivity"
@@ -221,6 +532,27 @@
             android:exported="false"
             android:theme="@style/Theme.PrismSettings"
             android:windowSoftInputMode="adjustResize" />
+
+        <!--
+            Lyke's floating window. supportsPictureInPicture + resizeableActivity are what make the
+            window possible at all, and the smallScreenSize/screenSize config changes keep the video
+            playing through a resize instead of recreating the activity on every drag.
+
+            taskAffinity is deliberately empty: this must land in a task of its OWN, so putting it
+            into the pinned PiP stack never drags the launcher's home task along with it.
+            excludeFromRecents keeps a one-video window out of the app switcher, where it would look
+            like a second copy of Prism.
+        -->
+        <activity
+            android:name=".social.LykePipActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:resizeableActivity="true"
+            android:supportsPictureInPicture="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.PrismLauncher" />
 
         <service
             android:name=".browser.PrivateDnsVpnService"

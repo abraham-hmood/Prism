@@ -1353,6 +1353,306 @@ UNIFICATION
     Done when: Prism can be set as the shell and safely unset.
 
 ================================================================================
-END OF PLAN — 75 phases, 0-3 complete.
+AETHER
+================================================================================
+
+[ ] PHASE 76 — Aether on Desktop
+    Source: core/src/main/kotlin/com/prism/launcher/aether/ (AetherBrain,
+            AetherConnectome, AetherCortices, AetherNeuron, AetherTensor,
+            AetherOps, AetherTokenizer, AetherMotorDecoder,
+            AetherMultimediaLoader, AetherTrainer, AetherGenerator,
+            AetherTelemetry — already plain Kotlin/JVM, no android.* imports,
+            so this is a genuine "wire it up" phase, not a rewrite like
+            Phase 1 was for Nora), plus app/.../aether/ (AetherService,
+            AetherStudio, AetherChat, AetherSettingsActivity,
+            AetherTrainingActivity, AetherBrainView) for the parts that DO
+            need a desktop-side counterpart.
+    Added after the fact: Aether (the Kotlin port of the separate
+    AetherCortex spiking-neural-network project) shipped as a second
+    on-device AI alongside Nora, on Android only, after most of this plan
+    was written. Per rule #6, it gets its own phase rather than being folded
+    into PHASE 1/3/28's Nora-shaped work.
+    Covers: training (dataset dir, epoch loop, biotrain/backprop routes),
+    the four --biogen generation routes (auto-regression, hallucination
+    video, deep-exposure dreaming, saccadic drawing), the brain-size /
+    resizable-geometry settings panel, and network knowledge-sharing
+    (LAN discovery + P2P Mesh integration, once that lands on Android —
+    see the in-progress knowledge-sync plan for Aether/AetherCortex).
+    Aether's own diagnostic view (AetherBrainView) is a plain Canvas +
+    Handler tick, not a TextureView render thread like NoraBrainView —
+    likely the easier of the two to port to a Compose Canvas.
+    Done when: a desktop build can train Aether on a local dataset, run all
+    four generation routes, and reach parity with the Android settings
+    screen (routes toggles, brain size, knowledge-sharing toggles once they
+    exist on Android).
+
+================================================================================
+PRISM SEARCH
+================================================================================
+
+    Added after the fact, per rule #6. The Prism search engine (index, crawler,
+    HTTP server, PageRank, seed management, diagnostics) shipped on Android
+    after this plan was written. Most of it is ALREADY in :core and needs
+    wiring rather than porting — check before rewriting anything.
+
+[ ] PHASE 77 — Search index and crawler on desktop
+    Source: core/.../search/ (PrismSearchIndex, PrismCrawler,
+            PrismSearchServer, PrismSearchDiagnostics — already plain
+            Kotlin/JVM), plus app/.../search/ for the scheduling side.
+    The index, PageRank power iteration, TF-IDF ranking and crawl logic are
+    portable as-is. What is Android-only is the SCHEDULING: Android uses
+    WorkManager for the periodic crawl. Desktop needs an equivalent behind a
+    capability interface (a ScheduledExecutorService is almost certainly
+    enough) rather than a WorkManager shim.
+    Desktop has a real advantage here worth exploiting: no doze, no background
+    execution limits, and disk to spare. A desktop node can hold a far larger
+    index than a phone, which makes the desktop the natural place to run the
+    crawler for a household mesh.
+    Covers: crawl interval setting, user + discovered seed lists, max-seed
+    cap (-1 = unlimited), and the diagnostics panel.
+    Done when: a desktop build crawls from a seed list on a schedule, serves
+    results, and its diagnostics report the same fields the Android panel does.
+
+[ ] PHASE 78 — Search page and prism.com hosting
+    Source: app/.../search/PrismSearchServer.kt, and the reserved-domain
+            dispatch in the mesh stack.
+    Depends on PHASE 48/49/50 (mesh gossip, P2P DNS, proxy server) — the
+    search page is served over the same reserved-domain path other mesh sites
+    use, so this cannot land before that does.
+    Watch for the port. Android picks a random unprivileged port and stores
+    it, having been burned by 842 being privileged. Desktop must do the same
+    rather than hard-coding one; Windows in particular refuses low ports
+    without elevation.
+    Done when: prism.com resolves and serves the search page from a desktop
+    node on the mesh, and falls back to localhost when the mesh is off.
+
+================================================================================
+BROWSER (features added after PHASE 55-58)
+================================================================================
+
+[ ] PHASE 79 — Bookmarks and downloads
+    Source: app/.../browser/BrowserPageView.kt (bookmark star, 3-dot menu),
+            PrismSettings bookmark/download storage (already in :core),
+            app/.../browser/PrismDownloadNotifications.kt.
+    Storage is already portable; what is Android-only is DownloadManager and
+    the notification. Desktop needs its own download queue — JCEF has a
+    download handler, so wire that rather than reimplementing HTTP fetching.
+    Covers: bookmark add/remove/list, download list, per-row long-press
+    removal with confirmation, and progress notification via DesktopNotifier.
+    Match the Android removal semantics: removing a downloaded FILE deletes it
+    from disk; removing a downloaded SITE also un-hosts it from the mesh and
+    deletes only files under the mirrors directory, never a user's own folder.
+    Done when: bookmarks and downloads work from the desktop browser and both
+    lists survive a restart.
+
+[ ] PHASE 80 — Whole-site download (crawl, not mirror)
+    Source: app/.../browser/PrismSiteDownloader.kt.
+    IMPORTANT DISTINCTION, and the reason this is its own phase: mirroring
+    (PHASE 54) replicates a site ALREADY hosted on the mesh from its published
+    manifest. It cannot download an ordinary website — that needs a bounded
+    same-host crawl. Both exist on Android and the browser chooses between
+    them by domain type. Desktop must keep that distinction or the button
+    fails on every non-mesh site, which is exactly how this broke on Android.
+    Bounds to preserve: same host only, page cap, total byte cap, per-file
+    cap, inter-request delay. A desktop can afford larger caps than a phone;
+    raising them is fine, removing them is not.
+    Known gap on Android, worth fixing here first if convenient: links inside
+    saved HTML are not rewritten to relative paths, so a mirrored page still
+    reaches the live origin for assets.
+    Done when: a desktop build downloads an ordinary website and serves it
+    back, and the mesh/web routing choice matches Android's.
+
+================================================================================
+CRYPTO WALLET
+================================================================================
+
+    Added after the fact, per rule #6. The wallet shipped on Android after
+    this plan was written. THE HARD PART IS ALREADY DONE AND ALREADY PORTABLE:
+    everything in core/.../wallet/ is plain Kotlin/JVM with BouncyCastle, is
+    covered by tests against published BIP-39/BIP-32/BIP-84/EIP-155 vectors,
+    and runs on desktop today. Do not rewrite any of it.
+
+[ ] PHASE 81 — WalletCipher for desktop
+    Source: core/.../wallet/WalletVault.kt (the WalletCipher interface),
+            app/.../wallet/WalletKeystoreCipher.kt (the Android version).
+    THIS PHASE BLOCKS EVERY OTHER WALLET PHASE. WalletVault refuses to store a
+    recovery phrase unless a cipher is installed, deliberately — there is no
+    plaintext fallback and one must not be added. Android uses the hardware
+    Keystore; desktop has no equivalent that is as strong.
+    Options, in descending order of preference:
+      - OS keychain: Windows DPAPI (CryptProtectData), or libsecret / GNOME
+        Keyring on Linux. Closest to the Android guarantee.
+      - A passphrase the user sets, stretched with PBKDF2 or Argon2, unlocking
+        the vault for a session.
+    DO NOT ship a key derived from something sitting on disk next to the
+    ciphertext. That protects against nothing while looking like it protects
+    against everything, which is worse than refusing to run.
+    Done when: a desktop build creates a wallet, restarts, and still reads its
+    phrase — and a copy of the data directory alone does not reveal it.
+
+[ ] PHASE 82 — Wallet page on desktop
+    Source: app/.../wallet/WalletPageView.kt, layout include_wallet_page.xml.
+    SlotAssignment.Wallet already exists and LauncherShell already names it in
+    slotLabel/slotIcon — it currently routes to UnportedSlot with the cipher
+    named as the blocker. Replace that with a real page.
+    Covers: setup (create / import), the two tabs, the coin list, and the coin
+    detail with send / receive / export private key. Back from a detail returns
+    to the list, as on Android.
+    Two conventions worth keeping so the platforms do not diverge: the tab
+    control is an iOS-style segmented control rather than a tab strip, and the
+    export-private-key button is NOT optional — it is the only recovery route
+    for a 30-word phrase, which no other wallet software accepts.
+    Done when: a desktop build creates a wallet, shows balances and fiat
+    values, and sends a transaction.
+
+[ ] PHASE 83 — Custom coins and user-created chains
+    Source: core/.../wallet/CoinRegistry.kt (addCustom),
+            core/.../wallet/CustomChainFactory.kt.
+    Both are already portable. This phase is UI: the add-a-coin flow, the
+    unlisted-coin form (SLIP-44 type + address scheme), and the create-a-chain
+    flow that derives genesis parameters, magic bytes, address version, ports
+    and reward schedule from the coin name alone.
+    Desktop is the natural HOME for a user-created chain's node, which is what
+    the Android flow already assumes: it asks the user to point the coin at a
+    PC running Prism Desktop on the mesh. Desktop should eventually ACCEPT
+    that role rather than only generating the config — see PHASE 86.
+    Done when: a desktop build creates a chain from a name and derives a
+    working address for it.
+
+[ ] PHASE 84 — Wallet backup archive
+    Source: core/.../wallet/WalletArchive.kt (already portable and tested).
+    File dialogs only: Android uses the Storage Access Framework, desktop uses
+    a file chooser. The archive format, encryption and merge logic need no
+    changes and MUST NOT diverge — an archive written on a phone has to open
+    on a desktop and the reverse.
+    Done when: an archive written on Android restores on desktop, coin lists
+    merge, and a wrong phrase is refused rather than producing an empty wallet.
+
+================================================================================
+MINING AND NODES
+================================================================================
+
+[ ] PHASE 85 — Mining on desktop
+    Source: core/.../wallet/Mining.kt (algorithms, share target, block header
+            — portable, tested against Bitcoin's genesis block),
+            app/.../wallet/StratumClient.kt, MiningService.kt, SoloMiner.kt.
+    The Stratum client is plain sockets and moves nearly unchanged. What is
+    Android-only is the foreground service, the wake lock and the
+    battery-optimisation prompt — desktop needs none of them, making this one
+    of the few phases where desktop is SIMPLER than Android.
+    Desktop is also where mining stops being pointless. A PC has orders of
+    magnitude more CPU than a phone, no thermal ceiling worth speaking of, and
+    can stay running. If a share is ever found, it will be here.
+    Covers: pool mode (Stratum), solo mode (getblocktemplate against a node),
+    thread count, and the share counter feeding the wallet's yield display.
+    Done when: a desktop build mines against a pool and reports accepted
+    shares, and the wallet page shows the estimated yield.
+
+[ ] PHASE 86 — Hosting blockchain nodes
+    Source: app/.../wallet/PrismNodeManager.kt.
+    On Android this is largely blocked: node executables cannot be shipped and
+    app storage cannot be executed. NONE OF THAT APPLIES ON DESKTOP, which can
+    launch bitcoind or any fork as an ordinary subprocess. This phase inverts
+    the Android situation — what is a documented gap on mobile is
+    straightforward here, and desktop becomes the node the phones point at.
+    Covers: node discovery or bundling, config generation (reuse
+    PrismNodeManager's, including loopback-only RPC binding and forced pruning
+    where the chain supports it), process supervision, and exposing the RPC
+    endpoint to mesh peers that selected this machine.
+    Remember what pruning does and does not do: it caps storage, not the
+    initial download. A desktop still fetches and validates the whole chain
+    once, which is the part users are surprised by.
+    Done when: a desktop build starts a node, and an Android peer on the mesh
+    can select it and solo-mine against it.
+
+[ ] PHASE 87 — PrismCoin node on desktop
+    Source: core/.../wallet/psc/ (PrismCoin, PscChain, PrismCoinValuation —
+            portable and tested: peg arithmetic, reorgs, signature
+            verification, note authentication),
+            app/.../wallet/psc/PrismCoinNode.kt (mesh transport, persistence).
+    Depends on PHASE 48 (mesh gossip) — PrismCoin blocks and transactions ride
+    the same gossip opcodes as everything else.
+    A desktop node matters disproportionately here. PrismCoin's security is
+    proportional to total hash rate, and its worst structural problem is that
+    a mesh of phones partitions constantly and therefore reorgs constantly.
+    Desktop nodes are better connected and stay online, so they are what makes
+    the chain converge at all.
+    KEEP THE ELIGIBILITY RULE: only devices with the wallet page on a desktop
+    slot participate. Do not make every desktop install a node silently.
+    Covers: chain persistence with re-validation on load, block and
+    transaction gossip, mining against the local chain, and the labour-hour
+    valuation panel (target = global average hourly wage, actual = production
+    cost, never merged into one figure).
+    Done when: a desktop and an Android node converge on the same chain over
+    the mesh, and a payment sent from one appears on the other.
+
+[ ] PHASE 88 — Receive notifications
+    Source: app/.../wallet/WalletReceiveNotifier.kt.
+    Straightforward through DesktopNotifier. Preserve both behaviours: balance
+    increases are detected against a stored baseline, so a payment that landed
+    while the app was closed is still reported, and a first sighting is
+    deliberately NOT treated as a receipt. PrismCoin arrivals carry a signed
+    note shown alongside the amount; every other chain shows the amount alone
+    because no note field exists on those chains.
+    Done when: a desktop build notifies on receipt for both an external coin
+    and PrismCoin, with the note shown where present.
+
+[ ] PHASE 89 — On-device compilation (probably NOT wanted on desktop)
+    Source: core/.../wallet/NativeBuildPlan.kt,
+            app/.../wallet/NativeBuildEngine.kt, NativeCompilerActivity.kt.
+    READ THIS BEFORE PORTING ANYTHING. The Android compiler exists solely to
+    work around Android's refusal to execute binaries from app storage: the
+    toolchain has to be a dlopen'd library, and every compiler invocation is
+    spelled out because make and cmake cannot run at all. Desktop has none of
+    those constraints — it can invoke a real toolchain, or simply ship
+    prebuilt libraries.
+    So the correct desktop answer is almost certainly to SKIP the compiler and
+    ship RandomX and anything else as normal build artefacts. Port it only if
+    there is a reason beyond symmetry with Android.
+    What IS worth taking: the library-loading path, so a desktop build can use
+    a RandomX built elsewhere.
+    Done when: either RandomX mining works on desktop from a shipped library,
+    or a deliberate decision is recorded here that on-device compilation is
+    not wanted on desktop.
+
+================================================================================
+REMAINING MOBILE-ONLY SURFACE
+================================================================================
+
+[ ] PHASE 90 — Voice input and dictation
+    Source: app/.../voice/.
+    Android uses SpeechRecognizer. Desktop needs either a local model (Whisper
+    through the native-loading path) or an OS API — Windows has one, Linux
+    effectively does not, so a bundled local model is probably the only answer
+    that works on both.
+    Done when: dictation produces text in the same places it does on Android,
+    or the feature is explicitly recorded here as desktop-unsupported, with
+    the reason.
+
+[ ] PHASE 91 — Diagnostics parity
+    Source: app/.../PrismDiagnostics.kt, DiagnosticsActivity.kt, and the
+            per-subsystem diagnostics added later (search, browser, mesh).
+    Largely portable; the platform-specific parts are network interface
+    enumeration and process/thread stats. Desktop should ADD what Android
+    cannot report — real memory figures, per-core CPU — rather than reporting
+    a subset of the Android panel.
+    Done when: the desktop diagnostics screen covers every subsystem the
+    Android one does.
+
+[ ] PHASE 92 — Plugin pages on desktop
+    Source: app/.../DynamicPageLoader.kt, PluginPageDiscovery.kt.
+    Already named as unported in LauncherShell. Android loads a View class out
+    of another APK; desktop would scan a plugins directory for JARs and load a
+    Composable or a Swing component through a defined SPI.
+    This needs a DECISION before any code: the Android plugin contract is
+    "return an Android View", which has no desktop equivalent. Either define a
+    second, desktop-shaped contract, or define one neutral contract both
+    platforms implement. Do not fake an Android View on desktop.
+    Done when: a sample plugin JAR loads as a desktop page, and the contract
+    is documented well enough for a third party to build against it.
+
+================================================================================
+END OF PLAN — 92 phases, 0-3 complete.
 Remember: check off each phase as you complete it.
 ================================================================================
+

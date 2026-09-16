@@ -38,4 +38,6 @@
     <string name="virt_status_stopped">Stopped</string>
     <string name="virt_status_error">Error — tap power to retry</string>
     <string name="virt_not_supported">Virtualization not supported on this device</string>
+    <string name="writer_subtype_en">English (Prism Writer)</string>
+    <string name="writer_ime_label">Prism Writer</string>
 </resources>

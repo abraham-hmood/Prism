@@ -26,6 +26,7 @@ import com.prism.launcher.databinding.ActivityLauncherBinding
 import com.prism.launcher.messaging.MessagingPageView
 import android.widget.Toast
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class LauncherActivity : PrismBaseActivity() {
 
@@ -58,6 +59,145 @@ class LauncherActivity : PrismBaseActivity() {
             PrivateDnsVpnService.start(this)
         }
         browserPage?.resyncPrivateVpn()
+    }
+
+    /**
+     * Document pickers, exposed for page views.
+     *
+     * A VIEW CANNOT REGISTER FOR ACTIVITY RESULTS -- `registerForActivityResult` must be called
+     * before the activity reaches STARTED, which a page view created later cannot do. So the
+     * launchers live here and pages borrow them through [pickDocument]/[createDocument].
+     *
+     * The callback is cleared as soon as it fires, so a cancelled pick cannot leave a stale
+     * closure holding a destroyed page alive.
+     */
+    private var documentPickCallback: ((android.net.Uri?) -> Unit)? = null
+    private var documentCreateCallback: ((android.net.Uri?) -> Unit)? = null
+
+    private val openDocumentLauncher =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            documentPickCallback?.invoke(uri)
+            documentPickCallback = null
+        }
+
+    private val createDocumentLauncher =
+        registerForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
+            documentCreateCallback?.invoke(uri)
+            documentCreateCallback = null
+        }
+
+    /**
+     * Records a video for Lyke, through the system camera.
+     *
+     * THE SYSTEM CAMERA RATHER THAN AN IN-APP PREVIEW, for now. An embedded viewfinder needs
+     * CameraX and a camera permission flow; ACTION_VIDEO_CAPTURE reuses the camera app the device
+     * already has, needs no permission of ours, and produces the same file. Worth replacing with a
+     * real in-app recorder later — this is the honest first version, not the finished one.
+     */
+    private val lykeRecordLauncher =
+        registerForActivityResult(ActivityResultContracts.CaptureVideo()) { captured ->
+            val uri = pendingLykeCapture
+            pendingLykeCapture = null
+            if (captured == true && uri != null) importLykeVideo(uri)
+        }
+
+    private val lykePickLauncher =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            uri?.let { importLykeVideo(it) }
+        }
+
+    private var pendingLykeCapture: android.net.Uri? = null
+
+    /**
+     * Set when Prism itself is about to send the user somewhere, so [onUserLeaveHint] can tell that
+     * apart from the user walking away.
+     *
+     * The camera and the file picker are both other apps, so leaving for one of them looks exactly
+     * like leaving Prism -- and floating the feed over the camera while somebody is recording a
+     * video FOR that feed is absurd. Consumed on the next leave hint rather than cleared on return,
+     * because the return trip is a result callback that may never arrive if the user backs out.
+     */
+    private var suppressLykePipOnce = false
+
+    fun startLykeRecording() {
+        suppressLykePipOnce = true
+        runCatching {
+            val dir = java.io.File(cacheDir, "lyke-capture").apply { mkdirs() }
+            val file = java.io.File(dir, "capture-${System.currentTimeMillis()}.mp4")
+            val uri = androidx.core.content.FileProvider.getUriForFile(
+                this, "$packageName.fileprovider", file
+            )
+            pendingLykeCapture = uri
+            lykeRecordLauncher.launch(uri)
+        }.onFailure {
+            PrismLogger.logError("Lyke", "Could not open the camera", it)
+            android.widget.Toast.makeText(this, "No camera available", android.widget.Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun startLykeUpload() {
+        suppressLykePipOnce = true
+        runCatching { lykePickLauncher.launch(arrayOf("video/*")) }
+    }
+
+    /**
+     * Copies a captured or picked video into Lyke's own storage and posts it.
+     *
+     * COPIED, because the source is either a cache file the system may clear or a content:// URI
+     * whose grant does not survive a restart — and a feed entry pointing at either becomes a blank
+     * frame later with nothing to explain it.
+     */
+    private fun importLykeVideo(source: android.net.Uri) {
+        Thread({
+            // Copy first, ASK SECOND. The description prompt needs the video to already exist: a
+            // user who types a caption and then watches the import fail has lost work for nothing,
+            // and the copy is the part that can fail.
+            val stored = runCatching {
+                val dir = java.io.File(filesDir, "lyke/mine").apply { mkdirs() }
+                val target = java.io.File(dir, "lyke-${System.currentTimeMillis()}.mp4")
+                contentResolver.openInputStream(source)?.use { input ->
+                    target.outputStream().use { output -> input.copyTo(output) }
+                } ?: return@runCatching null
+                target.absolutePath
+            }.getOrNull()
+
+            runOnUiThread {
+                if (stored == null) {
+                    android.widget.Toast.makeText(
+                        this, "Could not import that video", android.widget.Toast.LENGTH_SHORT
+                    ).show()
+                    return@runOnUiThread
+                }
+                com.prism.launcher.social.LykeDescriptionDialog.show(this) { description ->
+                    Thread({
+                        com.prism.launcher.social.LykeStore.addVideo(stored, description)
+                        runOnUiThread {
+                            android.widget.Toast.makeText(
+                                this, "Posted to Lyke", android.widget.Toast.LENGTH_SHORT
+                            ).show()
+                            refreshLykeFeed()
+                        }
+                    }, "lyke-post").apply { isDaemon = true; start() }
+                }
+            }
+        }, "lyke-import").apply { isDaemon = true; start() }
+    }
+
+    /** Nudges the feed to re-read itself after a post, if Lyke is on screen. */
+    private fun refreshLykeFeed() {
+        runCatching { com.prism.launcher.social.LykeView.onScreen?.reload() }
+    }
+
+    fun pickDocument(mimeTypes: Array<String>, onResult: (android.net.Uri?) -> Unit) {
+        documentPickCallback = onResult
+        runCatching { openDocumentLauncher.launch(mimeTypes) }
+            .onFailure { documentPickCallback = null }
+    }
+
+    fun createDocument(suggestedName: String, onResult: (android.net.Uri?) -> Unit) {
+        documentCreateCallback = onResult
+        runCatching { createDocumentLauncher.launch(suggestedName) }
+            .onFailure { documentCreateCallback = null }
     }
 
     private val notificationPermissionLauncher = registerForActivityResult(
@@ -166,6 +306,8 @@ class LauncherActivity : PrismBaseActivity() {
                         tryConsumeBrowserBack() -> Unit
                         tryConsumeFileExplorerBack() -> Unit
                         tryConsumeNebulaSocialBack() -> Unit
+                        tryConsumeWalletBack() -> Unit
+                        tryConsumeEditorBack() -> Unit
                         else -> {
                             isEnabled = false
                             onBackPressedDispatcher.onBackPressed()
@@ -185,17 +327,99 @@ class LauncherActivity : PrismBaseActivity() {
         }
 
         requestNotificationPermissionIfNeeded()
-        requestNotificationPermissionIfNeeded()
+
+        // A cold start from the notification: the pager has just been given its adapter, so the
+        // page it wants does not exist yet -- showQuantisationSection posts past that.
+        handleLaunchIntent(intent)
+    }
+
+    /**
+     * A notification tapped while Prism is already running arrives here rather than through
+     * onCreate, because the launcher is `singleTask`. Without this the tap would bring the launcher
+     * forward on whatever page it was already on and silently drop the request.
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleLaunchIntent(intent)
+    }
+
+    private fun handleLaunchIntent(intent: Intent?) {
+        if (intent?.action == ACTION_SHOW_QUANTISATION) {
+            showQuantisationSection()
+        }
+        if (intent?.action == ACTION_RUN_WINDOWS_EXE) {
+            val path = intent.getStringExtra(EXTRA_EXE_PATH) ?: return
+            val position = findVirtualizationOsPosition()
+            if (position < 0) {
+                Toast.makeText(this, "Add the Virtualization page to a slot first", Toast.LENGTH_LONG).show()
+                return
+            }
+            binding.desktopPager.setCurrentItem(position, false)
+            // Posted for the same reason the quantisation hand-off is: the page for a slot does not
+            // exist until the pager has laid it out, and a cold start arrives before that.
+            binding.desktopPager.post {
+                (findPageViewAt(position) as? com.prism.launcher.virtualization.VirtualizationPageView)
+                    ?.runWindowsExecutable(java.io.File(path))
+            }
+        }
     }
 
     override fun onResume() {
         super.onResume()
+
+        // Duress: the decoy replaces the launcher, and the launcher is what Home reaches. Checked
+        // on every resume rather than once at startup, because the flag is set while the lock
+        // screen is still in front and the launcher resumes immediately behind it.
+        if (com.prism.launcher.lock.DuressResponder.isActive) {
+            startActivity(
+                Intent(this, com.prism.launcher.lock.DummyLauncherActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+            )
+            return
+        }
+
+        // Home cannot be intercepted, but Prism IS home -- so a press of it lands here, and this is
+        // where a lock that was dismissed that way gets put back.
+        com.prism.launcher.lock.LockGate.showIfLocked(this)
+
         shakeDetector.start()
+        // Back in Prism, so the floating copy has nothing left to do — the real feed is on screen
+        // behind it, and two players on the same video is one too many.
+        com.prism.launcher.social.LykePipActivity.dismiss()
     }
 
     override fun onPause() {
         super.onPause()
         shakeDetector.stop()
+    }
+
+    /**
+     * Leaving Prism with Lyke open floats it in a picture-in-picture window.
+     *
+     * This is the last moment it can be done: the window is opened by starting an activity, and
+     * Android 10 onwards blocks that outright once the process is in the background. `onPause` is
+     * already too late on some versions, and `onStop` always is.
+     *
+     * The check is deliberately narrow. `nebulaSocialPage` is set while the page is ATTACHED, and
+     * the pager keeps neighbours attached to make swiping smooth — so a page sitting one swipe away
+     * with Lyke selected would otherwise pop up a video the user cannot see the source of. Requiring
+     * it to be the current page means the feed only follows them out if they were actually watching
+     * it.
+     */
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+
+        if (suppressLykePipOnce) {
+            suppressLykePipOnce = false
+            return
+        }
+
+        val page = nebulaSocialPage ?: return
+        if (!page.isShowingLyke()) return
+        if (findPageViewAt(binding.desktopPager.currentItem) !== page) return
+
+        com.prism.launcher.social.LykePipActivity.launch(this, page.currentLykeVideoId())
     }
 
     private fun togglePageLock() {
@@ -281,6 +505,32 @@ class LauncherActivity : PrismBaseActivity() {
 
     private fun tryConsumeNebulaSocialBack(): Boolean {
         return nebulaSocialPage?.handleBack() ?: false
+    }
+
+    /**
+     * Back inside VS Code belongs to VS Code.
+     *
+     * Found by scanning the pager rather than held as a field, for the reason the wallet lookup
+     * gives: the page can sit in any slot and is created and recycled by the adapter.
+     */
+    private fun tryConsumeEditorBack(): Boolean {
+        val position = slotPreferences.getAssignments().indexOfFirst { it is SlotAssignment.Editor }
+        if (position < 0) return false
+        if (binding.desktopPager.currentItem != position) return false
+        return (findPageViewAt(position) as? com.prism.launcher.editor.EditorPageView)
+            ?.handleBack() ?: false
+    }
+
+    /**
+     * Back on a coin's detail returns to the wallet list rather than leaving the launcher.
+     *
+     * Found by scanning the pager rather than held as a field, because the wallet page can sit in
+     * any slot and is created and recycled by the adapter -- a retained reference would go stale
+     * the first time the user scrolled past it.
+     */
+    private fun tryConsumeWalletBack(): Boolean {
+        val page = findPageViewAt(binding.desktopPager.currentItem)
+        return (page as? com.prism.launcher.wallet.WalletPageView)?.handleBack() ?: false
     }
 
     fun requestVpnPermission(intent: Intent) {
@@ -395,6 +645,9 @@ class LauncherActivity : PrismBaseActivity() {
 
     private fun showPickerPositionsStep(initialSlot: Int) {
         pendingPickerSlot = initialSlot.coerceIn(0, mainAdapter.itemCount - 1)
+        // Nothing to search on the position step; the field belongs to the options step only.
+        (binding.pickerMainPager.parent as? android.view.ViewGroup)
+            ?.findViewWithTag<android.view.View>("pickerSearch")?.visibility = View.GONE
         binding.pickerSubtitle.setText(R.string.page_picker_step_positions)
         binding.pickerBack.visibility = View.GONE
         binding.pickerMainPager.adapter = PositionPickerAdapter(
@@ -432,7 +685,7 @@ class LauncherActivity : PrismBaseActivity() {
     private fun showPickerOptionsStep() {
         binding.pickerSubtitle.setText(R.string.page_picker_step_options)
         binding.pickerBack.visibility = View.VISIBLE
-        binding.pickerMainPager.adapter = VerticalPageOptionsAdapter(
+        val adapter = VerticalPageOptionsAdapter(
             this,
             pendingPickerSlot,
             discoveredPlugins,
@@ -440,10 +693,72 @@ class LauncherActivity : PrismBaseActivity() {
             applySlotPick(pendingPickerSlot, choice)
             hidePagePicker()
         }
+        binding.pickerMainPager.adapter = adapter
         binding.pickerMainPager.setCurrentItem(0, false)
+        installPickerSearch(adapter)
+    }
+
+    /**
+     * A search box over the page choices.
+     *
+     * The list is a dozen built-ins plus every plugin page installed on the device, shown one at a
+     * time in a vertical pager -- so finding a particular page meant flicking through all of them.
+     *
+     * INSERTED ABOVE THE PAGER, not appended. The picker's container is a vertical LinearLayout
+     * whose pager carries layout_weight="1", so a plain addView() puts the field last -- below the
+     * weighted pager and the add-page button, where the weight has already claimed every remaining
+     * pixel and it gets no height at all. That is why it did not appear. It goes at a fixed index
+     * just under the subtitle instead, with explicit params.
+     *
+     * Added in code rather than to the layout because the picker has two steps sharing one
+     * container; a permanent field in the XML would hang over the position step too, where there
+     * is nothing to search.
+     */
+    private fun installPickerSearch(adapter: VerticalPageOptionsAdapter) {
+        val holder = binding.pickerMainPager.parent as? android.widget.LinearLayout ?: return
+        var field = holder.findViewWithTag<android.widget.EditText>("pickerSearch")
+        if (field == null) {
+            field = android.widget.EditText(this).apply {
+                tag = "pickerSearch"
+                hint = "Search pages"
+                maxLines = 1
+                textSize = 15f
+                background = com.prism.launcher.nora.IosUi.fieldBackground(this@LauncherActivity)
+                setTextColor(com.prism.launcher.nora.IosUi.label(this@LauncherActivity))
+                setHintTextColor(com.prism.launcher.nora.IosUi.tertiaryLabel(this@LauncherActivity))
+                val pad = com.prism.launcher.nora.IosUi.dp(this@LauncherActivity, 10f)
+                setPadding(pad, pad, pad, pad)
+            }
+            val margin = com.prism.launcher.nora.IosUi.dp(this, 24f)
+            val params = android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                setMargins(margin, com.prism.launcher.nora.IosUi.dp(this@LauncherActivity, 12f), margin, 0)
+            }
+            val subtitleIndex = holder.indexOfChild(binding.pickerSubtitle)
+            holder.addView(field, if (subtitleIndex >= 0) subtitleIndex + 1 else 0, params)
+
+            field.addTextChangedListener(object : android.text.TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {
+                    (binding.pickerMainPager.adapter as? VerticalPageOptionsAdapter)
+                        ?.filter(s?.toString().orEmpty())
+                    binding.pickerMainPager.setCurrentItem(0, false)
+                }
+                override fun afterTextChanged(s: android.text.Editable?) {}
+            })
+        }
+        // The watcher reads the live adapter off the pager, so re-entering the step with a new
+        // adapter does not need it re-attached -- attaching again would filter twice per keystroke.
+        field.visibility = View.VISIBLE
+        field.setText("")
+        adapter.filter("")
     }
 
     private fun hidePagePicker() {
+        (binding.pickerMainPager.parent as? android.view.ViewGroup)
+            ?.findViewWithTag<android.view.View>("pickerSearch")?.visibility = View.GONE
         binding.pagePickerOverlay.visibility = View.GONE
         binding.pickerMainPager.adapter = null
         binding.pickerBack.visibility = View.GONE
@@ -471,8 +786,11 @@ class LauncherActivity : PrismBaseActivity() {
             PagePickChoice.NebulaSocial -> SlotAssignment.NebulaSocial
             PagePickChoice.VirtualizationOs -> SlotAssignment.VirtualizationOs
             PagePickChoice.Models -> SlotAssignment.Models
+            PagePickChoice.Editor -> SlotAssignment.Editor
+            PagePickChoice.Science -> SlotAssignment.Science
             PagePickChoice.ModelStore -> SlotAssignment.ModelStore
             PagePickChoice.AgenticTools -> SlotAssignment.AgenticTools
+            PagePickChoice.Wallet -> SlotAssignment.Wallet
             is PagePickChoice.PluginPage -> SlotAssignment.Custom(
                 choice.info.packageName,
                 choice.info.viewClassName,
@@ -547,6 +865,80 @@ class LauncherActivity : PrismBaseActivity() {
 
     fun findVirtualizationOsPosition(): Int =
         slotPreferences.getAssignments().indexOfFirst { it is SlotAssignment.VirtualizationOs }
+
+    /** Turns the pager to [position]. Public so a page can hand off to another page. */
+    fun goToPage(position: Int) {
+        if (position >= 0) binding.desktopPager.setCurrentItem(position, true)
+    }
+
+    fun findModelsPosition(): Int =
+        slotPreferences.getAssignments().indexOfFirst { it is SlotAssignment.Models }
+
+    /**
+     * Turns to the models page and opens its quantisation section.
+     *
+     * Posted rather than called straight through: the page for a slot only exists once the pager has
+     * laid it out, so a request arriving from a notification -- which can land before the pager has
+     * built anything -- would find no view to talk to. The post runs after the swap.
+     */
+    private fun showQuantisationSection() {
+        val position = findModelsPosition()
+        if (position < 0) {
+            Toast.makeText(
+                this, "Add the Models page to a slot to use quantisation", Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+        binding.desktopPager.setCurrentItem(position, false)
+        binding.desktopPager.post {
+            (findPageViewAt(position) as? ModelsPageView)?.showSection(quant = true)
+        }
+    }
+
+    /**
+     * Hands a finished model to the user through the system's file picker.
+     *
+     * ACTION_CREATE_DOCUMENT rather than writing into a path Prism chooses: "anywhere in /sdcard"
+     * includes directories no app may write to directly under scoped storage, and the picker is the
+     * one mechanism that can grant access to the place the user actually points at. It also means
+     * they name the file and see where it went, instead of being told afterwards.
+     */
+    fun exportQuantisedModel(file: java.io.File) {
+        pendingExport = file
+        runCatching {
+            exportModelLauncher.launch(file.name)
+        }.onFailure {
+            pendingExport = null
+            Toast.makeText(this, "No file picker is available", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private var pendingExport: java.io.File? = null
+
+    private val exportModelLauncher =
+        registerForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
+            val source = pendingExport
+            pendingExport = null
+            if (uri == null || source == null) return@registerForActivityResult
+
+            // Off the main thread: these files are gigabytes, and copying one on the UI thread would
+            // freeze the launcher for the length of the copy.
+            lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                val copied = runCatching {
+                    contentResolver.openOutputStream(uri)?.use { output ->
+                        source.inputStream().use { input -> input.copyTo(output) }
+                    } ?: throw java.io.IOException("The picker returned a location that cannot be written")
+                }
+                withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    Toast.makeText(
+                        this@LauncherActivity,
+                        if (copied.isSuccess) "Exported ${source.name}"
+                        else "Export failed: ${copied.exceptionOrNull()?.message}",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+            }
+        }
 
     fun addToDesktop(item: DesktopItem) {
         val list = slotPreferences.getAssignments()
@@ -681,5 +1073,12 @@ class LauncherActivity : PrismBaseActivity() {
 
     companion object {
         // Constants replaced by dynamic overshoot logic
+
+        /** Sent by the quantisation notification: open the models page on its Quant section. */
+        const val ACTION_SHOW_QUANTISATION = "com.prism.launcher.SHOW_QUANTISATION"
+
+        /** Sent by [com.prism.launcher.virtualization.ExeLaunchActivity] with a staged .exe. */
+        const val ACTION_RUN_WINDOWS_EXE = "com.prism.launcher.RUN_WINDOWS_EXE"
+        const val EXTRA_EXE_PATH = "exe_path"
     }
 }

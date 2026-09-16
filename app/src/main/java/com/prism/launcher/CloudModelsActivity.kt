@@ -9,6 +9,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.TextView
 import android.widget.Toast
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -23,6 +24,11 @@ import java.util.UUID
  * cloud model on the Models desktop page, which just writes the same PrismSettings state.
  */
 class CloudModelsActivity : PrismBaseActivity() {
+
+    private companion object {
+        /** The same red the delete affordance uses, so "wrong" reads consistently here. */
+        val URL_ERROR_COLOR = Color.parseColor("#FF6B6B")
+    }
 
     private lateinit var binding: ActivityCloudModelsBinding
     private lateinit var adapter: CloudModelAdapter
@@ -76,9 +82,98 @@ class CloudModelsActivity : PrismBaseActivity() {
         val baseUrlInput = styledInput("Base URL (must be OpenAI-compatible)", existing?.baseUrl ?: "https://api.openai.com/v1/")
         val apiKeyInput = styledInput("API Key", existing?.apiKey ?: "", masked = true)
 
+        // ABOVE the field, not below it: the message explains what is wrong with the thing the
+        // user is about to correct, and putting it under the box pushes it behind the keyboard on
+        // most phones the moment the field is focused.
+        val urlError = TextView(this).apply {
+            textSize = 12f
+            setTextColor(URL_ERROR_COLOR)
+            visibility = android.view.View.GONE
+        }
+
         layout.addView(modelIdInput)
+        layout.addView(urlError)
         layout.addView(baseUrlInput)
         layout.addView(apiKeyInput)
+
+        val defaultUrlBackground = baseUrlInput.background
+        // Read on save. A probe that has not run yet counts as "not failed", so a user who never
+        // touches the field is not warned about a URL nothing has judged.
+        var urlProbeFailed = false
+
+        /**
+         * Clears the error state. Called before every probe so a stale message from a previous
+         * URL cannot sit above a field the user has since fixed.
+         */
+        fun clearUrlError() {
+            urlError.visibility = android.view.View.GONE
+            baseUrlInput.background = defaultUrlBackground
+        }
+
+        fun showUrlError(reason: String) {
+            urlError.text = reason
+            urlError.visibility = android.view.View.VISIBLE
+            baseUrlInput.background = android.graphics.drawable.GradientDrawable().apply {
+                setStroke((2 * density).toInt(), URL_ERROR_COLOR)
+                cornerRadius = 8 * density
+            }
+        }
+
+        /**
+         * Probes the URL and reports back on the UI thread.
+         *
+         * Runs off the main thread because it makes up to four network calls -- two candidates,
+         * each tried as a models listing and directly.
+         */
+        fun probeUrl(onDone: (Boolean) -> Unit = {}) {
+            val typed = baseUrlInput.text.toString().trim()
+            if (typed.isEmpty()) {
+                clearUrlError()
+                onDone(false)
+                return
+            }
+            urlError.visibility = android.view.View.VISIBLE
+            urlError.setTextColor(resolveAttr(R.attr.prismTextSecondary))
+            urlError.text = "Checking…"
+
+            val key = apiKeyInput.text.toString().trim()
+            Thread({
+                val result = CloudEndpointProbe.probe(typed, key)
+                runOnUiThread {
+                    urlError.setTextColor(URL_ERROR_COLOR)
+                    when (result) {
+                        is CloudEndpointProbe.Result.Ok -> {
+                            clearUrlError()
+                            urlProbeFailed = false
+                            // A corrected URL is written back rather than merely accepted: Prism
+                            // appends its own path, so saving the full completions URL would build
+                            // .../chat/completions/chat/completions and 404 at the first message.
+                            if (result.corrected) {
+                                baseUrlInput.setText(result.url)
+                                Toast.makeText(
+                                    this@CloudModelsActivity,
+                                    "Using ${result.url} — Prism adds the chat path itself.",
+                                    Toast.LENGTH_LONG,
+                                ).show()
+                            }
+                            onDone(true)
+                        }
+                        is CloudEndpointProbe.Result.Failed -> {
+                            showUrlError(result.reason)
+                            urlProbeFailed = true
+                            onDone(false)
+                        }
+                    }
+                }
+            }, "cloud-url-probe").start()
+        }
+
+        // Checked when the field loses focus, which is when the user has finished typing a URL
+        // rather than after every keystroke -- probing mid-word would fire a request per character
+        // and report failures for URLs nobody has finished entering yet.
+        baseUrlInput.setOnFocusChangeListener { _, hasFocus ->
+            if (!hasFocus) probeUrl()
+        }
 
         var deleteBtn: MaterialButton? = null
         if (existing != null) {
@@ -103,6 +198,18 @@ class CloudModelsActivity : PrismBaseActivity() {
                 val baseUrl = baseUrlInput.text.toString().trim()
                 val apiKey = apiKeyInput.text.toString().trim()
                 if (modelId.isNotEmpty() && baseUrl.isNotEmpty() && apiKey.isNotEmpty()) {
+                    // Saved even when the probe failed, with a warning rather than a block. The
+                    // probe is a heuristic over other people's servers -- a gateway that rejects
+                    // unauthenticated GETs outright would look dead to it while working fine for
+                    // real requests -- so refusing the save would make Prism unusable against a
+                    // correct endpoint it happens not to recognise. The red field already said so.
+                    if (urlProbeFailed) {
+                        Toast.makeText(
+                            this,
+                            "Saved, but that URL did not respond as an OpenAI-compatible endpoint.",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
                     val profile = PrismSettings.CloudModelProfile(
                         id = existing?.id ?: UUID.randomUUID().toString(),
                         apiKey = apiKey,

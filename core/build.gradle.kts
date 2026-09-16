@@ -59,6 +59,20 @@ dependencies {
     api("androidx.room:room-runtime:$roomVersion")
     ksp("androidx.room:room-compiler:$roomVersion")
 
+    // BouncyCastle, for the crypto wallet's key derivation (see com.prism.launcher.wallet).
+    //
+    // AN ARGUED-FOR ADDITION, per the module comment. The wallet needs RIPEMD-160, Keccak-256,
+    // secp256k1 point multiplication and RFC-6979 deterministic ECDSA -- none of which the JDK
+    // provides, and all of which guard real money. Hand-rolling them would put a subtly wrong
+    // curve implementation between a user and their funds, which is a far worse trade than one
+    // more dependency. It costs the contract nothing: this is a pure-JVM library available on
+    // every platform :core targets, and :app already ships it for on-device certificate
+    // generation, so no new artifact enters the APK.
+    //
+    // `api` rather than `implementation` because wallet signing on the Android side hands these
+    // types across the module boundary.
+    api("org.bouncycastle:bcprov-jdk18on:1.78.1")
+
     // The SQLite driver for non-Android JVMs. Android supplies its own through the framework,
     // which is why this is `compileOnly` for the core's own compilation and a real dependency
     // only where a desktop actually opens the database.

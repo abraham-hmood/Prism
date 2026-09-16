@@ -96,15 +96,45 @@ class AndroidNotifier(private val context: Context) : Notifier {
         }
     }
 
+    /**
+     * Ongoing progress notification.
+     *
+     * Silent and low-importance: a download that re-posts its notification every few percent would
+     * otherwise buzz continuously. `setOnlyAlertOnce` covers the same ground for older API levels
+     * where the channel importance is not consulted per-post.
+     */
+    override fun notifyProgress(
+        channel: String, id: Int, title: String, body: String, percent: Int, ongoing: Boolean
+    ) {
+        ensureChannel(channel, NotificationManager.IMPORTANCE_LOW)
+        val builder = androidx.core.app.NotificationCompat.Builder(context, channel)
+            .setSmallIcon(android.R.drawable.stat_sys_download)
+            .setContentTitle(title)
+            .setContentText(body)
+            .setOngoing(ongoing)
+            .setOnlyAlertOnce(true)
+            .setPriority(androidx.core.app.NotificationCompat.PRIORITY_LOW)
+            .setAutoCancel(!ongoing)
+        if (ongoing) {
+            if (percent in 0..100) builder.setProgress(100, percent, false)
+            else builder.setProgress(0, 0, true)
+        } else {
+            builder.setSmallIcon(android.R.drawable.stat_sys_download_done)
+        }
+        try {
+            NotificationManagerCompat.from(context).notify(id, builder.build())
+        } catch (e: SecurityException) {
+            PrismPlatform.log.debug("Prism/notify", "Progress notification suppressed: not permitted")
+        }
+    }
+
     override fun cancel(id: Int) = manager.cancel(id)
 
     override fun isAvailable(): Boolean =
         NotificationManagerCompat.from(context).areNotificationsEnabled()
 
-    private fun ensureChannel(id: String) {
+    private fun ensureChannel(id: String, importance: Int = NotificationManager.IMPORTANCE_DEFAULT) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || !channels.add(id)) return
-        manager.createNotificationChannel(
-            NotificationChannel(id, id, NotificationManager.IMPORTANCE_DEFAULT)
-        )
+        manager.createNotificationChannel(NotificationChannel(id, id, importance))
     }
 }

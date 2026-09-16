@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile train.py)",
+      "Bash(python3 -c ' *)",
+      "Bash(python -m py_compile brain/ann_baseline.py)",
+      "Bash(diff \"C:/Users/bremo/AetherCortex/brain/ann_baseline.py\" \"Z:/Projects/AetherCortex/brain/ann_baseline.py\")",
+      "Read(//tmp/**)",
+      "Bash(cp \"C:/Users/bremo/AetherCortex/brain/ann_baseline.py\" \"Z:/Projects/AetherCortex/brain/ann_baseline.py\")",
+      "Bash(python -m py_compile train.py brain/ann_baseline.py)",
+      "Bash(git -c safe.directory='*' log --oneline --all -- '*ModelLoad*' '*LoadingDialog*' '*ImportProgress*' '*Progress*')",
+      "Bash(git -c safe.directory='*' log --oneline --all -i --grep=\"progress\")",
+      "Bash(git -c safe.directory='*' log --oneline --all -i --grep=\"loading.*dialog\\\\|import.*progress\\\\|model.*load\")",
+      "Bash(grep -n \"huggingface\\\\|civitai\\\\|ollama\\\\|https://\\\\|object \\\\|class \\\\|fun search\\\\|SOURCE\" \"z:/AndroidStudioProjects/Prism/core/src/main/kotlin/com/prism/launcher/messaging/ModelDiscoveryService.kt\")",
+      "Bash(powershell -Command \"Get-ChildItem -Path 'Z:\\\\AndroidStudioProjects\\\\Prism' -Recurse -Filter 'IosUi*.kt' -File | Select-Object -ExpandProperty FullName\")",
+      "Bash(git log *)",
+      "Bash(python -m py_compile main.py brain/dataset_hub.py config/constants.py)"
+    ]
+  }
+}

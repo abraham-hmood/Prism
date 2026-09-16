@@ -191,6 +191,23 @@ typedef struct {
 } block_q2_0;
 static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
 
+// Quinary quantisation: five levels {-2,-1,0,+1,+2}, scaled by one fp16 delta.
+//
+// PACKED THREE TO A BYTE, base 5: 5*5*5 = 125 fits in a byte with room to spare, where a naive
+// three-bits-per-weight layout would waste 3/8 of every byte representing the three unused codes.
+// That is the same trick TQ1_0 plays with five ternary weights per byte, and it is what keeps a
+// five-level type under 3 bits per weight.
+//
+// 64 weights need ceil(64/3) = 22 bytes, so the last byte carries a single weight; the indexing
+// (byte = i/3, slot = i%3) is uniform regardless, which matters more in the dot product than the
+// two-thirds of one byte it costs.
+#define QK5_Q0 64
+typedef struct {
+    ggml_half d;                 // delta (scale)
+    uint8_t qs[(QK5_Q0 + 2) / 3]; // three base-5 digits per byte
+} block_q5_q0;
+static_assert(sizeof(block_q5_q0) == sizeof(ggml_half) + (QK5_Q0 + 2) / 3, "wrong q5_q0 block size/padding");
+
 #define QK4_0 32
 typedef struct {
     ggml_half d;           // delta

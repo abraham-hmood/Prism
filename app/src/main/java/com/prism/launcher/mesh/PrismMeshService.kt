@@ -1,7 +1,6 @@
 package com.prism.launcher.mesh
 
 import android.util.Log
-import android.widget.Toast
 import com.prism.core.MeshUtils
 import com.prism.launcher.PrismApp
 import com.prism.launcher.PrismLogger
@@ -31,7 +30,9 @@ object PrismMeshService {
             com.prism.launcher.PrismLogger.coroutineHandler("Mesh")
     )
     private var socket: DatagramSocket? = null
-    
+    private var listenerJob: Job? = null
+    private var gossipJob: Job? = null
+
     // List of active peers (IP -> PeerInfo)
     private val activePeers = ConcurrentHashMap<String, PeerInfo>()
     
@@ -44,11 +45,46 @@ object PrismMeshService {
         var latency: Long = 9999L
     )
 
+    /**
+     * Whether this device is actually ON a meshnet right now -- the setting is enabled AND the
+     * control-plane loops are live.
+     *
+     * Deliberately agnostic about client vs. server: a device that started the mesh is on it
+     * whether anyone else has shown up yet or not, and a device that joined someone else's is on
+     * it too. [MeshUtils.getLocalMeshIp] cannot answer this on its own, because it falls back to
+     * the plain LAN address when no tunnel interface exists, so a non-empty result there says
+     * nothing about mesh membership.
+     */
+    fun isOnMesh(): Boolean =
+        PrismSettings.getMeshEnabled() && (listenerJob?.isActive == true || gossipJob?.isActive == true)
+
+    /** Mesh IPs of peers currently considered alive. */
+    fun activePeerIps(): List<String> = activePeers.keys.toList()
+
+    /** Last unexpected listener failure, or null if the listener has never failed. */
+    @Volatile
+    var lastListenerError: String? = null
+        private set
+
+    /** Human-readable listener health, for diagnostics. */
+    fun listenerHealth(): String = when {
+        listenerJob?.isActive == true -> "listening on ${PrismSettings.getMeshBootstrapPort()}"
+        lastListenerError != null -> "stopped after error: $lastListenerError"
+        PrismSettings.getMeshEnabled() -> "not running (start() never ran, or the port was taken)"
+        else -> "disabled in settings"
+    }
+
     fun start() {
+        if (!PrismSettings.getMeshEnabled()) {
+            Log.d(TAG, "Mesh disabled in settings; not starting the listener/gossip loops.")
+            return
+        }
+        if (listenerJob?.isActive == true || gossipJob?.isActive == true) return
+
         val context = PrismApp.instance
         val meshPort = try { PrismSettings.getMeshBootstrapPort().toInt() } catch(e: Exception) { DEFAULT_MESH_PORT }
 
-        meshScope.launch {
+        listenerJob = meshScope.launch {
             try {
                 socket = DatagramSocket(meshPort).apply {
                     reuseAddress = true
@@ -71,12 +107,22 @@ object PrismMeshService {
                     handlePacket(packet)
                 }
             } catch (e: Exception) {
-                PrismLogger.logError(TAG, "Mesh listener failed", e)
+                // stop() closes the socket out from under a blocked receive(), which throws
+                // SocketException("Socket closed"). That is the ordinary shutdown path, not a
+                // fault, and reporting it as an error sent people hunting for a mesh failure that
+                // never happened. A close while we are still meant to be running IS a real fault.
+                val deliberate = !isActive || socket == null || socket?.isClosed == true
+                if (deliberate) {
+                    PrismLogger.logInfo(TAG, "Mesh listener stopped")
+                } else {
+                    lastListenerError = "${e.javaClass.simpleName}: ${e.message}"
+                    PrismLogger.logError(TAG, "Mesh listener failed", e)
+                }
             }
         }
         
         // Peer Discovery & Gossip Task
-        meshScope.launch {
+        gossipJob = meshScope.launch {
             while (isActive) {
                 sendDiscoveryBroadcast(meshPort)
 
@@ -110,9 +156,39 @@ object PrismMeshService {
                     }
                 }
                 
+                // Compute-market capacity, re-announced periodically.
+                //
+                // Announcing once would be enough for peers already listening and useless for
+                // every peer that joins afterwards -- and MeshComputeRegistry expires an entry it
+                // has not heard from in fifteen minutes, so a device that announced at startup and
+                // went quiet would silently vanish from everyone's market. Five minutes is well
+                // inside that window and is a few hundred bytes.
+                if (PrismSettings.getComputeHostEnabled() &&
+                    now - lastComputeAnnounce > COMPUTE_ANNOUNCE_INTERVAL_MS
+                ) {
+                    lastComputeAnnounce = now
+                    runCatching { MeshComputeRegistry.announce(com.prism.launcher.PrismApp.instance) }
+                }
+
                 delay(if (activePeers.isEmpty()) 5000 else 15000)
             }
         }
+    }
+
+    /** When this device last put its capacity on the market. */
+    private var lastComputeAnnounce = 0L
+    private val COMPUTE_ANNOUNCE_INTERVAL_MS = 5 * 60 * 1000L
+
+    /** Stops the listener/gossip loops and releases the socket, so toggling the setting off takes effect immediately rather than only on next process start. */
+    fun stop() {
+        listenerJob?.cancel()
+        gossipJob?.cancel()
+        listenerJob = null
+        gossipJob = null
+        try { socket?.close() } catch (e: Exception) {}
+        socket = null
+        activePeers.clear()
+        pendingRequests.clear()
     }
 
     private fun sendDiscoveryBroadcast(port: Int) {
@@ -162,7 +238,7 @@ object PrismMeshService {
         info.port = packet.port
         
         if (isNew) {
-            showToast("Mesh: Peer discovered ($peerIp)")
+            PrismLogger.logInfo(TAG, "Peer discovered: $peerIp")
         }
 
         when (command) {
@@ -175,6 +251,114 @@ object PrismMeshService {
             0x0A.toByte() -> handleDiscoveryReq(peerIp, payload)
             0x0B.toByte() -> handleHeartbeatResp(peerIp, payload)
             P2pModelRegistry.OPCODE_MODEL_ANNOUNCE -> handleModelAnnounce(payload, peerIp)
+            P2pModelListings.OPCODE_LISTINGS -> P2pModelListings.ingestFromPeer(peerIp, payload)
+            P2pCoinOffers.OPCODE_OFFERS -> P2pCoinOffers.ingestFromPeer(peerIp, payload)
+
+            // A buyer asking this device to re-check a model it is selling. Handled off the
+            // dispatch thread because it makes two blocking HTTP calls, and this thread is the one
+            // every other peer's packets are waiting on.
+            // Mesh pool mining. Work goes out from a coordinator, shares come back; both are
+            // ignored outright by a device not running the mode, so a peer that never opted in
+            // costs nothing but a dropped packet.
+            com.prism.launcher.wallet.MeshPool.OPCODE_WORK ->
+                com.prism.launcher.wallet.MeshPool.onWork(peerIp, payload)
+            com.prism.launcher.wallet.MeshPool.OPCODE_SHARE ->
+                com.prism.launcher.wallet.MeshPool.onShare(
+                    com.prism.launcher.PrismApp.instance, peerIp, payload
+                )
+
+            // A buyer handing a model back. Off-thread: it scans the chain and signs.
+            com.prism.launcher.ModelRefunds.OPCODE_REFUND_REQUEST -> {
+                val ctx = com.prism.launcher.PrismApp.instance
+                Thread({
+                    com.prism.launcher.ModelRefunds.onRefundRequest(ctx, payload)
+                }, "model-refund-request").start()
+            }
+
+            // The seller's verdict coming back. Off-thread: the buyer re-runs its own lookups
+            // before paying, which is two blocking HTTP calls.
+            com.prism.launcher.ModelListingScanner.OPCODE_SALE_APPROVED -> {
+                val ctx = com.prism.launcher.PrismApp.instance
+                Thread({
+                    com.prism.launcher.ModelListingScanner.onSaleApproved(ctx, payload)
+                }, "model-sale-approved").start()
+            }
+
+            com.prism.launcher.ModelListingScanner.OPCODE_VERIFY_NOW -> {
+                val ctx = com.prism.launcher.PrismApp.instance
+                Thread({
+                    com.prism.launcher.ModelListingScanner.onVerifyRequest(ctx, payload, peerIp)
+                }, "model-verify-request").start()
+            }
+            // The compute market. Capability gossip is cheap and frequent; the RPC handshake is
+            // point-to-point and only happens when somebody is about to run a job.
+            MeshComputeRegistry.OPCODE_COMPUTE_ANNOUNCE ->
+                MeshComputeRegistry.ingestFromPeer(peerIp, payload)
+
+            // Starting an RPC server allocates threads and begins listening, so it goes off the
+            // dispatch thread like every other opcode that does real work here.
+            MeshComputeRegistry.OPCODE_RPC_REQUEST -> {
+                val ctx = com.prism.launcher.PrismApp.instance
+                Thread({ MeshInference.onRpcRequest(ctx, peerIp) }, "compute-rpc-request").start()
+            }
+
+            MeshComputeRegistry.OPCODE_RPC_READY -> MeshComputeRegistry.ingestRpcReady(peerIp, payload)
+
+            MeshComputeRegistry.OPCODE_DEBT_ANNOUNCE -> ComputeDebtLedger.ingestDebtAnnouncement(payload)
+
+            // The Science page. Cosmic-ray hits are high-rate and must not block the
+            // dispatch thread; the rest are rare enough to handle inline.
+            com.prism.launcher.science.MeshScience.OPCODE_COSMIC_HIT ->
+                com.prism.launcher.science.MeshScience.ingestHit(peerIp, payload)
+
+            // Witnessing signs with the wallet key, which derives an account -- too slow
+            // for the thread every other peer's packets queue behind.
+            com.prism.launcher.science.MeshScience.OPCODE_WITNESS_REQUEST -> {
+                Thread({
+                    com.prism.launcher.science.MeshScience.onWitnessRequest(peerIp, payload)
+                }, "science-witness").start()
+            }
+
+            com.prism.launcher.science.MeshScience.OPCODE_WITNESS_REPLY ->
+                com.prism.launcher.science.MeshScience.onWitnessReply(peerIp, payload)
+
+            com.prism.launcher.science.MeshScience.OPCODE_RF_SAMPLE ->
+                com.prism.launcher.science.MeshScience.ingestSample(peerIp, payload)
+
+            com.prism.launcher.aether.AetherMeshSync.OPCODE_AETHER_ANNOUNCE -> handleAetherAnnounce(payload, peerIp)
+            com.prism.launcher.social.NebulaMeshSync.OPCODE_NEBULA_ANNOUNCE -> handleNebulaAnnounce(payload, peerIp)
+
+            // PrismCoin blocks and transactions. The node itself decides whether this device
+            // participates -- having the Wallet page on a desktop slot is the opt-in -- so a peer
+            // that has not opted in simply drops these rather than relaying them.
+            com.prism.launcher.wallet.psc.PrismCoinNode.OPCODE_BLOCK,
+            com.prism.launcher.wallet.psc.PrismCoinNode.OPCODE_TX,
+            com.prism.launcher.wallet.psc.PrismCoinNode.OPCODE_HEAD ->
+                com.prism.launcher.wallet.psc.PrismCoinNode.onMeshMessage(
+                    com.prism.launcher.PrismApp.instance, command, payload
+                )
+        }
+    }
+
+    private fun handleAetherAnnounce(payload: String, peerIp: String) {
+        try {
+            val json = JSONObject(payload)
+            com.prism.launcher.aether.AetherMeshSync.ingestFromPeer(
+                peerIp = peerIp,
+                hasModel = json.optBoolean("has_model", false),
+                geometrySignature = json.optString("geometry_signature"),
+                score = json.optInt("score", com.prism.launcher.aether.AetherKnowledgeSync.DEFAULT_SCORE)
+            )
+        } catch (e: Exception) {}
+    }
+
+    /** A peer announcing it is serving a Nebula feed at NebulaMeshSync.NEBULA_HOST_DOMAIN. */
+    private fun handleNebulaAnnounce(payload: String, peerIp: String) {
+        try {
+            val obj = com.prism.core.json.JSONObject(payload)
+            com.prism.launcher.social.NebulaMeshSync.ingestFromPeer(peerIp, obj.optInt("posts", 0))
+        } catch (e: Exception) {
+            Log.w(TAG, "Bad Nebula announce from $peerIp: ${e.message}")
         }
     }
 
@@ -192,7 +376,7 @@ object PrismMeshService {
     }
 
     private fun handleDiscoveryReq(peerIp: String, payload: String) {
-        showToast("Mesh: Client connected ($peerIp)")
+        PrismLogger.logInfo(TAG, "Client connected: $peerIp")
         try {
             val json = JSONObject(payload)
             val peerPort = json.optInt("port", DEFAULT_MESH_PORT)
@@ -247,7 +431,7 @@ object PrismMeshService {
     }
 
     private fun handleDnsSyncReq(peerIp: String, port: Int, payload: String) {
-        showToast("Mesh: Sync requested by $peerIp")
+        PrismLogger.logDebug(TAG, "Sync requested by $peerIp")
         try {
             val json = JSONObject(payload)
             if (json.has("dns")) {
@@ -267,7 +451,7 @@ object PrismMeshService {
             val json = JSONObject(payload)
             if (json.has("dns")) ingestDnsJson(json.getJSONObject("dns"))
             if (json.has("peers")) handlePeerListResp(json.getString("peers"))
-            showToast("Mesh: Sync received from $peerIp")
+            PrismLogger.logDebug(TAG, "Sync received from $peerIp")
         } catch (e: Exception) {}
     }
 
@@ -362,6 +546,21 @@ object PrismMeshService {
         sendPacket(targetIp, info.port, 0x08.toByte(), payload.toString())
     }
 
+    /**
+     * Sends to one known peer, looking its port up from the active table.
+     *
+     * The broadcast helper is wrong for anything addressed: a request meant for the peer selling a
+     * particular model would otherwise reach every device on the mesh, each of which would do the
+     * work of deciding the message was not for it.
+     *
+     * Silently does nothing for a peer that is not currently active, which is the honest outcome --
+     * there is no route to it, and callers of this are advisory rather than load-bearing.
+     */
+    fun sendToPeer(targetIp: String, command: Byte, payload: String) {
+        val info = activePeers[targetIp] ?: return
+        sendPacket(targetIp, info.port, command, payload)
+    }
+
     fun sendPacket(targetIp: String, targetPort: Int, command: Byte, payload: String) {
         meshScope.launch {
             try {
@@ -405,9 +604,18 @@ object PrismMeshService {
         return activePeers.containsKey(cleanIp)
     }
 
-    private fun showToast(message: String) {
-        meshScope.launch(Dispatchers.Main) {
-            Toast.makeText(PrismApp.instance, message, Toast.LENGTH_SHORT).show()
-        }
-    }
+    /**
+     * Tag for routine mesh gossip, which goes to diagnostics and nowhere else.
+     *
+     * THESE USED TO BE TOASTS, and they were unusable as one. Peer discovery, client connections
+     * and DNS syncs fire continuously for as long as the mesh is up -- the gossip loop wakes every
+     * 5 to 15 seconds and every peer on the network is a source -- so the launcher spent its time
+     * covered in notices about events the user had taken no action to cause and could take no
+     * action about. A toast interrupts to report something the person just did; none of this is
+     * that. It is exactly the background telemetry a diagnostics log exists to hold, and it is
+     * still there in full when somebody is actually debugging the mesh.
+     *
+     * Logged under the existing [TAG] rather than a tag of their own, so filtering diagnostics for
+     * the mesh returns all of it rather than half.
+     */
 }

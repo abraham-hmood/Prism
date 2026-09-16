@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Prism Editor</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #1e1e1e; }
+  #root { position: absolute; inset: 0; }
+  #boot {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: #9aa0a6; font: 14px -apple-system, Roboto, sans-serif; text-align: center; padding: 24px;
+  }
+</style>
+</head>
+<body>
+  <div id="root"></div>
+  <div id="boot">Loading editor…</div>
+
+  <!--
+    Monaco is loaded from Prism's own storage rather than a CDN: the editor has to work offline, and
+    a code editor that silently needs the network to open a file is not one.
+
+    The AMD loader is Monaco's own; it is not swapped for a bundler because Monaco ships this way and
+    the alternative is a build step this project does not have.
+  -->
+  <script src="/monaco/vs/loader.js"></script>
+  <script src="prism-editor.js"></script>
+</body>
+</html>

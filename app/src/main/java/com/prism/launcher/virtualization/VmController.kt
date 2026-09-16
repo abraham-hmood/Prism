@@ -22,7 +22,7 @@ import java.util.concurrent.Executors
  * On AVF the surface is wired via VirtualDisplay; on QEMU it connects to an in-process
  * VNC server over localhost.
  */
-class VmController(private val context: Context) {
+class VmController private constructor(private val context: Context) {
 
     enum class Mode { PRISM_OS, CUSTOM_ISO }
 
@@ -30,6 +30,49 @@ class VmController(private val context: Context) {
 
     companion object {
         private const val TAG = "VmController"
+
+        /** QEMU's VNC server. One constant, because four call sites used to hard-code 5900. */
+        const val VNC_PORT = 5900
+
+        /**
+         * Whether something is already serving VNC on the loopback port.
+         *
+         * A plain connect attempt, because that is the only question worth asking: if a socket is
+         * accepted then a VM is running and reachable, whoever started it and whichever app
+         * process it belonged to.
+         */
+        fun isVncPortLive(timeoutMs: Int = 300): Boolean = try {
+            java.net.Socket().use {
+                it.connect(java.net.InetSocketAddress("127.0.0.1", VNC_PORT), timeoutMs)
+                true
+            }
+        } catch (e: Exception) {
+            false
+        }
+
+        @Volatile
+        private var instance: VmController? = null
+
+        /**
+         * The one controller for this process.
+         *
+         * A SINGLETON BECAUSE THE VM OUTLIVES ANY VIEW. QEMU is a subprocess and the VNC renderer
+         * is a thread; both keep running while the desktop pager recycles the virtualization page,
+         * which it does as soon as the user swipes to another page and back.
+         *
+         * Constructing one controller per page view meant the rebuilt page got a FRESH controller:
+         * state STOPPED, no process handle, and -- the symptom that exposed it -- a null VNC
+         * renderer, so every keystroke was dropped with "no VNC connection is attached" while the
+         * old renderer carried on drawing the guest perfectly. Anything owning a subprocess cannot
+         * be scoped to a view that is thrown away and rebuilt.
+         *
+         * Holds the APPLICATION context: a singleton keeping an Activity alive would leak it for
+         * the life of the process.
+         */
+        fun get(context: Context): VmController =
+            instance ?: synchronized(this) {
+                instance ?: VmController(context.applicationContext).also { instance = it }
+            }
     }
 
     var state: State = State.STOPPED
@@ -72,6 +115,23 @@ class VmController(private val context: Context) {
         state = State.BOOTING
         executor.execute {
             try {
+                // A VM MAY ALREADY BE RUNNING, and not just because a page was recycled: QEMU is a
+                // subprocess, so it outlives the app process entirely. Android restarting the app
+                // (which it did between PIDs 8670 and 12504 in the field) leaves an orphan holding
+                // the VNC port -- and a second QEMU then fails to bind it and exits immediately,
+                // which is exactly the "QEMU exited immediately" that was being reported.
+                //
+                // So look before launching. If something is serving VNC, that IS the VM: attach to
+                // it and show it, rather than spawning a rival that cannot start.
+                if (isVncPortLive()) {
+                    PrismLogger.logInfo(TAG, "start(): a VM is already serving VNC — attaching instead of booting a second one")
+                    if (connectVncToSurface(VNC_PORT, surface)) {
+                        state = State.RUNNING
+                        return@execute
+                    }
+                    PrismLogger.logWarning(TAG, "start(): the port answered but the VNC handshake failed; booting fresh")
+                }
+
                 if (mode == Mode.PRISM_OS && isAvfSupported()) {
                     PrismLogger.logInfo(TAG, "Booting via AVF backend")
                     startAvf(surface)
@@ -123,6 +183,8 @@ class VmController(private val context: Context) {
     }
 
     fun stop() {
+        vncRenderer?.stopRenderer()
+        vncRenderer = null
         PrismLogger.logInfo(TAG, "stop()")
         executor.execute {
             try {
@@ -209,6 +271,143 @@ class VmController(private val context: Context) {
 
     // ── QEMU backend ──────────────────────────────────────────────────────────
 
+    /**
+     * The aarch64 UEFI firmware, unpacked from assets on first use.
+     *
+     * WITHOUT THIS NOTHING BOOTS. QEMU's "virt" machine deliberately has no boot ROM of its own --
+     * it is a paravirtual board, not a PC -- so with no firmware there is nothing to read the ISO's
+     * boot catalog and hand off to a bootloader. QEMU starts, shows a blank framebuffer, and looks
+     * like it hung. Alpine and every other aarch64 install image expect UEFI.
+     *
+     * A USER-SUPPLIED FILE STILL WINS. Anyone who drops their own build at the payload path gets
+     * theirs rather than the bundled one -- a firmware is exactly the sort of thing someone
+     * debugging a boot problem will want to swap.
+     */
+    private fun prepareUefiFirmware(): File? {
+        val userSupplied = File(context.filesDir, "${PrismOsConfig.PAYLOAD_DIR}/${PrismOsConfig.UEFI_FIRMWARE}")
+        if (userSupplied.exists() && userSupplied.length() > 0) {
+            PrismLogger.logInfo(TAG, "Using user-supplied firmware at ${userSupplied.absolutePath}")
+            return userSupplied
+        }
+
+        return try {
+            userSupplied.parentFile?.mkdirs()
+            context.assets.open("qemu/${PrismOsConfig.UEFI_FIRMWARE}").use { input ->
+                userSupplied.outputStream().use { input.copyTo(it) }
+            }
+            PrismLogger.logInfo(TAG, "Unpacked bundled UEFI firmware (${userSupplied.length()} bytes)")
+            userSupplied
+        } catch (e: Exception) {
+            PrismLogger.logError(TAG, "Could not unpack the bundled UEFI firmware", e)
+            null
+        }
+    }
+
+    /**
+     * Unpacks the parts of QEMU's data directory Prism ships, and returns it.
+     *
+     * ONLY THE KEYMAPS. A full QEMU install carries firmware blobs, ROMs and device trees, and
+     * bundling all of that would add tens of megabytes for things the "virt" machine never asks
+     * for. The keymap is different: it is required unconditionally by the VNC display, it is one
+     * self-contained 27 KB text file, and without it QEMU refuses to start at all.
+     *
+     * Copied on every launch only when missing or empty -- an interrupted first run would
+     * otherwise leave a truncated file that fails in a far more confusing way than an absent one.
+     */
+    private fun prepareQemuDataDir(): File? = try {
+        val dataDir = File(context.filesDir, "${PrismOsConfig.PAYLOAD_DIR}/qemu-data")
+        val keymaps = File(dataDir, "keymaps").apply { mkdirs() }
+
+        val names = context.assets.list("qemu/keymaps").orEmpty()
+        for (name in names) {
+            val target = File(keymaps, name)
+            if (target.exists() && target.length() > 0) continue
+            context.assets.open("qemu/keymaps/$name").use { input ->
+                target.outputStream().use { input.copyTo(it) }
+            }
+            PrismLogger.logInfo(TAG, "Unpacked QEMU keymap $name (${target.length()} bytes)")
+        }
+        if (names.isEmpty()) null else dataDir
+    } catch (e: Exception) {
+        PrismLogger.logError(TAG, "Could not prepare QEMU's data directory", e)
+        null
+    }
+
+    /**
+     * The live VNC connection, kept so keystrokes can reach the guest.
+     *
+     * Held here rather than in the page because the connection outlives the view: a page can be
+     * recycled and re-attached while the VM keeps running, and a renderer owned by the view would
+     * be lost with it.
+     */
+    @Volatile
+    private var vncRenderer: VncSurfaceRenderer? = null
+
+    /**
+     * Types a key into the guest.
+     *
+     * Returns false when nothing is connected, so the caller can leave the character in its own
+     * input field rather than silently swallowing what the user typed.
+     */
+    fun sendKey(keysym: Int, shift: Boolean = false): Boolean {
+        val renderer = vncRenderer ?: return false
+        val sent = renderer.typeKey(keysym, shift)
+        if (!sent && !renderer.isUsable) {
+            // The socket died under it. Clearing the handle turns the next ensureVncConnected()
+            // into a real reconnect rather than an early return on a corpse.
+            PrismLogger.logWarning(TAG, "sendKey(): the VNC connection is dead; dropping it so it can reconnect")
+            vncRenderer = null
+        }
+        return sent
+    }
+
+    /**
+     * A single press or release, for modifiers that must stay HELD across another key.
+     *
+     * [sendKey] sends a press and a release together, which is right for a character and wrong for
+     * Ctrl -- a Ctrl that releases before the key it modifies produces a plain keystroke, so Ctrl-C
+     * arrives as the letter c.
+     */
+    fun sendKeyRaw(keysym: Int, pressed: Boolean): Boolean {
+        val renderer = vncRenderer ?: return false
+        val sent = renderer.sendKeyEvent(keysym, pressed)
+        if (!sent && !renderer.isUsable) vncRenderer = null
+        return sent
+    }
+
+    /** Whether a VNC connection is currently attached, for diagnostics. */
+    fun hasVncConnection(): Boolean = vncRenderer != null
+
+    /**
+     * Re-attaches to a running VM whose renderer has been lost.
+     *
+     * Called when the page comes back and finds the VM notionally running with nothing connected --
+     * after an app process restart, a recycled page, or a dropped socket. Cheap and idempotent:
+     * it does nothing when a connection already exists.
+     */
+    fun ensureVncConnected(surface: Surface): Boolean {
+        // REBIND, do not just report success. The Surface passed here is a NEW one -- the old was
+        // destroyed when the page was recycled -- so an existing renderer is still drawing into a
+        // dead target and silently rendering nothing. Returning true without rebinding was why the
+        // VM looked frozen after the first swipe away and back.
+        vncRenderer?.let {
+            if (!it.isUsable) {
+                PrismLogger.logWarning(TAG, "ensureVncConnected(): the existing renderer is dead; reconnecting")
+                it.stopRenderer()
+                vncRenderer = null
+                return@let
+            }
+            it.rebind(surface)
+            PrismLogger.logInfo(TAG, "ensureVncConnected(): rebound the existing renderer to the new surface")
+            return true
+        }
+        if (!isVncPortLive()) return false
+        PrismLogger.logInfo(TAG, "ensureVncConnected(): reattaching to the running VM")
+        val ok = connectVncToSurface(VNC_PORT, surface)
+        if (ok) state = State.RUNNING
+        return ok
+    }
+
     private fun startQemu(isoPath: String, isIso: Boolean, surface: Surface) {
         val qemuBin = resolveQemuBinary()
             ?: throw IllegalStateException(
@@ -220,7 +419,7 @@ class VmController(private val context: Context) {
         PrismLogger.logInfo(TAG, "startQemu(): resolved binary at ${qemuBin.absolutePath}")
 
         // VNC on localhost:5900 so we can render to the SurfaceView
-        val vncPort = 5900
+        val vncPort = VNC_PORT
         val cmd = mutableListOf(
             qemuBin.absolutePath,
             "-machine", "virt",
@@ -247,16 +446,52 @@ class VmController(private val context: Context) {
         // The "virt" machine has no boot ROM of its own — without UEFI firmware handing off to
         // the disk's bootloader, QEMU just sits at a black framebuffer forever. Optional because
         // we can't bundle a firmware binary ourselves; if present, use it.
-        val firmware = File(context.filesDir, "${PrismOsConfig.PAYLOAD_DIR}/${PrismOsConfig.UEFI_FIRMWARE}")
-        if (firmware.exists()) {
+        val firmware = prepareUefiFirmware()
+        if (firmware != null && firmware.exists()) {
             cmd += listOf("-bios", firmware.absolutePath)
             PrismLogger.logInfo(TAG, "startQemu(): using UEFI firmware ${firmware.absolutePath}")
         } else {
-            PrismLogger.logWarning(TAG, "startQemu(): no UEFI firmware at ${firmware.absolutePath} — the virt machine has no boot ROM without one, so QEMU may run with nothing to display")
+            PrismLogger.logWarning(TAG, "startQemu(): no UEFI firmware available — the virt machine has no boot ROM without one, so QEMU may run with nothing to display")
         }
+        // QEMU'S DATA DIRECTORY. The VNC display ALWAYS initialises a keyboard layout -- it
+        // defaults to "en-us" and there is no flag to skip it -- and it finds one by looking for
+        // <datadir>/keymaps/<name>. A bare binary lifted out of a distro package has no datadir,
+        // so the lookup fails and QEMU exits immediately with
+        //   "could not read keymap file: 'en-us'"
+        // which is exactly the code-1 exit this hit. -L points it at a directory Prism populates
+        // from its own assets.
+        val qemuData = prepareQemuDataDir()
+        if (qemuData != null) {
+            cmd += listOf("-L", qemuData.absolutePath)
+            PrismLogger.logInfo(TAG, "startQemu(): QEMU data dir at ${qemuData.absolutePath}")
+        } else {
+            PrismLogger.logWarning(TAG, "startQemu(): no QEMU data dir — the VNC display will fail to load its keymap")
+        }
+
         cmd += listOf(
             "-display", "vnc=127.0.0.1:${vncPort - 5900}",
             "-device", "virtio-gpu-pci",
+            // INPUT DEVICES, WITHOUT WHICH THE GUEST HAS NO KEYBOARD.
+            //
+            // "virt" is a paravirtual board, not a PC: it has no PS/2 controller and QEMU adds no
+            // input hardware to it by default. VNC key events were therefore being accepted and
+            // then discarded, because there was no device to deliver them to -- the miner-style
+            // failure where every layer reports success and nothing happens. The client was fine
+            // the whole time; the machine simply had no keyboard plugged in.
+            //
+            // The tablet is an ABSOLUTE pointer rather than a relative mouse, which is what a
+            // touchscreen needs: a tap reports where it is, instead of a delta from where the
+            // cursor used to be.
+            "-device", "virtio-keyboard-pci",
+            "-device", "virtio-tablet-pci",
+            // SERIAL CONSOLE ONTO STDOUT, which is already being drained into PrismLogger.
+            //
+            // Everything the firmware and the kernel say has been going to a device nobody reads.
+            // That is why a guest that boots, fails to log in, and re-prompts looks identical to a
+            // guest that ignores input: the one place that says which it is was discarded. With
+            // this, Alpine's boot messages and its login failures land in logcat next to the
+            // keysyms Prism sent, so the two can finally be compared.
+            "-serial", "stdio",
             "-net", "none"
         )
         // Deliberately no "-nographic" — it disables the video/display devices entirely and
@@ -320,7 +555,17 @@ class VmController(private val context: Context) {
 
         val vncConnected = connectVncToSurface(vncPort, surface)
         if (!vncConnected) {
-            PrismLogger.logWarning(TAG, "startQemu(): VNC never connected — QEMU process is alive, but nothing will render to the SurfaceView")
+            // NOT "RUNNING". A state of RUNNING with no VNC connection is a lie the whole UI then
+            // repeats: the control bar appears, the boot overlay hides, and the user is left
+            // looking at a blank surface typing into nothing -- which is precisely how this
+            // presented. Report what is actually true.
+            PrismLogger.logWarning(TAG, "startQemu(): VNC never connected — nothing can render or receive input")
+            runCatching { process.destroy() }
+            qemuProcess = null
+            throw IllegalStateException(
+                "QEMU started but its VNC server never accepted a connection on port $vncPort. " +
+                    "If a previous VM is still running, stop it and try again."
+            )
         }
 
         // Nothing watches for the VM dying *after* this point otherwise — if QEMU crashes a few
@@ -418,7 +663,7 @@ class VmController(private val context: Context) {
 
     private fun resumeQemu(surface: Surface) {
         // Re-connect VNC renderer to new surface after page re-attach
-        connectVncToSurface(5900, surface)
+        connectVncToSurface(VNC_PORT, surface)
     }
 
     /**
@@ -434,13 +679,35 @@ class VmController(private val context: Context) {
      * slightly too long to come up meant no frames ever rendered, with no error anywhere.
      * Returns whether a connection was actually established.
      */
+    /**
+     * Points the VNC renderer at any display server on [port].
+     *
+     * Public because the Windows runtime needs it too: [WineSession] starts Xvfb and x11vnc rather
+     * than QEMU, but what reaches the screen afterwards is the same VNC stream into the same
+     * Surface, and duplicating the renderer for the second caller would mean two of them to fix.
+     */
+    fun attachVnc(port: Int, surface: Surface): Boolean = connectVncToSurface(port, surface)
+
     private fun connectVncToSurface(port: Int, surface: Surface): Boolean {
         val maxAttempts = 6
         repeat(maxAttempts) { attempt ->
             try {
                 val socket = Socket()
                 socket.connect(InetSocketAddress("127.0.0.1", port), 500)
-                VncSurfaceRenderer(socket, surface).start()
+                // A second connection to the same server is wasteful and confusing -- it is why
+                // "VNC ready" was appearing twice -- so an existing live one is rebound instead.
+                val existing = vncRenderer
+                if (existing != null && existing.isUsable) {
+                    runCatching { socket.close() }
+                    existing.rebind(surface)
+                    PrismLogger.logInfo(TAG, "connectVncToSurface(): already connected; rebound instead")
+                    return true
+                }
+
+                val renderer = VncSurfaceRenderer(socket, surface)
+                vncRenderer?.stopRenderer()
+                vncRenderer = renderer
+                renderer.start()
                 PrismLogger.logInfo(TAG, "connectVncToSurface(): connected on attempt ${attempt + 1}")
                 return true
             } catch (e: Exception) {

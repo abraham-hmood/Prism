@@ -1,0 +1,460 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The wallet desktop page. Three states live in one layout, swapped by visibility:
+     setup (no wallet yet), the tabbed main view, and a single wallet's detail. -->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="?attr/prismBackground">
+
+    <!-- ── State 1: no wallet yet ───────────────────────────────────────── -->
+    <LinearLayout
+        android:id="@+id/setupPanel"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:gravity="center"
+        android:orientation="vertical"
+        android:padding="32dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Wallet"
+            android:textColor="?attr/prismTextPrimary"
+            android:textSize="32sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:layout_marginBottom="40dp"
+            android:gravity="center"
+            android:text="Keys are generated and stored on this device. Nothing is sent anywhere."
+            android:textColor="?attr/prismTextSecondary"
+            android:textSize="14sp" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/createWalletButton"
+            android:layout_width="match_parent"
+            android:layout_height="50dp"
+            android:letterSpacing="0"
+            android:text="Create a new wallet"
+            android:textAllCaps="false"
+            android:textColor="@android:color/white"
+            android:textSize="17sp"
+            android:textStyle="bold"
+            app:backgroundTint="@color/imessage_blue"
+            app:cornerRadius="14dp"
+            app:elevation="0dp" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/importWalletButton"
+            style="@style/Widget.MaterialComponents.Button.TextButton"
+            android:layout_width="match_parent"
+            android:layout_height="50dp"
+            android:layout_marginTop="6dp"
+            android:letterSpacing="0"
+            android:text="Import wallet"
+            android:textAllCaps="false"
+            android:textColor="@color/imessage_blue"
+            android:textSize="17sp" />
+    </LinearLayout>
+
+    <!-- ── State 2: the tabbed wallet ───────────────────────────────────── -->
+    <LinearLayout
+        android:id="@+id/mainPanel"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:visibility="gone">
+
+        <!-- iOS large title, then a UISegmentedControl rather than a Material tab strip. -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="20dp"
+            android:layout_marginTop="18dp"
+            android:layout_marginEnd="12dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:id="@+id/largeTitle"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:letterSpacing="0.01"
+                android:text="Wallet"
+                android:textColor="?attr/prismTextPrimary"
+                android:textSize="34sp"
+                android:textStyle="bold" />
+
+            <!-- iOS puts an ellipsis-in-a-circle at the trailing edge of a large title for
+                 screen-level actions; this carries backup and restore. Only on the Mining tab. -->
+            <TextView
+                android:id="@+id/miningMenuButton"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:background="?android:attr/selectableItemBackgroundBorderless"
+                android:contentDescription="Backup and restore"
+                android:gravity="center"
+                android:text="⋯"
+                android:textColor="@color/imessage_blue"
+                android:textSize="26sp"
+                android:textStyle="bold"
+                android:visibility="gone" />
+        </LinearLayout>
+
+        <com.prism.launcher.nora.IosSegmentedControl
+            android:id="@+id/walletTabs"
+            android:layout_width="match_parent"
+            android:layout_height="34dp"
+            android:layout_marginStart="16dp"
+            android:layout_marginTop="14dp"
+            android:layout_marginEnd="16dp"
+            android:layout_marginBottom="6dp" />
+
+        <FrameLayout
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1">
+
+            <!-- Tab 1: every wallet -->
+            <androidx.recyclerview.widget.RecyclerView
+                android:id="@+id/walletsRecycler"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:clipToPadding="false"
+                android:paddingStart="12dp"
+                android:paddingTop="8dp"
+                android:paddingEnd="12dp"
+                android:paddingBottom="88dp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/addCoinButton"
+                android:layout_width="wrap_content"
+                android:layout_height="52dp"
+                android:layout_gravity="bottom|center_horizontal"
+                android:layout_marginBottom="20dp"
+                android:paddingStart="24dp"
+                android:paddingEnd="24dp"
+                android:letterSpacing="0"
+                android:text="Add a coin"
+                android:textAllCaps="false"
+                android:textColor="@android:color/white"
+                android:textSize="16sp"
+                app:backgroundTint="@color/imessage_blue"
+                app:cornerRadius="26dp"
+                app:elevation="0dp" />
+
+            <!-- Tab 3: the mesh compute market. Filled in code by ComputeMarketView, because the
+                 rows are built from live mesh gossip and there is no fixed list to lay out. -->
+            <ScrollView
+                android:id="@+id/computePanel"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:visibility="gone" />
+
+            <!-- Tab 2: mining -->
+            <ScrollView
+                android:id="@+id/miningPanel"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:padding="16dp"
+                android:visibility="gone">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:id="@+id/miningStatus"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:background="@drawable/bg_wallet_card"
+                        android:padding="16dp"
+                        android:text="Not mining"
+                        android:textColor="?attr/prismTextPrimary"
+                        android:textSize="14sp" />
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="20dp"
+                        android:layout_marginBottom="8dp"
+                        android:text="Coins Prism can mine on this device"
+                        android:textColor="?attr/prismTextSecondary"
+                        android:textSize="13sp" />
+
+                    <LinearLayout
+                        android:id="@+id/mineableList"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="vertical" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/refreshMineableButton"
+                        style="@style/Widget.MaterialComponents.Button.TextButton"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:text="Look for more mineable coins" />
+
+                    <TextView
+                        android:id="@+id/miningCaveat"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="16dp"
+                        android:textColor="?attr/prismTextSecondary"
+                        android:textSize="12sp" />
+                </LinearLayout>
+            </ScrollView>
+        </FrameLayout>
+    </LinearLayout>
+
+    <!-- ── State 3: one wallet's detail ─────────────────────────────────── -->
+    <LinearLayout
+        android:id="@+id/detailPanel"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:padding="20dp"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/detailBackButton"
+                style="@style/Widget.MaterialComponents.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:minWidth="0dp"
+                android:paddingStart="0dp"
+                android:letterSpacing="0"
+                android:text="‹ Wallets"
+                android:textAllCaps="false"
+                android:textColor="@color/imessage_blue"
+                android:textSize="17sp" />
+
+            <TextView
+                android:id="@+id/detailTitle"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:layout_weight="1"
+                android:text="Bitcoin"
+                android:textColor="?attr/prismTextPrimary"
+                android:textSize="20sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:background="@drawable/bg_wallet_card"
+            android:gravity="center"
+            android:orientation="vertical"
+            android:padding="28dp">
+
+            <TextView
+                android:id="@+id/detailBalance"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="—"
+                android:textColor="?attr/prismTextPrimary"
+                android:textSize="34sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/detailFiat"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:textColor="?attr/prismTextSecondary"
+                android:textSize="16sp" />
+        </LinearLayout>
+
+        <!-- PrismCoin only: what one PSC is meant to be worth against what it demonstrably is.
+             Two separate numbers, never merged, because the peg is on issuance and not on price. -->
+        <LinearLayout
+            android:id="@+id/pscPanel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:background="@drawable/bg_wallet_card"
+            android:orientation="vertical"
+            android:padding="18dp"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:letterSpacing="0.06"
+                android:text="LABOUR-HOUR PEG"
+                android:textColor="?attr/prismTextSecondary"
+                android:textSize="11sp" />
+
+            <TextView
+                android:id="@+id/pscTargetValue"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:textColor="?attr/prismTextPrimary"
+                android:textSize="15sp" />
+
+            <TextView
+                android:id="@+id/pscTargetBasis"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:textColor="?attr/prismTextSecondary"
+                android:textSize="12sp" />
+
+            <TextView
+                android:id="@+id/pscTrueValue"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:textColor="?attr/prismTextPrimary"
+                android:textSize="15sp" />
+
+            <TextView
+                android:id="@+id/pscTrueBasis"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:textColor="?attr/prismTextSecondary"
+                android:textSize="12sp" />
+
+            <TextView
+                android:id="@+id/pscHoldingsValue"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:textColor="?attr/prismTextPrimary"
+                android:textSize="15sp" />
+
+            <TextView
+                android:id="@+id/pscChainStatus"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:textColor="?attr/prismTextSecondary"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <!-- Pool-mining yield for this coin. Hidden entirely when there is nothing to report,
+             rather than showing a row of zeroes on a wallet that has never mined. -->
+        <LinearLayout
+            android:id="@+id/sharesPanel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:background="@drawable/bg_wallet_card"
+            android:orientation="vertical"
+            android:padding="18dp"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/sharesCount"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="?attr/prismTextPrimary"
+                android:textSize="15sp" />
+
+            <TextView
+                android:id="@+id/sharesInCoin"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textColor="?attr/prismTextPrimary"
+                android:textSize="15sp" />
+
+            <TextView
+                android:id="@+id/sharesInFiat"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textColor="?attr/prismTextSecondary"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/sharesCaveat"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:textColor="?attr/prismTextSecondary"
+                android:textSize="11sp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:orientation="horizontal">
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/sendButton"
+                android:layout_width="0dp"
+                android:layout_height="50dp"
+                android:layout_marginEnd="5dp"
+                android:layout_weight="1"
+                android:letterSpacing="0"
+                android:text="Send"
+                android:textAllCaps="false"
+                android:textColor="@android:color/white"
+                android:textSize="17sp"
+                android:textStyle="bold"
+                app:backgroundTint="@color/imessage_blue"
+                app:cornerRadius="14dp"
+                app:elevation="0dp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/receiveButton"
+                android:layout_width="0dp"
+                android:layout_height="50dp"
+                android:layout_marginStart="5dp"
+                android:layout_weight="1"
+                android:letterSpacing="0"
+                android:text="Receive"
+                android:textAllCaps="false"
+                android:textColor="@color/imessage_blue"
+                android:textSize="17sp"
+                android:textStyle="bold"
+                app:backgroundTint="@color/ios_tinted_fill"
+                app:cornerRadius="14dp"
+                app:elevation="0dp" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/detailAddress"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:textColor="?attr/prismTextSecondary"
+            android:textIsSelectable="true"
+            android:textSize="12sp" />
+
+        <!-- The escape hatch. A 30-word phrase restores nowhere but Prism, so a per-coin key is
+             the only thing that makes these funds reachable if this app stops working. -->
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/exportKeyButton"
+            style="@style/Widget.MaterialComponents.Button.TextButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:letterSpacing="0"
+            android:paddingStart="0dp"
+            android:text="Export private key"
+            android:textAllCaps="false"
+            android:textColor="@color/imessage_blue"
+            android:textSize="15sp" />
+    </LinearLayout>
+</FrameLayout>

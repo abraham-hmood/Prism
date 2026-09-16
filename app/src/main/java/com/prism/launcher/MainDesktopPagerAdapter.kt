@@ -98,10 +98,14 @@ class MainDesktopPagerAdapter(
                 com.prism.launcher.virtualization.VirtualizationPageView(activity)
 
             SlotAssignment.Models -> ModelsPageView(activity)
+            SlotAssignment.Editor -> com.prism.launcher.editor.EditorPageView(activity)
+            SlotAssignment.Science -> com.prism.launcher.science.SciencePageView(activity)
 
             SlotAssignment.ModelStore -> ModelStorePageView(activity)
 
             SlotAssignment.AgenticTools -> com.prism.launcher.agentic.AgenticToolsPageView(activity)
+
+            SlotAssignment.Wallet -> com.prism.launcher.wallet.WalletPageView(activity)
 
             SlotAssignment.Default -> DesktopGridPage(
                 ctx,

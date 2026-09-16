@@ -143,9 +143,88 @@ object PrismMirrorManager {
         com.prism.launcher.mesh.PrismMeshService.broadcastDnsUpdate(domain)
     }
 
+    /**
+     * One funnel for mirroring progress, so the notification cannot disagree with the in-app
+     * indicator: both read the same number from the same call.
+     *
+     * 100 ends the ongoing notification rather than leaving it pinned forever; a negative percent
+     * means the mirror failed and reports that instead of vanishing silently, which would look
+     * identical to a download that simply never finished.
+     */
+    /**
+     * Progress from another downloader (see [PrismSiteDownloader]), routed through the same funnel
+     * as mesh mirroring so the in-app indicator and the notification stay consistent no matter
+     * which kind of download produced the number.
+     */
+    fun reportProgress(domain: String, percent: Int) = updateProgress(domain, percent)
+
+    /**
+     * Registers a site that was crawled from the open web, using the identical registration path
+     * mesh mirroring uses -- mirrored list, hosted list, local DNS record, mesh announcement. How
+     * the bytes arrived is not something the rest of the system should have to care about.
+     */
+    fun registerDownloadedSite(context: Context, domain: String, localPath: String) =
+        finalizeMirror(context, domain, localPath)
+
+    /**
+     * Undoes [finalizeMirror]: stops serving [domain] to the mesh and deletes the downloaded copy.
+     *
+     * Lives next to registration deliberately -- registration touches four separate places (mirror
+     * list, hosted list, DNS ledger, web-host cache) and a removal that forgets one of them leaves
+     * a site that is half-gone: still announced but unservable, or deleted from disk but still
+     * advertised.
+     *
+     * TWO THINGS THIS WILL NOT DO, both for the user's protection:
+     *
+     * 1. It only deletes files under the mirrors directory. The hosted-sites list also holds sites
+     *    the user pointed at their OWN folders through P2P hosting; recursively deleting one of
+     *    those because a domain name matched would destroy their originals.
+     * 2. It only un-hosts the entry whose localPath is this mirror's. If the user was already
+     *    hosting the same domain from their own folder, mirroring left that entry alone, so
+     *    removing the mirror must leave it alone too.
+     *
+     * Peers keep their DNS record pointing here until it ages out or another provider answers --
+     * there is no "unpublish" opcode in the gossip protocol. They will get a 404 from the web host
+     * in the meantime, which is the correct answer once the content is gone.
+     *
+     * @return true if the site was found and removed.
+     */
+    fun removeSite(context: Context, domain: String): Boolean {
+        val mirrors = PrismSettings.getP2pMirroredSites()
+        val mirror = mirrors.find { it.domain.equals(domain, ignoreCase = true) } ?: return false
+
+        PrismSettings.setP2pMirroredSites(mirrors.filterNot { it.domain.equals(domain, ignoreCase = true) })
+
+        PrismSettings.setP2pHostedSites(
+            PrismSettings.getP2pHostedSites().filterNot {
+                it.domain.equals(domain, ignoreCase = true) && it.localPath == mirror.localPath
+            }
+        )
+
+        P2pDnsManager.deleteRecord(context, domain)
+        // Otherwise the host would keep answering from its in-memory file map for a site whose
+        // files no longer exist.
+        PrismWebHost.clearCache(domain)
+
+        val dir = java.io.File(mirror.localPath)
+        val mirrorsRoot = PrismSettings.getMirrorsDir().canonicalFile
+        val underMirrors = runCatching {
+            dir.canonicalFile.toPath().startsWith(mirrorsRoot.toPath())
+        }.getOrDefault(false)
+        if (underMirrors && dir.exists()) {
+            dir.deleteRecursively()
+        } else if (!underMirrors) {
+            Log.w(TAG, "Left ${mirror.localPath} on disk for $domain: outside the mirrors directory")
+        }
+
+        Log.i(TAG, "Removed $domain from the mesh")
+        return true
+    }
+
     private fun updateProgress(domain: String, percent: Int) {
         val current = _syncProgress.value.toMutableMap()
         current[domain] = percent
         _syncProgress.value = current
+        com.prism.launcher.browser.PrismDownloadNotifications.siteProgress(domain, percent)
     }
 }

@@ -59,6 +59,16 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }
 
+// THE SAME PYTHON BOTH PLATFORMS RUN. prism_cakechat.py and prism_corpus.py live in the Android
+// module because Chaquopy owns that directory, but nothing in them is Android-specific -- they are
+// stdlib plus TensorFlow. Pointing desktop's resources at the same directory means one copy, so a
+// fix to the corpus converter or the keras bridge cannot land on one platform and not the other.
+sourceSets {
+    named("main") {
+        resources.srcDir("../app/src/main/python")
+    }
+}
+
 compose.desktop {
     application {
         mainClass = "com.prism.desktop.MainKt"
@@ -223,4 +233,11 @@ val buildAllNative by tasks.registering {
 
 if (project.hasProperty("prismNative")) {
     tasks.named("compileKotlin") { dependsOn(buildNativeKernels) }
+}
+
+// Bytecode caches are per-interpreter-version and get written into the source tree whenever the
+// shared Python is run directly during development. Packaging them ships another release's .pyc
+// files to a different Python than the one that wrote them.
+tasks.named<ProcessResources>("processResources") {
+    exclude("__pycache__/**", "**/*.pyc")
 }

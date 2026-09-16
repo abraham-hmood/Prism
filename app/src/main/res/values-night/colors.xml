@@ -6,6 +6,9 @@
     <color name="prism_text_secondary">#99FFFFFF</color>
     <color name="social_text_main">#FFFFFFFF</color>
 
+    <!-- Tracks the dark-mode system blue below, at the same ~15% fill. -->
+    <color name="ios_tinted_fill">#260A84FF</color>
+
     <!-- Dark-mode overrides for the iMessage bubble colors declared in values/colors.xml -->
     <color name="imessage_blue">#FF0A84FF</color>
     <color name="imessage_bubble_received">#FF26252A</color>

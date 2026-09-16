@@ -1,6 +1,7 @@
 package com.prism.launcher.agentic
 
 import android.content.Context
+import android.content.res.ColorStateList
 import android.util.AttributeSet
 import android.view.Gravity
 import android.view.LayoutInflater
@@ -12,6 +13,7 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.prism.launcher.AppDatabase
@@ -530,14 +532,53 @@ class AgenticToolsAdapter(
         b.toolRoot.setOnLongClickListener { onImportedToolLongClick(entity); true }
     }
 
+    /**
+     * Capability-gated builtins render red and disabled when their capability is missing:
+     * `def.requiresActiveLine` (read_text/send_text/make_call) unless
+     * [com.prism.core.PrismPlatform.host.hasActiveCellularLine], and `def.requiresImageGenerator`
+     * (generate_image) unless [com.prism.launcher.PrismSettings.hasImageGenerator]. Purely a
+     * visual reflection of the real gates [AgenticEngine.run]/[AgenticBuiltinTools.execute]
+     * already enforce; this view never decides on its own whether a tool is allowed to run.
+     */
     private fun bindBuiltinTool(holder: ToolVH, def: ToolDefinition) {
         val b = holder.binding
+        val ctx = b.toolRoot.context
         b.toolName.text = def.name
         b.toolSubtitle.text = def.description
         b.toolBuiltinBadge.visibility = View.VISIBLE
         b.toolEnabledSwitch.visibility = View.GONE
         b.toolEnabledSwitch.setOnCheckedChangeListener(null)
-        b.toolRoot.setOnClickListener { onBuiltinToolClick(def) }
+
+        val lineActive = com.prism.core.PrismPlatform.host.hasActiveCellularLine()
+        val imageGenLoaded = com.prism.launcher.PrismSettings.hasImageGenerator()
+        val missingLine = def.requiresActiveLine && !lineActive
+        val missingImageGen = def.requiresImageGenerator && !imageGenLoaded
+        val disabled = missingLine || missingImageGen
+
+        if (disabled) {
+            b.toolBuiltinBadge.text = if (missingImageGen) "NEEDS IMAGE MODEL" else "NEEDS SIM"
+            b.toolBuiltinBadge.setTextColor(ContextCompat.getColor(ctx, R.color.tool_disabled_fg))
+            b.toolBuiltinBadge.backgroundTintList =
+                ColorStateList.valueOf(ContextCompat.getColor(ctx, R.color.tool_disabled_bg))
+            b.toolName.setTextColor(ContextCompat.getColor(ctx, R.color.tool_disabled_fg))
+            b.toolSubtitle.text = if (missingImageGen) {
+                "${def.description} (needs an image generation model — import one in Settings > AI Engine)"
+            } else {
+                "${def.description} (needs an active SIM or eSIM)"
+            }
+            b.toolRoot.alpha = 0.5f
+            b.toolRoot.isEnabled = false
+            b.toolRoot.setOnClickListener(null)
+        } else {
+            b.toolBuiltinBadge.text = "BUILT-IN"
+            b.toolBuiltinBadge.setTextColor(ContextCompat.getColor(ctx, R.color.model_tag_text_fg))
+            b.toolBuiltinBadge.backgroundTintList =
+                ColorStateList.valueOf(ContextCompat.getColor(ctx, R.color.model_tag_text_bg))
+            b.toolName.setTextColor(ContextCompat.getColor(ctx, R.color.prism_text_primary))
+            b.toolRoot.alpha = 1.0f
+            b.toolRoot.isEnabled = true
+            b.toolRoot.setOnClickListener { onBuiltinToolClick(def) }
+        }
         b.toolRoot.setOnLongClickListener { true }
     }
 

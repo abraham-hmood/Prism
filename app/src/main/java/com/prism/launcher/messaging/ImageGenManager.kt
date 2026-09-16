@@ -76,4 +76,39 @@ object ImageGenManager {
         }
         return null
     }
+
+    /**
+     * Recognizes "draw/generate me a picture of X" style requests in a user's own message and
+     * returns just the X, or null if this isn't an image request.
+     *
+     * Returning the SUBJECT rather than the whole message is the point: the previous behaviour fed
+     * the entire raw text to the generator, so "generate image of a red fox" asked a diffusion
+     * model to render the words "generate image of" as part of the picture. The leading phrase is
+     * an instruction to Prism, not part of what the user wants to see.
+     *
+     * Only used on the non-agentic path. With agentic tools enabled the model calls
+     * `generate_image` and writes a proper prompt itself, which is strictly better than any
+     * keyword match -- this exists so that Sam can still make pictures without tool-calling turned
+     * on, not as the preferred route.
+     */
+    fun parseImageRequest(text: String): String? {
+        val triggers = listOf(
+            "generate an image of", "generate an image", "generate image of", "generate image",
+            "make me a picture of", "make a picture of", "make a picture",
+            "draw me a picture of", "draw me a picture", "draw a picture of", "draw a picture",
+            "draw me an image of", "create an image of", "create an image"
+        )
+        val lower = text.lowercase()
+        val hit = triggers.firstOrNull { lower.contains(it) } ?: return null
+
+        val index = lower.indexOf(hit)
+        val subject = text.substring(index + hit.length)
+            .trimStart(' ', ':', ',', '-', '—')
+            .removePrefix("of ")
+            .trim()
+        // "generate an image" with nothing after it is still an image request; fall back to
+        // whatever else the user said rather than handing the generator an empty prompt.
+        return subject.ifBlank { text.replace(Regex("(?i)" + Regex.escape(hit)), "").trim() }
+            .ifBlank { null }
+    }
 }

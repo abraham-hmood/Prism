@@ -2,6 +2,8 @@ package com.prism.launcher
 
 import com.prism.core.MeshUtils
 import com.prism.core.PrismPlatform
+import com.prism.core.json.JSONArray
+import com.prism.core.json.JSONObject
 import java.io.File
 
 /**
@@ -53,7 +55,7 @@ object PrismSettings {
     // ── Browser ─────────────────────────────────────────────────────────────
 
     /**
-     * Search engine identifier: "ddg" | "google" | "bing" | "custom".
+     * Search engine identifier: "prism" | "ddg" | "google" | "bing" | "custom".
      * When "custom", [getCustomSearchUrl] is used.
      */
     fun getSearchEngine(): String =
@@ -73,12 +75,796 @@ object PrismSettings {
     fun buildSearchUrl(query: String): String {
         val encoded = java.net.URLEncoder.encode(query, "UTF-8")
         return when (getSearchEngine()) {
+            // Prism's own engine. On a mesh server node it answers at the reserved domain; other-
+            // wise it is a plain loopback server on this device. Either way the browser only ever
+            // needs a URL, so it needs to know nothing about which of the two is running.
+            "prism"  -> "${prismSearchBaseUrl()}/?q=$encoded"
             "google" -> "https://www.google.com/search?q=$encoded"
             "bing"   -> "https://www.bing.com/search?q=$encoded"
             "custom" -> getCustomSearchUrl().replace("%s", encoded)
             else     -> "https://duckduckgo.com/?q=$encoded"  // "ddg"
         }
     }
+
+    // -- Prism search engine -------------------------------------------------
+
+    /** Reserved mesh domain the search engine is published under when this device serves the mesh. */
+    const val PRISM_SEARCH_DOMAIN = "prism.com"
+
+    /**
+     * Loopback port the search engine listens on when there is no mesh to publish on.
+     *
+     * CHOSEN AT RANDOM FROM THE UNPRIVILEGED RANGE, ONCE, THEN REMEMBERED. The first version of
+     * this hardcoded 842, which is below 1024 -- binding a privileged port needs root on Android
+     * and Linux, so the listener threw on startup and every request got connection-refused while
+     * the rest of the feature looked fine. [MeshUtils.findAvailablePort] draws from 1024-65535 and
+     * proves the port is bindable before returning it, which is the same thing the VPN server port
+     * does a few functions below.
+     *
+     * Persisted rather than re-rolled per launch: the port appears in the browser's saved default
+     * search engine, in bookmarks and in the address Settings offers to copy, and none of those
+     * should rot the next time the app starts. Anything already stored below 1024 is migrated off
+     * -- an install that ran the hardcoded 842 heals itself instead of staying broken forever.
+     */
+    fun getPrismSearchPort(): Int {
+        val stored = prefs().getInt(KEY_PRISM_SEARCH_PORT, 0)
+        if (stored in 1024..65535) return stored
+        val port = MeshUtils.findAvailablePort()
+        setPrismSearchPort(port)
+        return port
+    }
+
+    fun setPrismSearchPort(value: Int) = prefs().edit().putInt(KEY_PRISM_SEARCH_PORT, value).apply()
+
+    /**
+     * Where the search engine is reachable right now.
+     *
+     * A mesh SERVER node publishes at the reserved domain so every peer can reach it by name; any
+     * other device -- mesh client, or mesh disabled entirely -- runs the identical server bound to
+     * loopback for its own use. The engine itself is the same either way; only the address differs,
+     * which is why every caller goes through this one function rather than deciding for itself.
+     */
+    fun prismSearchBaseUrl(): String =
+        if (isPrismSearchOnMesh()) "http://$PRISM_SEARCH_DOMAIN"
+        else "http://127.0.0.1:${getPrismSearchPort()}"
+
+    /** True when this device both is on a mesh and is acting as its server node. */
+    fun isPrismSearchOnMesh(): Boolean =
+        getMeshEnabled() && getPrismVpnRole() == PRISM_ROLE_SERVER
+
+    // -- Browser bookmarks & downloads ---------------------------------------
+    // Stored in preferences as JSON rather than in AppDatabase. Adding tables there means bumping
+    // the database version, and that database uses fallbackToDestructiveMigration -- a bump wipes
+    // the user's stats, agentic tools and Nebula feed (see AppDatabase's doc comment). Bookmarks
+    // are small and few; the same reasoning the hosted-sites and mirrored-sites lists already use.
+
+    data class Bookmark(val title: String, val url: String, val savedAt: Long = System.currentTimeMillis())
+
+    /**
+     * A file the browser downloaded. [localPath] may be blank if the system chose the location.
+     *
+     * [downloadId] is the DownloadManager job that produced it, kept so the file can later be
+     * deleted through DownloadManager. That matters under scoped storage: the file in the public
+     * Downloads folder belongs to the download that created it, and asking DownloadManager to
+     * remove it works whether or not this app happens to hold broad storage permission. -1 means
+     * unknown (an entry recorded before this was tracked), and deletion falls back to the path.
+     */
+    data class DownloadedFile(
+        val fileName: String,
+        val url: String,
+        val localPath: String = "",
+        val savedAt: Long = System.currentTimeMillis(),
+        val downloadId: Long = -1L
+    )
+
+    fun getBookmarks(): List<Bookmark> = try {
+        val arr = JSONArray(prefs().getString(KEY_BOOKMARKS, "[]") ?: "[]")
+        (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            Bookmark(o.optString("title", ""), o.optString("url", ""), o.optLong("at", 0L))
+        }.filter { it.url.isNotBlank() }
+    } catch (e: Exception) {
+        emptyList()
+    }
+
+    private fun saveBookmarks(list: List<Bookmark>) {
+        val arr = JSONArray()
+        for (b in list) {
+            arr.put(JSONObject().put("title", b.title).put("url", b.url).put("at", b.savedAt))
+        }
+        prefs().edit().putString(KEY_BOOKMARKS, arr.toString()).apply()
+    }
+
+    /** Returns true if it was added, false if this URL was already bookmarked. */
+    fun addBookmark(title: String, url: String): Boolean {
+        val clean = url.trim()
+        if (clean.isBlank()) return false
+        val list = getBookmarks()
+        if (list.any { it.url.equals(clean, ignoreCase = true) }) return false
+        saveBookmarks(list + Bookmark(title.ifBlank { clean }, clean))
+        return true
+    }
+
+    fun removeBookmark(url: String) {
+        saveBookmarks(getBookmarks().filterNot { it.url.equals(url.trim(), ignoreCase = true) })
+    }
+
+    fun isBookmarked(url: String): Boolean {
+        val clean = url.trim()
+        return clean.isNotBlank() && getBookmarks().any { it.url.equals(clean, ignoreCase = true) }
+    }
+
+    fun getDownloadedFiles(): List<DownloadedFile> = try {
+        val arr = JSONArray(prefs().getString(KEY_DOWNLOADS, "[]") ?: "[]")
+        (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            DownloadedFile(
+                o.optString("name", ""), o.optString("url", ""),
+                o.optString("path", ""), o.optLong("at", 0L),
+                o.optLong("did", -1L)
+            )
+        }.filter { it.fileName.isNotBlank() }
+    } catch (e: Exception) {
+        emptyList()
+    }
+
+    private fun saveDownloadedFiles(list: List<DownloadedFile>) {
+        val arr = JSONArray()
+        for (d in list) {
+            arr.put(
+                JSONObject().put("name", d.fileName).put("url", d.url)
+                    .put("path", d.localPath).put("at", d.savedAt).put("did", d.downloadId)
+            )
+        }
+        prefs().edit().putString(KEY_DOWNLOADS, arr.toString()).apply()
+    }
+
+    /** Newest first, capped -- this is a convenience list, not a system download database. */
+    fun recordDownloadedFile(
+        fileName: String,
+        url: String,
+        localPath: String = "",
+        downloadId: Long = -1L
+    ) {
+        if (fileName.isBlank()) return
+        val entry = DownloadedFile(fileName, url, localPath, downloadId = downloadId)
+        saveDownloadedFiles((listOf(entry) + getDownloadedFiles()).take(200))
+    }
+
+    /**
+     * Drops one entry from the list. Matched on [DownloadedFile.savedAt] as well as name and url,
+     * because the same file downloaded twice is two distinct entries and removing one must not
+     * silently take the other with it.
+     *
+     * The file on disk is NOT touched here -- deleting it is the caller's decision, made where the
+     * user can be asked.
+     */
+    fun removeDownloadedFile(entry: DownloadedFile) {
+        saveDownloadedFiles(
+            getDownloadedFiles().filterNot {
+                it.savedAt == entry.savedAt && it.fileName == entry.fileName && it.url == entry.url
+            }
+        )
+    }
+
+    fun clearDownloadedFiles() = prefs().edit().remove(KEY_DOWNLOADS).apply()
+
+    // ── Wallet mining ───────────────────────────────────────────────────────
+
+    /**
+     * Where the mining tab looks up which coins use which algorithm.
+     *
+     * Configurable rather than hard-coded because this kind of endpoint disappears without notice,
+     * and a dead URL should be something the user can repoint rather than something that needs a
+     * new build. Blank disables discovery and leaves the built-in list in charge.
+     */
+    fun getMiningDiscoveryUrl(): String =
+        prefs().getString(KEY_MINING_DISCOVERY, "https://api.minerstat.com/v2/coins") ?: ""
+
+    fun setMiningDiscoveryUrl(value: String) =
+        prefs().edit().putString(KEY_MINING_DISCOVERY, value.trim()).apply()
+
+    const val MINING_MODE_POOL = "pool"
+    const val MINING_MODE_SOLO = "solo"
+
+    /**
+     * Pool through the mesh: one device holds the upstream connection for everybody.
+     *
+     * Selectable only while the mesh is actually up. The mode is still STORED when the mesh goes
+     * down rather than being reset, because losing mesh connectivity for a minute should not
+     * silently move somebody onto a different mining mode and a different payout address; the
+     * miner falls back for that run and says so.
+     */
+    const val MINING_MODE_MESH = "mesh"
+
+    /**
+     * Pool or solo, and the two are genuinely different protocols rather than a flag.
+     *
+     * POOL speaks Stratum to a pool server, which hands down work and pays for shares -- partial
+     * proofs far below the network's difficulty. A miner sees a number move.
+     *
+     * SOLO talks `getblocktemplate` to a full node the user runs, builds its own coinbase paying
+     * itself, and submits whole blocks. There are no shares and no partial credit: it is the entire
+     * block reward or nothing at all, and at a phone's hash rate the expected wait for a Bitcoin
+     * block exceeds the age of the universe by many orders of magnitude. It is implemented because
+     * it is the honest meaning of "mining alone", not because it will pay out.
+     */
+    fun getMiningMode(): String = prefs().getString(KEY_MINING_MODE, MINING_MODE_POOL) ?: MINING_MODE_POOL
+
+    fun setMiningMode(value: String) =
+        prefs().edit().putString(KEY_MINING_MODE, value).apply()
+
+    /** The node's JSON-RPC endpoint, e.g. http://192.168.1.10:8332 . Solo mining needs one. */
+    fun getSoloNodeUrl(): String = prefs().getString(KEY_SOLO_NODE_URL, "") ?: ""
+
+    fun setSoloNodeUrl(value: String) =
+        prefs().edit().putString(KEY_SOLO_NODE_URL, value.trim()).apply()
+
+    /**
+     * Whether Prism runs the node itself instead of talking to one the user already has.
+     *
+     * When set, [getSoloNodeUrl] is ignored (and shown disabled rather than hidden, so it is
+     * obvious the field still exists and why it does not apply), and [getSoloNodeCredentials]
+     * switches meaning: it stops being the credentials of somebody else's node and becomes the
+     * credentials Prism's own node is configured WITH.
+     */
+    fun getSelfHostNode(): Boolean = prefs().getBoolean(KEY_SELF_HOST_NODE, false)
+
+    fun setSelfHostNode(value: Boolean) =
+        prefs().edit().putBoolean(KEY_SELF_HOST_NODE, value).apply()
+
+    /**
+     * `rpcuser:rpcpassword`.
+     *
+     * Read as the remote node's credentials normally, and as the credentials to CONFIGURE the
+     * bundled node with when [getSelfHostNode] is on.
+     */
+    fun getSoloNodeCredentials(): String = prefs().getString(KEY_SOLO_NODE_AUTH, "") ?: ""
+
+    fun setSoloNodeCredentials(value: String) =
+        prefs().edit().putString(KEY_SOLO_NODE_AUTH, value.trim()).apply()
+
+    /**
+     * Accepted shares per coin, and the summed pool difficulty behind them.
+     *
+     * PERSISTED RATHER THAN LIVE, because the in-memory counter resets whenever the service
+     * restarts -- and a service designed to be restarted by the system would show a total that
+     * silently fell back to zero overnight. The DIFFICULTY SUM is kept alongside the count because
+     * the count alone cannot be converted into coins: a share is only worth the difficulty it was
+     * found at, and pools vary that per connection.
+     */
+    fun getMinedShares(symbol: String): Pair<Long, Double> {
+        val raw = prefs().getString(KEY_MINED_SHARES, "{}") ?: "{}"
+        return runCatching {
+            val entry = JSONObject(raw).optJSONObject(symbol.uppercase()) ?: return 0L to 0.0
+            entry.optLong("count", 0L) to entry.optDouble("difficulty", 0.0)
+        }.getOrDefault(0L to 0.0)
+    }
+
+    fun recordMinedShare(symbol: String, difficulty: Double) {
+        val (count, total) = getMinedShares(symbol)
+        setMinedShares(symbol, count + 1, total + difficulty.coerceAtLeast(0.0))
+    }
+
+    fun setMinedShares(symbol: String, count: Long, totalDifficulty: Double) {
+        val raw = prefs().getString(KEY_MINED_SHARES, "{}") ?: "{}"
+        val json = runCatching { JSONObject(raw) }.getOrDefault(JSONObject())
+        json.put(
+            symbol.uppercase(),
+            JSONObject().put("count", count).put("difficulty", totalDifficulty)
+        )
+        prefs().edit().putString(KEY_MINED_SHARES, json.toString()).apply()
+    }
+
+    /** Every coin with a share history, for backup. */
+    fun allMinedShares(): Map<String, Pair<Long, Double>> {
+        val raw = prefs().getString(KEY_MINED_SHARES, "{}") ?: "{}"
+        return runCatching {
+            val json = JSONObject(raw)
+            val out = HashMap<String, Pair<Long, Double>>()
+            val keys = json.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                val entry = json.optJSONObject(key) ?: continue
+                out[key] = entry.optLong("count", 0L) to entry.optDouble("difficulty", 0.0)
+            }
+            out
+        }.getOrDefault(emptyMap())
+    }
+
+    // ── On-device compilation (experimental) ────────────────────────────────
+
+    /**
+     * Whether Prism may compile native mining libraries on the device and load them.
+     *
+     * OFF BY DEFAULT AND WARNED ABOUT EVERY TIME IT IS ENABLED. Compiled code is loaded into
+     * Prism's own process and runs with every permission the app holds -- this is the largest trust
+     * decision the app can make, and it is not one to slip past somebody in a settings list.
+     */
+    fun getExperimentalCompiler(): Boolean = prefs().getBoolean(KEY_EXPERIMENTAL_COMPILER, false)
+
+    fun setExperimentalCompiler(value: Boolean) =
+        prefs().edit().putBoolean(KEY_EXPERIMENTAL_COMPILER, value).apply()
+
+    /**
+     * Where the clang toolchain pack is fetched from.
+     *
+     * Blank by default because no such pack exists yet: it must be a clang driver built for
+     * arm64/bionic AS A SHARED LIBRARY, since Android will not execute a compiler binary from app
+     * storage. Configurable rather than hard-coded so it can be pointed at one once it exists.
+     */
+    fun getToolchainUrl(): String = prefs().getString(KEY_TOOLCHAIN_URL, "") ?: ""
+
+    fun setToolchainUrl(value: String) =
+        prefs().edit().putString(KEY_TOOLCHAIN_URL, value.trim()).apply()
+
+    /**
+     * The generated chain configuration for a user-created coin, and where its node lives.
+     *
+     * Kept so the config can be shown or exported later -- somebody has to paste it into whatever
+     * runs the node, and regenerating it from the name would be right but is not obviously right
+     * to a user staring at a screen.
+     */
+    fun getCustomChainConfig(symbol: String): String =
+        prefs().getString(KEY_CHAIN_CONFIG_PREFIX + symbol.uppercase(), "") ?: ""
+
+    fun setCustomChainConfig(symbol: String, config: String) =
+        prefs().edit().putString(KEY_CHAIN_CONFIG_PREFIX + symbol.uppercase(), config).apply()
+
+    fun getCustomChainNode(symbol: String): String =
+        prefs().getString(KEY_CHAIN_NODE_PREFIX + symbol.uppercase(), "") ?: ""
+
+    fun setCustomChainNode(symbol: String, url: String) =
+        prefs().edit().putString(KEY_CHAIN_NODE_PREFIX + symbol.uppercase(), url.trim()).apply()
+
+    /**
+     * The balance last observed for a coin, or null if it has never been seen.
+     *
+     * NULL AND ZERO MEAN DIFFERENT THINGS here, which is why this is nullable rather than
+     * defaulting to zero: a coin that has never been checked must not have its whole existing
+     * balance announced as a fresh receipt the first time Prism looks at it.
+     */
+    fun getLastSeenBalance(symbol: String): java.math.BigInteger? {
+        val raw = prefs().getString(KEY_LAST_BALANCE_PREFIX + symbol.uppercase(), null)
+        if (raw.isNullOrBlank()) return null
+        return runCatching { java.math.BigInteger(raw) }.getOrNull()
+    }
+
+    fun setLastSeenBalance(symbol: String, balance: java.math.BigInteger) =
+        prefs().edit()
+            .putString(KEY_LAST_BALANCE_PREFIX + symbol.uppercase(), balance.toString())
+            .apply()
+
+    /**
+     * A payout address the user supplied for a coin Prism cannot derive keys for.
+     *
+     * MONERO IS THE REASON THIS EXISTS. It uses ed25519 and a two-key address, so no BIP-39 phrase
+     * of Prism's derives a usable one -- the user pastes an address from a real Monero wallet and
+     * mining rewards go there. Kept separate from the derived-wallet list so it is obvious the
+     * coins land somewhere Prism does not hold the keys to.
+     */
+    fun getExternalPayoutAddress(symbol: String): String =
+        prefs().getString(KEY_PAYOUT_PREFIX + symbol.uppercase(), "") ?: ""
+
+    fun setExternalPayoutAddress(symbol: String, address: String) =
+        prefs().edit().putString(KEY_PAYOUT_PREFIX + symbol.uppercase(), address.trim()).apply()
+
+    /**
+     * Last known network difficulty and block reward for a coin, with the time it was fetched.
+     *
+     * CACHED BECAUSE THE FREE EXPLORER APIS RATE-LIMIT HARD, and the numbers barely move -- Bitcoin
+     * retargets every two weeks. Without a cache the mining estimate appeared or vanished depending
+     * on whether that particular request survived the rate limiter, which looked exactly like a
+     * bug because it was one.
+     *
+     * Returns difficulty, reward (in whole coins) and the fetch timestamp, or null if never seen.
+     */
+    fun getCachedChainStats(symbol: String): Triple<Double, String, Long>? {
+        val raw = prefs().getString(KEY_CHAIN_STATS_PREFIX + symbol.uppercase(), null) ?: return null
+        val parts = raw.split("|")
+        if (parts.size < 3) return null
+        val difficulty = parts[0].toDoubleOrNull() ?: return null
+        val at = parts[2].toLongOrNull() ?: return null
+        return Triple(difficulty, parts[1], at)
+    }
+
+    fun setCachedChainStats(symbol: String, difficulty: Double, reward: String, at: Long) =
+        prefs().edit()
+            .putString(KEY_CHAIN_STATS_PREFIX + symbol.uppercase(), "$difficulty|$reward|$at")
+            .apply()
+
+    /**
+     * Whether RandomX may use its JIT.
+     *
+     * ON BY DEFAULT, because the interpreter is not merely slower -- it is unusable. Measured on a
+     * real device it produced about 4 hashes per second; the JIT is two to three orders of
+     * magnitude faster, which is the difference between mining and pretending to.
+     *
+     * This was briefly defaulted off while a crash was being chased. That crash turned out to be a
+     * use-after-free in Prism's own VM handling (freeing another thread's VM during a seed
+     * rotation), not the JIT, and it is fixed -- so the caution is no longer warranted. The setting
+     * remains because whether a device permits the write-then-execute transition still varies by
+     * OEM and SELinux policy, and the native side falls back to the interpreter on its own if the
+     * allocation is refused.
+     */
+    fun getRandomXJit(): Boolean = prefs().getBoolean(KEY_RANDOMX_JIT, true)
+
+    fun setRandomXJit(value: Boolean) =
+        prefs().edit().putBoolean(KEY_RANDOMX_JIT, value).apply()
+
+    /**
+     * Set while a JIT-enabled RandomX VM is being brought up, cleared once it has hashed.
+     *
+     * A CRASH DETECTOR. If the JIT faults there is no exception to catch and no chance to record
+     * anything -- the process is simply gone. So the intent is written down BEFORE the risky part
+     * and cleared after it succeeds; finding it still set on the next launch means the last attempt
+     * did not survive, and the JIT disables itself. At most one crash, then it self-heals.
+     */
+    fun getRandomXJitPending(): Boolean = prefs().getBoolean(KEY_RANDOMX_JIT_PENDING, false)
+
+    fun setRandomXJitPending(value: Boolean) =
+        prefs().edit().putBoolean(KEY_RANDOMX_JIT_PENDING, value).apply()
+
+    /** Path of a library Prism built for a coin, or blank. */
+    fun getCompiledLibrary(symbol: String): String =
+        prefs().getString(KEY_COMPILED_LIB_PREFIX + symbol.uppercase(), "") ?: ""
+
+    fun setCompiledLibrary(symbol: String, path: String) =
+        prefs().edit().putString(KEY_COMPILED_LIB_PREFIX + symbol.uppercase(), path).apply()
+
+    /** 0 means "decide from the core count", which is what the service does by default. */
+    fun getMiningThreads(): Int = prefs().getInt(KEY_MINING_THREADS, 0)
+
+    fun setMiningThreads(value: Int) =
+        prefs().edit().putInt(KEY_MINING_THREADS, value.coerceIn(0, 16)).apply()
+
+    /**
+     * Whether Prism's search page summarises results with a local AI model.
+     *
+     * OFF BY DEFAULT, and only ever honoured for a model the user runs -- an on-device import or an
+     * Ollama server on their own network. A cloud API key does not enable it: sending every search
+     * query to somebody else's service would undo the reason this search engine exists. See
+     * PrismSearchSummary.isAvailable.
+     */
+    fun getSearchAiSummary(): Boolean = prefs().getBoolean(KEY_SEARCH_AI_SUMMARY, false)
+
+    fun setSearchAiSummary(value: Boolean) =
+        prefs().edit().putBoolean(KEY_SEARCH_AI_SUMMARY, value).apply()
+
+    // ── Prism Writer (keyboard) ─────────────────────────────────────────────
+
+    const val WRITER_THEME_SYSTEM = "system"
+    const val WRITER_THEME_LIGHT = "light"
+    const val WRITER_THEME_DARK = "dark"
+
+    /** Colour of the glide trail. Red by default, as specified. */
+    /**
+     * Keyboard appearance.
+     *
+     * 0 MEANS "FOLLOW THE THEME", never "transparent black". Every one of these defaults to 0 so an
+     * unset colour keeps the light/dark palette the view already computes -- storing a real colour
+     * as the default would freeze the keyboard to one theme the first time anything read it.
+     */
+    fun getWriterPanelColor(): Int = prefs().getInt(KEY_WRITER_PANEL, 0)
+    fun setWriterPanelColor(value: Int) = prefs().edit().putInt(KEY_WRITER_PANEL, value).apply()
+
+    fun getWriterKeyColor(): Int = prefs().getInt(KEY_WRITER_KEY, 0)
+    fun setWriterKeyColor(value: Int) = prefs().edit().putInt(KEY_WRITER_KEY, value).apply()
+
+    fun getWriterKeyTextColor(): Int = prefs().getInt(KEY_WRITER_KEY_TEXT, 0)
+    fun setWriterKeyTextColor(value: Int) = prefs().edit().putInt(KEY_WRITER_KEY_TEXT, value).apply()
+
+    fun getWriterAccentColor(): Int = prefs().getInt(KEY_WRITER_ACCENT, 0)
+    fun setWriterAccentColor(value: Int) = prefs().edit().putInt(KEY_WRITER_ACCENT, value).apply()
+
+    /**
+     * A background image for the keyboard, as a content:// or file:// string. Empty for none.
+     *
+     * Stored as a URI rather than a copied bitmap: the picture can be large, and a keyboard that
+     * duplicated it into its own storage would keep a stale copy after the user changed the
+     * original. The view loads it downsampled; see PrismKeyboardView.
+     */
+    /**
+     * Every background the user has added, newest last. Newline-separated URIs.
+     *
+     * A LIBRARY, NOT ONE SLOT. The active image is a separate setting that points into this list,
+     * so turning a background off does not lose the picture — which is the difference between a
+     * toggle and having to find the file again.
+     */
+    fun getWriterBackgroundLibrary(): List<String> =
+        prefs().getString(KEY_WRITER_BG_LIBRARY, "").orEmpty()
+            .split("\n").map { it.trim() }.filter { it.isNotEmpty() }
+
+    fun addWriterBackground(uri: String): Boolean {
+        val cleaned = uri.trim()
+        if (cleaned.isEmpty()) return false
+        val current = getWriterBackgroundLibrary()
+        if (current.any { it == cleaned }) return false
+        prefs().edit()
+            .putString(KEY_WRITER_BG_LIBRARY, (current + cleaned).joinToString("\n"))
+            .apply()
+        return true
+    }
+
+    fun removeWriterBackground(uri: String) {
+        val remaining = getWriterBackgroundLibrary().filterNot { it == uri }
+        prefs().edit().putString(KEY_WRITER_BG_LIBRARY, remaining.joinToString("\n")).apply()
+        // Clearing the active pointer too, or the keyboard keeps drawing a picture the user deleted.
+        if (getWriterBackgroundImage() == uri) setWriterBackgroundImage("")
+    }
+
+    fun getWriterBackgroundImage(): String = prefs().getString(KEY_WRITER_BG_IMAGE, "").orEmpty()
+    fun setWriterBackgroundImage(value: String) =
+        prefs().edit().putString(KEY_WRITER_BG_IMAGE, value).apply()
+
+    /** How much the background image is dimmed so key labels stay readable, 0..100. */
+    fun getWriterBackgroundDim(): Int = prefs().getInt(KEY_WRITER_BG_DIM, 35).coerceIn(0, 100)
+    fun setWriterBackgroundDim(value: Int) =
+        prefs().edit().putInt(KEY_WRITER_BG_DIM, value.coerceIn(0, 100)).apply()
+
+    /** Whether the glide trail is drawn with a glow. */
+    fun getWriterTrailGlow(): Boolean = prefs().getBoolean(KEY_WRITER_TRAIL_GLOW, true)
+    fun setWriterTrailGlow(value: Boolean) =
+        prefs().edit().putBoolean(KEY_WRITER_TRAIL_GLOW, value).apply()
+
+    /** The user's named dictionaries, encoded by [com.prism.launcher.writer.WriterUserDictionary]. */
+    fun getWriterDictionaries(): String = prefs().getString(KEY_WRITER_DICTS, "").orEmpty()
+    fun setWriterDictionaries(value: String) =
+        prefs().edit().putString(KEY_WRITER_DICTS, value).apply()
+
+    /** Word rewrites, one `from=to` per line. */
+    fun getWriterRedefinitions(): String = prefs().getString(KEY_WRITER_REDEFS, "").orEmpty()
+    fun setWriterRedefinitions(value: String) =
+        prefs().edit().putString(KEY_WRITER_REDEFS, value).apply()
+
+    /**
+     * A Tenor API key for the GIF and sticker panel. Blank disables it.
+     *
+     * A SETTING RATHER THAN A CONSTANT: a key belongs to whoever registered it, and one embedded in
+     * a shipped app is someone else's quota under someone else's terms.
+     */
+    fun getWriterGifApiKey(): String = prefs().getString(KEY_WRITER_GIF_KEY, "").orEmpty()
+    fun setWriterGifApiKey(value: String) =
+        prefs().edit().putString(KEY_WRITER_GIF_KEY, value.trim()).apply()
+
+    // ── Lyke ───────────────────────────────────────────────────────────────
+
+    fun getLykeUserId(): String = prefs().getString(KEY_LYKE_ID, "").orEmpty()
+    fun setLykeUserId(value: String) = prefs().edit().putString(KEY_LYKE_ID, value).apply()
+
+    fun getLykeUserName(): String = prefs().getString(KEY_LYKE_NAME, "").orEmpty()
+    fun setLykeUserName(value: String) = prefs().edit().putString(KEY_LYKE_NAME, value).apply()
+
+    fun getLykeAvatar(): String = prefs().getString(KEY_LYKE_AVATAR, "").orEmpty()
+    fun setLykeAvatar(value: String) = prefs().edit().putString(KEY_LYKE_AVATAR, value).apply()
+
+    /**
+     * A default password, generated once.
+     *
+     * EXISTS SO THE ACCOUNT IS RECOVERABLE, not as security: it is what lets the same identity be
+     * restored on another device. Shown to the user on first run precisely because a password they
+     * never saw is one they cannot keep.
+     */
+    fun getLykePassword(): String {
+        val existing = prefs().getString(KEY_LYKE_PASSWORD, "").orEmpty()
+        if (existing.isNotBlank()) return existing
+        val alphabet = "abcdefghijkmnpqrstuvwxyz23456789"
+        val generated = (1..12).map { alphabet.random() }.joinToString("")
+        prefs().edit().putString(KEY_LYKE_PASSWORD, generated).apply()
+        return generated
+    }
+    fun setLykePassword(value: String) = prefs().edit().putString(KEY_LYKE_PASSWORD, value).apply()
+
+    fun getLykeProfileConfirmed(): Boolean = prefs().getBoolean(KEY_LYKE_CONFIRMED, false)
+    fun setLykeProfileConfirmed(value: Boolean) =
+        prefs().edit().putBoolean(KEY_LYKE_CONFIRMED, value).apply()
+
+    fun getLykeFollowing(): List<String> = splitIds(prefs().getString(KEY_LYKE_FOLLOWING, ""))
+    fun setLykeFollowing(value: List<String>) =
+        prefs().edit().putString(KEY_LYKE_FOLLOWING, value.joinToString("\n")).apply()
+
+    fun getLykeFollowers(): List<String> = splitIds(prefs().getString(KEY_LYKE_FOLLOWERS, ""))
+    fun setLykeFollowers(value: List<String>) =
+        prefs().edit().putString(KEY_LYKE_FOLLOWERS, value.joinToString("\n")).apply()
+
+    private fun splitIds(raw: String?): List<String> =
+        raw.orEmpty().split("\n").map { it.trim() }.filter { it.isNotEmpty() }
+
+    /** Whether the suggestion strip is shown above the keys. */
+    fun getWriterSuggestions(): Boolean = prefs().getBoolean(KEY_WRITER_SUGGESTIONS, true)
+    fun setWriterSuggestions(value: Boolean) =
+        prefs().edit().putBoolean(KEY_WRITER_SUGGESTIONS, value).apply()
+
+    fun getWriterTrailColor(): Int = prefs().getInt(KEY_WRITER_TRAIL, 0xFFFF3B30.toInt())
+
+    fun setWriterTrailColor(value: Int) =
+        prefs().edit().putInt(KEY_WRITER_TRAIL, value).apply()
+
+    /**
+     * The keyboard's own theme, independent of the launcher's.
+     *
+     * A keyboard is used inside other apps, so following the SYSTEM setting rather than Prism's own
+     * is the default -- a dark keyboard under a light app looks like a bug. The on-keyboard switch
+     * writes LIGHT or DARK here and stops following.
+     */
+    fun getWriterTheme(): String =
+        prefs().getString(KEY_WRITER_THEME, WRITER_THEME_SYSTEM) ?: WRITER_THEME_SYSTEM
+
+    fun setWriterTheme(value: String) =
+        prefs().edit().putString(KEY_WRITER_THEME, value).apply()
+
+    fun getWriterSwipeEnabled(): Boolean = prefs().getBoolean(KEY_WRITER_SWIPE, true)
+    fun setWriterSwipeEnabled(value: Boolean) =
+        prefs().edit().putBoolean(KEY_WRITER_SWIPE, value).apply()
+
+    fun getWriterAutocorrect(): Boolean = prefs().getBoolean(KEY_WRITER_AUTOCORRECT, true)
+    fun setWriterAutocorrect(value: Boolean) =
+        prefs().edit().putBoolean(KEY_WRITER_AUTOCORRECT, value).apply()
+
+    /** 0 disables key vibration; otherwise milliseconds, kept short enough to feel like a click. */
+    fun getWriterHapticsMs(): Int = prefs().getInt(KEY_WRITER_HAPTICS, 12)
+    fun setWriterHapticsMs(value: Int) =
+        prefs().edit().putInt(KEY_WRITER_HAPTICS, value.coerceIn(0, 60)).apply()
+
+    /** Whether AI assistance rewrites/completes as the user types. */
+    fun getWriterAiAssist(): Boolean = prefs().getBoolean(KEY_WRITER_AI, true)
+    fun setWriterAiAssist(value: Boolean) =
+        prefs().edit().putBoolean(KEY_WRITER_AI, value).apply()
+
+    /** Target language for live translate, as an English name the model will understand. */
+    fun getWriterTranslateTarget(): String =
+        prefs().getString(KEY_WRITER_TRANSLATE_TO, "Spanish") ?: "Spanish"
+
+    fun setWriterTranslateTarget(value: String) =
+        prefs().edit().putString(KEY_WRITER_TRANSLATE_TO, value.trim()).apply()
+
+    /** Whether a translation is spoken aloud as well as typed. */
+    fun getWriterSpeakTranslation(): Boolean =
+        prefs().getBoolean(KEY_WRITER_SPEAK_TRANSLATION, true)
+
+    fun setWriterSpeakTranslation(value: Boolean) =
+        prefs().edit().putBoolean(KEY_WRITER_SPEAK_TRANSLATION, value).apply()
+
+    /** Words the keyboard has learned, persisted so they survive a restart. */
+    fun getWriterLearnedWords(): List<String> =
+        (prefs().getString(KEY_WRITER_LEARNED, "") ?: "").split(",").filter { it.isNotBlank() }
+
+    fun setWriterLearnedWords(words: List<String>) =
+        prefs().edit().putString(KEY_WRITER_LEARNED, words.joinToString(",")).apply()
+
+    /** How often the crawler runs, in hours. Default 2, as specified; 0 disables scheduled crawls. */
+    fun getSearchCrawlIntervalHours(): Int = prefs().getInt(KEY_SEARCH_CRAWL_HOURS, 2)
+    fun setSearchCrawlIntervalHours(value: Int) =
+        prefs().edit().putInt(KEY_SEARCH_CRAWL_HOURS, value.coerceIn(0, 168)).apply()
+
+    /**
+     * Seeds the user typed in, as they typed them. Kept SEPARATE from the crawler's discoveries
+     * below: merging the two into one blob would bury a handful of hand-chosen entries under
+     * hundreds of automatic ones, and the next edit in Settings would silently delete whatever
+     * the crawler had learned. Two lists, two lifetimes -- the user owns one, the crawler owns
+     * the other, and neither can clobber the other.
+     */
+    fun getUserSearchSeeds(): List<String> = parseSeeds(getUserSearchSeedsRaw())
+
+    /** Raw text of the user's seed list, for the Settings editor to show and round-trip. */
+    fun getUserSearchSeedsRaw(): String = prefs().getString(KEY_SEARCH_SEEDS, "") ?: ""
+
+    fun setSearchSeeds(value: String) = prefs().edit().putString(KEY_SEARCH_SEEDS, value).apply()
+
+    /** Appends one seed to the user's list, ignoring blanks and duplicates. Returns true if added. */
+    fun addUserSearchSeed(seed: String): Boolean {
+        val cleaned = seed.trim()
+        if (!cleaned.startsWith("http")) return false
+        if (getUserSearchSeeds().any { it.equals(cleaned, ignoreCase = true) }) return false
+        val raw = getUserSearchSeedsRaw()
+        setSearchSeeds(if (raw.isBlank()) cleaned else raw.trimEnd() + "\n" + cleaned)
+        return true
+    }
+
+    /**
+     * Origins the crawler found on its own -- one per host, `scheme://host`.
+     *
+     * Every crawl reaches hosts that were not seeds, and each of those is a place a future crawl
+     * could start from. Recording them is what lets the index widen instead of orbiting the same
+     * few starting points forever: crawl N discovers the hosts that seed crawl N+1, which is how
+     * a link graph big enough for PageRank to say anything gets built out of four defaults.
+     *
+     * Capped, oldest dropped first: the frontier of the web is effectively infinite and a seed
+     * list is not the place to store it.
+     */
+    fun getDiscoveredSearchSeeds(): List<String> =
+        parseSeeds(prefs().getString(KEY_SEARCH_DISCOVERED, "") ?: "")
+
+    fun setDiscoveredSearchSeeds(seeds: List<String>) {
+        val limit = getMaxDiscoveredSeeds()
+        // -1 means keep everything. Oldest are dropped first otherwise, so the newest frontier --
+        // the part a future crawl has not explored yet -- is what survives.
+        val capped = if (limit < 0) seeds else seeds.takeLast(limit)
+        prefs().edit().putString(KEY_SEARCH_DISCOVERED, capped.joinToString("\n")).apply()
+    }
+
+    /**
+     * How many crawler-discovered origins to retain. -1 keeps every one.
+     *
+     * Unlimited is a real choice rather than a footgun to hide: the discovered list is plain text
+     * in preferences and each entry is a few dozen bytes, so tens of thousands cost little. What
+     * it does affect is crawl SHAPE -- every retained origin is a seed, and a crawl bounded by
+     * maxPages spread across 50,000 seeds visits one page per site instead of following any link
+     * graph, which is exactly the graph PageRank needs. Worth knowing before setting it to -1.
+     */
+    fun getMaxDiscoveredSeeds(): Int = prefs().getInt(KEY_SEARCH_MAX_SEEDS, MAX_DISCOVERED_SEEDS)
+
+    fun setMaxDiscoveredSeeds(value: Int) {
+        val clean = if (value < 0) -1 else value.coerceAtLeast(0)
+        prefs().edit().putInt(KEY_SEARCH_MAX_SEEDS, clean).apply()
+        // Applying a smaller cap should take effect now, not silently at the next crawl.
+        if (clean >= 0) setDiscoveredSearchSeeds(getDiscoveredSearchSeeds())
+    }
+
+    fun clearDiscoveredSearchSeeds() = prefs().edit().remove(KEY_SEARCH_DISCOVERED).apply()
+
+    /**
+     * Merges newly-found origins into the discovered list, de-duplicated BY HOST against
+     * everything already known -- the user's seeds and the defaults included -- so a host the
+     * user already listed is never echoed back as a discovery, and one host cannot occupy a
+     * hundred slots through a hundred different paths.
+     *
+     * Returns how many were genuinely new.
+     */
+    fun recordDiscoveredSeeds(origins: Collection<String>): Int {
+        if (origins.isEmpty()) return 0
+        val known = HashSet<String>()
+        for (u in getUserSearchSeeds() + DEFAULT_SEARCH_SEEDS + getDiscoveredSearchSeeds()) {
+            hostOfUrl(u)?.let { known.add(it) }
+        }
+        val current = getDiscoveredSearchSeeds().toMutableList()
+        var added = 0
+        for (origin in origins) {
+            val host = hostOfUrl(origin) ?: continue
+            if (!known.add(host)) continue
+            current.add(origin)
+            added++
+        }
+        if (added > 0) setDiscoveredSearchSeeds(current)
+        return added
+    }
+
+    /** Everything a crawl starts from: the user's seeds, what the crawler has discovered, and the
+     * built-in defaults as a floor so a crawl is never seedless. */
+    fun getSearchSeeds(): List<String> {
+        val all = LinkedHashSet<String>()
+        all.addAll(getUserSearchSeeds())
+        all.addAll(getDiscoveredSearchSeeds())
+        all.addAll(DEFAULT_SEARCH_SEEDS)
+        return all.toList()
+    }
+
+    private fun parseSeeds(raw: String): List<String> =
+        raw.split(Regex("[,\r\n]+")).map { it.trim() }.filter { it.startsWith("http") }
+
+    private fun hostOfUrl(url: String): String? = try {
+        java.net.URL(url).host?.lowercase()?.takeIf { it.isNotBlank() }
+    } catch (e: Exception) {
+        null
+    }
+
+    /** Default retention for crawler-discovered origins; see [getMaxDiscoveredSeeds] to change it. */
+    const val MAX_DISCOVERED_SEEDS = 500
+
+    /**
+     * Where a crawl starts when the user has not chosen seeds.
+     *
+     * Kept small and encyclopedic on purpose. Seeds are the one place a search engine's operator
+     * can quietly bias it, so these are reference sources with dense outbound links rather than
+     * anything commercial -- they exist to give PageRank a connected graph to work on, and every
+     * ranking decision after that comes from the link structure, not from this list.
+     */
+    val DEFAULT_SEARCH_SEEDS = listOf(
+        "https://en.wikipedia.org/wiki/Special:Random",
+        "https://en.wikipedia.org/wiki/Web_search_engine",
+        "https://news.ycombinator.com/",
+        "https://www.gutenberg.org/"
+    )
 
     /** Whether JavaScript is enabled in WebViews */
     fun getJsEnabled(): Boolean =
@@ -206,6 +992,102 @@ object PrismSettings {
     fun setSecondaryDns(value: String) =
         prefs().edit().putString(KEY_SECONDARY_DNS, value.trim()).apply()
 
+    // ── Aether ──────────────────────────────────────────────────────────────
+
+    /** `--biotrain`: local Hebbian/STDP training across the whole connectome. Opt-out, on by default. */
+    fun getAetherBiotrainEnabled(): Boolean = prefs().getBoolean(KEY_AETHER_BIOTRAIN, true)
+    fun setAetherBiotrainEnabled(value: Boolean) = prefs().edit().putBoolean(KEY_AETHER_BIOTRAIN, value).apply()
+
+    /** `--biogen`: the four elaborate generation modes vs. one plain forward-pass generation. Opt-out, on by default. */
+    fun getAetherBiogenEnabled(): Boolean = prefs().getBoolean(KEY_AETHER_BIOGEN, true)
+    fun setAetherBiogenEnabled(value: Boolean) = prefs().edit().putBoolean(KEY_AETHER_BIOGEN, value).apply()
+
+    /** `--share-knowledge` equivalent: serve this device's trained connectome to LAN/mesh peers. Opt-in, off by default -- unlike biotrain/biogen this opens a network listener. */
+    fun getAetherShareKnowledgeEnabled(): Boolean = prefs().getBoolean(KEY_AETHER_SHARE_KNOWLEDGE, false)
+    fun setAetherShareKnowledgeEnabled(value: Boolean) = prefs().edit().putBoolean(KEY_AETHER_SHARE_KNOWLEDGE, value).apply()
+
+    /** `--use-text-model` equivalent: experimental ANN-baseline-conversion (see AetherAnnBaseline).
+     * Opt-in, off by default -- unlike biotrain/biogen this is genuinely experimental, and the
+     * settings row itself stays disabled until Sam has an active local text model regardless. */
+    fun getAetherAnnBaselineEnabled(): Boolean = prefs().getBoolean(KEY_AETHER_ANN_BASELINE, false)
+    fun setAetherAnnBaselineEnabled(value: Boolean) = prefs().edit().putBoolean(KEY_AETHER_ANN_BASELINE, value).apply()
+
+    /** `--surprisal-weighting` equivalent -- optional, on top of ANN-baseline-conversion's
+     * always-automatic soft-target distillation (see AetherAnnBaseline). Opt-in, off by default,
+     * same reasoning as the baseline checkbox itself: genuinely experimental. */
+    fun getAetherSurprisalWeightingEnabled(): Boolean = prefs().getBoolean(KEY_AETHER_SURPRISAL_WEIGHTING, false)
+    fun setAetherSurprisalWeightingEnabled(value: Boolean) = prefs().edit().putBoolean(KEY_AETHER_SURPRISAL_WEIGHTING, value).apply()
+
+    /** `--attention-cooccurrence-prior` equivalent -- optional, see AetherAnnBaseline. Opt-in, off by default. */
+    fun getAetherCooccurrencePriorEnabled(): Boolean = prefs().getBoolean(KEY_AETHER_COOCCURRENCE_PRIOR, false)
+    fun setAetherCooccurrencePriorEnabled(value: Boolean) = prefs().edit().putBoolean(KEY_AETHER_COOCCURRENCE_PRIOR, value).apply()
+
+    /** `--receive-knowledge` equivalent: discover and merge peers' trained connectomes. Opt-in, off by default. */
+    fun getAetherReceiveKnowledgeEnabled(): Boolean = prefs().getBoolean(KEY_AETHER_RECEIVE_KNOWLEDGE, false)
+    fun setAetherReceiveKnowledgeEnabled(value: Boolean) = prefs().edit().putBoolean(KEY_AETHER_RECEIVE_KNOWLEDGE, value).apply()
+
+    /** `--checkpoint-interval` equivalent: how many epochs pass between periodic connectome saves
+     * during training (epoch 1 and the final epoch always save regardless -- see
+     * [com.prism.launcher.aether.AetherTrainer.train]). AetherCortex's own default is 10; this
+     * defaults lower since a training run here is more likely to be interrupted (backgrounded,
+     * killed for memory) than a desktop process. Set from the textbox on Aether's training page. */
+    fun getAetherCheckpointIntervalEpochs(): Int = prefs().getInt(KEY_AETHER_CHECKPOINT_INTERVAL_EPOCHS, 3)
+    fun setAetherCheckpointIntervalEpochs(value: Int) = prefs().edit().putInt(KEY_AETHER_CHECKPOINT_INTERVAL_EPOCHS, value).apply()
+
+    // ── Dataset downloads (Nora + Aether, see DatasetDiscoveryService/DatasetDownloader) ───────
+
+    /** Whether [com.prism.launcher.messaging.DatasetDownloadWorker] periodically looks for and
+     * downloads datasets. Opt-in, off by default -- this is unattended network + storage use on
+     * the user's behalf, same reasoning as Nora's own autonomous-training toggle. */
+    fun getDatasetAutoDownloadEnabled(): Boolean = prefs().getBoolean(KEY_DATASET_AUTO_DOWNLOAD, false)
+    fun setDatasetAutoDownloadEnabled(value: Boolean) = prefs().edit().putBoolean(KEY_DATASET_AUTO_DOWNLOAD, value).apply()
+
+    /** Hours between automatic dataset-download cycles. 1..24, default 2. */
+    fun getDatasetAutoDownloadIntervalHours(): Int =
+        prefs().getInt(KEY_DATASET_AUTO_DOWNLOAD_HOURS, 2).coerceIn(1, 24)
+    fun setDatasetAutoDownloadIntervalHours(hours: Int) =
+        prefs().edit().putInt(KEY_DATASET_AUTO_DOWNLOAD_HOURS, hours.coerceIn(1, 24)).apply()
+
+    /** A dataset (found via [com.prism.launcher.messaging.DatasetDiscoveryService]) is only ever
+     * shown or auto-downloaded if its total size is at or over this many bytes. Default 0 (no
+     * effective minimum) -- paired with [getDatasetMaxSizeBytes] as the two thumbs of the size
+     * range slider on the Dataset Downloads screen. */
+    fun getDatasetMinSizeBytes(): Long = prefs().getLong(KEY_DATASET_MIN_SIZE_BYTES, 0L)
+    fun setDatasetMinSizeBytes(value: Long) = prefs().edit().putLong(KEY_DATASET_MIN_SIZE_BYTES, value).apply()
+
+    /** A dataset (found via [com.prism.launcher.messaging.DatasetDiscoveryService]) is only ever
+     * shown or auto-downloaded if its total size is at or under this many bytes. Default 500MB. */
+    fun getDatasetMaxSizeBytes(): Long = prefs().getLong(KEY_DATASET_MAX_SIZE_BYTES, 500L * 1024 * 1024)
+    fun setDatasetMaxSizeBytes(value: Long) = prefs().edit().putLong(KEY_DATASET_MAX_SIZE_BYTES, value).apply()
+
+    /** Repo ids already downloaded (by either a manual tap or an automatic cycle) -- consulted so
+     * a periodic cycle never re-downloads the same dataset, and so the list can grey out/hide
+     * what's already present. */
+    fun getDownloadedDatasetRepoIds(): Set<String> =
+        prefs().getStringSet(KEY_DOWNLOADED_DATASET_REPO_IDS, emptySet()) ?: emptySet()
+    fun addDownloadedDatasetRepoId(repoId: String) {
+        val updated = getDownloadedDatasetRepoIds().toMutableSet().apply { add(repoId) }
+        prefs().edit().putStringSet(KEY_DOWNLOADED_DATASET_REPO_IDS, updated).apply()
+    }
+
+    /** Repo ids the "-random" search has already surfaced -- consulted so repeated random
+     * searches keep exploring rather than showing the same handful of datasets every time. */
+    fun getSeenDatasetRepoIds(): Set<String> =
+        prefs().getStringSet(KEY_SEEN_DATASET_REPO_IDS, emptySet()) ?: emptySet()
+    fun addSeenDatasetRepoIds(repoIds: Collection<String>) {
+        val updated = getSeenDatasetRepoIds().toMutableSet().apply { addAll(repoIds) }
+        prefs().edit().putStringSet(KEY_SEEN_DATASET_REPO_IDS, updated).apply()
+    }
+
+    /** Whether dataset downloads use a shallow `git clone` of the whole repo (both Hugging Face
+     * and GitHub serve datasets as real git repositories) instead of fetching each file over
+     * plain HTTP one at a time. On by default -- see [com.prism.launcher.messaging.GitDatasetDownloader]
+     * for why this is a strict superset of the plain-HTTP method (it falls back to the exact same
+     * per-file HTTP fetch for anything the clone can't give real content for, e.g. a Git LFS
+     * pointer file) rather than a riskier alternative to it. */
+    fun getDatasetUseGitEnabled(): Boolean = prefs().getBoolean(KEY_DATASET_USE_GIT, true)
+    fun setDatasetUseGitEnabled(value: Boolean) = prefs().edit().putBoolean(KEY_DATASET_USE_GIT, value).apply()
+
     // ── DNS Proxy (for Access Points) ───────────────────────────────────────
 
     /** Whether the DNS Proxy Service is enabled (listens on 0.0.0.0:53) */
@@ -301,6 +1183,19 @@ object PrismSettings {
 
     fun setVpnTunnelingEnabled(value: Boolean) =
         prefs().edit().putBoolean(KEY_VPN_TUNNELING_ENABLED, value).apply()
+
+    /**
+     * Whether the mesh control plane (`PrismMeshService`) is allowed to run.
+     *
+     * Default true so nothing changes for anyone already relying on P2P hosting/DNS/model
+     * sharing -- the bug this fixes is that there was previously no way to turn it off at all,
+     * not that it defaulted on.
+     */
+    fun getMeshEnabled(): Boolean =
+        prefs().getBoolean(KEY_MESH_ENABLED, true)
+
+    fun setMeshEnabled(value: Boolean) =
+        prefs().edit().putBoolean(KEY_MESH_ENABLED, value).apply()
 
     /** Which VPN Mode is selected: "prism" | "external" */
     fun getVpnMode(): String =
@@ -582,6 +1477,83 @@ object PrismSettings {
         return mirrors
     }
 
+    // ── Web Cache (pages kept as they were browsed) ────────────────────────
+    //
+    // TWO SEPARATE SWITCHES, AND THE SECOND IS NOT A DETAIL OF THE FIRST. Caching a page keeps a
+    // copy of something the user looked at; publishing it hands that copy to every peer on the
+    // mesh. A browsing history is not something to start sharing as a side effect of enabling a
+    // cache, so the sharing decision is its own explicit act -- and the storage layout reflects
+    // that: an unshared cache is never registered as a hosted site or a DNS record, so there is
+    // nothing for a peer to find even if it asks.
+
+    /** Whether visited pages are cached at all. Meaningless without a live Prism tunnel. */
+    fun getWebCacheEnabled(): Boolean = prefs().getBoolean(KEY_WEB_CACHE_ENABLED, false)
+
+    fun setWebCacheEnabled(value: Boolean) =
+        prefs().edit().putBoolean(KEY_WEB_CACHE_ENABLED, value).apply()
+
+    // -- Personal history ---------------------------------------------------
+
+    /**
+     * Whether Prism keeps a searchable record of what the user has read, watched and said.
+     *
+     * DEFAULTS ON, unlike the mesh-facing switches, because this one never leaves the device: it is
+     * the same information the browser, the messaging page and the file explorer already hold, in a
+     * form that can be searched. Those settings default off because they publish; this does not.
+     *
+     * Reading it is a different question from keeping it -- see [getHistoryToolEnabled].
+     */
+    fun getHistoryEnabled(): Boolean = prefs().getBoolean(KEY_HISTORY_ENABLED, true)
+
+    fun setHistoryEnabled(value: Boolean) =
+        prefs().edit().putBoolean(KEY_HISTORY_ENABLED, value).apply()
+
+    /**
+     * Whether the AI may search that history.
+     *
+     * SEPARATE FROM KEEPING IT, and off by default. A local record the user can search themselves is
+     * one thing; handing a model the ability to read it -- a model that may well be a cloud endpoint,
+     * depending on which engine they have selected -- is a different decision, and it should be one
+     * they took rather than one that arrived switched on.
+     */
+    fun getHistoryToolEnabled(): Boolean = prefs().getBoolean(KEY_HISTORY_TOOL, false)
+
+    fun setHistoryToolEnabled(value: Boolean) =
+        prefs().edit().putBoolean(KEY_HISTORY_TOOL, value).apply()
+
+    /** Whether cached pages are served to mesh peers. Meaningless without [getWebCacheEnabled]. */
+    fun getWebCacheMeshSharing(): Boolean = prefs().getBoolean(KEY_WEB_CACHE_MESH, false)
+
+    fun setWebCacheMeshSharing(value: Boolean) =
+        prefs().edit().putBoolean(KEY_WEB_CACHE_MESH, value).apply()
+
+    /**
+     * Whether a cached video is also posted to Lyke.
+     *
+     * ITS OWN SWITCH, not a consequence of caching. A cached page sits on the device; a Lyke post is
+     * published under the user's name and syncs to peers, so this turns "a video I watched" into
+     * "a video I posted" -- about someone else's work. That is a decision, and it defaults to no.
+     */
+    fun getWebCacheLykeUpload(): Boolean = prefs().getBoolean(KEY_WEB_CACHE_LYKE, false)
+
+    fun setWebCacheLykeUpload(value: Boolean) =
+        prefs().edit().putBoolean(KEY_WEB_CACHE_LYKE, value).apply()
+
+    /**
+     * Where cached pages live -- deliberately NOT [getMirrorsDir].
+     *
+     * Mirrors are sites the user explicitly asked to download and host; this is an automatic cache
+     * with its own eviction policy. Sharing one directory would mean an eviction pass could delete
+     * a site somebody deliberately published, and "stop sharing my cache" could not be answered
+     * without walking the mirror list to work out which files were whose.
+     *
+     * Does NOT create the directory, unlike [getMirrorsDir]. Every settings row that reports the
+     * cache size asks for this path, and a disabled feature has no business leaving an empty folder
+     * in the user's Documents; the writers create it when there is finally something to put in it.
+     */
+    fun getWebCacheDir(): java.io.File =
+        java.io.File(PrismPlatform.host.documentsDir(), "WebCache")
+
     // ── Networked Storage ───────────────────────────────────────────────────
 
     data class NetworkStorage(
@@ -624,6 +1596,19 @@ object PrismSettings {
     // file still documents every value stored under "prism_settings".
 
     // ── AI & Intelligence ───────────────────────────────────────────────────
+
+    /**
+     * Route Sam's local answers through a trained CakeChat instead of the GGUF engine.
+     *
+     * A separate switch rather than another AI_MODE, because it is not a peer of local/cloud -- it
+     * is a choice of which local engine answers, and it only means anything while the mode is
+     * already local. Modelling it as a mode would let a user select "CakeChat" and then wonder why
+     * a cloud key was still being used.
+     */
+    fun getUseCakeChat(): Boolean = prefs().getBoolean(KEY_USE_CAKECHAT, false)
+
+    fun setUseCakeChat(value: Boolean) =
+        prefs().edit().putBoolean(KEY_USE_CAKECHAT, value).apply()
 
     const val AI_MODE_LOCAL = "local"
     const val AI_MODE_CLOUD = "cloud"
@@ -763,6 +1748,98 @@ object PrismSettings {
     const val VIRT_MODE_PRISM_OS   = "prism_os"
     const val VIRT_MODE_CUSTOM_ISO = "custom_iso"
 
+    // -- Windows executables ------------------------------------------------
+
+    /**
+     * Whether the Virtualization page runs Windows programs instead of a guest OS.
+     *
+     * Two different things share one page because they answer the same question -- "run software
+     * this device cannot run natively" -- and only one of them can be on screen at a time. The
+     * switch also decides whether Prism offers itself for opening .exe files, because appearing in
+     * that chooser while unable to run one would be a bad joke.
+     */
+    fun getWindowsMode(): Boolean = prefs().getBoolean(KEY_WINDOWS_MODE, false)
+
+    fun setWindowsMode(value: Boolean) =
+        prefs().edit().putBoolean(KEY_WINDOWS_MODE, value).apply()
+
+    // ── The lock screen ────────────────────────────────────────────────────
+
+    /**
+     * Whether the decoy launcher is showing because a duress credential was entered.
+     *
+     * Kept in ordinary settings on purpose. Anything more elaborate -- an encrypted store, a
+     * separate process -- would be a place for someone inspecting the device to notice that a
+     * mechanism exists, and the flag's value is not the secret. The secret is the credential.
+     */
+    fun getDuressActive(): Boolean = prefs().getBoolean(KEY_DURESS_ACTIVE, false)
+
+    fun setDuressActive(value: Boolean) =
+        prefs().edit().putBoolean(KEY_DURESS_ACTIVE, value).apply()
+
+    /** Whether Prism draws its own lock screen when the device wakes. */
+    fun getLockScreenEnabled(): Boolean = prefs().getBoolean(KEY_LOCKSCREEN, false)
+
+    fun setLockScreenEnabled(value: Boolean) =
+        prefs().edit().putBoolean(KEY_LOCKSCREEN, value).apply()
+
+    /** Whether the lock offers fingerprint unlock, when the device has a sensor. */
+    fun getLockBiometric(): Boolean = prefs().getBoolean(KEY_LOCK_BIOMETRIC, true)
+
+    fun setLockBiometric(value: Boolean) =
+        prefs().edit().putBoolean(KEY_LOCK_BIOMETRIC, value).apply()
+
+    /** Whether the medical card appears on the lock screen. */
+    fun getMedicalOnLock(): Boolean = prefs().getBoolean(KEY_MEDICAL_ON_LOCK, true)
+
+    fun setMedicalOnLock(value: Boolean) =
+        prefs().edit().putBoolean(KEY_MEDICAL_ON_LOCK, value).apply()
+
+    // ── The mesh compute market ────────────────────────────────────────────
+
+    /**
+     * Whether this device offers its own compute to other peers.
+     *
+     * Off by default, and deliberately separate from using other people's: lending a phone's memory
+     * and cores to strangers on the mesh drains its battery and is not something to opt anyone into
+     * silently. Turning it on is what makes this device appear in other people's market lists.
+     */
+    fun getComputeHostEnabled(): Boolean = prefs().getBoolean(KEY_COMPUTE_HOST, false)
+
+    fun setComputeHostEnabled(value: Boolean) =
+        prefs().edit().putBoolean(KEY_COMPUTE_HOST, value).apply()
+
+    /** Let Prism pick the peer, rather than using whatever the user last tapped. */
+    fun getComputeAutoSelect(): Boolean = prefs().getBoolean(KEY_COMPUTE_AUTO, false)
+
+    fun setComputeAutoSelect(value: Boolean) =
+        prefs().edit().putBoolean(KEY_COMPUTE_AUTO, value).apply()
+
+    /** Which capability the market list is ordered by. Stored as the enum name. */
+    fun getComputeSortKey(): String = prefs().getString(KEY_COMPUTE_SORT, "OVERALL").orEmpty()
+
+    fun setComputeSortKey(value: String) =
+        prefs().edit().putString(KEY_COMPUTE_SORT, value).apply()
+
+    /**
+     * Mesh addresses of the peers the user chose, comma-separated.
+     *
+     * More than one means the model is split across them; one means it runs whole on that peer.
+     * Empty means inference stays on this device.
+     */
+    fun getComputePeers(): List<String> =
+        prefs().getString(KEY_COMPUTE_PEERS, "").orEmpty()
+            .split(',').map { it.trim() }.filter { it.isNotEmpty() }
+
+    fun setComputePeers(peers: List<String>) =
+        prefs().edit().putString(KEY_COMPUTE_PEERS, peers.joinToString(",")).apply()
+
+    /** Where the Wine/box64/rootfs archive is fetched from. Empty until the user sets one. */
+    fun getWindowsLayerUrl(): String = prefs().getString(KEY_WINDOWS_LAYER_URL, "").orEmpty()
+
+    fun setWindowsLayerUrl(value: String) =
+        prefs().edit().putString(KEY_WINDOWS_LAYER_URL, value.trim()).apply()
+
     fun getVirtualizationEnabled(): Boolean =
         prefs().getBoolean(KEY_VIRT_ENABLED, false)
 
@@ -795,6 +1872,31 @@ object PrismSettings {
     fun setMaxTokens(value: Int) =
         prefs().edit().putInt(KEY_MAX_TOKENS, value).apply()
 
+    // ── Prism Swap (Sam) ──────────────────────────────────────────────────────
+    // Sam's own disk-backed swap, alongside Nora's -- see PrismSwap.kt (core/messaging), which
+    // wraps a SwapRegion the same way NoraSwap does. Separate swapfile/settings from Nora's (the
+    // data is structurally unrelated -- a GGUF blob vs. Nora's float tensors), same user-facing
+    // "Prism Swap" name and shape.
+
+    /** Auto-enabled by AiManager.onLocalTextModelActivated when a model doesn't fit in free RAM. */
+    fun getPrismSwapEnabled(): Boolean = prefs().getBoolean(KEY_PRISM_SWAP_ENABLED, false)
+    fun setPrismSwapEnabled(value: Boolean) = prefs().edit().putBoolean(KEY_PRISM_SWAP_ENABLED, value).apply()
+
+    /** Swap file size, bytes. Auto-raised to cover a model's shortfall on import/activation;
+     * user-adjustable afterward via the Prism Swap size slider. */
+    fun getPrismSwapBytes(): Long = prefs().getLong(KEY_PRISM_SWAP_BYTES, 512L shl 20)
+    fun setPrismSwapBytes(value: Long) = prefs().edit().putLong(KEY_PRISM_SWAP_BYTES, value).apply()
+
+    /** RAM deficit (bytes) below which Tier 1 (mmap fallback + KV-cache/context downgrade, real
+     * swap only for the one buffer that's actually file-shaped) is tried before failing. */
+    fun getPrismSwapMitigationThresholdBytes(): Long = prefs().getLong(KEY_PRISM_SWAP_MITIGATION_THRESHOLD, 512L shl 20)
+    fun setPrismSwapMitigationThresholdBytes(value: Long) = prefs().edit().putLong(KEY_PRISM_SWAP_MITIGATION_THRESHOLD, value).apply()
+
+    /** RAM deficit (bytes) below which Tier 2 (full custom swap-backed ggml device -- weights,
+     * KV cache, and compute buffers all off-heap) is tried when Tier 1 alone isn't enough. */
+    fun getPrismSwapFullThresholdBytes(): Long = prefs().getLong(KEY_PRISM_SWAP_FULL_THRESHOLD, 3L shl 30)
+    fun setPrismSwapFullThresholdBytes(value: Long) = prefs().edit().putLong(KEY_PRISM_SWAP_FULL_THRESHOLD, value).apply()
+
     /** Returns true if a local image model exists in internal storage */
     fun isLocalImageModelImported(): Boolean {
         val path = getLocalImageModelPath()
@@ -802,6 +1904,29 @@ object PrismSettings {
         val file = java.io.File(path)
         return file.exists() && file.absolutePath.startsWith(PrismPlatform.host.dataDir().absolutePath)
     }
+
+    /**
+     * Whether an image generator is actually usable right now.
+     *
+     * Deliberately mirrors the exact branch `ImageGenManager.generateImage` takes, so this can
+     * never claim an image generator is available in a state where that call would immediately
+     * return null: in Cloud mode it needs an active cloud model to POST to, and in every other
+     * mode it needs a local image model that is imported AND still present on disk (a model whose
+     * files were deleted out from under the setting must read as unavailable, not merely
+     * configured).
+     *
+     * This is the single gate behind both the `generate_image` agentic tool and Sam's own image
+     * route, and the one the Agentic Tools page reads to grey the tool out -- one predicate, so
+     * what the UI shows and what the tool does can't drift apart.
+     *
+     * The Cloud arm is the honest limit of a static check: whether a given endpoint really serves
+     * image generation cannot be known without issuing a billable request, so a cloud model that
+     * turns out to be text-only surfaces as a failure from the tool itself rather than as a
+     * greyed-out button.
+     */
+    fun hasImageGenerator(): Boolean =
+        if (getAiMode() == AI_MODE_CLOUD) getActiveCloudModel() != null
+        else isLocalImageModelImported()
 
     // ── Imported Model Registry ─────────────────────────────────────────────
 
@@ -1010,6 +2135,60 @@ object PrismSettings {
     private const val KEY_DEFAULT_PAGE       = "default_page"
     private const val KEY_SHOW_DRAWER_LABELS = "show_drawer_labels"
     private const val KEY_SEARCH_ENGINE      = "search_engine"
+    private const val KEY_PRISM_SEARCH_PORT  = "prism_search_port"
+    private const val KEY_SEARCH_CRAWL_HOURS = "search_crawl_interval_hours"
+    private const val KEY_SEARCH_AI_SUMMARY = "search_ai_summary"
+    private const val KEY_WRITER_TRAIL = "writer_trail_color"
+    private const val KEY_WRITER_THEME = "writer_theme"
+    private const val KEY_WRITER_SWIPE = "writer_swipe"
+    private const val KEY_WRITER_PANEL = "writer_panel_color"
+    private const val KEY_WRITER_KEY = "writer_key_color"
+    private const val KEY_WRITER_KEY_TEXT = "writer_key_text_color"
+    private const val KEY_WRITER_ACCENT = "writer_accent_color"
+    private const val KEY_WRITER_BG_IMAGE = "writer_bg_image"
+    private const val KEY_WRITER_BG_LIBRARY = "writer_bg_library"
+    private const val KEY_WRITER_DICTS = "writer_dictionaries"
+    private const val KEY_WRITER_REDEFS = "writer_redefinitions"
+    private const val KEY_WRITER_SUGGESTIONS = "writer_suggestions"
+    private const val KEY_WRITER_GIF_KEY = "writer_gif_api_key"
+    private const val KEY_LYKE_ID = "lyke_user_id"
+    private const val KEY_LYKE_NAME = "lyke_user_name"
+    private const val KEY_LYKE_AVATAR = "lyke_avatar"
+    private const val KEY_LYKE_PASSWORD = "lyke_password"
+    private const val KEY_LYKE_CONFIRMED = "lyke_profile_confirmed"
+    private const val KEY_LYKE_FOLLOWING = "lyke_following"
+    private const val KEY_LYKE_FOLLOWERS = "lyke_followers"
+    private const val KEY_WRITER_BG_DIM = "writer_bg_dim"
+    private const val KEY_WRITER_TRAIL_GLOW = "writer_trail_glow"
+    private const val KEY_WRITER_AUTOCORRECT = "writer_autocorrect"
+    private const val KEY_WRITER_HAPTICS = "writer_haptics_ms"
+    private const val KEY_WRITER_AI = "writer_ai_assist"
+    private const val KEY_WRITER_TRANSLATE_TO = "writer_translate_to"
+    private const val KEY_WRITER_SPEAK_TRANSLATION = "writer_speak_translation"
+    private const val KEY_WRITER_LEARNED = "writer_learned_words"
+    private const val KEY_MINING_DISCOVERY = "mining_discovery_url"
+    private const val KEY_MINING_THREADS = "mining_threads"
+    private const val KEY_USE_CAKECHAT = "use_cakechat"
+    private const val KEY_MINING_MODE = "mining_mode"
+    private const val KEY_SOLO_NODE_URL = "mining_solo_node_url"
+    private const val KEY_SOLO_NODE_AUTH = "mining_solo_node_auth"
+    private const val KEY_SELF_HOST_NODE = "mining_self_host_node"
+    private const val KEY_MINED_SHARES = "mining_shares_by_coin"
+    private const val KEY_EXPERIMENTAL_COMPILER = "mining_experimental_compiler"
+    private const val KEY_TOOLCHAIN_URL = "mining_toolchain_url"
+    private const val KEY_COMPILED_LIB_PREFIX = "mining_compiled_lib_"
+    private const val KEY_PAYOUT_PREFIX = "mining_payout_address_"
+    private const val KEY_CHAIN_STATS_PREFIX = "chain_stats_"
+    private const val KEY_RANDOMX_JIT = "mining_randomx_jit"
+    private const val KEY_RANDOMX_JIT_PENDING = "mining_randomx_jit_pending"
+    private const val KEY_CHAIN_CONFIG_PREFIX = "custom_chain_config_"
+    private const val KEY_CHAIN_NODE_PREFIX = "custom_chain_node_"
+    private const val KEY_LAST_BALANCE_PREFIX = "wallet_last_balance_"
+    private const val KEY_SEARCH_SEEDS       = "search_seeds"
+    private const val KEY_SEARCH_DISCOVERED  = "search_discovered_seeds"
+    private const val KEY_SEARCH_MAX_SEEDS   = "search_max_discovered_seeds"
+    private const val KEY_BOOKMARKS          = "browser_bookmarks"
+    private const val KEY_DOWNLOADS          = "browser_downloads"
     private const val KEY_CUSTOM_SEARCH_URL  = "custom_search_url"
     private const val KEY_JS_ENABLED         = "js_enabled"
     private const val KEY_PRIVATE_BY_DEFAULT = "private_by_default"
@@ -1060,6 +2239,30 @@ object PrismSettings {
     private const val KEY_DNS_PROXY_ENABLED  = "dns_proxy_enabled"
     private const val KEY_DNS_PROXY_MODE     = "dns_proxy_mode"
     
+    private const val KEY_MESH_ENABLED       = "mesh_enabled"
+
+    private const val KEY_AETHER_BIOTRAIN    = "aether_biotrain_enabled"
+    private const val KEY_AETHER_BIOGEN      = "aether_biogen_enabled"
+    private const val KEY_AETHER_SHARE_KNOWLEDGE   = "aether_share_knowledge_enabled"
+    private const val KEY_AETHER_RECEIVE_KNOWLEDGE = "aether_receive_knowledge_enabled"
+    private const val KEY_AETHER_ANN_BASELINE      = "aether_ann_baseline_enabled"
+    private const val KEY_AETHER_SURPRISAL_WEIGHTING = "aether_surprisal_weighting_enabled"
+    private const val KEY_AETHER_COOCCURRENCE_PRIOR  = "aether_cooccurrence_prior_enabled"
+    private const val KEY_AETHER_CHECKPOINT_INTERVAL_EPOCHS = "aether_checkpoint_interval_epochs"
+
+    private const val KEY_DATASET_AUTO_DOWNLOAD = "dataset_auto_download_enabled"
+    private const val KEY_DATASET_AUTO_DOWNLOAD_HOURS = "dataset_auto_download_interval_hours"
+    private const val KEY_DATASET_MIN_SIZE_BYTES = "dataset_min_size_bytes"
+    private const val KEY_DATASET_MAX_SIZE_BYTES = "dataset_max_size_bytes"
+    private const val KEY_DOWNLOADED_DATASET_REPO_IDS = "downloaded_dataset_repo_ids"
+    private const val KEY_SEEN_DATASET_REPO_IDS = "seen_dataset_repo_ids"
+    private const val KEY_DATASET_USE_GIT = "dataset_use_git_enabled"
+
+    private const val KEY_PRISM_SWAP_ENABLED              = "prism_swap_enabled"
+    private const val KEY_PRISM_SWAP_BYTES                = "prism_swap_bytes"
+    private const val KEY_PRISM_SWAP_MITIGATION_THRESHOLD = "prism_swap_mitigation_threshold_bytes"
+    private const val KEY_PRISM_SWAP_FULL_THRESHOLD       = "prism_swap_full_threshold_bytes"
+
     private const val KEY_VPN_TUNNELING_ENABLED = "vpn_tunneling_enabled"
     private const val KEY_VPN_MODE           = "vpn_mode"
     private const val KEY_PRISM_VPN_ROLE     = "prism_vpn_role"
@@ -1083,6 +2286,21 @@ object PrismSettings {
     private const val KEY_P2P_MODEL_HOSTING_ENABLED = "p2p_model_hosting_enabled"
     private const val KEY_SELECTED_P2P_MODEL     = "selected_p2p_model"
     private const val KEY_P2P_MIRRORED_SITES     = "p2p_mirrored_sites"
+    private const val KEY_WEB_CACHE_ENABLED      = "web_cache_enabled"
+    private const val KEY_WEB_CACHE_MESH         = "web_cache_mesh_sharing"
+    private const val KEY_WEB_CACHE_LYKE         = "web_cache_lyke_upload"
+    private const val KEY_HISTORY_ENABLED        = "history_enabled"
+    private const val KEY_HISTORY_TOOL           = "history_tool_enabled"
+    private const val KEY_DURESS_ACTIVE          = "duress_active"
+    private const val KEY_LOCKSCREEN             = "lockscreen_enabled"
+    private const val KEY_LOCK_BIOMETRIC         = "lock_biometric"
+    private const val KEY_MEDICAL_ON_LOCK        = "medical_on_lock"
+    private const val KEY_COMPUTE_HOST           = "compute_host"
+    private const val KEY_COMPUTE_AUTO           = "compute_auto"
+    private const val KEY_COMPUTE_SORT           = "compute_sort"
+    private const val KEY_COMPUTE_PEERS          = "compute_peers"
+    private const val KEY_WINDOWS_MODE           = "windows_mode"
+    private const val KEY_WINDOWS_LAYER_URL      = "windows_layer_url"
     private const val KEY_NETWORK_STORAGES       = "network_storages"
     const val KEY_ACCESS_POINTS                 = "access_points"
     private const val KEY_FONT_STYLE             = "font_style"
@@ -1170,7 +2388,15 @@ object PrismSettings {
     }
 
     // Model Download URLs
-    const val MODEL_FALCON_1B = "https://huggingface.co/vshymanskyy/falcon-1b-it-tflite/resolve/main/falcon-1b-it-cpu-int4.bin"
+    /**
+     * The Falcon repo ID, not a file URL.
+     *
+     * The old value pointed at one specific .bin in a TFLite repo -- a single quantisation, chosen
+     * for the user, in a format the GGUF path cannot load. This names the REPO so the picker can ask
+     * Hugging Face which quantisations actually exist and let the user choose one that fits their
+     * device's RAM.
+     */
+    const val MODEL_FALCON_1B_REPO = "tiiuae/Falcon3-1B-Instruct-GGUF"
     const val MODEL_PHI_2 = "https://huggingface.co/vshymanskyy/phi-2-tflite/resolve/main/phi-2-cpu-int4.bin"
     const val MODEL_QWEN_1_5 = "https://huggingface.co/litert-community/Qwen2.5-1.5B-Instruct/resolve/main/Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.task"
     const val MODEL_MOBILEBERT = "https://huggingface.co/google/mobilebert/resolve/main/mobilebert.tflite"

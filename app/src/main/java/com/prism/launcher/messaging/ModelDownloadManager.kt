@@ -90,7 +90,11 @@ object ModelDownloadManager {
         }
     }
 
-    /** Plain File-to-File copy of an already-downloaded model (in app-external storage) into filesDir/models. */
+    /** Plain File-to-File copy of an already-downloaded model (in app-external storage) into
+     * filesDir/models. No [onStage]/progress dialog here -- this runs from [completionReceiver],
+     * an application-scoped BroadcastReceiver with no Activity window to host a dialog in (the
+     * download itself already has its own OS notification progress); the eager preload inside
+     * [registerImportedModel] still happens, just silently. */
     private fun importDownloadedModel(context: Context, sourceFile: File, fileName: String, isImageModel: Boolean) {
         val modelsDir = File(context.filesDir, "models")
         if (!modelsDir.exists()) modelsDir.mkdirs()
@@ -100,14 +104,7 @@ object ModelDownloadManager {
             val expectedSize = sourceFile.length()
             var errorMessage: String? = null
             try {
-                sourceFile.inputStream().use { input ->
-                    java.io.FileOutputStream(targetFile).use { fos ->
-                        val output = java.io.BufferedOutputStream(fos)
-                        input.copyTo(output)
-                        output.flush()
-                        fos.fd.sync()
-                    }
-                }
+                copyWithProgress(sourceFile.inputStream(), targetFile, expectedSize, onProgress = null)
                 val copiedSize = targetFile.length()
                 if (copiedSize <= 0L) {
                     errorMessage = "0 bytes were copied."
@@ -129,6 +126,32 @@ object ModelDownloadManager {
         }
     }
 
+    /** Streams [input] into [targetFile] in 64KB chunks, reporting running byte counts through
+     * [onProgress] as it goes -- the mechanism a caller with a visible progress dialog
+     * ([SettingsActivity]'s model picker) uses for real, byte-counted copy progress, as opposed
+     * to the indeterminate stage text the model-load step itself reports afterward. */
+    private fun copyWithProgress(
+        input: java.io.InputStream, targetFile: File, expectedSize: Long,
+        onProgress: ((copiedBytes: Long, totalBytes: Long) -> Unit)?
+    ) {
+        input.use { stream ->
+            java.io.FileOutputStream(targetFile).use { fos ->
+                val output = java.io.BufferedOutputStream(fos)
+                val buffer = ByteArray(1 shl 16)
+                var copied = 0L
+                while (true) {
+                    val n = stream.read(buffer)
+                    if (n < 0) break
+                    output.write(buffer, 0, n)
+                    copied += n
+                    onProgress?.invoke(copied, expectedSize)
+                }
+                output.flush()
+                fos.fd.sync()
+            }
+        }
+    }
+
     /** [scope] is Dispatchers.IO -- Toast requires a thread with a Looper, so callers reached from
      * there (unlike the BroadcastReceiver's onReceive, which is already main-thread) must post. */
     private fun toastOnMain(context: Context, message: String, duration: Int = Toast.LENGTH_SHORT) {
@@ -137,23 +160,62 @@ object ModelDownloadManager {
         }
     }
 
-    /** Registers a fully-copied, verified model file as imported, and activates it. */
-    fun registerImportedModel(context: Context, targetFile: File, fileName: String, isImageModel: Boolean) {
+    /**
+     * Registers a fully-copied, verified model file as imported, activates it, and then eagerly
+     * warms it up (loads it into memory right now instead of leaving it to load lazily and
+     * silently on whatever chat message the user sends first) -- [onStage], when given, reports
+     * every stage of that warm-up (see [GgufInferenceService.preload]/[LocalImageService.preload]).
+     * Called only from within this object's own [scope]-launched coroutines, both already on
+     * Dispatchers.IO, so calling the suspend preload functions directly here is safe.
+     */
+    private suspend fun registerImportedModel(
+        context: Context, targetFile: File, fileName: String, isImageModel: Boolean,
+        onStage: ((String) -> Unit)? = null
+    ) {
         if (isImageModel) {
             PrismSettings.setLocalImageModelPath(targetFile.absolutePath)
         } else {
             PrismSettings.setLocalAiModelPath(targetFile.absolutePath)
+            AiManager.onLocalTextModelActivated(context, targetFile.absolutePath)
         }
         PrismSettings.addImportedModel(PrismSettings.ImportedModel(
                 path = targetFile.absolutePath,
                 displayName = fileName,
                 type = if (isImageModel) PrismSettings.MODEL_TYPE_IMAGE else PrismSettings.MODEL_TYPE_TEXT
             ))
-        toastOnMain(context, "Intelligence Acquired: $fileName")
+
+        val loadError = try {
+            if (isImageModel) {
+                LocalImageService.preload(context, targetFile.absolutePath, onStage)
+                null
+            } else {
+                GgufInferenceService.preload(targetFile.absolutePath, onStage)
+            }
+        } catch (e: Exception) {
+            e.message ?: "Unknown error"
+        }
+
+        if (loadError == null) {
+            toastOnMain(context, "Intelligence Acquired: $fileName")
+        } else {
+            // Not treated as an import failure -- the file is safely on disk and registered
+            // either way; only the eager warm-up didn't work. The exact same load will simply be
+            // retried (and its error surfaced the usual way) the next time it's actually used.
+            toastOnMain(context, "$fileName imported, but couldn't be loaded yet: $loadError", Toast.LENGTH_LONG)
+        }
     }
 
-    /** Copies a user-picked SAF content:// Uri into filesDir/models, with byte-count verification. Activity-scoped (needs a live ContentResolver call from the picker flow). */
-    fun copyUriToInternal(context: Context, uri: Uri, fileName: String, isImageModel: Boolean, onDone: (success: Boolean, errorMessage: String?) -> Unit) {
+    /** Copies a user-picked SAF content:// Uri into filesDir/models, with byte-count verification.
+     * Activity-scoped (needs a live ContentResolver call from the picker flow). [onProgress]
+     * reports running byte counts during the copy; [onStage] reports the model-load stages that
+     * follow it (see [registerImportedModel]) -- together the full story a caller with a visible
+     * progress dialog (`SettingsActivity`'s model picker) needs. */
+    fun copyUriToInternal(
+        context: Context, uri: Uri, fileName: String, isImageModel: Boolean,
+        onProgress: ((copiedBytes: Long, totalBytes: Long) -> Unit)? = null,
+        onStage: ((String) -> Unit)? = null,
+        onDone: (success: Boolean, errorMessage: String?) -> Unit
+    ) {
         val modelsDir = File(context.filesDir, "models")
         if (!modelsDir.exists()) modelsDir.mkdirs()
         val targetFile = File(modelsDir, fileName)
@@ -168,14 +230,7 @@ object ModelDownloadManager {
                 if (input == null) {
                     errorMessage = "Could not open the selected file for reading."
                 } else {
-                    input.use { stream ->
-                        java.io.FileOutputStream(targetFile).use { fos ->
-                            val output = java.io.BufferedOutputStream(fos)
-                            stream.copyTo(output)
-                            output.flush()
-                            fos.fd.sync()
-                        }
-                    }
+                    copyWithProgress(input, targetFile, expectedSize, onProgress)
                     val copiedSize = targetFile.length()
                     if (copiedSize <= 0L) {
                         errorMessage = "0 bytes were copied — the source file may be inaccessible."
@@ -189,7 +244,7 @@ object ModelDownloadManager {
             }
 
             if (errorMessage == null) {
-                registerImportedModel(context, targetFile, fileName, isImageModel)
+                registerImportedModel(context, targetFile, fileName, isImageModel, onStage)
             } else {
                 targetFile.delete()
             }

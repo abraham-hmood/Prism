@@ -3,6 +3,8 @@ package com.prism.launcher.agentic
 import com.prism.core.MeshUtils
 import com.prism.core.PrismPlatform
 import com.prism.core.json.JSONObject
+import com.prism.launcher.PrismSettings
+import com.prism.launcher.history.PrismHistory
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
@@ -26,6 +28,11 @@ object AgenticBuiltinTools {
     const val ID_WRITE_FILE = "write_file"
     const val ID_MKDIR = "mkdir"
     const val ID_P2P_HOST = "p2p_host"
+    const val ID_READ_TEXT = "read_text"
+    const val ID_SEND_TEXT = "send_text"
+    const val ID_MAKE_CALL = "make_call"
+    const val ID_GENERATE_IMAGE = "generate_image"
+    const val ID_PERSONAL_HISTORY = "search_personal_history"
 
     private const val MAX_RESULT_CHARS = 4000
     private const val MAX_LISTED_ENTRIES = 200
@@ -94,6 +101,60 @@ object AgenticBuiltinTools {
                 """{"type":"object","properties":{"path":{"type":"string","description":"Absolute path, or a path relative to internal storage root, of the folder to host"},"domain":{"type":"string","description":"Domain name to claim on the mesh, e.g. myfiles.p2p"}},"required":["path","domain"]}"""
             ),
             executor = ToolExecutorConfig.Builtin(ID_P2P_HOST)
+        ),
+        // --- Messaging/telephony tools: require an active SIM/eSIM, see [requiresActiveLine]'s
+        // doc comment -- never shown to a model, nor runnable, without one. ---
+        ToolDefinition(
+            name = ID_READ_TEXT,
+            description = "Reads the most recent text message (SMS) from a phone number or a saved contact. Only available when this device has an active cellular line (SIM or eSIM).",
+            parametersSchema = JSONObject(
+                """{"type":"object","properties":{"contact":{"type":"string","description":"A phone number, or the name of a saved contact -- either is accepted."}},"required":["contact"]}"""
+            ),
+            executor = ToolExecutorConfig.Builtin(ID_READ_TEXT),
+            requiresActiveLine = true
+        ),
+        ToolDefinition(
+            name = ID_SEND_TEXT,
+            description = "Sends a text message (SMS) to a phone number or a saved contact. Only available when this device has an active cellular line (SIM or eSIM).",
+            parametersSchema = JSONObject(
+                """{"type":"object","properties":{"contact":{"type":"string","description":"A phone number, or the name of a saved contact -- either is accepted."},"message":{"type":"string","description":"The text message to send."}},"required":["contact","message"]}"""
+            ),
+            executor = ToolExecutorConfig.Builtin(ID_SEND_TEXT),
+            requiresActiveLine = true
+        ),
+        ToolDefinition(
+            name = ID_MAKE_CALL,
+            description = "Places a phone call to a phone number or a saved contact. Only available when this device has an active cellular line (SIM or eSIM).",
+            parametersSchema = JSONObject(
+                """{"type":"object","properties":{"contact":{"type":"string","description":"A phone number, or the name of a saved contact -- either is accepted."}},"required":["contact"]}"""
+            ),
+            executor = ToolExecutorConfig.Builtin(ID_MAKE_CALL),
+            requiresActiveLine = true
+        ),
+        // --- Image generation: requires a loaded image generator, see [requiresImageGenerator]. ---
+        ToolDefinition(
+            name = ID_GENERATE_IMAGE,
+            description = "Generates an image from a text description using the image generation model loaded on this device, saves it to the gallery, and shows it in the conversation. Only available when an image generator is loaded.",
+            parametersSchema = JSONObject(
+                """{"type":"object","properties":{"prompt":{"type":"string","description":"A description of the image to generate. Be specific and visual -- describe the subject, setting, and style, e.g. 'a red fox asleep on a mossy log, morning light, photorealistic'."}},"required":["prompt"]}"""
+            ),
+            executor = ToolExecutorConfig.Builtin(ID_GENERATE_IMAGE),
+            requiresImageGenerator = true
+        ),
+        // --- The user's own history. Gated on a setting; see searchPersonalHistory. ---
+        ToolDefinition(
+            name = ID_PERSONAL_HISTORY,
+            description =
+                "Searches what the user of this device has personally read, watched, said and " +
+                "opened -- web pages they visited, videos they played, messages they exchanged, " +
+                "files they opened, and searches they ran. Use this for questions about the " +
+                "user's own past ('that article I read last month', 'what was the restaurant " +
+                "someone mentioned', 'the PDF I opened yesterday'). It searches THIS USER'S " +
+                "activity only, never the open web -- use web_search for that.",
+            parametersSchema = JSONObject(
+                """{"type":"object","properties":{"query":{"type":"string","description":"Words to look for. May be empty to list everything in a time range."},"kind":{"type":"string","description":"Restrict to one kind: page, video, message, file, search, or app. Omit for all kinds."},"since":{"type":"string","description":"Earliest time to include, as an ISO date (2026-08-01) or a relative phrase like '7 days', '3 months', 'yesterday'."},"until":{"type":"string","description":"Latest time to include, same formats as since."},"limit":{"type":"integer","description":"How many results to return. Default 15, maximum 50."}},"required":["query"]}"""
+            ),
+            executor = ToolExecutorConfig.Builtin(ID_PERSONAL_HISTORY),
         )
     )
 
@@ -107,6 +168,45 @@ object AgenticBuiltinTools {
      */
     var p2pHostHandler: (suspend (path: String, domain: String) -> String)? = null
 
+    /**
+     * Hooks for the three messaging/telephony tools -- like [p2pHostHandler], :core cannot reach
+     * SMS/Telephony/Contacts APIs directly (they need a real Android `Context`), so the platform
+     * installs these from `:app` (`AgenticMessagingTools`, wired in `PrismApp`). `contact` is a
+     * phone number OR a contact name; resolving which is the handler's job, not this file's.
+     */
+    var readTextHandler: (suspend (contact: String) -> String)? = null
+    var sendTextHandler: (suspend (contact: String, message: String) -> String)? = null
+    var makeCallHandler: (suspend (contact: String) -> String)? = null
+
+    /**
+     * Hook for `generate_image`, installed from `:app` for the same reason as the handlers above:
+     * running a diffusion model and writing the result into MediaStore both need a real Android
+     * `Context`, which `:core` has no access to.
+     *
+     * Returns the saved image's content URI as a string, or null if generation failed.
+     */
+    var generateImageHandler: (suspend (prompt: String) -> String?)? = null
+
+    /**
+     * Content URI of the image `generate_image` produced during the current turn, or null.
+     *
+     * A tool can only hand the model back TEXT -- that is the whole tool-calling protocol -- so
+     * this is how the actual picture reaches the conversation instead of being merely described.
+     * [AgenticEngine.run] clears it when a turn starts and consumes it when that turn ends,
+     * attaching it as the turn's media so Sam's reply carries the image itself. Kept here rather
+     * than threaded through every backend's return path because all four of them already funnel
+     * through that one function.
+     */
+    @Volatile
+    private var pendingImageUri: String? = null
+
+    /** Reads and clears [pendingImageUri]; see its doc comment. Called only by [AgenticEngine]. */
+    fun consumeGeneratedImageUri(): String? {
+        val uri = pendingImageUri
+        pendingImageUri = null
+        return uri
+    }
+
     suspend fun execute(id: String, argumentsJson: String): String {
         val args = try { JSONObject(argumentsJson) } catch (e: Exception) { JSONObject() }
         return when (id) {
@@ -119,8 +219,166 @@ object AgenticBuiltinTools {
             ID_MKDIR -> makeDirectory(args.optString("path", ""))
             ID_P2P_HOST -> p2pHostHandler?.invoke(args.optString("path", ""), args.optString("domain", ""))
                 ?: "Error: P2P hosting is not available on this platform yet."
+            ID_READ_TEXT -> requireActiveLine()
+                ?: readTextHandler?.invoke(args.optString("contact", ""))
+                ?: "Error: reading text messages is not available on this platform."
+            ID_SEND_TEXT -> requireActiveLine()
+                ?: sendTextHandler?.invoke(args.optString("contact", ""), args.optString("message", ""))
+                ?: "Error: sending text messages is not available on this platform."
+            ID_MAKE_CALL -> requireActiveLine()
+                ?: makeCallHandler?.invoke(args.optString("contact", ""))
+                ?: "Error: placing calls is not available on this platform."
+            ID_GENERATE_IMAGE -> generateImage(args.optString("prompt", ""))
+            ID_PERSONAL_HISTORY -> searchPersonalHistory(args)
             else -> "Error: unknown built-in tool '$id'"
         }
+    }
+
+    /**
+     * Answers questions about the user's own past from [PrismHistory].
+     *
+     * TWO SEPARATE PERMISSIONS, and both are checked here rather than at the call site. Keeping a
+     * history and letting a model read one are different decisions -- the engine the user has
+     * selected may be a cloud endpoint, so answering this tool can mean their reading history
+     * leaves the device. The refusals say which switch is off, because a model told only "not
+     * available" will cheerfully invent an answer instead.
+     *
+     * Results are formatted as lines rather than JSON: this text goes into a model's context, and
+     * the compact form leaves room for more of it.
+     */
+    private fun searchPersonalHistory(args: JSONObject): String {
+        if (!PrismSettings.getHistoryEnabled()) {
+            return "Error: Prism is not keeping a personal history. The user can turn it on in " +
+                "Settings > Privacy & History."
+        }
+        if (!PrismSettings.getHistoryToolEnabled()) {
+            return "Error: the user has not allowed AI access to their personal history. They can " +
+                "allow it in Settings > Privacy & History."
+        }
+
+        val kind = PrismHistory.Kind.parse(args.optString("kind", ""))
+        val results = PrismHistory.search(
+            query = args.optString("query", ""),
+            kinds = if (kind == null) emptySet() else setOf(kind),
+            since = parseWhen(args.optString("since", "")),
+            until = parseWhen(args.optString("until", "")),
+            limit = args.optInt("limit", 15).coerceIn(1, 50),
+        )
+
+        if (results.isEmpty()) return "No matching activity found in the user's history."
+
+        val out = StringBuilder()
+        for (entry in results) {
+            out.append(formatDay(entry.at)).append("  [").append(entry.kind.name.lowercase()).append("] ")
+            out.append(entry.title.ifBlank { entry.uri })
+            if (entry.uri.isNotBlank() && entry.uri != entry.title) out.append("  <").append(entry.uri).append('>')
+            if (entry.visits > 1) out.append("  (seen ").append(entry.visits).append(" times)")
+            if (entry.text.isNotBlank()) {
+                out.append("\n    ").append(entry.text.replace('\n', ' ').take(240))
+            }
+            out.append('\n')
+            if (out.length > MAX_RESULT_CHARS) {
+                out.append("... more results omitted\n")
+                break
+            }
+        }
+        return out.toString().trim()
+    }
+
+    /**
+     * Turns what a model wrote into a timestamp.
+     *
+     * Models express time the way people do -- "last month", "7 days", "2026-08-01" -- so accepting
+     * only epoch milliseconds would mean the tool worked in testing and failed in use. Anything
+     * unrecognised returns null, which the search reads as "no bound" rather than "no results":
+     * a misparsed date that silently filtered everything out would look exactly like an empty
+     * history.
+     */
+    private fun parseWhen(raw: String): Long? {
+        val text = raw.trim().lowercase()
+        if (text.isEmpty()) return null
+
+        val now = System.currentTimeMillis()
+        val day = 86_400_000L
+
+        when (text) {
+            "today" -> return now - day
+            "yesterday" -> return now - 2 * day
+            "this week", "last week" -> return now - 7 * day
+            "this month", "last month" -> return now - 30 * day
+            "this year", "last year" -> return now - 365 * day
+        }
+
+        // "7 days", "3 months ago", "2 weeks"
+        Regex("""(\d+)\s*(day|week|month|year)""").find(text)?.let { m ->
+            val n = m.groupValues[1].toLongOrNull() ?: return@let
+            val unit = when (m.groupValues[2]) {
+                "day" -> day
+                "week" -> 7 * day
+                "month" -> 30 * day
+                else -> 365 * day
+            }
+            return now - n * unit
+        }
+
+        // ISO date, with or without a time.
+        Regex("""(\d{4})-(\d{2})-(\d{2})""").find(text)?.let { m ->
+            return runCatching {
+                val cal = java.util.Calendar.getInstance()
+                cal.clear()
+                cal.set(
+                    m.groupValues[1].toInt(),
+                    m.groupValues[2].toInt() - 1,
+                    m.groupValues[3].toInt(),
+                )
+                cal.timeInMillis
+            }.getOrNull()
+        }
+
+        return raw.trim().toLongOrNull()
+    }
+
+    private fun formatDay(at: Long): String =
+        java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.US).format(java.util.Date(at))
+
+    /** Same shape as [requireStorageAccess]: null means the precondition holds, a string is the
+     * refusal a model/tester should see. [AgenticEngine.run] already excludes these tools from
+     * what a model is offered when this would refuse -- this is the second, defense-in-depth
+     * check for any caller that reaches [execute] directly (e.g. the tools page's "test" button). */
+    private fun requireActiveLine(): String? {
+        return if (!PrismPlatform.host.hasActiveCellularLine())
+            "Error: this tool needs an active cellular line (SIM or eSIM). This device doesn't have one right now."
+        else null
+    }
+
+    /**
+     * Runs the image generator and records the result for [consumeGeneratedImageUri].
+     *
+     * The availability re-check is the same defense-in-depth as [requireActiveLine]: [AgenticEngine.run]
+     * already withholds this tool from any model when no generator is loaded, so reaching here in
+     * that state means a direct caller (the tools page's "test" button) rather than a model.
+     *
+     * A null from the handler is reported as a failure, never as success with no picture -- an
+     * endpoint that doesn't actually do image generation, a corrupt model directory, or an
+     * out-of-memory diffusion run all land here, and a model told "done!" with nothing to show
+     * would go on to describe an image that does not exist.
+     */
+    private suspend fun generateImage(prompt: String): String {
+        if (prompt.isBlank()) return "Error: prompt is required."
+        if (!com.prism.launcher.PrismSettings.hasImageGenerator()) {
+            return "Error: no image generator is loaded. Import and activate an image model in " +
+                "Settings > AI Engine, or switch to Cloud mode with a cloud model selected."
+        }
+        val handler = generateImageHandler
+            ?: return "Error: image generation is not available on this platform."
+
+        val uri = handler.invoke(prompt)
+            ?: return "Error: the image generator failed to produce an image. The loaded model may " +
+                "not be a working image generator, or it ran out of memory."
+
+        pendingImageUri = uri
+        return "Generated and saved an image for: \"$prompt\". It is already attached to this " +
+            "reply and visible to the user, so describe it briefly rather than restating the prompt."
     }
 
     /**

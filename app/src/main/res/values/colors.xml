@@ -31,7 +31,23 @@
     <color name="model_tag_text_fg">#FF00BA7C</color>
     <color name="model_tag_image_bg">#22FF4FA3</color>
     <color name="model_tag_image_fg">#FFFF4FA3</color>
+
+    <!-- Agentic tools that are disabled unless a precondition is met (e.g. read_text/send_text/
+         make_call, which need an active SIM/eSIM) -->
+    <color name="tool_disabled_bg">#22FF3B30</color>
+    <color name="tool_disabled_fg">#FFFF3B30</color>
     
+    <!-- iOS "tinted" button fill: the system blue at ~15% over the background, which is what
+         UIKit's .tinted button style paints behind its blue label. Overridden for dark mode. -->
+    <color name="ios_tinted_fill">#26007AFF</color>
+
+    <!-- The same tinted treatment for a destructive action. -->
+    <color name="ios_destructive_fill">#26FF3B30</color>
+
+    <!-- Destructive actions (the remove-download X). Fixed red, not theme-aware: it must read as
+         a warning against both the light and dark surfaces, and it is never a background. -->
+    <color name="prism_destructive">#FFFF3B30</color>
+
     <!-- P2P Health Check Refinement -->
     <color name="check_dns_blue">#FF00D5FF</color>
     <color name="check_no_dns_pink">#FFFF77EE</color>

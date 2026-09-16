@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- On-device compiler. iOS grouped layout: large title, a status card, a determinate bar, then a
+     monospaced console. Theme-aware throughout via ?attr, so it follows light and dark mode. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="?attr/prismBackground"
+    android:orientation="vertical">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="20dp"
+        android:layout_marginTop="18dp"
+        android:layout_marginEnd="12dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:id="@+id/compilerTitle"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Compiling"
+            android:textColor="?attr/prismTextPrimary"
+            android:textSize="34sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/compilerClose"
+            android:layout_width="wrap_content"
+            android:layout_height="40dp"
+            android:gravity="center"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp"
+            android:text="Done"
+            android:textColor="@color/imessage_blue"
+            android:textSize="17sp" />
+    </LinearLayout>
+
+    <!-- Status card -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="16dp"
+        android:layout_marginTop="12dp"
+        android:layout_marginEnd="16dp"
+        android:background="@drawable/bg_wallet_card"
+        android:orientation="vertical"
+        android:padding="18dp">
+
+        <TextView
+            android:id="@+id/compilerPhase"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Preparing"
+            android:textColor="?attr/prismTextPrimary"
+            android:textSize="17sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/compilerStep"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:textColor="?attr/prismTextSecondary"
+            android:textSize="14sp" />
+
+        <ProgressBar
+            android:id="@+id/compilerProgress"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="6dp"
+            android:layout_marginTop="14dp"
+            android:max="100"
+            android:progressTint="@color/imessage_blue" />
+
+        <TextView
+            android:id="@+id/compilerRemaining"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:textColor="?attr/prismTextSecondary"
+            android:textSize="13sp" />
+    </LinearLayout>
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="32dp"
+        android:layout_marginTop="22dp"
+        android:layout_marginBottom="6dp"
+        android:letterSpacing="0.06"
+        android:text="BUILD LOG"
+        android:textColor="?attr/prismTextSecondary"
+        android:textSize="12sp" />
+
+    <!-- The console. Scrollable, monospaced, selectable so a failure can be copied out. -->
+    <ScrollView
+        android:id="@+id/compilerLogScroll"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_marginStart="16dp"
+        android:layout_marginEnd="16dp"
+        android:layout_weight="1"
+        android:background="@drawable/bg_wallet_card"
+        android:padding="14dp"
+        android:scrollbars="vertical">
+
+        <TextView
+            android:id="@+id/compilerLog"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textColor="?attr/prismTextSecondary"
+            android:textIsSelectable="true"
+            android:textSize="11sp" />
+    </ScrollView>
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/compilerCancel"
+        android:layout_width="match_parent"
+        android:layout_height="50dp"
+        android:layout_marginStart="16dp"
+        android:layout_marginTop="14dp"
+        android:layout_marginEnd="16dp"
+        android:layout_marginBottom="20dp"
+        android:letterSpacing="0"
+        android:text="Cancel compilation"
+        android:textAllCaps="false"
+        android:textColor="@color/prism_destructive"
+        android:textSize="17sp"
+        android:textStyle="bold"
+        app:backgroundTint="@color/ios_destructive_fill"
+        app:cornerRadius="14dp"
+        app:elevation="0dp" />
+</LinearLayout>

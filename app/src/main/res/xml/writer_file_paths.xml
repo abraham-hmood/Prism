@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Only the GIF cache is shared, and only that.
+  A FileProvider grants another app read access to whatever these paths cover, so this is scoped to
+  the one directory the keyboard writes GIFs into rather than to cache-path as a whole.
+-->
+<paths>
+    <cache-path name="writer_gifs" path="writer-gifs/" />
+    <!-- Where the camera writes a Lyke recording before it is imported. -->
+    <cache-path name="lyke_capture" path="lyke-capture/" />
+</paths>

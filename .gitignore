@@ -27,3 +27,5 @@ build-verify/
 /prism-os/scripts/out/
 /prism-os/scripts/config-temp/
 /prism-os/scripts/*.log
+#Ignoring prism os fully for now
+/prism-os/

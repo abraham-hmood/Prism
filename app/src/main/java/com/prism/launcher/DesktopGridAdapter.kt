@@ -32,8 +32,16 @@ class DesktopGridAdapter(
         private set
 
     fun refreshFromStore() {
-        cells = store.readGrid(cellCount).toTypedArray()
-        notifyDataSetChanged()
+        val previous = cells
+        val next = store.readGrid(cellCount).toTypedArray()
+        cells = next
+        // Diffed rather than a blanket notifyDataSetChanged(): this is called on every desktop
+        // page rebuild (including ViewPager2 recycling an offscreen page), and a full rebind
+        // re-resolves every icon and reallocates every folder-preview bitmap even when nothing
+        // on that page actually changed.
+        for (i in 0 until minOf(previous.size, next.size)) {
+            if (previous[i] != next[i]) notifyItemChanged(i)
+        }
     }
 
     fun move(from: Int, to: Int) {
@@ -213,12 +221,49 @@ class DesktopGridAdapter(
         imageView.colorFilter = null
     }
 
+    // Icon decode is a PackageManager resource lookup, not a field read -- worth caching since
+    // onBindViewHolder previously called it fresh on every bind, including every rebind from a
+    // ViewPager2 page recycle. Labels aren't cached: they're cheap string lookups, not decodes.
+
     private fun resolveLabel(cn: ComponentName): String = try {
         packageManager.getActivityInfo(cn, 0).loadLabel(packageManager).toString()
     } catch (_: Throwable) { cn.packageName.split(".").last() }
 
-    private fun resolveIcon(cn: ComponentName): Drawable? = try { packageManager.getActivityIcon(cn) }
-        catch (_: Throwable) { try { packageManager.getApplicationIcon(cn.packageName) } catch (_: Throwable) { null } }
+    private fun resolveIcon(cn: ComponentName): Drawable? =
+        synchronized(iconCache) {
+            iconCache.getOrPut(cn) {
+                try { packageManager.getActivityIcon(cn) }
+                catch (_: Throwable) { try { packageManager.getApplicationIcon(cn.packageName) } catch (_: Throwable) { null } }
+            }
+        }
 
     class VH(val binding: ItemDesktopCellBinding) : RecyclerView.ViewHolder(binding.root)
+
+    companion object {
+        /**
+         * SHARED ACROSS ADAPTERS AND BOUNDED, both of which matter.
+         *
+         * Each entry is a decoded Drawable -- an adaptive icon is two full layers, and at launcher
+         * density one runs to a couple of hundred kilobytes. This used to be a per-adapter field with
+         * no limit, which cost twice over: every desktop page in the pager built its own copy of the
+         * same icons, and each copy grew to hold every app ever scrolled past for the life of the
+         * process. On a phone with a few hundred apps installed that is tens of megabytes of Java
+         * heap, for icons that are not on screen.
+         *
+         * Instances are handed out shared, exactly as the per-adapter cache already did -- this
+         * changes how many copies exist, not whether they are shared.
+         *
+         * 96 covers several screens of a grid, which is all a cache in front of a PackageManager
+         * lookup needs to do.
+         */
+        private val iconCache = object : LinkedHashMap<ComponentName, Drawable?>(128, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<ComponentName, Drawable?>?) =
+                size > 96
+        }
+
+        /** Drops every cached icon. Called under memory pressure; they re-decode on next bind. */
+        fun trimIconCache() {
+            synchronized(iconCache) { iconCache.clear() }
+        }
+    }
 }

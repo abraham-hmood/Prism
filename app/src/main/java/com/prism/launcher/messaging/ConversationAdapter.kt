@@ -2,6 +2,8 @@ package com.prism.launcher.messaging
 
 import android.view.LayoutInflater
 import android.view.ViewGroup
+import androidx.recyclerview.widget.DiffUtil
+import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
 import com.prism.launcher.databinding.ItemConversationBinding
 import java.text.SimpleDateFormat
@@ -14,17 +16,19 @@ data class ThreadInfo(
     val timestamp: Long = 0L
 )
 
+private object ThreadInfoDiff : DiffUtil.ItemCallback<ThreadInfo>() {
+    override fun areItemsTheSame(old: ThreadInfo, new: ThreadInfo) = old.threadId == new.threadId
+    override fun areContentsTheSame(old: ThreadInfo, new: ThreadInfo) = old == new
+}
+
 class ConversationAdapter(
-    private var threads: List<ThreadInfo>,
+    initialThreads: List<ThreadInfo>,
     private val onClick: (ThreadInfo) -> Unit
-) : RecyclerView.Adapter<ConversationAdapter.VH>() {
+) : ListAdapter<ThreadInfo, ConversationAdapter.VH>(ThreadInfoDiff) {
 
-    fun update(newThreads: List<ThreadInfo>) {
-        threads = newThreads
-        notifyDataSetChanged()
-    }
+    init { submitList(initialThreads) }
 
-    override fun getItemCount(): Int = threads.size
+    fun update(newThreads: List<ThreadInfo>) = submitList(newThreads)
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
         val binding = ItemConversationBinding.inflate(LayoutInflater.from(parent.context), parent, false)
@@ -34,7 +38,7 @@ class ConversationAdapter(
     private val timeFormat = SimpleDateFormat("h:mm a", Locale.getDefault())
 
     override fun onBindViewHolder(holder: VH, position: Int) {
-        val t = threads[position]
+        val t = getItem(position)
         holder.binding.conversationName.text = t.address
         holder.binding.conversationSnippet.text = t.snippet
         holder.binding.conversationAvatarInitial.text = t.address.trim().firstOrNull()?.uppercase() ?: "?"

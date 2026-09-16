@@ -7,29 +7,56 @@
     android:clipToPadding="false"
     android:orientation="vertical">
 
-    <!-- Header -->
-    <TextView
-        android:id="@+id/modelsTitle"
+    <!--
+        Title row rather than a bare title, so the section switcher has somewhere to live.
+        Nebula builds its chevron in code because it shares a RelativeLayout with other screens;
+        this layout belongs to one page, so the row is declared here where it can be read.
+    -->
+    <LinearLayout
+        android:id="@+id/modelsTitleRow"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:alpha="0.8"
-        android:fontFamily="sans-serif-medium"
-        android:paddingHorizontal="24dp"
-        android:paddingTop="20dp"
-        android:paddingBottom="4dp"
-        android:text="Models"
-        android:textColor="@color/white"
-        android:textSize="20sp" />
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="16dp"
+        android:paddingTop="12dp"
+        android:paddingEnd="16dp">
 
-    <TextView
-        android:id="@+id/modelsSubtitle"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:paddingHorizontal="24dp"
-        android:paddingBottom="12dp"
-        android:text="Models imported to this device"
-        android:textColor="@color/prism_text_muted"
-        android:textSize="13sp" />
+        <TextView
+            android:id="@+id/modelsSectionSwitch"
+            android:layout_width="32dp"
+            android:layout_height="40dp"
+            android:contentDescription="Switch between Models and Quant"
+            android:gravity="center"
+            android:text="›"
+            android:textColor="@color/prism_accent"
+            android:textSize="26sp" />
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/modelsTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:alpha="0.9"
+                android:fontFamily="sans-serif-medium"
+                android:text="Models"
+                android:textColor="@color/white"
+                android:textSize="20sp" />
+
+            <TextView
+                android:id="@+id/modelsSubtitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Models imported to this device"
+                android:textColor="@color/prism_text_muted"
+                android:textSize="13sp" />
+        </LinearLayout>
+    </LinearLayout>
 
     <TextView
         android:id="@+id/modelsEmptyState"
@@ -43,6 +70,14 @@
         android:textSize="14sp"
         android:visibility="gone" />
 
+    <!--
+        Both sections take the remaining height and one of them is always gone, so the page is
+        exactly as tall as the screen whichever is showing.
+
+        The list's bottom padding was 80dp, which on a short screen pushed the last model under the
+        gesture bar with nothing below it to explain the gap. 24dp clears the bar without eating a
+        row of content.
+    -->
     <androidx.recyclerview.widget.RecyclerView
         android:id="@+id/modelsRecycler"
         android:layout_width="match_parent"
@@ -50,5 +85,12 @@
         android:layout_weight="1"
         android:clipToPadding="false"
         android:paddingHorizontal="16dp"
-        android:paddingBottom="80dp" />
+        android:paddingBottom="24dp" />
+
+    <FrameLayout
+        android:id="@+id/modelsQuantContainer"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:visibility="gone" />
 </LinearLayout>

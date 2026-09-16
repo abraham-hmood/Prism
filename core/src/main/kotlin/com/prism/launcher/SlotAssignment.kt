@@ -24,6 +24,9 @@ sealed class SlotAssignment {
     data object Models : SlotAssignment()
     data object ModelStore : SlotAssignment()
     data object AgenticTools : SlotAssignment()
+    data object Wallet : SlotAssignment()
+    data object Editor : SlotAssignment()
+    data object Science : SlotAssignment()
 
     fun serialize(): String = when (this) {
         is Default -> "default"
@@ -38,6 +41,9 @@ sealed class SlotAssignment {
         is Models -> "models"
         is ModelStore -> "model_store"
         is AgenticTools -> "agentic_tools"
+        is Wallet -> "wallet"
+        is Editor -> "editor"
+        is Science -> "science"
         is Custom -> "custom|$packageName|$viewClassName"
     }
 
@@ -55,6 +61,9 @@ sealed class SlotAssignment {
             if (raw == "models") return Models
             if (raw == "model_store") return ModelStore
             if (raw == "agentic_tools") return AgenticTools
+            if (raw == "wallet") return Wallet
+            if (raw == "editor") return Editor
+            if (raw == "science") return Science
             val parts = raw.split("|")
             if (parts.size == 3 && parts[0] == "custom") {
                 return Custom(parts[1], parts[2])

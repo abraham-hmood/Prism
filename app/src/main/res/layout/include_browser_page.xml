@@ -87,6 +87,27 @@
                 app:iconPadding="0dp" />
 
             <com.google.android.material.button.MaterialButton
+                android:id="@+id/bookmarkButton"
+                style="@style/Widget.Material3.Button.IconButton"
+                android:layout_width="48dp"
+                android:layout_height="48dp"
+                android:contentDescription="Bookmark this page"
+                app:icon="@drawable/ic_star_outline_24"
+                app:iconTint="?attr/prismTextPrimary" />
+
+            <!-- Mesh-only: crawls the current site so it can be hosted on the mesh.
+                 Hidden entirely off-mesh, since there is nowhere to host it. -->
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/downloadSiteButton"
+                style="@style/Widget.Material3.Button.IconButton"
+                android:layout_width="48dp"
+                android:layout_height="48dp"
+                android:visibility="gone"
+                android:contentDescription="Download this site for the mesh"
+                app:icon="@drawable/ic_download_24"
+                app:iconTint="?attr/prismTextPrimary" />
+
+            <com.google.android.material.button.MaterialButton
                 android:id="@+id/browserMenuButton"
                 style="@style/Widget.Material3.Button.IconButton"
                 android:layout_width="48dp"
