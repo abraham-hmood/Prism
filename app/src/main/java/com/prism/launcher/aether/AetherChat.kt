@@ -104,6 +104,33 @@ object AetherChat {
                 }
             }
 
+            lower == "/newchat" -> {
+                // Clears the episodic trace and nothing else. Between turns it is kept, which is
+                // what makes a question about something established earlier answerable at all.
+                AetherStudio.newConversation(ctx)
+                return Reply("New conversation. I have forgotten what we were talking about.")
+            }
+
+            lower == "/corpus" -> {
+                onProgress("Reading the dataset folder…")
+                val report = AetherStudio.loadCorpus(ctx)
+                return Reply(
+                    if (report.conversations == 0) report.note
+                    else "Corpus ready: ${report.note}\n\nTrain now and I will learn to answer " +
+                        "rather than to label."
+                )
+            }
+
+            lower == "/seedcorpus" -> {
+                val written = AetherStudio.seedCorpus()
+                return Reply(
+                    "Wrote a child-directed corpus to ${written.absolutePath}.\n\nIt is short, " +
+                        "repetitive and concrete on purpose -- that register is both the " +
+                        "developmental step after labelling and what makes a corpus learnable by " +
+                        "a small spiking network. Run /corpus next."
+                )
+            }
+
             lower == "/forget" -> {
                 AetherStudio.forget(ctx)
                 AetherChatStore.clear(ctx)
@@ -147,6 +174,20 @@ object AetherChat {
                 val result = AetherStudio.generateSaccadicDrawing(ctx, prompt) { i, total -> onProgress("Saccade $i/$total…") }
                 return if (result.uri != null) Reply(result.note, result.uri, "image") else Reply(result.note)
             }
+        }
+
+        // THE DEFAULT PATH IS NOW CONVERSATION, when she has a lexicon.
+        //
+        // The temporal probe below reads a prompt through the VISUAL pathway and decodes Broca cold,
+        // which is the right thing for flashcard labelling and the wrong thing for being spoken to.
+        // Once a dialogue corpus has given her words, a typed line is a turn: it goes in at the ears
+        // and comes back out of the lexical band, with the hippocampal trace carrying what was said
+        // earlier in the conversation. Falling back to the probe when there is no lexicon keeps
+        // every pre-dialogue connectome working exactly as before.
+        if (AetherStudio.canConverse(ctx)) {
+            onProgress("Listening…")
+            val spoken = AetherStudio.converse(ctx, text)
+            return if (spoken.reply.isNotBlank()) Reply(spoken.reply) else Reply(spoken.note)
         }
 
         return simple(ctx, text, onProgress, "")

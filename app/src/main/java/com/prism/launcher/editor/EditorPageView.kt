@@ -540,6 +540,9 @@ class EditorPageView(context: Context) : FrameLayout(context) {
                         "Extension ${args.optString("id")} did not activate: ${args.optString("message")}"
                     )
                     "extension-message" -> toast(args.optString("message"))
+                    "extension-state" -> withContext(Dispatchers.IO) {
+                        saveExtensionState(args.optString("scope"), args.optString("state"))
+                    }
                     "node-host-wanted" -> startNodeHost()
                     "host-error" -> PrismLogger.logWarning(
                         "PrismEditor", "Extension host: ${args.optString("message")}"
@@ -754,7 +757,10 @@ class EditorPageView(context: Context) : FrameLayout(context) {
             // Node takes a second or so to boot, and it has to be up before the page tries to
             // activate anything into it -- so it is started here, before the first activation, and
             // not lazily on the first message.
-            if (installed.any { it.runtime == ExtensionStore.RUNTIME_NODE }) startNodeHost()
+            if (installed.any { it.runtime == ExtensionStore.RUNTIME_NODE }) {
+                startNodeHost()
+                installMissingDependencies(installed)
+            }
 
             js("PrismEditor.startExtensionHost()")
             var activated = 0
@@ -762,12 +768,14 @@ class EditorPageView(context: Context) : FrameLayout(context) {
                 val runtime = extension.runtime ?: return@forEach
                 val source = withContext(Dispatchers.IO) { ExtensionStore.entrySource(extension) }
                     ?: return@forEach
+                val extra = withContext(Dispatchers.IO) { extensionContextJson(extension) }
                 js(
                     "PrismEditor.activateExtension(" +
                         jsString(extension.id) + ", " +
                         jsString(extension.directory.absolutePath) + ", " +
                         jsString(source) + ", " +
-                        jsString(runtime) + ")"
+                        jsString(runtime) + ", " +
+                        jsString(extra) + ")"
                 )
                 activated++
             }
@@ -775,6 +783,109 @@ class EditorPageView(context: Context) : FrameLayout(context) {
                 PrismLogger.logInfo("PrismEditor", "Activated $activated extension(s)")
             }
         }
+    }
+
+    /**
+     * Runs `npm install` for any Node extension that declares dependencies and has none unpacked.
+     *
+     * ## Why this is rare, and why it has to exist anyway
+     *
+     * A `.vsix` is supposed to be self-contained: almost every published extension either bundles
+     * its dependencies into one file or ships `node_modules` inside the package, and for those this
+     * does nothing at all. The exceptions are the ones the user is most likely to have sideloaded —
+     * an extension built locally, or one whose author expected a desktop install to run npm — and
+     * before there was a guest with npm in it there was no way to help them.
+     *
+     * In the background and never blocking: it needs the network, it can take minutes, and the
+     * extension it is for is either already working without its optional dependencies or already
+     * failing. Neither case is improved by making the editor wait.
+     */
+    private fun installMissingDependencies(installed: List<ExtensionStore.Installed>) {
+        val needing = installed.filter { extension ->
+            extension.runtime == ExtensionStore.RUNTIME_NODE &&
+                !File(extension.directory, "node_modules").isDirectory &&
+                declaresDependencies(extension.directory)
+        }
+        if (needing.isEmpty()) return
+
+        scope.launch(Dispatchers.IO) {
+            needing.forEach { extension ->
+                PrismLogger.logInfo("PrismEditor", "Installing dependencies for ${extension.id}")
+                val result = NodeRuntime.installDependencies(context, extension.directory)
+                if (result.ok) {
+                    PrismLogger.logSuccess("PrismEditor", "${extension.id}: dependencies installed")
+                    withContext(Dispatchers.Main) { toast("${extension.displayName} is ready") }
+                } else {
+                    PrismLogger.logWarning(
+                        "PrismEditor",
+                        "${extension.id}: npm install failed — ${result.output.takeLast(400)}"
+                    )
+                }
+            }
+        }
+    }
+
+    private fun declaresDependencies(directory: File): Boolean = runCatching {
+        val json = org.json.JSONObject(File(directory, "package.json").readText())
+        (json.optJSONObject("dependencies")?.length() ?: 0) > 0
+    }.getOrDefault(false)
+
+    /**
+     * The directories and saved state an extension's `ExtensionContext` is built from.
+     *
+     * Created here, not in the host: the host may be a Web Worker with no filesystem at all, and
+     * an extension that finds `globalStorageUri` pointing at a directory that does not exist fails
+     * on its first write just as surely as one that finds it undefined.
+     *
+     * State lives beside the storage directories rather than inside them, because an extension is
+     * entitled to delete everything in its own storage and should not be able to lose the editor's
+     * record of its settings by doing so.
+     */
+    private fun extensionContextJson(extension: ExtensionStore.Installed): String {
+        val base = File(context.filesDir, "editor")
+        val storage = File(base, "storage/${extension.id}").apply { mkdirs() }
+        val globalStorage = File(base, "global-storage/${extension.id}").apply { mkdirs() }
+        val logs = File(base, "logs/${extension.id}").apply { mkdirs() }
+
+        val manifest = runCatching {
+            org.json.JSONObject(File(extension.directory, "package.json").readText())
+        }.getOrElse { org.json.JSONObject() }
+
+        return org.json.JSONObject()
+            .put("storage", storage.absolutePath)
+            .put("globalStorage", globalStorage.absolutePath)
+            .put("logs", logs.absolutePath)
+            .put("manifest", manifest)
+            .put("state", readExtensionState(extension.id))
+            .toString()
+    }
+
+    private fun extensionStateFile(id: String): File =
+        File(context.filesDir, "editor/state/$id.json")
+
+    private fun readExtensionState(id: String): org.json.JSONObject =
+        runCatching { org.json.JSONObject(extensionStateFile(id).readText()) }
+            .getOrElse { org.json.JSONObject().put("global", org.json.JSONObject()).put("workspace", org.json.JSONObject()) }
+
+    /**
+     * Records one memento write.
+     *
+     * The host sends the whole store rather than the one key that changed, which looks wasteful and
+     * is the right call: a memento is a handful of small values, and a protocol that sent deltas
+     * would need the two sides to agree about ordering across an async channel that does not
+     * guarantee any.
+     */
+    private fun saveExtensionState(scope: String, state: String) {
+        // The scope is "global-<id>" or "workspace-<id>"; the id is everything after the first dash.
+        val kind = scope.substringBefore('-')
+        val id = scope.substringAfter('-')
+        if (id.isBlank() || (kind != "global" && kind != "workspace")) return
+
+        val file = extensionStateFile(id)
+        file.parentFile?.mkdirs()
+        val current = readExtensionState(id)
+        current.put(kind, runCatching { org.json.JSONObject(state) }.getOrElse { org.json.JSONObject() })
+        runCatching { file.writeText(current.toString()) }
     }
 
     /**
@@ -786,12 +897,158 @@ class EditorPageView(context: Context) : FrameLayout(context) {
      * while nobody was listening arrives immediately.
      */
     private fun startNodeHost() {
-        if (!NodeRuntime.isAvailable) return
         NodeRuntime.setListener { line ->
             scope.launch { js("PrismEditor.nodeMessage(" + jsString(line) + ")") }
         }
         if (!NodeRuntime.start(context)) {
-            scope.launch { js("PrismEditor.nodeHostGone(" + jsString(NodeRuntime.unavailableReason()) + ")") }
+            val reason = NodeRuntime.unavailableReason(context)
+            scope.launch { js("PrismEditor.nodeHostGone(" + jsString(reason) + ")") }
+            // An offer, not just a complaint. The runtime is a download away and the user is
+            // sitting in front of the one screen where that matters.
+            if (!NodeRuntime.isInstalled(context) && NodeRuntime.canInstall(context)) {
+                offerNodeInstall(reason)
+            }
+        }
+    }
+
+    /**
+     * Asks whether to install the Node runtime, once per page.
+     *
+     * Once, because a user who said no to a sixty-megabyte download should not be asked again every
+     * time an extension activates -- and extensions activate constantly.
+     */
+    private var offeredNode = false
+
+    private fun offerNodeInstall(reason: String) {
+        if (offeredNode) return
+        offeredNode = true
+        androidx.appcompat.app.AlertDialog.Builder(context)
+            .setTitle("Install the Node.js runtime?")
+            .setMessage(
+                reason + "\n\nIt installs a small Linux guest with Node.js and npm inside it, " +
+                    "which is what lets desktop extensions run language servers, formatters and " +
+                    "their own bundled tools."
+            )
+            .setPositiveButton("Install") { _, _ -> installNodeRuntime() }
+            .setNegativeButton("Not now", null)
+            .show()
+    }
+
+    /**
+     * Downloads and unpacks the runtime, with the progress on screen.
+     *
+     * The dialog is not cancellable and the install is not resumable: a half-unpacked rootfs is
+     * worse than none, so [NodeInstaller] deletes and starts over rather than trying to continue,
+     * and letting the user dismiss the dialog would hide a job that is still writing.
+     */
+    private fun installNodeRuntime() {
+        val progress = android.widget.ProgressBar(context, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            isIndeterminate = false
+        }
+        val label = TextView(context).apply {
+            text = "Starting…"
+            textSize = 13f
+            setTextColor(IosUi.secondaryLabel(context))
+            setPadding(IosUi.dp(context, 4f), IosUi.dp(context, 10f), 0, 0)
+        }
+        val body = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            val p = IosUi.dp(context, 20f)
+            setPadding(p, p, p, p)
+            addView(progress)
+            addView(label)
+        }
+        val dialog = androidx.appcompat.app.AlertDialog.Builder(context)
+            .setTitle("Installing Node.js")
+            .setView(body)
+            .setCancelable(false)
+            .create()
+        dialog.show()
+
+        scope.launch {
+            val failure = withContext(Dispatchers.IO) {
+                NodeInstaller.install(context) { percent, message ->
+                    scope.launch {
+                        progress.progress = percent
+                        label.text = message
+                    }
+                }
+            }
+            runCatching { dialog.dismiss() }
+            if (failure != null) {
+                androidx.appcompat.app.AlertDialog.Builder(context)
+                    .setTitle("Node.js did not install")
+                    .setMessage(failure)
+                    .setPositiveButton("Close", null)
+                    .show()
+                return@launch
+            }
+            // Extensions were classified against a device with no Node, so the whole set is
+            // reloaded rather than only the ones that failed: an extension that was running in the
+            // Worker may now belong in Node.
+            toast("Node.js is ready")
+            loadExtensions()
+        }
+    }
+
+    /**
+     * The runtime's own screen: what is installed, whether it runs, and the two buttons.
+     */
+    private fun showNodeRuntimeSheet() {
+        scope.launch {
+            val installed = withContext(Dispatchers.IO) { NodeInstaller.isInstalled(context) }
+            val blocked = withContext(Dispatchers.IO) { NodeInstaller.unavailableReason(context) }
+            val version = withContext(Dispatchers.IO) { NodeInstaller.installedVersion(context) }
+            val bytes = withContext(Dispatchers.IO) { NodeInstaller.installedBytes(context) }
+
+            val builder = androidx.appcompat.app.AlertDialog.Builder(context)
+                .setTitle("Node.js runtime")
+
+            when {
+                blocked != null -> builder
+                    .setMessage(blocked)
+                    .setPositiveButton("Close", null)
+
+                !installed -> builder
+                    .setMessage(
+                        "Not installed.\n\nDesktop extensions — the ones that declare `main` — " +
+                            "need a real Node.js with a filesystem and the ability to start other " +
+                            "programs. Installing it downloads about " +
+                            "${NodeInstaller.APPROXIMATE_DOWNLOAD_MB} MB and unpacks a small Linux " +
+                            "guest that Prism runs through PRoot."
+                    )
+                    .setPositiveButton("Install") { _, _ -> installNodeRuntime() }
+                    .setNegativeButton("Close", null)
+
+                else -> builder
+                    .setMessage(
+                        "Installed: ${version ?: "unknown version"}\n" +
+                            "On disk: ${bytes / (1024 * 1024)} MB\n" +
+                            "Host: ${if (NodeRuntime.isRunning) "running" else "not running"}"
+                    )
+                    .setPositiveButton("Restart host") { _, _ ->
+                        scope.launch {
+                            withContext(Dispatchers.IO) { NodeRuntime.restart(context) }
+                            toast(if (NodeRuntime.isRunning) "The Node host restarted" else "The Node host did not start")
+                            loadExtensions()
+                        }
+                    }
+                    .setNeutralButton("Check") { _, _ ->
+                        scope.launch {
+                            val reported = withContext(Dispatchers.IO) { NodeRuntime.version(context) }
+                            toast(reported?.let { "node $it" } ?: "Node did not answer — see diagnostics")
+                        }
+                    }
+                    .setNegativeButton("Remove") { _, _ ->
+                        scope.launch {
+                            withContext(Dispatchers.IO) { NodeInstaller.uninstall(context) }
+                            toast("The Node runtime was removed")
+                            loadExtensions()
+                        }
+                    }
+            }
+            builder.show()
         }
     }
 
@@ -862,6 +1119,7 @@ class EditorPageView(context: Context) : FrameLayout(context) {
             EditorMenus.A_SOURCE_CONTROL -> showSourceControl()
             EditorMenus.A_RUN_VIEW, EditorMenus.A_TESTING -> showRunView()
             EditorMenus.A_EXTENSIONS, EditorMenus.A_MARKETPLACE -> openMarketplace()
+            EditorMenus.A_NODE_RUNTIME -> showNodeRuntimeSheet()
             EditorMenus.A_BROWSER -> openInPrismBrowser()
             EditorMenus.A_PROBLEMS -> showProblems()
             EditorMenus.A_OUTPUT, EditorMenus.A_DEBUG_CONSOLE -> showTerminal(focusOutput = true)

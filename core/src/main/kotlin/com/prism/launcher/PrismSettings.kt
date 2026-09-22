@@ -1509,6 +1509,25 @@ object PrismSettings {
         prefs().edit().putBoolean(KEY_HISTORY_ENABLED, value).apply()
 
     /**
+     * Whether notifications are kept after they are dismissed.
+     *
+     * On by default, because a notification history that is off by default is a feature nobody
+     * discovers -- and the whole point is to still have the code or the delivery time an hour after
+     * the shade forgot it. It is a switch rather than a constant because notification bodies carry
+     * message text, two-factor codes and banking amounts, so someone has to be able to say no; and
+     * NotificationHistory.clear deletes the file rather than hiding rows, so saying no afterwards
+     * actually removes what was kept.
+     *
+     * Independent of [getHistoryEnabled] on purpose: reading history and notification history are
+     * different exposures, and someone may reasonably want one without the other.
+     */
+    fun getNotificationHistoryEnabled(): Boolean =
+        prefs().getBoolean(KEY_NOTIFICATION_HISTORY_ENABLED, true)
+
+    fun setNotificationHistoryEnabled(value: Boolean) =
+        prefs().edit().putBoolean(KEY_NOTIFICATION_HISTORY_ENABLED, value).apply()
+
+    /**
      * Whether the AI may search that history.
      *
      * SEPARATE FROM KEEPING IT, and off by default. A local record the user can search themselves is
@@ -1758,10 +1777,34 @@ object PrismSettings {
      * switch also decides whether Prism offers itself for opening .exe files, because appearing in
      * that chooser while unable to run one would be a bad joke.
      */
+    /**
+     * Whether tapping an app runs it inside the guest instead of on the phone.
+     *
+     * OFF BY DEFAULT, and it should stay that way: a virtualized app runs in an emulated Android
+     * under QEMU with no hardware acceleration, which is correct and slow. It is a deliberate choice
+     * per person, not a default anybody should be given without asking.
+     *
+     * The guest is the reason the security properties hold. Running the app inside a VM is what
+     * makes "the app cannot read the key protecting its data" and "the app is sandboxed" true, and
+     * the alternative -- loading its APK into Prism's own process, the way VirtualApp does -- would
+     * make both of them false, because the app would then share Prism's uid and address space.
+     */
+    fun getVirtualizeAndroidApps(): Boolean =
+        prefs().getBoolean(KEY_VIRTUALIZE_ANDROID_APPS, false)
+
+    fun setVirtualizeAndroidApps(value: Boolean) =
+        prefs().edit().putBoolean(KEY_VIRTUALIZE_ANDROID_APPS, value).apply()
+
     fun getWindowsMode(): Boolean = prefs().getBoolean(KEY_WINDOWS_MODE, false)
 
     fun setWindowsMode(value: Boolean) =
         prefs().edit().putBoolean(KEY_WINDOWS_MODE, value).apply()
+
+    /** Whether the feature tour has been completed or skipped. */
+    fun getOnboardingSeen(): Boolean = prefs().getBoolean(KEY_ONBOARDING_SEEN, false)
+
+    fun setOnboardingSeen(value: Boolean) =
+        prefs().edit().putBoolean(KEY_ONBOARDING_SEEN, value).apply()
 
     // ── The lock screen ────────────────────────────────────────────────────
 
@@ -1933,10 +1976,19 @@ object PrismSettings {
     const val MODEL_TYPE_TEXT = "text"
     const val MODEL_TYPE_IMAGE = "image"
 
+    /**
+     * A text-to-speech model, which is a third kind of thing and not a variety of the other two.
+     *
+     * Text models answer, image models draw, audio models speak. They are imported through the same
+     * picker and registered in the same list, but nothing else about them is shared: a different
+     * runtime loads them and a different part of the app asks them for anything.
+     */
+    const val MODEL_TYPE_AUDIO = "audio"
+
     data class ImportedModel(
         val path: String,
         val displayName: String,
-        val type: String, // MODEL_TYPE_TEXT | MODEL_TYPE_IMAGE
+        val type: String, // MODEL_TYPE_TEXT | MODEL_TYPE_IMAGE | MODEL_TYPE_AUDIO
         val importedAt: Long = System.currentTimeMillis()
     )
 
@@ -1967,6 +2019,93 @@ object PrismSettings {
     fun removeImportedModel(path: String) {
         setImportedModels(getImportedModels().filter { it.path != path })
     }
+
+    // ── Speech (text to speech) ─────────────────────────────────────────────
+
+    /**
+     * The imported audio model Prism should speak with, or empty for none.
+     *
+     * Empty is the normal state and is NOT an error: with no audio model imported, speech falls to
+     * the built-in Kokoro-82M. An imported model is an override, which is why every Kokoro setting
+     * is disabled while one is active -- those knobs belong to an engine that is not being used.
+     */
+    fun getLocalAudioModelPath(): String =
+        prefs().getString(KEY_LOCAL_AUDIO_MODEL_PATH, "") ?: ""
+
+    fun setLocalAudioModelPath(value: String) =
+        prefs().edit().putString(KEY_LOCAL_AUDIO_MODEL_PATH, value).apply()
+
+    /** True when the user has imported a speech model of their own and it is still on disk. */
+    fun isLocalAudioModelImported(): Boolean =
+        getLocalAudioModelPath().isNotEmpty()
+
+    /**
+     * Whether speech comes from the built-in Kokoro rather than something the user imported.
+     *
+     * The single question every Kokoro setting is gated on, so that "is this knob live?" has one
+     * answer in one place rather than the same condition spelled out at each call site.
+     */
+    fun isUsingKokoro(): Boolean = !isLocalAudioModelImported()
+
+    // ── Kokoro-82M ──────────────────────────────────────────────────────────
+
+    /**
+     * Kokoro's voices are per-speaker, because the three of them are not one assistant.
+     *
+     * Sam, Nora and Aether are distinct personas with distinct pages, and a single shared voice
+     * would make a call indistinguishable from a call to either of the others. Sam's is set from
+     * Intelligence & Messaging; Nora's and Aether's from their own settings screens.
+     */
+    const val VOICE_SPEAKER_SAM = "sam"
+    const val VOICE_SPEAKER_NORA = "nora"
+    const val VOICE_SPEAKER_AETHER = "aether"
+
+    /** af_heart is Kokoro's own default and the highest-graded voice in its VOICES table. */
+    const val KOKORO_DEFAULT_VOICE = "af_heart"
+
+    fun getKokoroVoice(speaker: String): String =
+        prefs().getString(KEY_KOKORO_VOICE_PREFIX + speaker, KOKORO_DEFAULT_VOICE)
+            ?: KOKORO_DEFAULT_VOICE
+
+    fun setKokoroVoice(speaker: String, voice: String) =
+        prefs().edit().putString(KEY_KOKORO_VOICE_PREFIX + speaker, voice).apply()
+
+    /** Playback rate, as a multiplier. Kokoro takes this as a model input, not as resampling. */
+    fun getKokoroSpeed(): Float =
+        prefs().getFloat(KEY_KOKORO_SPEED, 1.0f)
+
+    fun setKokoroSpeed(value: Float) =
+        prefs().edit().putFloat(KEY_KOKORO_SPEED, value.coerceIn(0.5f, 2.0f)).apply()
+
+    /**
+     * Which published quantisation of Kokoro to fetch.
+     *
+     * Named rather than numbered because the sizes are what the choice is actually about: the
+     * difference between 86 MB and 325 MB matters more on a phone than the last fraction of
+     * fidelity does.
+     */
+    const val KOKORO_VARIANT_Q8F16 = "model_q8f16"
+    const val KOKORO_VARIANT_QUANTIZED = "model_quantized"
+    const val KOKORO_VARIANT_FP16 = "model_fp16"
+    const val KOKORO_VARIANT_FULL = "model"
+
+    fun getKokoroVariant(): String =
+        prefs().getString(KEY_KOKORO_VARIANT, KOKORO_VARIANT_Q8F16) ?: KOKORO_VARIANT_Q8F16
+
+    fun setKokoroVariant(value: String) =
+        prefs().edit().putString(KEY_KOKORO_VARIANT, value).apply()
+
+    /**
+     * Speak replies aloud outside call mode too.
+     *
+     * Off by default: a reply read out loud in a room is a different thing from one that arrives
+     * silently, and the user should choose that rather than discover it.
+     */
+    fun getSpeakRepliesAloud(): Boolean =
+        prefs().getBoolean(KEY_SPEAK_REPLIES_ALOUD, false)
+
+    fun setSpeakRepliesAloud(value: Boolean) =
+        prefs().edit().putBoolean(KEY_SPEAK_REPLIES_ALOUD, value).apply()
 
     // ── KV Cache Compression (GGUF / llama.cpp engine) ──────────────────────
 
@@ -2230,6 +2369,11 @@ object PrismSettings {
     private const val KEY_STREAMING_ENABLED    = "ai_streaming_enabled"
     private const val KEY_MAX_TOKENS           = "ai_max_tokens"
     private const val KEY_IMPORTED_MODELS      = "imported_models"
+    private const val KEY_LOCAL_AUDIO_MODEL_PATH = "local_audio_model_path"
+    private const val KEY_KOKORO_VOICE_PREFIX  = "kokoro_voice_"
+    private const val KEY_KOKORO_SPEED         = "kokoro_speed"
+    private const val KEY_KOKORO_VARIANT       = "kokoro_variant"
+    private const val KEY_SPEAK_REPLIES_ALOUD  = "speak_replies_aloud"
     private const val KEY_KV_CACHE_QUANT       = "kv_cache_quant"
     private const val KEY_AI_BACKEND           = "ai_backend_mode"
     private const val KEY_NEBULA_INTERVAL_HOURS = "nebula_generation_interval_hours"
@@ -2289,8 +2433,10 @@ object PrismSettings {
     private const val KEY_WEB_CACHE_ENABLED      = "web_cache_enabled"
     private const val KEY_WEB_CACHE_MESH         = "web_cache_mesh_sharing"
     private const val KEY_WEB_CACHE_LYKE         = "web_cache_lyke_upload"
+    private const val KEY_NOTIFICATION_HISTORY_ENABLED = "notification_history_enabled"
     private const val KEY_HISTORY_ENABLED        = "history_enabled"
     private const val KEY_HISTORY_TOOL           = "history_tool_enabled"
+    private const val KEY_ONBOARDING_SEEN        = "onboarding_seen"
     private const val KEY_DURESS_ACTIVE          = "duress_active"
     private const val KEY_LOCKSCREEN             = "lockscreen_enabled"
     private const val KEY_LOCK_BIOMETRIC         = "lock_biometric"
@@ -2307,6 +2453,7 @@ object PrismSettings {
     private const val KEY_CUSTOM_FONT_PATH       = "custom_font_path"
     private const val KEY_VIRT_ENABLED           = "virt_enabled"
     private const val KEY_VIRT_MODE              = "virt_mode"
+    private const val KEY_VIRTUALIZE_ANDROID_APPS = "virtualize_android_apps"
     private const val KEY_VIRT_ISO_PATH          = "virt_iso_path"
     private const val KEY_THEME_MODE             = "theme_mode"
     private const val KEY_DESKTOP_MOBILE_MODE    = "desktop_mobile_mode"

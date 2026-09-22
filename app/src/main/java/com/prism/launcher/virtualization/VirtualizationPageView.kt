@@ -25,6 +25,21 @@ class VirtualizationPageView(context: Context) : FrameLayout(context) {
 
     companion object {
         private const val TAG = "VirtualizationPageView"
+
+        /**
+         * The app this page was last asked to show, remembered across page recycling.
+         *
+         * Process-wide rather than per-view for the same reason VmController is: the pager throws
+         * this view away whenever it scrolls far enough, and the app it was showing is still running
+         * in the other process.
+         */
+        @Volatile
+        private var lastHostedPackage: String? = null
+
+        /** Forgotten when the app is closed, so the page goes back to being a guest-OS viewer. */
+        fun forgetHostedApp() {
+            lastHostedPackage = null
+        }
     }
 
     // Shared, not per-view: the page is recycled by the desktop pager while QEMU and the VNC
@@ -40,6 +55,18 @@ class VirtualizationPageView(context: Context) : FrameLayout(context) {
     private lateinit var tvVmStatus: TextView
     private lateinit var btnVmPower: ImageButton
     private lateinit var btnVmKeyboard: ImageButton
+    private lateinit var appSurface: android.view.SurfaceView
+
+    /**
+     * The embedded Android app, when app virtualization is showing one here.
+     *
+     * Bound against the APPLICATION context, not this view's: the page is recycled every time the
+     * user swipes away from it, and a binding held by a dead view would tear the app down on every
+     * swipe. See [hostVirtualApp] for how a recycled page picks the running app back up.
+     */
+    private val embedder by lazy {
+        com.prism.launcher.virtualapp.VirtualAppEmbedder(context.applicationContext, appSurface)
+    }
 
     init {
         PrismLogger.logInfo(TAG, "VirtualizationPageView constructed")
@@ -56,6 +83,50 @@ class VirtualizationPageView(context: Context) : FrameLayout(context) {
         tvVmStatus   = findViewById(R.id.tvVmStatus)
         btnVmPower   = findViewById(R.id.btnVmPower)
         btnVmKeyboard = findViewById(R.id.btnVmKeyboard)
+        appSurface    = findViewById(R.id.appSurface)
+
+        // ABOVE the launcher's own window, decided once and never changed.
+        //
+        // A SurfaceView's surface sits BEHIND its host window by default -- the window punches a
+        // hole to show it through -- and an embedded hierarchy inherits that order. The window
+        // manager then lists the launcher's window above the embedded one, with a touchable region
+        // covering the whole screen, so every tap is consumed by the launcher and the app renders
+        // perfectly while responding to nothing. `dumpsys input` showed exactly that: the host at
+        // index 27 and `Embedded{...}` at 28.
+        //
+        // Set here rather than at attach time because changing it recreates the surface, which
+        // orphans an already-attached child package. Safe because nothing of Prism's is drawn over
+        // this area while an app is showing: the boot overlay and the control bar are both gone.
+        appSurface.setZOrderOnTop(true)
+
+        // Touches on the app's surface belong to the app. Consumed here and forwarded, because the
+        // window manager does not route them into the embedded hierarchy on this platform -- see
+        // VirtualAppHostService.dispatchTouch for what was tried and what it did.
+        appSurface.setOnTouchListener { _, event ->
+            if (embedder.current == null) false else embedder.dispatchTouch(event)
+        }
+
+        embedder.onShown = { label ->
+            bootOverlay.visibility = View.GONE
+            // The bar stays, and is the only way off this page while an app is up: the app consumes
+            // touches on its own surface, so the pager cannot be swiped through it.
+            controlBar.visibility = View.VISIBLE
+            tvVmStatus.text = label
+            btnVmPower.setImageResource(android.R.drawable.ic_menu_close_clear_cancel)
+            btnVmPower.contentDescription = context.getString(R.string.virt_close_app)
+            btnVmKeyboard.setImageResource(android.R.drawable.ic_menu_revert)
+            btnVmKeyboard.contentDescription = context.getString(R.string.virt_back_in_app)
+            PrismLogger.logInfo(TAG, "Showing $label on the virtualization page")
+        }
+
+        embedder.onExhausted = { closeVirtualApp() }
+        embedder.onFailure = { reason ->
+            appSurface.visibility = View.GONE
+            bootOverlay.visibility = View.VISIBLE
+            bootProgress.visibility = View.GONE
+            tvBootLabel.text = reason
+            PrismLogger.logWarning(TAG, "Could not embed the app: $reason")
+        }
 
         // Re-registered on attach, cleared on detach. The controller is process-wide now, so a
         // callback left behind by a recycled page would keep that page (and its whole view tree)
@@ -63,6 +134,10 @@ class VirtualizationPageView(context: Context) : FrameLayout(context) {
         vmController.onStateChanged = { state -> post { applyState(state) } }
 
         btnVmPower.setOnClickListener {
+            if (showingApp()) {
+                closeVirtualApp()
+                return@setOnClickListener
+            }
             when (vmController.state) {
                 VmController.State.RUNNING, VmController.State.PAUSED -> vmController.stop()
                 VmController.State.STOPPED, VmController.State.ERROR  -> bootFromSettings()
@@ -70,7 +145,9 @@ class VirtualizationPageView(context: Context) : FrameLayout(context) {
             }
         }
 
-        btnVmKeyboard.setOnClickListener { toggleGuestKeyboard() }
+        btnVmKeyboard.setOnClickListener {
+            if (showingApp()) embedder.goBack() else toggleGuestKeyboard()
+        }
 
         // The surface itself takes focus, so tapping the VM and typing works without hunting for
         // the keyboard button first.
@@ -107,6 +184,11 @@ class VirtualizationPageView(context: Context) : FrameLayout(context) {
         // out, and the shared controller has no idea which page is on screen.
         vmController.onStateChanged = { state -> post { applyState(state) } }
         applyState(vmController.state)
+        // A page that was recycled while an app was showing picks it back up. The service returns
+        // the surface it is already rendering into rather than reloading, so the app does not
+        // restart just because the user swiped away and back.
+        lastHostedPackage?.let { hostVirtualApp(it) }
+
         // SurfaceHolder callback handles boot; if surface already exists resume
         val surface = vmSurface.holder.surface
         if (surface != null && surface.isValid && vmController.state == VmController.State.PAUSED) {
@@ -135,6 +217,51 @@ class VirtualizationPageView(context: Context) : FrameLayout(context) {
 
     /** True when the page should be a Windows runtime rather than the guest-OS viewer. */
     private fun windowsMode(): Boolean = PrismSettings.getWindowsMode()
+
+    // -- Embedded Android apps -------------------------------------------------
+
+    /**
+     * Shows a virtualized Android app on this page.
+     *
+     * The app itself runs in `:virtualapp`; this page shows the surface it renders into. Nothing
+     * about the app's code, its data or the vault key enters the launcher's process -- see
+     * VirtualAppHostService for why that separation is the whole reason this is not simply hosted
+     * here directly.
+     */
+    fun hostVirtualApp(packageName: String) {
+        lastHostedPackage = packageName
+        bootProgress.visibility = View.VISIBLE
+        bootOverlay.visibility = View.VISIBLE
+        tvBootLabel.text = context.getString(R.string.virt_status_opening_app)
+        // Stops QEMU from owning the surface underneath, for the same reason the two halves of this
+        // page have always been exclusive: only one of them can be on screen.
+        vmController.pause()
+        // And hides its surface outright. Two SurfaceViews in one hierarchy have to be ordered
+        // explicitly, and the call that does it (setZOrderMediaOverlay) lifts the surface above the
+        // host window, which breaks touch routing into the embedded app. With the guest's surface
+        // gone there is nothing to order against, so the app can stay where input works.
+        vmSurface.visibility = View.GONE
+        embedder.show(packageName)
+    }
+
+    /** True while this page is showing an embedded app rather than a guest OS. */
+    private fun showingApp(): Boolean = embedder.current != null
+
+    /**
+     * Closes the embedded app and hands the page back to the guest-OS viewer.
+     *
+     * Stopping the embedder is also what seals the app's data: the binding drops, and VaultService
+     * encrypts the working directory again.
+     */
+    fun closeVirtualApp() {
+        embedder.stop()
+        forgetHostedApp()
+        appSurface.visibility = View.GONE
+        vmSurface.visibility = View.VISIBLE
+        btnVmPower.setImageResource(android.R.drawable.ic_lock_power_off)
+        btnVmKeyboard.setImageResource(android.R.drawable.ic_menu_myplaces)
+        applyState(vmController.state)
+    }
 
     /**
      * Runs [exe], installing the compatibility layer first if it is missing.
@@ -195,51 +322,101 @@ class VirtualizationPageView(context: Context) : FrameLayout(context) {
         session.start(container, exe)
     }
 
-    /** Offers to fetch the layer, and explains what it is before downloading a gigabyte. */
+    /** Offers to fetch the layer, and says what that involves before a few hundred megabytes. */
     private fun promptWindowsInstall(pendingExe: java.io.File?) {
-        val url = PrismSettings.getWindowsLayerUrl()
-        if (url.isBlank()) {
-            androidx.appcompat.app.AlertDialog.Builder(context)
-                .setTitle("Windows layer not configured")
-                .setMessage(
-                    "Running .exe files needs Wine, box64 and a small Linux root filesystem. " +
-                        "Prism does not bundle them -- they are large and separately licensed -- so " +
-                        "set a source archive in Settings > OS Virtualization.\n\nThe archive must " +
-                        "contain:\n\n" + WineInstaller.expectedLayout()
-                )
-                .setPositiveButton("OK", null)
-                .show()
-            return
+        val override = PrismSettings.getWindowsLayerUrl()
+        val message = if (override.isNotBlank()) {
+            "Downloads and unpacks the archive set in Settings > OS Virtualization, instead of " +
+                "assembling the layer from upstream.\n\nIt has to contain:\n\n" +
+                WineInstaller.expectedLayout()
+        } else {
+            "Running .exe files needs Wine, box64 and a small Linux root filesystem. Prism " +
+                "assembles them from the Ubuntu, box64 and WineHQ projects -- roughly " +
+                "${WineInstaller.approximateDownloadMb()} MB, downloaded once.\n\n" +
+                "64-bit Windows programs only: box64 translates x86_64, and 32-bit x86 would " +
+                "need a different translator."
         }
 
         androidx.appcompat.app.AlertDialog.Builder(context)
             .setTitle("Install the Windows layer?")
-            .setMessage(
-                "Downloads and unpacks Wine, box64 and a Linux root filesystem. This is a large " +
-                    "download and happens once."
-            )
+            .setMessage(message)
             .setPositiveButton("Install") { _, _ -> installWindowsLayer(pendingExe) }
             .setNegativeButton("Cancel", null)
             .show()
     }
 
+    /**
+     * Runs the install with progress on screen.
+     *
+     * A dialog rather than the toast this used to show, because the work behind it is a few hundred
+     * megabytes over several stages and can take many minutes -- long enough that without a visible
+     * percentage the only signal that anything is happening is that Prism has not crashed.
+     */
     private fun installWindowsLayer(pendingExe: java.io.File?) {
         WineInstaller.sourceUrl = PrismSettings.getWindowsLayerUrl()
-        val toast = android.widget.Toast.makeText(context, "Installing…", android.widget.Toast.LENGTH_SHORT)
-        toast.show()
+
+        val status = android.widget.TextView(context).apply {
+            textSize = 14f
+            setTextColor(com.prism.launcher.nora.IosUi.secondaryLabel(context))
+            text = "Starting…"
+        }
+        val bar = android.widget.ProgressBar(
+            context, null, android.R.attr.progressBarStyleHorizontal,
+        ).apply {
+            max = 100
+            progressDrawable = com.prism.launcher.nora.IosUi.progressDrawable(context)
+        }
+        val body = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            val side = com.prism.launcher.nora.IosUi.dp(context, 20f)
+            setPadding(side, com.prism.launcher.nora.IosUi.dp(context, 4f), side, side)
+            addView(status)
+            addView(
+                bar,
+                android.widget.LinearLayout.LayoutParams(
+                    android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                    android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
+                ).apply { topMargin = com.prism.launcher.nora.IosUi.dp(context, 12f) },
+            )
+        }
+
+        val dialog = androidx.appcompat.app.AlertDialog.Builder(context)
+            .setTitle("Installing the Windows layer")
+            .setView(body)
+            .setCancelable(false)
+            .create()
+        dialog.show()
 
         Thread({
+            // The installer reports every megabyte and every line apt prints, which is far more
+            // often than a screen can usefully change -- so the UI is only touched when the
+            // percentage moves or a quarter of a second has passed.
+            var lastPercent = -1
+            var lastPost = 0L
             val error = WineInstaller.install(context) { percent, message ->
-                PrismLogger.logDebug(TAG, "wine install $percent% $message")
+                val now = android.os.SystemClock.uptimeMillis()
+                if (percent != lastPercent || now - lastPost > 250L) {
+                    lastPercent = percent
+                    lastPost = now
+                    post {
+                        bar.progress = percent
+                        status.text = message
+                    }
+                }
             }
             post {
+                runCatching { dialog.dismiss() }
                 if (error == null) {
                     android.widget.Toast.makeText(
                         context, "Windows layer installed", android.widget.Toast.LENGTH_SHORT
                     ).show()
                     startWineSession(pendingExe)
                 } else {
-                    android.widget.Toast.makeText(context, error, android.widget.Toast.LENGTH_LONG).show()
+                    androidx.appcompat.app.AlertDialog.Builder(context)
+                        .setTitle("The install did not finish")
+                        .setMessage(error)
+                        .setPositiveButton("OK", null)
+                        .show()
                 }
             }
         }, "wine-install").apply { isDaemon = true; start() }
@@ -256,7 +433,45 @@ class VirtualizationPageView(context: Context) : FrameLayout(context) {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        // An embedded app is laid out against a size this side chose, so it has to be told when
+        // that changes -- otherwise a rotation leaves it stretched rather than relaid out.
+        if (showingApp()) embedder.resize(appSurface.width, appSurface.height)
+    }
+
     private fun bootFromSettings() {
+        // WINDOWS MODE BOOTS NOTHING. The two halves of this page are exclusive -- one runs a guest
+        // OS under QEMU, the other runs Wine under PRoot, and only one of them can own the surface
+        // (the class comment says so). This check was missing, so turning "switch to running Windows
+        // executables" on changed which UI appeared while the surface callback went on booting
+        // PrismOS underneath it: the setting looked ignored because, for the part that matters, it
+        // was.
+        if (windowsMode()) {
+            PrismLogger.logInfo(TAG, "bootFromSettings(): skipped — Windows mode is on")
+            return
+        }
+
+        // An app is on screen here; booting a guest OS underneath it would fight for the surface.
+        if (showingApp()) {
+            PrismLogger.logInfo(TAG, "bootFromSettings(): skipped — an app is embedded")
+            return
+        }
+
+        // APP VIRTUALIZATION BOOTS NOTHING EITHER, for the same reason and with the same shape as
+        // the check above. With "Virtualize Android apps" on, an app's code runs in Prism's own
+        // process (VirtualizedAppLauncher) and there is no guest for a guest OS to be: QEMU would
+        // burn a core and several hundred megabytes booting PrismOS behind a page nothing routes
+        // to. The setting looked ignored because the half that costs anything went on running.
+        if (PrismSettings.getVirtualizeAndroidApps()) {
+            PrismLogger.logInfo(TAG, "bootFromSettings(): skipped — app virtualization is on")
+            tvBootLabel.text = context.getString(R.string.virt_status_app_virtualization)
+            bootOverlay.visibility = View.VISIBLE
+            bootProgress.visibility = View.GONE
+            controlBar.visibility = View.GONE
+            return
+        }
+
         val surface = vmSurface.holder.surface
         if (surface == null || !surface.isValid) {
             PrismLogger.logWarning(TAG, "bootFromSettings(): skipped — surface not ready (surface=$surface)")
@@ -544,6 +759,10 @@ class VirtualizationPageView(context: Context) : FrameLayout(context) {
     }
 
     private fun applyState(state: VmController.State) {
+        // An embedded app owns the bar and the overlay while it is up; the guest's state must not
+        // reach in and relabel them.
+        if (showingApp()) return
+
         // The terminal keys follow the control bar: both are only meaningful while a VM is running.
         updateTerminalKeyRow(state == VmController.State.RUNNING)
 
@@ -554,7 +773,13 @@ class VirtualizationPageView(context: Context) : FrameLayout(context) {
             VmController.State.STOPPED -> {
                 bootOverlay.visibility = View.VISIBLE
                 bootProgress.visibility = View.GONE
-                tvBootLabel.text = context.getString(R.string.virt_status_stopped)
+                // "Stopped" would read as something that failed to start. With app virtualization
+                // on nothing was meant to start, and the overlay should say which of the two it is.
+                tvBootLabel.text = if (PrismSettings.getVirtualizeAndroidApps()) {
+                    context.getString(R.string.virt_status_app_virtualization)
+                } else {
+                    context.getString(R.string.virt_status_stopped)
+                }
                 controlBar.visibility = View.GONE
             }
             VmController.State.BOOTING -> {

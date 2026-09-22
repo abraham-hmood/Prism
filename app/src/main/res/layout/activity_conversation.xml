@@ -54,6 +54,20 @@
                 android:textSize="17sp"
                 android:textStyle="bold" />
 
+            <!-- Call. Shown only on Sam, Nora and Aether: a call is a conversation with something
+                 that can answer, and an SMS thread has nobody on the other end to talk to. -->
+            <ImageButton
+                android:id="@+id/conversationCallBtn"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:layout_alignParentEnd="true"
+                android:layout_centerVertical="true"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="@string/call_start"
+                android:src="@android:drawable/ic_menu_call"
+                android:visibility="gone"
+                app:tint="@color/imessage_blue" />
+
             <View
                 android:layout_width="match_parent"
                 android:layout_height="1px"

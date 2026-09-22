@@ -396,15 +396,7 @@ self.onmessage = function (event) {
   switch (msg.type) {
     case 'activate':
       try {
-        var context = {
-          subscriptions: [],
-          extensionPath: msg.path || '',
-          extensionUri: Uri.file(msg.path || ''),
-          globalState: memento('global-' + msg.id),
-          workspaceState: memento('workspace-' + msg.id),
-          extensionMode: vscode.ExtensionMode.Production,
-          asAbsolutePath: function (rel) { return (msg.path || '') + '/' + rel; }
-        };
+        var context = buildExtensionContext(msg);
         activateExtension(msg.id, msg.source, context)
           .then(function () { self.postMessage({ type: 'activated', id: msg.id }); })
           .catch(function (e) { self.postMessage({ type: 'activation-failed', id: msg.id, message: String(e && e.message || e) }); });
@@ -443,13 +435,139 @@ self.onmessage = function (event) {
   }
 };
 
-function memento(scope) {
-  var store = Object.create(null);
+/**
+ * The `ExtensionContext` handed to `activate`.
+ *
+ * ## Why this is a function and not an object literal
+ *
+ * Because it got long, and it got long for a reason worth recording. The first version had six
+ * fields — subscriptions, the two mementos, the path, the mode — which is everything a *web*
+ * extension touches. Desktop extensions touch far more, and they do it on the first line of
+ * `activate` without checking: `context.globalStorageUri.fsPath` to find a cache directory,
+ * `context.logUri` for a log file, `context.secrets.get` for a token, `context.storagePath` in
+ * anything written before 2021. Every one of those was `undefined`, and reading `.fsPath` off
+ * `undefined` throws before the extension has done anything at all.
+ *
+ * So the rule here is: if VS Code's own `ExtensionContext` has a member, this provides something
+ * with the right shape, even when the thing behind it is a stub. An extension that gets a working
+ * object and finds it empty degrades; an extension that gets `undefined` crashes.
+ *
+ * ## Storage
+ *
+ * The paths come from Kotlin, which is the only side that knows where the app may write. They live
+ * outside the extension's own directory on purpose — uninstalling an extension should not silently
+ * destroy the user's settings for it, and reinstalling should find them again. The Node host
+ * creates them before activation; the Worker host cannot, and an extension that writes there will
+ * fail, which is the honest behaviour for a host with no filesystem.
+ */
+function buildExtensionContext(msg) {
+  var root = msg.path || '';
+  var storage = msg.storage || '';
+  var globalStorage = msg.globalStorage || '';
+  var logs = msg.logs || '';
+
   return {
+    subscriptions: [],
+
+    extensionPath: root,
+    extensionUri: Uri.file(root),
+    asAbsolutePath: function (rel) {
+      return (root + '/' + String(rel)).replace(/\/+/g, '/');
+    },
+
+    globalState: memento('global-' + msg.id, (msg.state || {}).global, true),
+    workspaceState: memento('workspace-' + msg.id, (msg.state || {}).workspace, false),
+
+    // Both the Uri and the deprecated string form. A great deal of published code still reads the
+    // string, and VS Code kept it for exactly that reason.
+    storageUri: storage ? Uri.file(storage) : undefined,
+    storagePath: storage || undefined,
+    globalStorageUri: globalStorage ? Uri.file(globalStorage) : undefined,
+    globalStoragePath: globalStorage || undefined,
+    logUri: logs ? Uri.file(logs) : undefined,
+    logPath: logs || undefined,
+
+    extensionMode: vscode.ExtensionMode.Production,
+
+    // A secret store, in memory. NOT persisted, and that is deliberate: a real one would be a
+    // promise to keep tokens safely that this host is in no position to make. An extension asking
+    // for a secret gets undefined and prompts the user again, which is the correct degradation.
+    secrets: {
+      get: function () { return Promise.resolve(undefined); },
+      store: function () { return Promise.resolve(); },
+      delete: function () { return Promise.resolve(); },
+      onDidChange: function () { return { dispose: function () {} }; }
+    },
+
+    // Extensions mutate this to affect terminals they spawn. Prism's terminal does not read it yet,
+    // so the collection records and does nothing — which is a no-op, not a crash.
+    environmentVariableCollection: (function () {
+      var vars = Object.create(null);
+      var collection = {
+        persistent: false,
+        description: '',
+        replace: function (name, value) { vars[name] = { value: value, type: 1 }; },
+        append: function (name, value) { vars[name] = { value: value, type: 2 }; },
+        prepend: function (name, value) { vars[name] = { value: value, type: 3 }; },
+        get: function (name) { return vars[name]; },
+        forEach: function (fn, thisArg) {
+          Object.keys(vars).forEach(function (k) { fn.call(thisArg, k, vars[k], collection); });
+        },
+        delete: function (name) { delete vars[name]; },
+        clear: function () { vars = Object.create(null); },
+        getScoped: function () { return collection; }
+      };
+      return collection;
+    })(),
+
+    extension: {
+      id: msg.id,
+      extensionPath: root,
+      extensionUri: Uri.file(root),
+      isActive: true,
+      packageJSON: msg.manifest || {},
+      exports: undefined,
+      extensionKind: 1,
+      activate: function () { return Promise.resolve(); }
+    },
+
+    // Added in 1.90 and already called unconditionally by a handful of AI extensions.
+    languageModelAccessInformation: {
+      onDidChange: function () { return { dispose: function () {} }; },
+      canSendRequest: function () { return undefined; }
+    }
+  };
+}
+
+/**
+ * A `Memento`: the key-value store `context.globalState` and `context.workspaceState` are.
+ *
+ * `get` is synchronous in the VS Code API and `update` returns a promise, which is the shape that
+ * decides how this persists: the whole store is handed over at activation time (so `get` can answer
+ * immediately) and each `update` posts a save (so nothing blocks). An extension that writes "do not
+ * show this again" on Monday finds it on Tuesday, which was not true when the store was a bare
+ * object living for the lifetime of the host.
+ *
+ * `setKeysForSync` exists only on the global state in VS Code and does nothing anywhere without a
+ * settings-sync service; it is here because extensions call it unconditionally.
+ */
+function memento(scope, initial, global) {
+  var store = Object.create(null);
+  if (initial && typeof initial === 'object') {
+    Object.keys(initial).forEach(function (k) { store[k] = initial[k]; });
+  }
+  var api = {
     get: function (key, fallback) { return store[key] === undefined ? fallback : store[key]; },
-    update: function (key, value) { store[key] = value; return Promise.resolve(); },
+    update: function (key, value) {
+      if (value === undefined) delete store[key];
+      else store[key] = value;
+      self.postMessage({ type: 'save-state', scope: scope, state: store });
+      return Promise.resolve();
+    },
     keys: function () { return Object.keys(store); }
   };
+  if (global) api.setKeysForSync = function () {};
+  return api;
 }
 
 /** Asks every registered completion provider and flattens what they return. */

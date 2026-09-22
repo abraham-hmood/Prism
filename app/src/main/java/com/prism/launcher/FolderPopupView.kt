@@ -176,6 +176,7 @@ class FolderInternalAdapter(
 
         b.root.setOnClickListener {
             when (item) {
+                is DesktopItem.Widget, is DesktopItem.Occupied -> Unit  // widgets are not folder members; covered cells are not targets
                 is DesktopItem.App -> onLaunchApp(item.component)
                 is DesktopItem.FileRef -> onLaunchFile(item.absolutePath)
                 is DesktopItem.DirectoryRef -> onLaunchFolder(item)
@@ -185,6 +186,7 @@ class FolderInternalAdapter(
         }
 
         when (item) {
+            is DesktopItem.Widget, is DesktopItem.Occupied -> Unit  // widgets are not folder members; covered cells are not targets
             is DesktopItem.App -> {
                 b.label.text = try {
                     pm.getActivityInfo(item.component, 0).loadLabel(pm).toString()

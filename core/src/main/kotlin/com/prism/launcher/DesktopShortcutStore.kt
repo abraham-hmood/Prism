@@ -30,6 +30,34 @@ sealed class DesktopItem {
     data class Folder(val name: String, val folderId: String) : DesktopItem()
     data class NetworkedFolder(val url: String, val name: String, val type: String) : DesktopItem()
 
+    /**
+     * A home-screen widget, held at its top-left cell.
+     *
+     * [appWidgetId] is the id the platform's AppWidgetHost allocated. It is the widget's whole
+     * identity -- the provider, its configuration and its state all hang off it -- so losing it
+     * orphans a widget that keeps running and can never be reached again. [deleteAppWidgetId] on
+     * removal is what prevents that.
+     *
+     * The spans are in grid cells. A widget is the only item here that is bigger than one cell, and
+     * the cells it covers are held by [Occupied] entries so that the grid stays a flat list of cells
+     * with exactly one owner each.
+     */
+    data class Widget(val appWidgetId: Int, val spanX: Int, val spanY: Int) : DesktopItem()
+
+    /**
+     * A cell covered by a widget whose top-left is elsewhere.
+     *
+     * WHY OCCUPANCY IS STORED RATHER THAN DERIVED. It could be recomputed by walking the grid and
+     * expanding every widget's spans, and that was the first design. Storing it means the grid
+     * remains what every other part of this screen already assumes it is: a flat array where cell
+     * N is owned by exactly the thing at index N. Reordering, drag-and-drop, the delete zone and
+     * "find the first empty cell" all keep working untouched, where a derived occupancy would have
+     * needed each of them taught about widgets.
+     *
+     * [ownerIndex] points back at the widget so a covered cell can find what covers it.
+     */
+    data class Occupied(val ownerIndex: Int) : DesktopItem()
+
     fun serialize(): String {
         return when (this) {
             is App -> "app|$appId"
@@ -37,6 +65,8 @@ sealed class DesktopItem {
             is DirectoryRef -> "dir|$absolutePath|$name"
             is Folder -> "folder|$name|$folderId"
             is NetworkedFolder -> "network|$url|$name|$type"
+            is Widget -> "widget|$appWidgetId|$spanX|$spanY"
+            is Occupied -> "occupied|$ownerIndex"
         }
     }
 
@@ -51,6 +81,10 @@ sealed class DesktopItem {
                 "network" -> parts.getOrNull(1)?.let {
                     NetworkedFolder(it, parts.getOrNull(2) ?: "Networked Folder", parts.getOrNull(3) ?: "ftp")
                 }
+                "widget" -> parts.getOrNull(1)?.toIntOrNull()?.let {
+                    Widget(it, parts.getOrNull(2)?.toIntOrNull() ?: 1, parts.getOrNull(3)?.toIntOrNull() ?: 1)
+                }
+                "occupied" -> Occupied(parts.getOrNull(1)?.toIntOrNull() ?: -1)
                 else -> {
                     // Legacy migration: before the tagged format, a cell was a bare flattened
                     // ComponentName. `ComponentName.unflattenFromString` used to do the
@@ -92,6 +126,70 @@ class DesktopShortcutStore(private val pageIndex: Int = 1) {
 
         /** How many cells a desktop page has. */
         const val GRID_SIZE = 24
+
+        /** How many cells across a desktop page is. Cell N is at (N % COLUMNS, N / COLUMNS). */
+        const val COLUMNS = 4
+
+        /**
+         * Whether a [spanX] x [spanY] block fits at [index] with nothing already in the way.
+         *
+         * [ignoreOwner] lets a widget be tested against a move or a resize of itself: its own cells
+         * are the ones it is vacating, so counting them as occupied would make every widget unable
+         * to grow by a single cell.
+         */
+        fun fits(
+            grid: List<DesktopItem?>,
+            index: Int,
+            spanX: Int,
+            spanY: Int,
+            ignoreOwner: Int = -1,
+        ): Boolean {
+            val column = index % COLUMNS
+            val row = index / COLUMNS
+            if (column + spanX > COLUMNS) return false
+            if ((row + spanY) * COLUMNS > grid.size) return false
+
+            for (y in 0 until spanY) {
+                for (x in 0 until spanX) {
+                    val cell = (row + y) * COLUMNS + (column + x)
+                    if (cell >= grid.size) return false
+                    when (val existing = grid[cell]) {
+                        null -> Unit
+                        is DesktopItem.Occupied -> if (existing.ownerIndex != ignoreOwner) return false
+                        is DesktopItem.Widget -> if (cell != ignoreOwner) return false
+                        else -> return false
+                    }
+                }
+            }
+            return true
+        }
+
+        /** Writes a widget at [index] and marks the cells it covers. Assumes [fits] already said yes. */
+        fun placeWidget(grid: MutableList<DesktopItem?>, index: Int, widget: DesktopItem.Widget) {
+            val column = index % COLUMNS
+            val row = index / COLUMNS
+            for (y in 0 until widget.spanY) {
+                for (x in 0 until widget.spanX) {
+                    val cell = (row + y) * COLUMNS + (column + x)
+                    if (cell < grid.size) {
+                        grid[cell] = if (cell == index) widget else DesktopItem.Occupied(index)
+                    }
+                }
+            }
+        }
+
+        /** Clears a widget and every cell it covered. */
+        fun clearWidget(grid: MutableList<DesktopItem?>, index: Int) {
+            val widget = grid.getOrNull(index) as? DesktopItem.Widget ?: return
+            val column = index % COLUMNS
+            val row = index / COLUMNS
+            for (y in 0 until widget.spanY) {
+                for (x in 0 until widget.spanX) {
+                    val cell = (row + y) * COLUMNS + (column + x)
+                    if (cell < grid.size) grid[cell] = null
+                }
+            }
+        }
 
         /** Adds an item specifically to the given desktop page index. */
         fun add(item: DesktopItem, pageIndex: Int) {

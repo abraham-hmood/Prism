@@ -134,6 +134,22 @@
 
             </LinearLayout>
         </FrameLayout>
+
+        <!-- A virtualized ANDROID app, embedded here rather than opened as a separate screen.
+
+             Last in the stack, so it covers the boot overlay when an app is showing. It holds no
+             app code: the app runs in the :virtualapp process and what lands here is a
+             SurfacePackage, a handle to its composited window plus an input channel. That split is
+             deliberate and is described in VirtualAppHostService.
+
+             Starts gone, and is made visible BEFORE the app is requested: a SurfaceView only has a
+             surface and a host token while it is visible, and both are needed to attach the child
+             package and to route touches into it. -->
+        <SurfaceView
+            android:id="@+id/appSurface"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:visibility="gone" />
     </FrameLayout>
 
 </LinearLayout>

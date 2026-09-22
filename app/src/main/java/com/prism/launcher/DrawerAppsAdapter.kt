@@ -15,6 +15,10 @@ import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
 import com.prism.launcher.databinding.ItemDrawerAppBinding
 import com.prism.launcher.databinding.ItemDrawerGroupBinding
+import com.prism.launcher.databinding.ItemDrawerNotificationBinding
+import com.prism.launcher.databinding.ItemDrawerWidgetBinding
+import com.prism.launcher.databinding.ItemDrawerSectionBinding
+import com.prism.launcher.notifications.NotificationHistory
 
 data class DrawerAppEntry(
     val component: ComponentName,
@@ -26,12 +30,49 @@ data class DrawerAppEntry(
 sealed class DrawerItem {
     data class Group(val title: String, val apps: List<DrawerAppEntry>) : DrawerItem()
     data class App(val entry: DrawerAppEntry) : DrawerItem()
+
+    /** A heading between kinds of result, so a notification list below the apps is labelled. */
+    data class Section(val title: String) : DrawerItem()
+
+    /**
+     * A notification the search matched.
+     *
+     * Search reaches notification history as well as apps because the two questions are the same
+     * question: someone typing "monzo" is looking for the bank, and whether what they want is the
+     * app or the message it sent an hour ago is not something the search box can know. Showing both
+     * costs one section heading and answers both.
+     */
+    data class Notification(val record: NotificationHistory.Record) : DrawerItem()
+
+    /**
+     * A widget the search matched, draggable onto a desktop page.
+     *
+     * Found by the same box that finds apps, because a user looking for their clock does not think
+     * of "the Clock app" and "the Clock widget" as two searches. [label] is the widget's own label
+     * and [appLabel] the app it came from, so both are searchable -- "google" should find the search
+     * bar widget even though the widget is called "Search".
+     */
+    data class Widget(
+        val provider: String,
+        val label: String,
+        val appLabel: String,
+        val previewImage: Int,
+        val icon: Int,
+    ) : DrawerItem()
 }
 
 private object DrawerDiff : DiffUtil.ItemCallback<DrawerItem>() {
     override fun areItemsTheSame(old: DrawerItem, new: DrawerItem): Boolean {
         if (old is DrawerItem.Group && new is DrawerItem.Group) return old.title == new.title
         if (old is DrawerItem.App && new is DrawerItem.App) return old.entry.component == new.entry.component
+        if (old is DrawerItem.Section && new is DrawerItem.Section) return old.title == new.title
+        if (old is DrawerItem.Widget && new is DrawerItem.Widget) return old.provider == new.provider
+        if (old is DrawerItem.Notification && new is DrawerItem.Notification) {
+            // Identity is the app plus when it arrived. The stored key would be better but is empty
+            // for anything recorded before a key was available, and two notifications from one app in
+            // the same millisecond is not a case worth carrying a field for.
+            return old.record.packageName == new.record.packageName && old.record.at == new.record.at
+        }
         return false
     }
 
@@ -46,26 +87,49 @@ class DrawerAppsAdapter(
     companion object {
         const val VIEW_TYPE_APP = 1
         const val VIEW_TYPE_GROUP = 2
+        const val VIEW_TYPE_SECTION = 3
+        const val VIEW_TYPE_NOTIFICATION = 4
+        const val VIEW_TYPE_WIDGET = 5
     }
 
     override fun getItemViewType(position: Int): Int {
         return when (getItem(position)) {
             is DrawerItem.App -> VIEW_TYPE_APP
             is DrawerItem.Group -> VIEW_TYPE_GROUP
+            is DrawerItem.Section -> VIEW_TYPE_SECTION
+            is DrawerItem.Notification -> VIEW_TYPE_NOTIFICATION
+            is DrawerItem.Widget -> VIEW_TYPE_WIDGET
         }
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
         val inflater = LayoutInflater.from(parent.context)
-        return if (viewType == VIEW_TYPE_GROUP) {
-            GroupVH(ItemDrawerGroupBinding.inflate(inflater, parent, false))
-        } else {
-            AppVH(ItemDrawerAppBinding.inflate(inflater, parent, false))
+        return when (viewType) {
+            VIEW_TYPE_GROUP -> GroupVH(ItemDrawerGroupBinding.inflate(inflater, parent, false))
+            VIEW_TYPE_SECTION ->
+                SectionVH(ItemDrawerSectionBinding.inflate(inflater, parent, false))
+            VIEW_TYPE_NOTIFICATION ->
+                NotificationVH(ItemDrawerNotificationBinding.inflate(inflater, parent, false))
+            VIEW_TYPE_WIDGET ->
+                WidgetVH(ItemDrawerWidgetBinding.inflate(inflater, parent, false))
+            else -> AppVH(ItemDrawerAppBinding.inflate(inflater, parent, false))
         }
     }
 
     override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
         val item = getItem(position)
+        if (holder is SectionVH && item is DrawerItem.Section) {
+            holder.binding.sectionTitle.text = item.title
+            return
+        }
+        if (holder is NotificationVH && item is DrawerItem.Notification) {
+            bindNotification(holder, item.record)
+            return
+        }
+        if (holder is WidgetVH && item is DrawerItem.Widget) {
+            bindWidget(holder, item)
+            return
+        }
         if (holder is AppVH && item is DrawerItem.App) {
             bindApp(holder, item.entry)
         } else if (holder is GroupVH && item is DrawerItem.Group) {
@@ -76,6 +140,74 @@ class DrawerAppsAdapter(
             )
             holder.binding.groupRecycler.adapter = innerAdapter
             innerAdapter.submitList(item.apps)
+        }
+    }
+
+    private fun bindWidget(holder: WidgetVH, item: DrawerItem.Widget) {
+        val context = holder.itemView.context
+        holder.binding.widgetLabel.text = item.label
+        holder.binding.widgetApp.text = item.appLabel
+
+        // The provider's preview if it published one, its icon if not. A widget with neither is
+        // shown with the generic icon rather than an empty box, which at least says "widget".
+        val preview = runCatching {
+            val resources = context.packageManager.getResourcesForApplication(
+                android.content.ComponentName.unflattenFromString(item.provider)!!.packageName
+            )
+            when {
+                item.previewImage != 0 -> resources.getDrawable(item.previewImage, null)
+                item.icon != 0 -> resources.getDrawable(item.icon, null)
+                else -> null
+            }
+        }.getOrNull()
+        if (preview != null) {
+            holder.binding.widgetPreview.setImageDrawable(preview)
+        } else {
+            holder.binding.widgetPreview.setImageResource(android.R.drawable.ic_menu_add)
+        }
+
+        // Tapping places it on the first desktop page; see LauncherActivity.placeWidgetOnDesktop for
+        // why that exists next to the drag.
+        holder.itemView.setOnClickListener {
+            (context as? com.prism.launcher.LauncherActivity)?.placeWidgetOnDesktop(item.provider)
+        }
+
+        // Dragged exactly the way an app is, so the desktop's existing drop handling is what
+        // receives it -- see WidgetPlacement for what happens on the other side.
+        holder.itemView.setOnLongClickListener {
+            if (!allowDragToDesktop()) return@setOnLongClickListener false
+            val clip = ClipData.newPlainText(
+                com.prism.launcher.widgets.WidgetPlacement.DRAG_LABEL, item.provider
+            )
+            val shadow = View.DragShadowBuilder(holder.itemView)
+            holder.itemView.startDragAndDrop(clip, shadow, null, View.DRAG_FLAG_GLOBAL)
+            true
+        }
+    }
+
+    private fun bindNotification(holder: NotificationVH, record: NotificationHistory.Record) {
+        val context = holder.itemView.context
+        holder.binding.notificationApp.text = record.appLabel
+        holder.binding.notificationTitle.text = record.title
+        holder.binding.notificationTitle.visibility =
+            if (record.title.isBlank()) ViewGroup.GONE else ViewGroup.VISIBLE
+        holder.binding.notificationText.text = record.text
+        holder.binding.notificationText.visibility =
+            if (record.text.isBlank()) ViewGroup.GONE else ViewGroup.VISIBLE
+        holder.binding.notificationWhen.text =
+            android.text.format.DateUtils.getRelativeTimeSpanString(
+                record.at, System.currentTimeMillis(), android.text.format.DateUtils.MINUTE_IN_MILLIS
+            )
+        holder.binding.notificationIcon.setImageDrawable(
+            runCatching { context.packageManager.getApplicationIcon(record.packageName) }.getOrNull()
+        )
+        holder.itemView.setOnClickListener {
+            runCatching {
+                val intent = context.packageManager
+                    .getLaunchIntentForPackage(record.packageName) ?: return@runCatching
+                intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(intent)
+            }
         }
     }
 
@@ -132,6 +264,13 @@ class DrawerAppsAdapter(
         }
     }
     class GroupVH(val binding: ItemDrawerGroupBinding) : RecyclerView.ViewHolder(binding.root)
+
+    class SectionVH(val binding: ItemDrawerSectionBinding) : RecyclerView.ViewHolder(binding.root)
+
+    class NotificationVH(val binding: ItemDrawerNotificationBinding) :
+        RecyclerView.ViewHolder(binding.root)
+
+    class WidgetVH(val binding: ItemDrawerWidgetBinding) : RecyclerView.ViewHolder(binding.root)
 
     class InnerGroupAdapter(
         private val onLaunch: (ComponentName) -> Unit,

@@ -36,6 +36,11 @@
     <string name="virt_status_running">Running</string>
     <string name="virt_status_paused">Paused</string>
     <string name="virt_status_stopped">Stopped</string>
+    <string name="call_start">Call</string>
+    <string name="virt_close_app">Close app</string>
+    <string name="virt_back_in_app">Back</string>
+    <string name="virt_status_opening_app">Opening app…</string>
+    <string name="virt_status_app_virtualization">Running Android apps inside Prism. The guest OS is off while this is on.</string>
     <string name="virt_status_error">Error — tap power to retry</string>
     <string name="virt_not_supported">Virtualization not supported on this device</string>
     <string name="writer_subtype_en">English (Prism Writer)</string>

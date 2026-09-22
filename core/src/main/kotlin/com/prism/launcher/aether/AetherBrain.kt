@@ -334,6 +334,49 @@ class AetherConnectome(
         cerebellum.resetState(); frontalLanguage.resetState()
     }
 
+    /**
+     * Clears the hippocampal fast-weight trace -- the only thing that carries context BETWEEN the
+     * turns of a conversation.
+     *
+     * DELIBERATELY SEPARATE FROM [resetState]. Membranes are cleared every turn, because no brain
+     * begins a sentence holding the voltages of the last one; the episodic trace is cleared only
+     * between conversations. That split is the whole mechanism behind answering "what colour is
+     * it" -- relational binding across turns is what hippocampal amnesics lose, and losing it is
+     * what makes their speech fluent sentence-by-sentence and incoherent as dialogue.
+     */
+    fun resetEpisodic() {
+        hippocampus.fastWeights.fill(0f)
+    }
+
+    /**
+     * Broca's graded output from the most recent forward pass, as [t][neuron].
+     *
+     * Null before a forward pass has run. See `LIFCortexLayer.evidenceTrace` for why the decoder
+     * reads membrane potential rather than spikes.
+     */
+    fun lastBrocaEvidence(): Array<FloatArray>? =
+        (frontalLanguage.layers.firstOrNull() as? LIFCortexLayer)?.evidenceTrace()
+
+    /**
+     * Runs one conversational turn and hands back Broca's evidence.
+     *
+     * Eyes closed: conversation does not require looking at anything, and passing a tensor of zeros
+     * instead of nothing would convolve 128x128x3 of it at every timestep -- the difference between
+     * roughly ten seconds and roughly three per turn on a phone.
+     */
+    fun runForEvidence(auditory: Array<FloatArray>, timeSteps: Int): Array<FloatArray> {
+        val width = auditory.firstOrNull()?.size ?: return emptyArray()
+        val stream = SpikeSequence(timeSteps, width, 1, 1)
+        for (t in 0 until minOf(timeSteps, auditory.size)) {
+            val frame = stream[t]
+            for (n in 0 until minOf(width, auditory[t].size)) frame.data[n] = auditory[t][n]
+        }
+
+        val silentVision = SpikeSequence(timeSteps, visualInputDim, 1, 1)
+        forward(silentVision, stream)
+        return lastBrocaEvidence() ?: emptyArray()
+    }
+
     fun zeroGrad() { for (l in allLayers()) l.zeroGrad() }
     fun applyGradients(lr: Float) { for (l in allLayers()) l.applyGradients(lr) }
 

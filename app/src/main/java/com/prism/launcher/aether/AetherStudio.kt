@@ -120,6 +120,158 @@ object AetherStudio {
         return true
     }
 
+    // ── Conversation ───────────────────────────────────────────────────────
+    //
+    // Ported from AetherCortex's execution/conversation.py. This is a DIFFERENT generation path
+    // from generateSimple: that one renders a prompt to pixels and reads the result through the
+    // visual/motor route, which is how flashcard labelling works. Dialogue goes in at the ears and
+    // comes out of Broca's lexical band, because conversation is auditory and reading is the
+    // special case -- routing a spoken question through the visual cortex would mean she can only
+    // talk to someone whose words are rendered on a screen in front of her.
+
+    /** The live conversation, kept between turns so the hippocampal trace survives. */
+    private var engine: AetherConversation.Engine? = null
+
+    /** The lexicon this connectome was trained with, loaded once beside its weights. */
+    private var lexicon: AetherLexicon? = null
+
+    /**
+     * The words Aether currently knows, or null when she has never been given a lexicon.
+     *
+     * Loaded from beside the weights, never rebuilt from a corpus -- neuron j means whichever word
+     * sat at index j during training, and rebuilding the order from a different corpus would
+     * silently reassign every word and make a trained Broca speak gibberish.
+     */
+    fun lexicon(ctx: Context): AetherLexicon? {
+        lexicon?.let { return it }
+        // The dialogue geometry travels with the weights too, and has to be applied BEFORE any
+        // turn is built -- the frame oscillators and the readout both depend on it.
+        AetherConversation.loadSettings(AetherConfig.weightsDir())
+        return AetherLexicon.load(AetherConfig.weightsDir())?.also { lexicon = it }
+    }
+
+    fun canConverse(ctx: Context): Boolean = lexicon(ctx) != null
+
+    /** A new partner, a new topic. Clears the episodic trace; nothing else is carried over. */
+    fun newConversation(ctx: Context) {
+        engine(ctx)?.newConversation()
+    }
+
+    private fun engine(ctx: Context): AetherConversation.Engine? {
+        val words = lexicon(ctx) ?: return null
+        engine?.let { return it }
+        return AetherConversation.Engine(brain(ctx), words).also { engine = it }
+    }
+
+    data class Spoken(val reply: String, val note: String)
+
+    /**
+     * One conversational turn.
+     *
+     * Runs on the default dispatcher because a turn is a full forward pass over the connectome --
+     * seconds, not milliseconds, and never on the main thread.
+     */
+    suspend fun converse(ctx: Context, said: String): Spoken = withContext(Dispatchers.Default) {
+        busy = true
+        try {
+            val live = engine(ctx) ?: return@withContext Spoken(
+                "",
+                "Aether has no lexicon yet, so she has no words to answer with. Train her on a " +
+                    "dialogue corpus first."
+            )
+            val reply = live.listenAndReply(said)
+            if (reply.text.isBlank()) {
+                Spoken("", "(nothing crossed the floor -- she heard it and had nothing to say)")
+            } else {
+                Spoken(reply.text, "")
+            }
+        } catch (e: OutOfMemoryError) {
+            AetherLog.fatal(AetherLog.Area.GENERATE, "Out of memory holding a conversation", e)
+            Spoken("", "Ran out of memory.")
+        } catch (e: Exception) {
+            AetherLog.error(AetherLog.Area.GENERATE, "Conversation turn failed", e)
+            Spoken("", "That turn failed: ${e.message}")
+        } finally {
+            busy = false
+        }
+    }
+
+    // ── Corpus ─────────────────────────────────────────────────────────────
+
+    data class CorpusReport(
+        val conversations: Int,
+        val exchanges: Int,
+        val words: Int,
+        val note: String,
+    )
+
+    /**
+     * Loads and CURATES a dialogue corpus, in the order the Python pipeline establishes.
+     *
+     * The order matters and is not arbitrary:
+     *
+     * 1. **Walk** the tree -- a dataset directory is a tree in practice, and a flat listing
+     *    silently trains on whichever files sat at the top level.
+     * 2. **Dedupe by content** -- copies of the same conversation in two directories would
+     *    otherwise be trained on twice and pollute any held-out split with verbatim duplicates.
+     * 3. **First sentences** -- a scraped persona corpus answers a short question with a thirty-word
+     *    monologue. Reducing to the first sentence keeps a whole, well-formed utterance; truncating
+     *    would teach her to stop mid-sentence.
+     * 4. **Window filter on RAW words, before the lexicon** -- the short turns are made of common
+     *    words, so a lexicon built from them alone fits the band and covers them. Built from the
+     *    whole corpus first, the vocabulary budget is spent on words that only appear in turns too
+     *    long to use, and nothing fits at all.
+     * 5. **Build the lexicon** from what survived, by frequency.
+     * 6. **Filter again against the lexicon** -- because encode() drops unknown words, a long reply
+     *    containing a few known ones would otherwise "fit" as a mangled subset of itself.
+     */
+    suspend fun loadCorpus(ctx: Context, directory: File = AetherConfig.datasetDir()): CorpusReport =
+        withContext(Dispatchers.Default) {
+            val raw = AetherDialogue.loadCorpus(directory)
+            if (raw.isEmpty()) {
+                return@withContext CorpusReport(
+                    0, 0, 0,
+                    "No .txt, .jsonl or .parquet corpus under ${directory.name}."
+                )
+            }
+
+            val unique = AetherDialogue.dedupe(raw)
+            val shortened = unique.map { AetherDialogue.toFirstSentences(it) }
+            val windowed = shortened.mapNotNull { AetherDialogue.withinWindow(it) }
+
+            if (windowed.isEmpty()) {
+                return@withContext CorpusReport(
+                    unique.size, 0, 0,
+                    "${unique.size} conversations, but none has an exchange short enough for the " +
+                        "window. Widen it, or use a corpus of shorter turns."
+                )
+            }
+
+            val built = AetherLexicon.fromConversations(windowed)
+            val usable = windowed.mapNotNull { AetherDialogue.fitsWindow(it, built) }
+            val exchanges = usable.sumOf { it.exchanges().size }
+
+            built.save(AetherConfig.weightsDir())
+            AetherConversation.saveSettings(AetherConfig.weightsDir())
+            lexicon = built
+            engine = null
+
+            CorpusReport(
+                usable.size, exchanges, built.size,
+                "${usable.size} conversations, $exchanges exchanges, ${built.size} words in the band."
+            )
+        }
+
+    /**
+     * Writes a generated child-directed corpus, for a connectome with nothing to learn from.
+     *
+     * The register is the point, not a placeholder: child-directed speech is short, repetitive,
+     * concrete and heavy with question-answer routines, which is both the developmental step after
+     * labelling and what makes a corpus learnable by a small spiking network.
+     */
+    fun seedCorpus(directory: File = AetherConfig.datasetDir(), conversations: Int = 120): File =
+        AetherDialogue.writeCorpus(directory, AetherDialogue.generateCorpus(conversations))
+
     data class Generated(val uri: Uri?, val file: File?, val note: String)
 
     private fun generator(ctx: Context): AetherGenerator = AetherGenerator(brain(ctx))

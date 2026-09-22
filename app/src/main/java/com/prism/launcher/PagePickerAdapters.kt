@@ -24,6 +24,9 @@ sealed interface PagePickChoice {
     data object Wallet : PagePickChoice
     data object Editor : PagePickChoice
     data object Science : PagePickChoice
+    data object Notifications : PagePickChoice
+    data object Language : PagePickChoice
+    data object Minigames : PagePickChoice
 }
 
 class PositionPickerAdapter(
@@ -161,6 +164,9 @@ class VerticalPageOptionsAdapter(
         add(Option("Models", "Manage imported AI models", PagePickChoice.Models))
         add(Option("Editor", "VS Code, with extensions, running on this device", PagePickChoice.Editor))
         add(Option("Science", "Cosmic rays, lab notebook, RF survey, lung and hearing tests", PagePickChoice.Science))
+        add(Option("Notifications", "Every notification you have had, searchable and kept", PagePickChoice.Notifications))
+        add(Option("Language", "Learn a language by speaking it, with an AI tutor", PagePickChoice.Language))
+        add(Option("Minigames", "Pong, chess, and a pencil-drawn empire on ruled paper", PagePickChoice.Minigames))
         add(Option("Model Store", "Browse, search, and download AI models", PagePickChoice.ModelStore))
         add(Option("Agentic Tools", "Manage AI tool-calling and custom syntaxes", PagePickChoice.AgenticTools))
         add(Option("Wallet", "Local crypto wallet and miner", PagePickChoice.Wallet))

@@ -28,6 +28,9 @@ import com.prism.launcher.nora.IosUi
 class AetherSettingsActivity : PrismBaseActivity() {
 
     private lateinit var content: LinearLayout
+
+    /** The row showing which Kokoro voice Aether speaks in. See [buildVoiceSection]. */
+    private lateinit var voiceRow: TextView
     private lateinit var statusLine: TextView
 
     /** One collapsible tuning-group section: its clickable header, its card of rows, and whether
@@ -130,6 +133,7 @@ class AetherSettingsActivity : PrismBaseActivity() {
         buildSizeSection()
         buildRegionSection()
         buildMemorySection()
+        buildVoiceSection()
         buildRoutesSection()
         buildAnnBaselineSection()
         buildKnowledgeSharingSection()
@@ -1171,6 +1175,70 @@ class AetherSettingsActivity : PrismBaseActivity() {
     }
 
     // ── Row builders (same shape as NoraSettingsActivity's) ────────────────
+
+
+    // -- Voice ---------------------------------------------------------------
+
+    /**
+     * Which of Kokoro's 54 voices Aether speaks in on a call.
+     *
+     * Here rather than in Intelligence & Messaging because Aether is not Sam: a call to one that
+     * sounded like a call to the other would make having two of them pointless. The row is greyed
+     * out when the user has imported a speech model of their own, for the same reason the whole
+     * Kokoro group is -- the setting belongs to an engine that is not running.
+     */
+    private fun buildVoiceSection() {
+        content.addView(IosUi.sectionHeader(this, "VOICE"))
+        val card = IosUi.card(this)
+
+        val usingKokoro = PrismSettings.isUsingKokoro()
+
+        voiceRow = TextView(this).apply {
+            textSize = 16f
+            val h = IosUi.dp(this@AetherSettingsActivity, 16f)
+            val v = IosUi.dp(this@AetherSettingsActivity, 14f)
+            setPadding(h, v, h, v)
+            isClickable = usingKokoro
+            isEnabled = usingKokoro
+            setTextColor(
+                if (usingKokoro) IosUi.label(this@AetherSettingsActivity) else IosUi.tertiaryLabel(this@AetherSettingsActivity)
+            )
+            setOnClickListener {
+                com.prism.launcher.speech.KokoroVoicePicker.show(
+                    this@AetherSettingsActivity, PrismSettings.VOICE_SPEAKER_AETHER,
+                ) { paintVoiceRow() }
+            }
+        }
+        card.addView(voiceRow)
+        content.addView(card)
+        content.addView(
+            IosUi.sectionFooter(
+                this,
+                if (usingKokoro)
+                    "Used when you call Aether from the Messages page."
+                else
+                    "Unavailable while your own speech model is active.",
+            )
+        )
+        content.addView(spacer())
+        paintVoiceRow()
+    }
+
+    private fun paintVoiceRow() {
+        val summary = com.prism.launcher.speech.KokoroVoicePicker.summaryFor(
+            this, PrismSettings.VOICE_SPEAKER_AETHER,
+        )
+        val text = android.text.SpannableStringBuilder("Voice" + System.lineSeparator()).append(summary)
+        text.setSpan(
+            android.text.style.ForegroundColorSpan(IosUi.secondaryLabel(this)),
+            6, text.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+        )
+        text.setSpan(
+            android.text.style.RelativeSizeSpan(0.82f),
+            6, text.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+        )
+        voiceRow.text = text
+    }
 
     private fun spacer(): View = View(this).apply {
         layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, IosUi.dp(this@AetherSettingsActivity, 16f))

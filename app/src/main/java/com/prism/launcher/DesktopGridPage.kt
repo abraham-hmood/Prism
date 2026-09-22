@@ -33,6 +33,9 @@ class DesktopGridPage(
     private val grid: RecyclerView
     private val deleteZone: DeleteZoneView
 
+    /** Draws the widgets on this page. See [com.prism.launcher.widgets.DesktopWidgetLayer]. */
+    private val widgetLayer: com.prism.launcher.widgets.DesktopWidgetLayer
+
     init {
         orientation = VERTICAL
         binding = PageDesktopRootBinding.inflate(LayoutInflater.from(context), this, true)
@@ -53,6 +56,35 @@ class DesktopGridPage(
         grid.layoutManager = GridLayoutManager(context, 4)
         grid.adapter = adapter
         grid.setHasFixedSize(true)
+
+        widgetLayer = com.prism.launcher.widgets.DesktopWidgetLayer(
+            context, grid, store, cellCount,
+            onChanged = {
+                adapter.refreshFromStore()
+                onDataChanged()
+            },
+        )
+        binding.widgetLayerHost.addView(
+            widgetLayer,
+            android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+            ),
+        )
+        // The widgets can only be positioned once the grid has laid its cells out, since the layer
+        // takes their geometry from the grid's own children rather than computing it.
+        //
+        // A ONE-SHOT LISTENER, REMOVING ITSELF. An ordinary global-layout listener calling
+        // requestLayout is an infinite loop by construction: the relayout it asks for fires the
+        // listener again. That loop pinned the main thread and left the whole desktop blank.
+        grid.viewTreeObserver.addOnGlobalLayoutListener(
+            object : android.view.ViewTreeObserver.OnGlobalLayoutListener {
+                override fun onGlobalLayout() {
+                    grid.viewTreeObserver.removeOnGlobalLayoutListener(this)
+                    widgetLayer.refresh()
+                }
+            },
+        )
 
         // Standard touch-to-move helper (long-press drag within grid)
         val touchHelper = ItemTouchHelper(
@@ -111,6 +143,18 @@ class DesktopGridPage(
                 DragEvent.ACTION_DROP -> {
                     // Source position: -1 means external drop (drawer / file explorer)
                     val sourcePos = event.localState as? Int ?: -1
+
+                    // A widget dragged out of the app drawer. Handled before resolveDraggedItem
+                    // because a widget is not a DesktopItem yet -- it has no id until the placement
+                    // dance below allocates one, and that dance can need the user twice.
+                    if (event.clipDescription?.label?.toString() ==
+                        com.prism.launcher.widgets.WidgetPlacement.DRAG_LABEL
+                    ) {
+                        if (!acceptDrawerDrops()) return@setOnDragListener false
+                        hideDeleteZone()
+                        return@setOnDragListener dropWidget(event)
+                    }
+
                     val draggedItem = resolveDraggedItem(event, sourcePos) ?: return@setOnDragListener false
 
                     // Gate cross-page drops only
@@ -141,6 +185,60 @@ class DesktopGridPage(
                 else -> true
             }
         }
+    }
+
+    /**
+     * Places a widget dropped from the app drawer.
+     *
+     * The cell size is measured from a laid-out cell rather than assumed, because it is what decides
+     * how many cells the widget asks for: a provider states its minimum size in dp, and turning that
+     * into a span needs the real size of a cell on this screen.
+     */
+    private fun dropWidget(event: DragEvent): Boolean {
+        val activity = context as? android.app.Activity ?: return false
+        val flattened = event.clipData?.getItemAt(0)?.text?.toString() ?: return false
+        val provider = com.prism.launcher.widgets.WidgetPlacement.providerFor(activity, flattened)
+            ?: return false
+
+        val child = grid.findChildViewUnder(event.x, event.y)
+        val cellIndex = if (child != null) grid.getChildAdapterPosition(child) else 0
+        if (cellIndex == RecyclerView.NO_POSITION) return false
+
+        val density = resources.displayMetrics.density
+        val sample = grid.layoutManager?.findViewByPosition(cellIndex)
+        val cellWidthDp = ((sample?.width ?: (grid.width / 4)) / density).toInt().coerceAtLeast(1)
+        val cellHeightDp = ((sample?.height ?: (grid.height / 6)) / density).toInt().coerceAtLeast(1)
+
+        return com.prism.launcher.widgets.WidgetPlacement.begin(
+            activity = activity,
+            provider = provider,
+            pageIndex = gridIndex,
+            cellIndex = cellIndex,
+            cellWidthDp = cellWidthDp,
+            cellHeightDp = cellHeightDp,
+            cellCount = cellCount,
+        ) {
+            adapter.refreshFromStore()
+            widgetLayer.refresh()
+            onDataChanged()
+        }
+    }
+
+    /** One cell's width in dp, measured from a laid-out cell. Null when nothing is laid out yet. */
+    fun cellWidthDp(): Int? {
+        val view = grid.layoutManager?.findViewByPosition(0) ?: return null
+        return (view.width / resources.displayMetrics.density).toInt().takeIf { it > 0 }
+    }
+
+    /** One cell's height in dp. See [cellWidthDp]. */
+    fun cellHeightDp(): Int? {
+        val view = grid.layoutManager?.findViewByPosition(0) ?: return null
+        return (view.height / resources.displayMetrics.density).toInt().takeIf { it > 0 }
+    }
+
+    /** Rebuilds the widgets on this page. Called when a placement finishes elsewhere. */
+    fun refreshWidgets() {
+        widgetLayer.refresh()
     }
 
     // ── Delete Zone ──────────────────────────────────────────────────────────
@@ -185,6 +283,10 @@ class DesktopGridPage(
                 // Serialized DesktopItem dragged from the desktop itself or from folder popup
                 val item = DesktopItem.deserialize(payload) ?: return
                 when (item) {
+                    // A widget is not moved between pages by this path: its host view lives in the
+                    // overlay and its id belongs to the page that allocated it, so it is removed
+                    // through DesktopWidgetLayer instead, which also releases the id.
+                    is DesktopItem.Widget, is DesktopItem.Occupied -> Unit
                     is DesktopItem.App -> adapter.removeByComponentName(item.component)
                     is DesktopItem.FileRef -> adapter.removeByFilePath(item.absolutePath)
                     is DesktopItem.DirectoryRef -> adapter.removeByFilePath(item.absolutePath)
@@ -232,6 +334,9 @@ class DesktopGridPage(
 
         val id = java.util.UUID.randomUUID().toString().substring(0, 4)
         val name = when (item) {
+            // A widget cannot be put inside a folder -- it is a live view bound to a set of cells,
+            // not a shortcut -- and a covered cell is not an item at all. Neither has a filename.
+            is DesktopItem.Widget, is DesktopItem.Occupied -> return
             is DesktopItem.App -> "app_${item.component.packageName}_$id.link"
             is DesktopItem.FileRef -> "file_$id.link"
             is DesktopItem.DirectoryRef -> "dir_$id.link"
@@ -277,7 +382,9 @@ class DesktopGridPage(
 
     private fun applyDropMatrix(dragged: DesktopItem, target: DesktopItem, srcPos: Int, dstPos: Int) {
         when (dragged) {
+            is DesktopItem.Widget, is DesktopItem.Occupied -> Unit  // widgets are not folder members; covered cells are not targets
             is DesktopItem.App -> when (target) {
+                is DesktopItem.Widget, is DesktopItem.Occupied -> Unit  // widgets are not folder members; covered cells are not targets
                 is DesktopItem.App, is DesktopItem.FileRef, is DesktopItem.NetworkedFolder -> {
                     val f = combineIntoFolder(dragged, target)
                     adapter.placeAt(dstPos, f)
@@ -314,6 +421,7 @@ class DesktopGridPage(
             }
 
             is DesktopItem.DirectoryRef -> when (target) {
+                is DesktopItem.Widget, is DesktopItem.Occupied -> Unit  // widgets are not folder members; covered cells are not targets
                 is DesktopItem.App, is DesktopItem.FileRef, is DesktopItem.NetworkedFolder -> {
                     val f = combineIntoFolder(dragged, target)
                     adapter.placeAt(dstPos, f)
@@ -331,6 +439,7 @@ class DesktopGridPage(
             }
 
             is DesktopItem.FileRef -> when (target) {
+                is DesktopItem.Widget, is DesktopItem.Occupied -> Unit  // widgets are not folder members; covered cells are not targets
                 is DesktopItem.App, is DesktopItem.FileRef, is DesktopItem.NetworkedFolder -> {
                     val f = combineIntoFolder(dragged, target)
                     adapter.placeAt(dstPos, f)

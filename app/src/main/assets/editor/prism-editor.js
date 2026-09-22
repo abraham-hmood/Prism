@@ -388,6 +388,13 @@
         handleHostCall(hostRef, msg);
         break;
 
+      // A memento write. Fire-and-forget on purpose: the VS Code API's `update` resolves as soon
+      // as the value is set, and an extension that awaited a round trip to disk on every setting
+      // would stall on a phone's storage.
+      case 'save-state':
+        notify('extension-state', { scope: msg.scope, state: JSON.stringify(msg.state || {}) });
+        break;
+
       case 'error':
         notify('host-error', { message: msg.message });
         break;
@@ -461,15 +468,38 @@
      * for a web extension. A Node extension is not handed its source here -- Node reads its own
      * files, which is the point of using Node -- so only the entry path travels.
      */
-    activateExtension: function (id, path, source, runtime) {
+    /**
+     * @param extra JSON from Kotlin: storage directories, saved state, and the manifest.
+     *
+     * Passed as one string rather than six arguments because it is all optional context for the
+     * ExtensionContext, and a bridge signature that grows a parameter every time an extension needs
+     * another field is a bridge nobody can change safely.
+     */
+    activateExtension: function (id, path, source, runtime, extra) {
+      var context = {};
+      if (extra) { try { context = JSON.parse(extra) || {}; } catch (e) { context = {}; } }
+
+      var message = {
+        type: 'activate',
+        id: id,
+        path: path,
+        storage: context.storage,
+        globalStorage: context.globalStorage,
+        logs: context.logs,
+        state: context.state,
+        manifest: context.manifest
+      };
+
       if (runtime === 'node') {
         if (!startNodeHost()) return false;
-        nodeHost.post({ type: 'activate', id: id, path: path, entry: source });
+        message.entry = source;
+        nodeHost.post(message);
         return true;
       }
       startHost();
       if (!workerHost) return false;
-      workerHost.post({ type: 'activate', id: id, path: path, source: source });
+      message.source = source;
+      workerHost.post(message);
       return true;
     },
 

@@ -21,15 +21,23 @@ import java.util.zip.ZipInputStream
  *
  * ## Which host an extension gets, and why that is decided here
  *
- * An extension's manifest says what it was built for. `browser` means it runs in the Web Worker
- * host -- no Node, no filesystem. `main` means it needs Node, and Prism has one: [NodeRuntime], a
- * real Node.js in the app's own process. Both are installable, and the manifest alone decides which
- * host loads it. An extension with neither is declarative -- a theme, a grammar, a snippet set --
- * and contributes through its manifest with nothing to run.
+ * An extension's manifest says what it was built for. `browser` means it can run in the Web Worker
+ * host -- no Node, no filesystem, no child processes. `main` is the desktop build, and it needs a
+ * real Node: [NodeRuntime], which Prism runs inside a PRoot guest.
  *
- * The one case still refused is a `main`-only extension on a device with no Node runtime (an ABI
- * the library was not built for). Refusing at install time with that reason is far better than
- * letting someone install it, enable it, and find it silently dead.
+ * When Node is installed, `main` WINS over `browser` for an extension that ships both. That is the
+ * opposite of what this used to do, and the reversal is the point of having a real Node at all: a
+ * `browser` build is the author's deliberately reduced version, missing whatever needed a
+ * filesystem or a subprocess. Preferring it when the full build can actually run would be choosing
+ * the cut-down extension on purpose. Without Node installed, `browser` is still the answer, because
+ * a reduced extension beats a dead one.
+ *
+ * An extension with neither entry point is declarative -- a theme, a grammar, a snippet set -- and
+ * contributes through its manifest with nothing to run.
+ *
+ * Nothing is refused at install time any more. A `main`-only extension installs on a device with no
+ * Node runtime and sits there inert with an offer to install one, which is a far better outcome
+ * than a download that fails with an explanation about ABIs.
  */
 object ExtensionStore {
 
@@ -86,20 +94,32 @@ object ExtensionStore {
         /** The Node entry point from the manifest's `main` field. */
         val nodeEntry: String?,
         val enabled: Boolean,
+        /**
+         * Whether a Node runtime is on this device.
+         *
+         * Carried as a field rather than asked for on demand because [runtime] is a property and
+         * has no Context to ask with. It is filled in once by [installed], so every extension in a
+         * listing agrees about it -- which matters, since a list where some rows had checked and
+         * others had not would be a genuinely confusing thing to debug.
+         */
+        val nodeReady: Boolean = false,
     ) {
         /**
          * Which host should load this, or null when there is nothing to load.
          *
-         * `browser` wins when an extension declares both, which many do: the Worker is the cheaper
-         * host and the browser build is the one its author tested against a host like this one.
+         * Node first when it is available: `main` is the full build and `browser` is the author's
+         * reduced one. See the class comment for why that order is deliberate.
          */
         val runtime: String? get() = when {
+            nodeEntry != null && nodeReady -> RUNTIME_NODE
             browserEntry != null -> RUNTIME_WORKER
-            nodeEntry != null && NodeRuntime.isAvailable -> RUNTIME_NODE
             else -> null
         }
 
         val isRunnable: Boolean get() = runtime != null
+
+        /** True when this would run better with Node than it does now. Drives the offer to install. */
+        val wantsNode: Boolean get() = nodeEntry != null && !nodeReady
     }
 
     const val RUNTIME_WORKER = "worker"
@@ -238,11 +258,9 @@ object ExtensionStore {
             val browser = json.optString("browser").takeIf { it.isNotBlank() }
             val main = json.optString("main").takeIf { it.isNotBlank() }
 
-            if (browser == null && main != null && !NodeRuntime.isAvailable) {
-                target.deleteRecursively()
-                return "${listing.displayName} needs Node.js to run, and this build of Prism has " +
-                    "no Node runtime for this device. Look for an extension that lists web support."
-            }
+            // A main-only extension used to be refused here when there was no Node. It is not any
+            // more: the runtime is a download away, so refusing the install would be refusing
+            // something the user can fix in a minute. It installs, and the editor offers Node.
 
             if (browser == null && main == null) {
                 // No entry point at all is normal for themes and grammars -- they are pure data,
@@ -254,7 +272,7 @@ object ExtensionStore {
             }
 
             onProgress(100, "Installed")
-            val host = if (browser != null) "worker" else "node"
+            val host = if (main != null && NodeRuntime.isInstalled(context)) "node" else "worker"
             PrismLogger.logSuccess(TAG, "Installed ${listing.id} (${browser ?: main}, $host host)")
             null
         } catch (t: Throwable) {
@@ -273,6 +291,9 @@ object ExtensionStore {
     fun installed(context: Context): List<Installed> {
         val dir = root(context)
         if (!dir.isDirectory) return emptyList()
+        // Asked once for the whole listing rather than per extension: it touches the filesystem,
+        // and an answer that changed halfway down the list would be worse than either answer.
+        val nodeReady = NodeRuntime.isInstalled(context)
         return dir.listFiles().orEmpty().filter { it.isDirectory }.mapNotNull { folder ->
             val manifest = File(folder, "package.json")
             if (!manifest.isFile) return@mapNotNull null
@@ -286,6 +307,7 @@ object ExtensionStore {
                     browserEntry = json.optString("browser").takeIf { it.isNotBlank() },
                     nodeEntry = json.optString("main").takeIf { it.isNotBlank() },
                     enabled = !File(folder, ".prism-disabled").isFile,
+                    nodeReady = nodeReady,
                 )
             }.getOrNull()
         }.sortedBy { it.displayName.lowercase() }

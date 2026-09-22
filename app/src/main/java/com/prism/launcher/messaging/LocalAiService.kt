@@ -104,37 +104,47 @@ object LocalAiService {
         val modelFile = java.io.File(modelPath)
         if (!modelFile.exists()) return "File not found: $modelPath"
 
-        // 1. Signature Guard: Magic Bytes
-        // MediaPipe .task files ARE ZIP archives (starting with PK\03\04)
-        // Raw TFLite files start with TFL3.
-        try {
-            val raf = java.io.RandomAccessFile(modelFile, "r")
-            val head = ByteArray(4)
-            val bytesRead = raf.read(head)
-            raf.close()
+        // 1. What the file actually is, read from its bytes.
+        //
+        // This used to demand a ZIP magic at offset zero and describe anything else as the wrong
+        // format for MediaPipe. Two things were wrong with that. A corrupt download -- a GGUF whose
+        // first megabytes arrived as zeroes -- was reported as a format mismatch, sending the user
+        // to look for a different model instead of downloading this one again. And a `.task` bundle
+        // with a few bytes in front of its ZIP header was refused outright, even though ZIP readers
+        // locate the central directory from the end of the file and handle a prefix by design.
+        //
+        // ModelFormat answers both questions honestly; the engine gets to decide the marginal case.
+        val detection = com.prism.launcher.messaging.ModelFormat.detect(modelFile)
 
-            // An empty/truncated file (0-3 readable header bytes) is a corrupt import, not a
-            // format mismatch — the download/copy step failed to write real content. Diagnose
-            // that honestly instead of blaming "wrong format" (a zero-filled buffer would
-            // otherwise misreport as Hex: 00000000, "Unknown/Binary").
-            if (bytesRead < 4) {
-                PrismLogger.logError("LocalAiService", "Corrupt import: only read $bytesRead of 4 header bytes from $modelPath (file size ${modelFile.length()} bytes)")
-                return "Model file is empty or corrupted (could only read $bytesRead of 4 header bytes). Please delete it in the Models page and re-download or re-import it."
-            }
-
-            val hex = head.joinToString("") { String.format("%02X", it) }
-
-            // ZIP Magic: 50 4B 03 04
-            if (hex != "504B0304") {
-                val type = when (hex) {
-                    "54464C33" -> "Raw TFLite File (TFL3)"
-                    else -> "Unknown/Binary (Hex: $hex)"
+        when (detection.kind) {
+            com.prism.launcher.messaging.ModelFormat.Kind.TASK_ZIP -> {
+                if (detection.offset > 0) {
+                    PrismLogger.logWarning(
+                        "LocalAiService",
+                        "${modelFile.name} has ${detection.offset} byte(s) before its ZIP header; " +
+                            "letting MediaPipe try it anyway",
+                    )
                 }
-                PrismLogger.logError("LocalAiService", "Format Mismatch: File is not a ZIP/Task bundle. Type detected: $type")
-                return "Incompatible Model Format: This file is a $type, but MediaPipe Android requires a wrapped '.task' ZIP bundle. Please ensure you are using a model exported specifically for the MediaPipe Android LLM Inference API."
             }
-        } catch (e: Exception) {
-            return "Read Error: Unable to verify model header: ${e.message}"
+
+            com.prism.launcher.messaging.ModelFormat.Kind.GGUF -> {
+                // Should have been routed to llama.cpp long before here; if it reaches this point
+                // the routing is wrong, and saying so is more useful than a format complaint.
+                PrismLogger.logError(
+                    "LocalAiService", "A GGUF model reached the MediaPipe path: $modelPath",
+                )
+                return "Internal routing error: ${modelFile.name} is a GGUF model and should run " +
+                    "on llama.cpp, not MediaPipe. Please report this."
+            }
+
+            else -> {
+                PrismLogger.logError(
+                    "LocalAiService",
+                    "Unusable model ${modelFile.name}: ${detection.kind} " +
+                        "(header ${detection.headerHex}, ${detection.leadingZeroes} leading zero bytes)",
+                )
+                return detection.explain(modelFile)
+            }
         }
 
         // 2. Hardware/RAM Guard
@@ -143,16 +153,17 @@ object LocalAiService {
         activityManager.getMemoryInfo(memInfo)
         
         val availableRamGb = memInfo.availMem / (1024.0 * 1024.0 * 1024.0)
-        
-        val thresholdGb = when {
-            modelPath.lowercase().contains("gemma") -> 1.2
-            modelPath.lowercase().contains("phi") -> 1.2
-            modelPath.lowercase().contains("qwen") -> 1.0
-            else -> 0.8
-        }
-        
+
+        // Sized from the file, not from its name. The old threshold was a lookup on the filename --
+        // 1.2 GB if it contained "gemma", 0.8 GB otherwise -- which let a 4 GB bundle through on a
+        // phone with 1 GB free and refused a 300 MB one on a phone with 900 MB.
+        val thresholdGb = com.prism.launcher.messaging.GgufInferenceService
+            .requiredBytes(modelPath) / (1024.0 * 1024.0 * 1024.0)
+
         if (availableRamGb < thresholdGb) {
-            return "Insufficient RAM: Your device only has ${String.format("%.2f", availableRamGb)}GB free. This model requires ~${thresholdGb}GB free to initialize safely."
+            return "Insufficient RAM: ${modelFile.name} needs about ${String.format("%.2f", thresholdGb)}GB " +
+                "to load and only ${String.format("%.2f", availableRamGb)}GB is free. Close some apps " +
+                "and try again, or pick a smaller quantisation."
         }
 
         return null
@@ -222,11 +233,25 @@ object LocalAiService {
 
             session.addQueryChunk(userText)
             val accumulator = StringBuilder()
+            // COUNTED INCREMENTALLY, one chunk at a time.
+            //
+            // This used to be `session.sizeInTokens(accumulator.toString())` on every callback:
+            // a full copy of the reply so far, handed to the tokenizer across JNI, for every
+            // token. Quadratic in the length of the answer, and the tokenizer is not cheap -- a
+            // long reply spent most of its time re-counting text it had already counted, which
+            // looked exactly like the model being slow.
+            //
+            // Summing each chunk's own count can drift by a token or two where a chunk boundary
+            // splits a token, which does not matter: this is a stop threshold, not a ledger.
+            var tokensSoFar = 0
             val listener = ProgressListener<String> { partial: String, _: Boolean ->
                 accumulator.append(partial)
                 onToken(partial)
-                if (maxTokens > 0 && session.sizeInTokens(accumulator.toString()) >= maxTokens) {
-                    session.cancelGenerateResponseAsync()
+                if (maxTokens > 0) {
+                    tokensSoFar += runCatching { session.sizeInTokens(partial) }.getOrDefault(1)
+                    if (tokensSoFar >= maxTokens) {
+                        session.cancelGenerateResponseAsync()
+                    }
                 }
             }
             val future = session.generateResponseAsync(listener)

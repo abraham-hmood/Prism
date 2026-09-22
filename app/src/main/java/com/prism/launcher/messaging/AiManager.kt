@@ -76,7 +76,21 @@ object AiManager {
      * anything thread-local would be read on a different thread than it was set on and silently
      * fail to apply. Passing it makes the one caller that needs it say so.
      */
-    suspend fun getResponse(context: Context, userText: String, imageUri: Uri? = null, onToken: ((String) -> Unit)? = null, onReasoning: ((String) -> Unit)? = null, history: List<String> = emptyList(), allowOffload: Boolean = true): Pair<String, Pair<String?, String?>> = withContext(Dispatchers.IO) {
+    /**
+     * [plainText] is for callers that need a TEXT COMPLETION and nothing else.
+     *
+     * The default path is Sam's: it may notice a request for a picture and draw one, or hand the
+     * whole turn to the agentic tool loop, or -- in Cloud mode -- route anything containing the
+     * word "video" to a video generator. Every one of those is right for a chat window and wrong
+     * for a caller that has composed a prompt and expects a string back.
+     *
+     * The language tutor is the caller this exists for. A lesson about films puts "video" in the
+     * prompt; a learner whose interests include art makes an image request appear out of nowhere;
+     * agentic tools turn a tutor into an agent with a shell. With this set, the only thing that
+     * decides where the prompt goes is the user's Local / Cloud / Ollama choice -- so the feature
+     * works identically on all three, which is the entire point.
+     */
+    suspend fun getResponse(context: Context, userText: String, imageUri: Uri? = null, onToken: ((String) -> Unit)? = null, onReasoning: ((String) -> Unit)? = null, history: List<String> = emptyList(), allowOffload: Boolean = true, plainText: Boolean = false): Pair<String, Pair<String?, String?>> = withContext(Dispatchers.IO) {
         val streaming = onToken != null && PrismSettings.getStreamingEnabled()
         val maxTokens = PrismSettings.getMaxTokens()
         val mode = PrismSettings.getAiMode()
@@ -95,7 +109,7 @@ object AiManager {
         // real tools and re-invoking the model until it reaches a plain answer. Not supported
         // together with an image attachment in v1 (multimodal + tool-calling in one turn adds a
         // lot of per-backend complexity for a combination that's rarely needed together).
-        if (PrismSettings.getAgenticToolsEnabled() && imageUri == null) {
+        if (!plainText && PrismSettings.getAgenticToolsEnabled() && imageUri == null) {
             return@withContext com.prism.launcher.agentic.AgenticEngine.run(userText, onToken, onReasoning)
         }
 
@@ -110,7 +124,7 @@ object AiManager {
         // Gated on hasImageGenerator() so that with no generator loaded this falls through to a
         // normal text reply, rather than returning a broken "here's your image" with nothing
         // attached.
-        if (PrismSettings.hasImageGenerator()) {
+        if (!plainText && PrismSettings.hasImageGenerator()) {
             val imagePrompt = ImageGenManager.parseImageRequest(userText)
             if (imagePrompt != null) {
                 val uri = ImageGenManager.generateImage(context, imagePrompt)
@@ -130,7 +144,7 @@ object AiManager {
         }
 
         if (mode == PrismSettings.AI_MODE_CLOUD) {
-            if (userText.contains("video", ignoreCase = true)) {
+            if (!plainText && userText.contains("video", ignoreCase = true)) {
                 return@withContext CloudAiService.generateResponse(userText)
             }
 

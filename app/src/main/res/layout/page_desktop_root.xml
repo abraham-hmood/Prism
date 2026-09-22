@@ -23,15 +23,31 @@
 
     </FrameLayout>
 
-    <androidx.recyclerview.widget.RecyclerView
-        android:id="@+id/desktopGrid"
+    <!-- The icon grid and the widget layer occupy the same space.
+
+         Widgets are drawn on top rather than inside because a GridLayoutManager can span columns but
+         not rows, so a 2x2 widget cannot be a grid item at all. The grid still owns which cells are
+         taken — see DesktopWidgetLayer for why that split rather than a custom cell layout. -->
+    <FrameLayout
         android:layout_width="match_parent"
         android:layout_height="0dp"
-        android:layout_weight="1"
-        android:clipToPadding="false"
-        android:paddingHorizontal="12dp"
-        android:paddingTop="4dp"
-        android:paddingBottom="8dp" />
+        android:layout_weight="1">
+
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/desktopGrid"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:clipToPadding="false"
+            android:paddingHorizontal="12dp"
+            android:paddingTop="4dp"
+            android:paddingBottom="8dp" />
+
+        <FrameLayout
+            android:id="@+id/widgetLayerHost"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:clipChildren="false" />
+    </FrameLayout>
 
     <LinearLayout
         android:id="@+id/hotseatContainer"

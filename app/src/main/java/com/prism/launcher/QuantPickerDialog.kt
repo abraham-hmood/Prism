@@ -85,6 +85,7 @@ object QuantPickerDialog {
 
         val stopping = AtomicBoolean(false)
         var worker: Thread? = null
+        var previousWorker: Thread? = null
         var partial: File? = null
 
         fun setButton(label: String, action: () -> Unit) {
@@ -116,8 +117,37 @@ object QuantPickerDialog {
             setButton("Stop") { stop() }
 
             val target = File(modelsDir(activity), quant.fileName)
-            val part = File(target.absolutePath + ".part")
+
+            // A UNIQUE scratch file per attempt, not a fixed `.part`.
+            //
+            // Two downloads of the same model used to share one path, and that is how a model ended
+            // up with a hole in it: the second attempt opens the file with truncation while the
+            // first thread is still writing, the first thread's descriptor keeps its own offset, and
+            // its next write lands far past the new end -- leaving megabytes of zeroes where the
+            // header should be and real tensor data after them. Exactly the corruption seen on the
+            // Falcon download, which reported "wrong format" because its GGUF magic was never
+            // written. Two attempts can now never touch the same bytes.
+            val part = File(target.absolutePath + ".part-" + System.nanoTime())
             partial = part
+
+            // Anything left by an attempt that died without cleaning up. Harmless to keep, but they
+            // are hundreds of megabytes each.
+            runCatching {
+                target.parentFile?.listFiles { file ->
+                    file.name.startsWith(target.name + ".part")
+                }?.forEach { stale -> if (stale != part) stale.delete() }
+            }
+
+            // One at a time. Starting a second download while the first is alive is what made two
+            // writers possible in the first place; the unique name above makes it harmless, and
+            // this makes it not happen.
+            previousWorker?.let { running ->
+                if (running.isAlive) {
+                    PrismLogger.logWarning("Models", "A download was already running; stopping it first")
+                    running.interrupt()
+                    runCatching { running.join(2_000) }
+                }
+            }
 
             worker = Thread({
                 var lastPercent = -1
@@ -127,10 +157,20 @@ object QuantPickerDialog {
                         if (!response.isSuccessful) error("HTTP ${response.code}")
                         val body = response.body ?: error("empty response")
                         val total = body.contentLength().takeIf { it > 0 } ?: quant.sizeBytes
+
+                        // Logged so a file that arrives wrong can be traced to what was served,
+                        // rather than only to the fact that it is wrong.
+                        PrismLogger.logInfo(
+                            "Models",
+                            "GET ${quant.downloadUrl} -> ${response.code}, " +
+                                "length=$total, type=${response.header("Content-Type")}, " +
+                                "encoding=${response.header("Content-Encoding")}",
+                        )
                         part.parentFile?.mkdirs()
 
                         body.byteStream().use { input ->
-                            part.outputStream().use { output ->
+                            java.io.FileOutputStream(part).use { fos ->
+                            val output = java.io.BufferedOutputStream(fos)
                                 val buffer = ByteArray(64 * 1024)
                                 var written = 0L
                                 while (true) {
@@ -160,10 +200,33 @@ object QuantPickerDialog {
                                     }
                                 }
                                 output.flush()
+                                // FLUSHED TO THE DEVICE, not just out of the Java buffer.
+                                //
+                                // flush() empties BufferedOutputStream into the kernel and stops
+                                // there; the rename below then publishes a file whose contents may
+                                // still be in page cache. A process killed in that window leaves a
+                                // file of the right length with holes in it -- which is exactly the
+                                // shape of the corruption seen here: megabytes of leading zeroes in
+                                // a file that otherwise looked complete.
+                                fos.fd.sync()
                             }
                         }
                     }
                     if (stopping.get()) error("stopped")
+
+                    // Checked before it is published under its real name. A download that arrived
+                    // damaged should not become the active model and fail on the first message.
+                    val detection = com.prism.launcher.messaging.ModelFormat.detect(part)
+                    if (!detection.isUsable) {
+                        PrismLogger.logError(
+                            "Models",
+                            "${quant.fileName} arrived unusable: ${detection.kind}, " +
+                                "header=${detection.headerHex}, blank=${detection.leadingZeroes}, " +
+                                "size=${part.length()} of expected ${quant.sizeBytes}",
+                        )
+                    }
+                    check(detection.isUsable) { detection.explain(part) }
+
                     if (target.exists()) target.delete()
                     check(part.renameTo(target)) { "could not finalise ${target.name}" }
                     true
@@ -189,7 +252,10 @@ object QuantPickerDialog {
                         dialog.dismiss()
                     }
                 }
-            }, "quant-download").also { it.start() }
+            }, "quant-download").also {
+                previousWorker = it
+                it.start()
+            }
         }
 
         // ── Populate the list ──────────────────────────────────────────────

@@ -7,6 +7,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Environment
 import android.widget.Toast
+import com.prism.launcher.PrismLogger
 import com.prism.launcher.PrismSettings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -170,26 +171,59 @@ object ModelDownloadManager {
      */
     private suspend fun registerImportedModel(
         context: Context, targetFile: File, fileName: String, isImageModel: Boolean,
+        modelType: String = if (isImageModel) PrismSettings.MODEL_TYPE_IMAGE else PrismSettings.MODEL_TYPE_TEXT,
         onStage: ((String) -> Unit)? = null
     ) {
-        if (isImageModel) {
-            PrismSettings.setLocalImageModelPath(targetFile.absolutePath)
-        } else {
-            PrismSettings.setLocalAiModelPath(targetFile.absolutePath)
-            AiManager.onLocalTextModelActivated(context, targetFile.absolutePath)
+        // VERIFIED BEFORE IT IS REGISTERED.
+        //
+        // A model that arrived broken used to be registered, activated, and only complained about
+        // on the first message the user sent -- by which point the failure looked like a problem
+        // with the model rather than with its download. Text models are checked here because they
+        // are the ones with a magic to check; an audio or image model is left alone.
+        if (modelType == PrismSettings.MODEL_TYPE_TEXT) {
+            val detection = ModelFormat.detect(targetFile)
+            if (!detection.isUsable) {
+                PrismLogger.logError(
+                    "ModelDownload",
+                    "Refusing ${targetFile.name}: ${detection.kind} " +
+                        "(header ${detection.headerHex}, ${detection.leadingZeroes} leading zeroes)",
+                )
+                targetFile.delete()
+                toastOnMain(context, detection.explain(targetFile), Toast.LENGTH_LONG)
+                return
+            }
         }
+
+        when (modelType) {
+            PrismSettings.MODEL_TYPE_IMAGE -> PrismSettings.setLocalImageModelPath(targetFile.absolutePath)
+            PrismSettings.MODEL_TYPE_AUDIO -> {
+                PrismSettings.setLocalAudioModelPath(targetFile.absolutePath)
+                // The speaker caches whichever engine the settings asked for, and the settings just
+                // changed. Without this the next thing spoken would still come from the old engine.
+                com.prism.launcher.speech.PrismSpeaker.invalidate()
+            }
+            else -> {
+                PrismSettings.setLocalAiModelPath(targetFile.absolutePath)
+                AiManager.onLocalTextModelActivated(context, targetFile.absolutePath)
+            }
+        }
+
         PrismSettings.addImportedModel(PrismSettings.ImportedModel(
                 path = targetFile.absolutePath,
                 displayName = fileName,
-                type = if (isImageModel) PrismSettings.MODEL_TYPE_IMAGE else PrismSettings.MODEL_TYPE_TEXT
+                type = modelType
             ))
 
         val loadError = try {
-            if (isImageModel) {
-                LocalImageService.preload(context, targetFile.absolutePath, onStage)
-                null
-            } else {
-                GgufInferenceService.preload(targetFile.absolutePath, onStage)
+            when (modelType) {
+                PrismSettings.MODEL_TYPE_IMAGE -> {
+                    LocalImageService.preload(context, targetFile.absolutePath, onStage)
+                    null
+                }
+                // Nothing to warm up: whether this file can be driven at all is a question about
+                // its format, and ImportedAudioEngine answers it when something asks to speak.
+                PrismSettings.MODEL_TYPE_AUDIO -> null
+                else -> GgufInferenceService.preload(targetFile.absolutePath, onStage)
             }
         } catch (e: Exception) {
             e.message ?: "Unknown error"
@@ -212,6 +246,7 @@ object ModelDownloadManager {
      * progress dialog (`SettingsActivity`'s model picker) needs. */
     fun copyUriToInternal(
         context: Context, uri: Uri, fileName: String, isImageModel: Boolean,
+        modelType: String = if (isImageModel) PrismSettings.MODEL_TYPE_IMAGE else PrismSettings.MODEL_TYPE_TEXT,
         onProgress: ((copiedBytes: Long, totalBytes: Long) -> Unit)? = null,
         onStage: ((String) -> Unit)? = null,
         onDone: (success: Boolean, errorMessage: String?) -> Unit
@@ -244,7 +279,7 @@ object ModelDownloadManager {
             }
 
             if (errorMessage == null) {
-                registerImportedModel(context, targetFile, fileName, isImageModel, onStage)
+                registerImportedModel(context, targetFile, fileName, isImageModel, modelType, onStage)
             } else {
                 targetFile.delete()
             }

@@ -44,6 +44,9 @@ class NoraSettingsActivity : PrismBaseActivity() {
     private val sizeFields = ArrayList<Pair<EditText, () -> Long>>()
     private lateinit var costLine: TextView
 
+    /** The row showing which Kokoro voice Nora speaks in. See [buildVoiceSection]. */
+    private lateinit var voiceRow: TextView
+
     private lateinit var ramSlider: android.widget.SeekBar
     private lateinit var ramLabel: TextView
     private var sliderMinBytes = 0L
@@ -129,6 +132,7 @@ class NoraSettingsActivity : PrismBaseActivity() {
 
         buildSizeSection()
         buildRegionSection()
+        buildVoiceSection()
         buildTrainingSection()
         buildPerformanceSection()
         buildTuningSection()
@@ -402,11 +406,81 @@ class NoraSettingsActivity : PrismBaseActivity() {
      * Disabled rather than hidden, and the whole row rather than just the field, so a disabled
      * parameter reads as "not in effect" instead of "broken".
      */
+    private fun spacer(): View = View(this).apply {
+        layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, IosUi.dp(this@NoraSettingsActivity, 18f),
+        )
+    }
+
     private fun refreshGates() {
         for ((view, gate) in gatedRows) setRowEnabled(view, gate())
         if (::swapContainer.isInitialized) {
             setRowEnabled(swapContainer, NoraPerformance.swapEnabled)
         }
+    }
+
+
+    // -- Voice ---------------------------------------------------------------
+
+    /**
+     * Which of Kokoro's 54 voices Nora speaks in on a call.
+     *
+     * Here rather than in Intelligence & Messaging because Nora is not Sam: a call to one that
+     * sounded like a call to the other would make having two of them pointless. The row is greyed
+     * out when the user has imported a speech model of their own, for the same reason the whole
+     * Kokoro group is -- the setting belongs to an engine that is not running.
+     */
+    private fun buildVoiceSection() {
+        content.addView(IosUi.sectionHeader(this, "VOICE"))
+        val card = IosUi.card(this)
+
+        val usingKokoro = PrismSettings.isUsingKokoro()
+
+        voiceRow = TextView(this).apply {
+            textSize = 16f
+            val h = IosUi.dp(this@NoraSettingsActivity, 16f)
+            val v = IosUi.dp(this@NoraSettingsActivity, 14f)
+            setPadding(h, v, h, v)
+            isClickable = usingKokoro
+            isEnabled = usingKokoro
+            setTextColor(
+                if (usingKokoro) IosUi.label(this@NoraSettingsActivity) else IosUi.tertiaryLabel(this@NoraSettingsActivity)
+            )
+            setOnClickListener {
+                com.prism.launcher.speech.KokoroVoicePicker.show(
+                    this@NoraSettingsActivity, PrismSettings.VOICE_SPEAKER_NORA,
+                ) { paintVoiceRow() }
+            }
+        }
+        card.addView(voiceRow)
+        content.addView(card)
+        content.addView(
+            IosUi.sectionFooter(
+                this,
+                if (usingKokoro)
+                    "Used when you call Nora from the Messages page."
+                else
+                    "Unavailable while your own speech model is active.",
+            )
+        )
+        content.addView(spacer())
+        paintVoiceRow()
+    }
+
+    private fun paintVoiceRow() {
+        val summary = com.prism.launcher.speech.KokoroVoicePicker.summaryFor(
+            this, PrismSettings.VOICE_SPEAKER_NORA,
+        )
+        val text = android.text.SpannableStringBuilder("Voice" + System.lineSeparator()).append(summary)
+        text.setSpan(
+            android.text.style.ForegroundColorSpan(IosUi.secondaryLabel(this)),
+            6, text.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+        )
+        text.setSpan(
+            android.text.style.RelativeSizeSpan(0.82f),
+            6, text.length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+        )
+        voiceRow.text = text
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()

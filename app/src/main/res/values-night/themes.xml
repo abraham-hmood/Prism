@@ -20,6 +20,10 @@
         <item name="prismOverlay">#E6000000</item>
         <item name="prismAccent">#7C9EFF</item>
         <item name="prismCardColor">#2C2C36</item>
+        <item name="alertDialogTheme">@style/Theme.Prism.Dialog</item>
+        <item name="materialAlertDialogTheme">@style/Theme.Prism.Dialog</item>
+        <item name="android:popupMenuStyle">@style/Prism.PopupMenu</item>
+        <item name="popupMenuStyle">@style/Prism.PopupMenu</item>
     </style>
 
     <style name="Theme.PrismSettings" parent="Theme.Material3.DayNight.NoActionBar">
@@ -38,5 +42,9 @@
         <item name="prismOverlay">#E6000000</item>
         <item name="prismAccent">#7C9EFF</item>
         <item name="prismCardColor">#2C2C36</item>
+        <item name="alertDialogTheme">@style/Theme.Prism.Dialog</item>
+        <item name="materialAlertDialogTheme">@style/Theme.Prism.Dialog</item>
+        <item name="android:popupMenuStyle">@style/Prism.PopupMenu</item>
+        <item name="popupMenuStyle">@style/Prism.PopupMenu</item>
     </style>
 </resources>

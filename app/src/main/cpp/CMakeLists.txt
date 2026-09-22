@@ -95,6 +95,53 @@ if (ANDROID_ABI STREQUAL "arm64-v8a")
     # negotiation that decides which peers take part (see MeshComputeRegistry).
     set(GGML_RPC ON CACHE BOOL "" FORCE)
 
+    # ── CPU feature dispatch, which is worth more than every other option here combined ─────────
+    #
+    # MEASURED on a Galaxy S22 (Snapdragon 8 Gen 1) with DeepSeek-R1-Distill-Qwen-1.5B Q4_K_M,
+    # prompt processing and token generation, tokens/sec:
+    #
+    #     baseline ARMv8 (what this build produced before)   12.7 pp    7.4 tg
+    #     +dotprod +fp16                                     52.3 pp   15.9 tg
+    #
+    # Four times the prompt speed and better than twice the generation speed, from nothing but
+    # telling the compiler which instructions the CPU has.
+    #
+    # WHY IT WAS SLOW. ggml-cpu picks its ARM architecture flags in ggml/src/ggml-cpu/CMakeLists.txt.
+    # GGML_NATIVE is off for a cross-compile -- correctly, since -mcpu=native would describe this
+    # build machine -- and with neither GGML_CPU_ARM_ARCH nor GGML_CPU_ALL_VARIANTS set, that leaves
+    # ARCH_FLAGS empty. Empty means baseline ARMv8-A: no SDOT, no SMMLA, no fp16 arithmetic. The
+    # Q4_K_M kernels then take their generic NEON path, and `llvm-objdump -d libggml-cpu.so | grep
+    # sdot` found exactly zero dot-product instructions in the shipped library. cmake said so too:
+    # "Performing Test HAVE_DOTPROD - Failed".
+    #
+    # WHY NOT JUST HARDCODE THE FLAGS. Because -march=armv8.2-a+dotprod compiles SDOT into the
+    # binary unconditionally, and dotprod is OPTIONAL in ARMv8.2: Snapdragon 845 and the whole
+    # Cortex-A75/A55 generation do not have it. Those phones would take SIGILL on the first matmul.
+    # Prism's minSdk is 26, so they are in range, and "fast on a 2022 phone, crashes on a 2018 one"
+    # is not a trade worth making.
+    #
+    # SO: DISPATCH AT RUNTIME. GGML_CPU_ALL_VARIANTS builds one ggml-cpu per feature set -- upstream
+    # ships an Android-specific ladder, from android_armv8.0_1 up to android_armv9.2_2 -- and each
+    # one carries a ggml_backend_score() that reads the CPU's own HWCAP bits through getauxval and
+    # returns zero if this machine cannot run it (ggml-cpu/arch/arm/cpu-feats.cpp). At startup ggml
+    # dlopens each and keeps the highest scorer. Every phone gets the best kernels it can execute and
+    # no phone gets an instruction it lacks.
+    #
+    # Two consequences to know about:
+    #
+    #   - GGML_BACKEND_DL requires BUILD_SHARED_LIBS, so ggml and llama become shared libraries and
+    #     each CPU variant is its own lib*.so in the APK. That is a few megabytes per variant; see
+    #     the variant list trimming below.
+    #   - The backends are found by scanning a DIRECTORY, and ggml's default guesses (the executable's
+    #     directory, the working directory) are both wrong inside an Android app -- argv[0] is
+    #     /system/bin/app_process64. gguf_bridge.cpp therefore calls
+    #     ggml_backend_load_all_from_path(nativeLibraryDir) before touching a backend, and
+    #     GgufInferenceService passes that path down. Without that call the registry finds nothing
+    #     and inference has no backend at all, so the two changes are a pair.
+    set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
+    set(GGML_BACKEND_DL ON CACHE BOOL "" FORCE)
+    set(GGML_CPU_ALL_VARIANTS ON CACHE BOOL "" FORCE)
+
     add_subdirectory(llama.cpp)
 
     add_library(gguf_bridge SHARED gguf_bridge.cpp)

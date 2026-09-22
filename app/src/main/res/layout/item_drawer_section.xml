@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A heading between kinds of search result, so "Notifications" below the apps is labelled rather
+     than just appearing. -->
+<TextView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/sectionTitle"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:paddingStart="20dp"
+    android:paddingEnd="20dp"
+    android:paddingTop="14dp"
+    android:paddingBottom="6dp"
+    android:textSize="12sp"
+    android:textAllCaps="true"
+    android:textColor="#99EBEBF5" />

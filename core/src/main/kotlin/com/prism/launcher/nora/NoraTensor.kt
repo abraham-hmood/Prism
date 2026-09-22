@@ -145,8 +145,18 @@ object Par {
 
     private val availableCores = max(2, Runtime.getRuntime().availableProcessors())
 
+    /**
+     * The default width: performance cores, not every core.
+     *
+     * These loops fan out and join before the operator returns, so the slowest worker sets the pace
+     * of each one. On a big.LITTLE phone the little cluster runs at around 0.6 of peak clock, which
+     * means a worker placed there adds a stall at every join rather than a fraction of a core --
+     * measurably so on the inference side, where 4 threads beat 6 on an 8-core phone. See PrismCpu.
+     */
+    private val defaultCores = max(2, com.prism.core.PrismCpu.performanceCores)
+
     @Volatile
-    private var cores = availableCores
+    private var cores = defaultCores
 
     @Volatile
     private var pool = newPool(cores)
@@ -163,17 +173,18 @@ object Par {
     fun coresAvailable(): Int = availableCores
 
     /**
-     * Resizes the pool. 0 means one worker per core.
+     * Resizes the pool. 0 means the default width, which is the performance cores -- see
+     * [defaultCores], and PrismCpu for why that is not the same as every core.
      *
-     * Exposed because "use every core" is the right default and the wrong policy during a long
-     * unattended run: saturating an 8-core phone makes the launcher itself stutter, and someone
-     * training overnight may reasonably want to give up throughput for a responsive UI. The old
-     * pool is shut down rather than dropped -- its threads are daemons, but leaking a full set
-     * of them on every settings change would still accumulate.
+     * Exposed because the default is a throughput choice and the right policy during a long
+     * unattended run may be a different one: someone training overnight may reasonably want to give
+     * up throughput for a responsive UI, and the slider still goes up to every core for anyone who
+     * wants to try it. The old pool is shut down rather than dropped -- its threads are daemons, but
+     * leaking a full set of them on every settings change would still accumulate.
      */
     @Synchronized
     fun configure(requested: Int) {
-        val want = if (requested <= 0) availableCores else min(requested, 64)
+        val want = if (requested <= 0) defaultCores else min(requested, 64)
         if (want == cores) return
         val old = pool
         cores = want

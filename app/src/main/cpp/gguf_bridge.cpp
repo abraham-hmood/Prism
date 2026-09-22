@@ -60,6 +60,56 @@ struct GgufContext {
 
 bool g_backend_initialized = false;
 
+// Where the backend .so files are: the app's native library directory, handed down from Kotlin.
+//
+// NEEDED BECAUSE THE BACKENDS ARE NOW SEPARATE LIBRARIES. The build enables GGML_CPU_ALL_VARIANTS
+// (see CMakeLists.txt for the four-times-faster reason why), which compiles one ggml-cpu per ARM
+// feature set and picks the best one this phone can actually execute at runtime. Choosing means
+// scanning a directory for libggml-cpu-*.so, and ggml's own default guesses for that directory are
+// the executable's own and the working directory -- inside an Android app those are
+// /system/bin/app_process64 and /, so the scan finds nothing and inference ends up with no backend
+// at all. The one path that is right is ApplicationInfo.nativeLibraryDir, which only the Java side
+// knows.
+std::string g_backend_dir;
+
+/**
+ * The CPU backend, fetched from the registry rather than by calling ggml_backend_cpu_init directly.
+ *
+ * WHY THE INDIRECTION. With GGML_BACKEND_DL the CPU backends are separate shared libraries that ggml
+ * dlopens and scores at startup (one per ARM feature set -- see CMakeLists.txt), so
+ * ggml_backend_cpu_init is not a symbol this library links against any more. Going through the
+ * registry also gets the RIGHT one: the variant chosen for this phone's actual instruction set,
+ * which is the entire point of building several.
+ */
+ggml_backend_t prism_cpu_backend_init() {
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (dev == nullptr) {
+        LOGE("no CPU device in the ggml registry; backend discovery must have found nothing");
+        return nullptr;
+    }
+    return ggml_backend_dev_init(dev, nullptr);
+}
+
+/**
+ * Looks up one of the RPC backend's entry points by name.
+ *
+ * The RPC server and the "treat this endpoint as a device" helper are not device operations, so they
+ * are not part of the backend interface; under GGML_BACKEND_DL they are not link-time symbols
+ * either. ggml publishes them through the registry's proc-address table for exactly this case (see
+ * ggml_backend_rpc_get_proc_address in ggml-rpc.cpp), which is the supported way to reach them.
+ */
+void * prism_rpc_proc(const char * name) {
+    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        const char * reg_name = ggml_backend_reg_name(reg);
+        if (reg_name != nullptr && std::strstr(reg_name, "RPC") != nullptr) {
+            return ggml_backend_reg_get_proc_address(reg, name);
+        }
+    }
+    LOGE("the RPC backend is not registered; %s is unavailable", name);
+    return nullptr;
+}
+
 void ensure_backend_init() {
     if (g_backend_initialized) return;
 
@@ -69,7 +119,24 @@ void ensure_backend_init() {
         }
     }, nullptr);
 
-    ggml_backend_load_all();
+    if (!g_backend_dir.empty()) {
+        ggml_backend_load_all_from_path(g_backend_dir.c_str());
+    } else {
+        // Nothing told us where to look. Try ggml's defaults rather than refusing to start: a build
+        // with the backends linked in still works this way, and a DL build will at least say so.
+        LOGE("no native library dir was set; backend discovery may find nothing");
+        ggml_backend_load_all();
+    }
+
+    // Worth a line in the log, because "which kernels am I actually running" is the first question
+    // whenever inference is slower than it should be, and the answer is otherwise invisible.
+    const size_t devices = ggml_backend_dev_count();
+    LOGI("ggml backends: %zu device(s)", devices);
+    for (size_t i = 0; i < devices; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        LOGI("  device %zu: %s (%s)", i, ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+    }
+
     g_backend_initialized = true;
 }
 
@@ -544,10 +611,20 @@ namespace {
 // Legacy (non-K-quant) formats ggml's ARM CPU backend "repacks" into interleaved layouts
 // at load time for faster NEON matmul. Repacking works better against a plain in-memory
 // buffer than a memory-mapped one on Android — matches OGAM's own documented finding.
+// Which quantizations ggml can repack into its blocked ARM layout.
+//
+// MUST MATCH ggml-cpu/repack.cpp, and it did not: that file repacks Q4_0, Q4_K and IQ4_NL (see the
+// type switch in ggml_backend_cpu_repack_buffer_type), while this listed only Q4_0 and IQ4_NL. The
+// omission mattered most for the commonest quantization there is -- a Q4_K_M model, which is what
+// almost every GGUF on Hugging Face is and what Prism is usually asked to run, was left on mmap and
+// so never repacked at all. Repacking is what feeds the dotprod and i8mm GEMM kernels, so the
+// fastest path was being skipped on exactly the models that would have used it most.
 bool is_repackable_quant(const std::string& modelPath) {
     std::string lower = modelPath;
     std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
-    return lower.find("q4_0") != std::string::npos || lower.find("iq4_nl") != std::string::npos;
+    return lower.find("q4_0") != std::string::npos ||
+           lower.find("q4_k") != std::string::npos ||
+           lower.find("iq4_nl") != std::string::npos;
 }
 
 // ggml-hexagon registers itself as GGML_BACKEND_DEVICE_TYPE_GPU (same category as OpenCL), so
@@ -686,7 +763,7 @@ void prism_swap_dev_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props* pr
 // The one piece of real reuse this whole device exists for: the actual compute backend is
 // ggml-cpu's own, completely unmodified -- see this block's file-header comment.
 ggml_backend_t prism_swap_dev_init_backend(ggml_backend_dev_t, const char*) {
-    return ggml_backend_cpu_init();
+    return prism_cpu_backend_init();
 }
 
 ggml_backend_buffer_type_t prism_swap_dev_get_buffer_type(ggml_backend_dev_t) { return &g_prism_swap_buft; }
@@ -754,6 +831,26 @@ void ensure_prism_swap_registered() {
 }
 
 } // namespace
+
+/**
+ * Tells the native side where the backend libraries are, before anything loads a model.
+ *
+ * Must be called first, and GgufInferenceService calls it as soon as the library loads. It is a
+ * plain setter rather than part of nativeLoadModel because backend discovery happens once per
+ * process while models come and go, and because the RPC server path starts a backend without ever
+ * loading a model locally.
+ */
+extern "C" JNIEXPORT void JNICALL
+Java_com_prism_launcher_messaging_GgufInferenceService_nativeSetBackendDir(
+        JNIEnv* env, jobject /* thiz */, jstring jDir) {
+    if (jDir == nullptr) return;
+    const char* dirChars = env->GetStringUTFChars(jDir, nullptr);
+    if (dirChars != nullptr) {
+        g_backend_dir = dirChars;
+        env->ReleaseStringUTFChars(jDir, dirChars);
+        LOGI("backend dir: %s", g_backend_dir.c_str());
+    }
+}
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_prism_launcher_messaging_GgufInferenceService_nativeLoadModel(
@@ -969,9 +1066,16 @@ Java_com_prism_launcher_messaging_GgufInferenceService_nativeStartRpcServer(
         return JNI_FALSE;
     }
 
+    typedef void (*rpc_start_server_t)(const char *, const char *, size_t, size_t, ggml_backend_dev_t *);
+    auto start_server = (rpc_start_server_t) prism_rpc_proc("ggml_backend_rpc_start_server");
+    if (start_server == nullptr) {
+        LOGE("RPC server: the RPC backend is unavailable");
+        return JNI_FALSE;
+    }
+
     g_rpc_server_started = true;
     LOGI("RPC server listening on %s with %zu device(s)", endpoint.c_str(), deviceCount);
-    ggml_backend_rpc_start_server(
+    start_server(
         endpoint.c_str(),
         cacheDir.empty() ? nullptr : cacheDir.c_str(),
         nThreads > 0 ? static_cast<size_t>(nThreads) : 4,
@@ -1020,7 +1124,11 @@ Java_com_prism_launcher_messaging_GgufInferenceService_nativeLoadModelDistribute
         env->DeleteLocalRef(item);
         if (endpoint.empty()) continue;
 
-        ggml_backend_reg_t reg = ggml_backend_rpc_add_server(endpoint.c_str());
+        typedef ggml_backend_reg_t (*rpc_add_server_t)(const char *);
+        auto add_server = (rpc_add_server_t) prism_rpc_proc("ggml_backend_rpc_add_server");
+        if (add_server == nullptr) break;
+
+        ggml_backend_reg_t reg = add_server(endpoint.c_str());
         if (!reg) {
             // One unreachable peer must not sink the whole load: the remaining devices plus local
             // RAM may still be enough, and failing here would turn a slow peer into a hard error.

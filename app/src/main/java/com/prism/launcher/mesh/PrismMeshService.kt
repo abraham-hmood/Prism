@@ -325,6 +325,41 @@ object PrismMeshService {
             com.prism.launcher.science.MeshScience.OPCODE_RF_SAMPLE ->
                 com.prism.launcher.science.MeshScience.ingestSample(peerIp, payload)
 
+            // The Minigames page. All of it is small and none of it touches disk on this thread:
+            // a chess move is five characters, a pong paddle is one number, and a battle is a seed.
+            com.prism.launcher.minigames.MinigameMesh.OPCODE_SEEK ->
+                com.prism.launcher.minigames.MinigameMesh.onSeek(peerIp, payload)
+            com.prism.launcher.minigames.MinigameMesh.OPCODE_ACCEPT ->
+                com.prism.launcher.minigames.MinigameMesh.onAccept(peerIp, payload)
+            com.prism.launcher.minigames.MinigameMesh.OPCODE_MOVE ->
+                com.prism.launcher.minigames.MinigameMesh.onMove(peerIp, payload)
+            com.prism.launcher.minigames.MinigameMesh.OPCODE_COUNTRY ->
+                com.prism.launcher.minigames.MinigameMesh.onCountry(peerIp, payload)
+            com.prism.launcher.minigames.MinigameMesh.OPCODE_BATTLE ->
+                com.prism.launcher.minigames.MinigameMesh.onBattle(peerIp, payload)
+
+            // Writes to preferences, so off the dispatch thread like the others that do.
+            com.prism.launcher.minigames.MinigameMesh.OPCODE_STRIKE -> {
+                Thread({
+                    com.prism.launcher.minigames.MinigameMesh.onStrike(peerIp, payload) { id, strike ->
+                        com.prism.launcher.minigames.MinigameStore.recordStrike(id, strike)
+                    }
+                }, "minigame-strike").start()
+            }
+
+            // These two write to preferences, so they go off the dispatch thread like every other
+            // opcode here that does.
+            com.prism.launcher.minigames.MinigameMesh.OPCODE_ALLIANCE -> {
+                Thread({
+                    com.prism.launcher.minigames.MinigameMesh.onAllianceRequest(peerIp, payload)
+                }, "minigame-alliance").start()
+            }
+            com.prism.launcher.minigames.MinigameMesh.OPCODE_ALLIANCE_REPLY -> {
+                Thread({
+                    com.prism.launcher.minigames.MinigameMesh.onAllianceReply(peerIp, payload)
+                }, "minigame-alliance-reply").start()
+            }
+
             com.prism.launcher.aether.AetherMeshSync.OPCODE_AETHER_ANNOUNCE -> handleAetherAnnounce(payload, peerIp)
             com.prism.launcher.social.NebulaMeshSync.OPCODE_NEBULA_ANNOUNCE -> handleNebulaAnnounce(payload, peerIp)
 

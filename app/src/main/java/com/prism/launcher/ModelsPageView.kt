@@ -63,7 +63,10 @@ class ModelsPageView @JvmOverloads constructor(
     init {
         binding.modelsRecycler.layoutManager = LinearLayoutManager(context)
         binding.modelsRecycler.adapter = adapter
-        binding.modelsSectionSwitch.setOnClickListener { openSectionMenu(it) }
+        // Section headers behave like a VS Code sidebar: tap one to open it, which closes the
+        // other. See the layout for why it is an accordion rather than independent toggles.
+        binding.sectionModelsHeader.setOnClickListener { showSection(quant = false) }
+        binding.sectionQuantHeader.setOnClickListener { showSection(quant = true) }
         refreshList()
 
         // Mirrors the service's state into the section whenever it changes. Collected by the page
@@ -113,23 +116,6 @@ class ModelsPageView @JvmOverloads constructor(
         viewScope.cancel()
     }
 
-    /**
-     * The chevron's menu: the two halves of this page.
-     *
-     * A PopupMenu for the same reason Nebula uses one -- two options do not justify a bar of tabs,
-     * and the title doubling as the current selection is what makes the chevron legible as a
-     * switcher rather than decoration.
-     */
-    private fun openSectionMenu(anchor: View) {
-        val menu = android.widget.PopupMenu(context, anchor)
-        menu.menu.add("Models")
-        menu.menu.add("Quant")
-        menu.setOnMenuItemClickListener { item ->
-            showSection(quant = item.title?.toString() == "Quant")
-            true
-        }
-        menu.show()
-    }
 
     /** Switches between the model list and quantisation. Public so the notification can land here. */
     fun showSection(quant: Boolean) {
@@ -164,12 +150,10 @@ class ModelsPageView @JvmOverloads constructor(
         binding.modelsEmptyState.visibility =
             if (!quant && adapter.itemCount == 0) View.VISIBLE else View.GONE
 
-        binding.modelsTitle.text = if (quant) "Quant" else "Models"
-        binding.modelsSubtitle.text = if (quant) {
-            "Quantise a local model to a smaller format"
-        } else {
-            "Models imported to this device"
-        }
+        // The chevrons say which way each section is facing, the way a sidebar does.
+        binding.chevronModels.text = if (quant) "\u25b8" else "\u25be"
+        binding.chevronQuant.text = if (quant) "\u25be" else "\u25b8"
+        binding.modelsCount.text = if (adapter.itemCount > 0) adapter.itemCount.toString() else ""
     }
 
     private fun scanOllama() {

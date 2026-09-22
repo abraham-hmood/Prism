@@ -77,6 +77,9 @@ class SettingsActivity : PrismBaseActivity() {
                 "AI engine, models, image generation, Nora, Aether and response behaviour",
                 listOf(
                     "Intelligence & Messaging",
+                    // Claimed explicitly, or it falls through to "Other" -- a header that no group
+                    // lists is not shown where it was written, it is swept into the catch-all.
+                    "Speech",
                     "Available LLM Models",
                     "Visual Intelligence (Diffusion)",
                     "Nora (Brain-Based Generation)",
@@ -362,20 +365,6 @@ class SettingsActivity : PrismBaseActivity() {
      * launcher that volunteers for file types it cannot open is a nuisance to everyone who installed
      * it for the other twenty features.
      */
-    private fun setExeHandlerEnabled(enabled: Boolean) {
-        runCatching {
-            packageManager.setComponentEnabledSetting(
-                android.content.ComponentName(
-                    this, com.prism.launcher.virtualization.ExeLaunchActivity::class.java
-                ),
-                if (enabled) android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_ENABLED
-                else android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
-                android.content.pm.PackageManager.DONT_KILL_APP,
-            )
-        }.onFailure {
-            PrismLogger.logWarning("Prism", "Could not change the .exe handler: ${it.message}")
-        }
-    }
 
     private fun startPrismVpnTunnel() {
         val consent = android.net.VpnService.prepare(this)
@@ -459,7 +448,7 @@ class SettingsActivity : PrismBaseActivity() {
             val progressDialog = com.prism.launcher.messaging.ModelLoadProgressDialog(this)
             progressDialog.show()
             com.prism.launcher.messaging.ModelDownloadManager.copyUriToInternal(
-                this, uri, fileName, isPickingImageModel,
+                this, uri, fileName, isPickingImageModel, modelType = pendingImportType,
                 onProgress = { copied, total ->
                     if (total > 0) {
                         val pct = ((copied * 100) / total).toInt()
@@ -654,23 +643,39 @@ class SettingsActivity : PrismBaseActivity() {
     }
 
 
+    /**
+     * Asks what kind of model is being imported, then opens the picker.
+     *
+     * Three kinds now, and a two-button dialog cannot ask a three-way question, so this is a list
+     * rather than positive/negative. The order is the order they were added, which is also roughly
+     * how often each is used.
+     */
     private fun pickLocalModel() {
-        PrismDialogFactory.show(
-            this,
-            "Model Type",
-            "What kind of intelligence are you importing?",
-            onPositive = {
-                isPickingImageModel = false
-                modelPicker.launch("*/*")
-            },
-            positiveText = "Text AI",
-            onNegative = {
-                isPickingImageModel = true
-                modelPicker.launch("*/*")
-            },
-            negativeText = "Image Gen"
+        val kinds = listOf(
+            Triple("Text AI", "A language model — .task, .gguf or .bin", PrismSettings.MODEL_TYPE_TEXT),
+            Triple("Image Gen", "A diffusion model for generating pictures", PrismSettings.MODEL_TYPE_IMAGE),
+            Triple(
+                "Audio",
+                "A text-to-speech model — " +
+                    com.prism.launcher.speech.ImportedAudioEngine.ACCEPTED_EXTENSIONS
+                        .joinToString(", ") { ".$it" },
+                PrismSettings.MODEL_TYPE_AUDIO,
+            ),
         )
+
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Model Type")
+            .setItems(kinds.map { it.first }.toTypedArray()) { _, which ->
+                pendingImportType = kinds[which].third
+                isPickingImageModel = pendingImportType == PrismSettings.MODEL_TYPE_IMAGE
+                modelPicker.launch("*/*")
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
+
+    /** Which of the three kinds the open picker is importing. See [pickLocalModel]. */
+    private var pendingImportType: String = PrismSettings.MODEL_TYPE_TEXT
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -1529,6 +1534,61 @@ class SettingsActivity : PrismBaseActivity() {
                 isEnabled = PrismSettings.getAiMode() == PrismSettings.AI_MODE_LOCAL
             ),
 
+            SettingItem.Header("Speech"),
+            run {
+                // DISABLED, NOT HIDDEN, when a different engine is in charge.
+                //
+                // Importing a speech model of your own overrides Kokoro, and every setting behind
+                // this row belongs to Kokoro -- its voices, its speed, its quantisation. Hiding the
+                // row would make the override look like the feature had vanished; greying it out
+                // says "this exists, and something else is using its place", which is the truth.
+                val usingKokoro = PrismSettings.isUsingKokoro()
+                SettingItem.Nav(
+                    "Kokoro-82M Voice & Speech",
+                    if (usingKokoro) {
+                        "Sam's voice, speed, and the Kokoro download — " +
+                            com.prism.launcher.speech.KokoroVoicePicker.summaryFor(
+                                this, PrismSettings.VOICE_SPEAKER_SAM,
+                            )
+                    } else {
+                        "Unavailable while \"${java.io.File(PrismSettings.getLocalAudioModelPath()).name}\" " +
+                            "is your speech model — remove it to go back to Kokoro"
+                    },
+                    {
+                        startActivity(android.content.Intent(
+                            this, com.prism.launcher.speech.KokoroSettingsActivity::class.java,
+                        ))
+                    },
+                    isEnabled = usingKokoro
+                )
+            },
+            run {
+                val path = PrismSettings.getLocalAudioModelPath()
+                SettingItem.Nav(
+                    "Speech Model",
+                    com.prism.launcher.speech.ImportedAudioEngine.describe(path),
+                    {
+                        if (path.isEmpty()) {
+                            pickLocalModel()
+                        } else {
+                            androidx.appcompat.app.AlertDialog.Builder(this)
+                                .setTitle("Use Kokoro again?")
+                                .setMessage(
+                                    "Removing this model does not delete the file. Prism goes back " +
+                                        "to speaking with Kokoro-82M."
+                                )
+                                .setPositiveButton("Remove") { _, _ ->
+                                    PrismSettings.setLocalAudioModelPath("")
+                                    com.prism.launcher.speech.PrismSpeaker.invalidate()
+                                    refresh()
+                                }
+                                .setNegativeButton("Keep", null)
+                                .show()
+                        }
+                    }
+                )
+            },
+
             SettingItem.Header("Available LLM Models"),
             SettingItem.Nav(
                 "Falcon3-1B-Instruct",
@@ -1649,32 +1709,53 @@ class SettingsActivity : PrismBaseActivity() {
                     refresh()
                 }
             ),
-            SettingItem.Picker(
-                "AI Backend",
-                run {
-                    val base = "Force which backend AI text generation uses, for both GGUF and .task models. GPU is faster when well-supported (falls back to CPU automatically if it fails); switch to CPU if generation is slow or unstable on your device. GPU only speeds up Q4_0/Q8_0 GGUF quants — K-quants (e.g. Q2_K) always run on CPU regardless."
-                    if (com.prism.launcher.messaging.GgufInferenceService.hasHexagonSupport()) {
-                        "$base NPU (Qualcomm Hexagon) offloads to your device's neural processor for GGUF models."
-                    } else {
-                        "$base NPU isn't available in this build — it requires a Qualcomm Hexagon SDK at build time, which isn't configured here."
+            run {
+                // NPU IS ALWAYS LISTED, and that is the point of this block.
+                //
+                // It used to be hidden whenever the Hexagon backend was absent, which is most
+                // builds -- so the answer to "why is there no NPU option?" was an empty space. The
+                // option is shown now and, if it cannot be used, says exactly why for THIS chip:
+                // the wrong Hexagon version, a build without the SDK, or a vendor llama.cpp has no
+                // backend for at all. Those are three different answers and only one of them is
+                // something the user could act on.
+                val npu = com.prism.launcher.messaging.NpuSupport.detect()
+
+                SettingItem.Picker(
+                    "AI Backend",
+                    buildString {
+                        append(
+                            "Force which backend AI text generation uses, for both GGUF and .task " +
+                                "models. GPU is faster when well-supported (falls back to CPU " +
+                                "automatically if it fails); switch to CPU if generation is slow or " +
+                                "unstable on your device. GPU only speeds up Q4_0/Q8_0 GGUF quants — " +
+                                "K-quants (e.g. Q2_K) always run on CPU regardless."
+                        )
+                        append(System.lineSeparator() + System.lineSeparator() + "NPU: ")
+                        append(npu.displayName)
+                        append(if (npu.usable) " — available." else " — unavailable. ${npu.reason}")
+                    },
+                    listOf("CPU", "GPU", "NPU"),
+                    PrismSettings.getAiBackend().coerceIn(0, 2),
+                    { idx ->
+                        if (idx == PrismSettings.AI_BACKEND_NPU && !npu.usable) {
+                            // Refused rather than accepted-and-ignored. Storing the choice would
+                            // leave the picker reading "NPU" while every token came off the CPU.
+                            androidx.appcompat.app.AlertDialog.Builder(this)
+                                .setTitle("NPU unavailable")
+                                .setMessage(
+                                    npu.displayName + System.lineSeparator() +
+                                        System.lineSeparator() + npu.reason
+                                )
+                                .setPositiveButton("OK", null)
+                                .show()
+                            refresh()
+                        } else {
+                            PrismSettings.setAiBackend(idx)
+                            refresh()
+                        }
                     }
-                },
-                run {
-                    val options = if (com.prism.launcher.messaging.GgufInferenceService.hasHexagonSupport()) {
-                        listOf("CPU", "GPU", "NPU")
-                    } else {
-                        listOf("CPU", "GPU")
-                    }
-                    options
-                },
-                PrismSettings.getAiBackend().coerceAtMost(
-                    (if (com.prism.launcher.messaging.GgufInferenceService.hasHexagonSupport()) 2 else 1)
-                ),
-                { idx ->
-                    PrismSettings.setAiBackend(idx)
-                    refresh()
-                }
-            ),
+                )
+            },
             SettingItem.Nav(
                 "Prism Swap",
                 "Lets Sam's local .gguf models spill onto disk when they don't fit in free RAM -- swap file size and activation thresholds" +
@@ -2114,6 +2195,27 @@ class SettingsActivity : PrismBaseActivity() {
             // ── OS Virtualization ────────────────────────────────────────────
             SettingItem.Header("OS Virtualization"),
             SettingItem.Toggle(
+                "Virtualize Android apps",
+                if (PrismSettings.getVirtualizeAndroidApps()) {
+                    "On — apps open inside Prism, with their APK and data kept in Prism's " +
+                        "encrypted vault. Not sandboxed from Prism, and Play Protect will not pass."
+                } else {
+                    "Runs an app's own code inside Prism instead of launching it normally. Its APK " +
+                        "is backed up on first use and its data is encrypted at rest."
+                },
+                PrismSettings.getVirtualizeAndroidApps(),
+                { enabled ->
+                    PrismSettings.setVirtualizeAndroidApps(enabled)
+                    // A guest that is already up would go on running behind a page that no longer
+                    // boots one -- QEMU is a subprocess and outlives both the page and the app
+                    // process, so nothing else would ever stop it.
+                    if (enabled) runCatching {
+                        com.prism.launcher.virtualization.VmController.get(this).stop()
+                    }
+                    refresh()
+                }
+            ),
+            SettingItem.Toggle(
                 "Switch to running Windows executables",
                 when {
                     !PrismSettings.getWindowsMode() ->
@@ -2124,7 +2226,8 @@ class SettingsActivity : PrismBaseActivity() {
                             "Prism appears in the chooser for them."
                     else ->
                         "Windows mode is on, but the compatibility layer is not installed yet. " +
-                            "Open the Virtualization page to install it."
+                            "Open the Virtualization page to download it — roughly " +
+                            "${com.prism.launcher.virtualization.WineInstaller.approximateDownloadMb()} MB."
                 },
                 PrismSettings.getWindowsMode(),
                 { enabled ->
@@ -2132,14 +2235,21 @@ class SettingsActivity : PrismBaseActivity() {
                     // The .exe chooser entry is a manifest component, toggled at runtime: leaving
                     // Prism in the Open-with list for a mode the user switched off would offer to
                     // open files it would then refuse.
-                    setExeHandlerEnabled(enabled)
+                    // The chooser entry follows the virtualization PAGE, not this switch -- see
+                    // ExeLaunchActivity.syncHandlerRegistration. Re-synced here anyway so the two
+                    // cannot drift while Settings is open.
+                    com.prism.launcher.virtualization.ExeLaunchActivity.syncHandlerRegistration(this)
                     refresh()
                 }
             ),
             SettingItem.TextInput(
                 "Windows layer source",
                 PrismSettings.getWindowsLayerUrl().ifBlank {
-                    "Not set — a URL to a Wine + box64 + rootfs archive"
+                    // An override, not a requirement: Prism builds the layer from the Ubuntu,
+                    // box64 and WineHQ projects on its own. This is here for somebody who wants a
+                    // Winlator container or a build of their own instead.
+                    "Optional — Prism assembles the layer itself. Set a URL to use your own " +
+                        "Wine + box64 + rootfs archive instead."
                 },
                 PrismSettings.getWindowsLayerUrl(),
                 { PrismSettings.setWindowsLayerUrl(it) },
@@ -2171,6 +2281,24 @@ class SettingsActivity : PrismBaseActivity() {
                 { isoPicker.launch(arrayOf("application/octet-stream", "*/*")) },
                 isEnabled = PrismSettings.getVirtualizationEnabled() &&
                     PrismSettings.getVirtualizationMode() == PrismSettings.VIRT_MODE_CUSTOM_ISO
+            ),
+
+            // ── The tour ─────────────────────────────────────────────────────
+            SettingItem.Header("Getting started"),
+            SettingItem.Nav(
+                "Take the tour again",
+                "Every feature Prism has, and what each one costs",
+                {
+                    // Finishing Settings first, because the tour draws over the launcher and would
+                    // otherwise be behind this screen.
+                    PrismSettings.setOnboardingSeen(false)
+                    android.widget.Toast.makeText(
+                        this,
+                        "The tour will start when you return to the home screen.",
+                        android.widget.Toast.LENGTH_LONG
+                    ).show()
+                    finish()
+                }
             ),
 
             // ── Medical ──────────────────────────────────────────────────────

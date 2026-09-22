@@ -50,8 +50,14 @@ object NoraPerformance {
      * are never touched at all. An untouched row contributes precisely nothing to the output,
      * so skipping it is not an approximation: it is the same sum with the zero terms omitted.
      * That makes this the rare option that is faster AND smaller AND exact.
+     *
+     * ON BY DEFAULT, because of that last sentence. It was off, which meant every install paid for
+     * the dense hub -- over half the memory budget, nearly all of it zeros -- and for gathering
+     * those zeros on every bind. An option that is strictly better on all three axes has no
+     * business being opt-in: leaving it off was not a conservative default, it was a slower and
+     * larger one that nobody had a reason to choose.
      */
-    var hubSparse = false
+    var hubSparse = true
 
     /** Put large structures in direct byte buffers -- off the managed heap, still in RAM. */
     var offHeap = false
@@ -59,8 +65,21 @@ object NoraPerformance {
     /** Put large structures in a memory-mapped file. Overrides [offHeap] when both are on. */
     var swapEnabled = false
 
-    /** Use the NEON/SIMD kernels for the 5x5 predictive-coding convolutions. */
-    var nativeConv = false
+    /**
+     * Use the NEON/SIMD kernels for the 5x5 predictive-coding convolutions.
+     *
+     * ON BY DEFAULT. nora_conv.cpp is a transcription of the Kotlin kernels with the loop nest
+     * rearranged so the innermost loop walks contiguous memory, and it is bit-identical by
+     * construction -- every output accumulates its terms in the same order, which is why its own
+     * header calls that guarantee the whole point. So there is nothing to trade off: the only
+     * reasons to stay on the JVM loops are that the library failed to load or that the kernel is too
+     * small to amortize the JNI crossing, and both are already handled ([NoraNative.available] and
+     * [nativeMinWork]) rather than needing a user to decide.
+     *
+     * It was off, which meant the measured gain on the retina-to-V1 link -- the largest link in the
+     * model -- was sitting behind a switch nobody had a reason to find.
+     */
+    var nativeConv = true
 
     // ── Parameters ──────────────────────────────────────────────────────────
 

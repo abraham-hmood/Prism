@@ -131,11 +131,29 @@ class HippocampalIndexLayer(
         for (t in 0 until steps) {
             val frame = inputs[t]
             val current = FloatArray(numNeurons)
-            for (j in 0 until numNeurons) {
-                var sum = biases[j]
-                for (i in 0 until inputSize) sum += frame[i] * (weights[i, j] + fastWeights[i, j]) * synapticMask[i, j]
-                for (k in 0 until numNeurons) sum += prevSpikes[k] * recurrentWeights[k, j] * recurrentMask[k, j]
-                current[j] = sum
+            // Input-major; see LIFCortexLayer.forward in AetherNeuron.kt for why, and for the
+            // bit-identity argument. One accumulator per output here, as before: biases, then every
+            // feed-forward term in ascending input order, then every recurrent term in ascending
+            // source order -- the same sequence the neuron-outermost form produced.
+            System.arraycopy(biases, 0, current, 0, numNeurons)
+            run {
+                val w = weights.data
+                val fw = fastWeights.data
+                val wm = synapticMask.data
+                for (i in 0 until inputSize) {
+                    val f = frame[i]
+                    if (f == 0f) continue
+                    val base = i * numNeurons
+                    for (j in 0 until numNeurons) current[j] += f * (w[base + j] + fw[base + j]) * wm[base + j]
+                }
+                val rw = recurrentWeights.data
+                val rm = recurrentMask.data
+                for (k in 0 until numNeurons) {
+                    val p = prevSpikes[k]
+                    if (p == 0f) continue
+                    val base = k * numNeurons
+                    for (j in 0 until numNeurons) current[j] += p * rw[base + j] * rm[base + j]
+                }
             }
             for (j in 0 until numNeurons) vMem[j] = beta * vMem[j] + current[j]
 
@@ -175,12 +193,21 @@ class GatedStriatalLayer(
         var meanAll = 0.0
         for (t in 0 until steps) {
             val frame = inputs[t]
-            for (j in 0 until numNeurons) {
-                var sum = biases[j]
-                for (i in 0 until inputSize) sum += frame[i] * weights[i, j] * synapticMask[i, j]
-                allProjections[t][j] = sum
-                meanAll += sum
+            val projection = allProjections[t]
+            // Input-major; see LIFCortexLayer.forward in AetherNeuron.kt.
+            System.arraycopy(biases, 0, projection, 0, numNeurons)
+            val w = weights.data
+            val wm = synapticMask.data
+            for (i in 0 until inputSize) {
+                val f = frame[i]
+                if (f == 0f) continue
+                val base = i * numNeurons
+                for (j in 0 until numNeurons) projection[j] += f * w[base + j] * wm[base + j]
             }
+            // The mean is accumulated in a second pass so it still sums the projections in ascending
+            // (t, j) order. Adding each one as it was produced would now visit them in a different
+            // order, and a running float sum is order-dependent.
+            for (j in 0 until numNeurons) meanAll += projection[j]
         }
         val noiseFloor = (meanAll / (steps.toLong() * numNeurons)).toFloat() * gateThreshold
 
@@ -266,13 +293,24 @@ class CerebellarSmoothCore(
     override fun forward(inputs: SpikeSequence, habituationGain: Float): SpikeSequence {
         val steps = inputs.steps
         val out = SpikeSequence(steps, numNeurons, 1, 1)
+        val projection = FloatArray(numNeurons)
         for (t in 0 until steps) {
             val frame = inputs[t]
-            for (j in 0 until numNeurons) {
-                var sum = biases[j]
-                for (i in 0 until inputSize) sum += frame[i] * weights[i, j] * synapticMask[i, j]
-                vMem[j] = beta * vMem[j] + sum
+            // Input-major; see LIFCortexLayer.forward in AetherNeuron.kt. The sums land in a scratch
+            // array first because the membrane update reads vMem[j] while writing it, so it cannot
+            // be folded into the accumulation pass.
+            System.arraycopy(biases, 0, projection, 0, numNeurons)
+            run {
+                val w = weights.data
+                val wm = synapticMask.data
+                for (i in 0 until inputSize) {
+                    val f = frame[i]
+                    if (f == 0f) continue
+                    val base = i * numNeurons
+                    for (j in 0 until numNeurons) projection[j] += f * w[base + j] * wm[base + j]
+                }
             }
+            for (j in 0 until numNeurons) vMem[j] = beta * vMem[j] + projection[j]
             val thr = AetherTextCoding.kWinnerTakeAll(
                 vMem, tState, AetherTextCoding.WTA_K,
                 AetherTextCoding.ASCII_LOW, minOf(AetherTextCoding.ASCII_HIGH, numNeurons),

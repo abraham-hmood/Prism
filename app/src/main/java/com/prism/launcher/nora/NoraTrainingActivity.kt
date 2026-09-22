@@ -199,6 +199,14 @@ class NoraTrainingActivity : PrismBaseActivity() {
             setOnClickListener { confirmForget() }
         })
         box.addView(row)
+        box.addView(
+            IosUi.tintedButton(ctx, "Import dataset folder").apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).apply { topMargin = IosUi.dp(ctx, 10f) }
+                setOnClickListener { pickDatasetFolder() }
+            }
+        )
         return box
     }
 
@@ -600,4 +608,44 @@ class NoraTrainingActivity : PrismBaseActivity() {
         if (!NoraTrainingState.running.value) NoraTelemetry.live = false
         super.onDestroy()
     }
+
+    /**
+     * Picks a folder and copies it into the dataset directory.
+     *
+     * OpenDocumentTree rather than a file picker, because a dataset is a folder: a corpus is many
+     * files, and an image set keeps its labels in its sub-folder names. Asking for files one at a
+     * time would lose the second of those entirely.
+     */
+    private val datasetPicker = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri == null) return@registerForActivityResult
+        // Persisted, so a later run can still read the folder if it is ever read in place.
+        runCatching {
+            contentResolver.takePersistableUriPermission(
+                uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        }
+        importDataset(uri)
+    }
+
+    private fun pickDatasetFolder() {
+        runCatching { datasetPicker.launch(null) }.onFailure {
+            Toast.makeText(this, "No folder picker on this device", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun importDataset(uri: android.net.Uri) {
+        Toast.makeText(this, "Importing\u2026", Toast.LENGTH_SHORT).show()
+        Thread({
+            val result = com.prism.launcher.training.DatasetImport.copyTree(
+                this, uri, com.prism.launcher.nora.NoraConfig.datasetDir(),
+            )
+            runOnUiThread {
+                Toast.makeText(this, result.describe(), Toast.LENGTH_LONG).show()
+                refreshStatus()
+            }
+        }, "dataset-import").apply { isDaemon = true; start() }
+    }
+
 }

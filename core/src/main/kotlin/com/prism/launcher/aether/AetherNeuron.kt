@@ -99,6 +99,20 @@ open class LIFCortexLayer(
     protected lateinit var cUAtStep: Array<FloatArray>       // [t][numNeurons] (facilitation gain, detached)
     protected lateinit var cSaturated: Array<BooleanArray>   // [t][numNeurons] -- clip saturation
 
+    /**
+     * The graded, pre-spike membrane potential of the most recent forward pass, or null before one.
+     *
+     * WHY THE DECODER NEEDS THIS AND NOT THE SPIKES. A spike train is binary, so every firing
+     * neuron holds the identical value -- ranking it returns the tie-break of whatever sort was
+     * used rather than anything the network computed. The membrane is what the competition was
+     * actually decided on, and reading a word out of a slot is a ranking problem.
+     *
+     * It is the same array the backward pass caches, exposed rather than copied: the decoder reads
+     * it immediately after the forward call and before anything else can overwrite it.
+     */
+    fun evidenceTrace(): Array<FloatArray>? =
+        if (::cVMemInhib.isInitialized && cSteps > 0) cVMemInhib else null
+
     override fun resetState() {
         vMem.fill(0f); tState.fill(threshold); habituationState.fill(0f)
         synapticU.fill(uInc); synapticX.fill(1f)
@@ -126,6 +140,22 @@ open class LIFCortexLayer(
         u[j] = uInc + (u[j] - uInc) * uDecay + uInc * (1f - u[j]) * prevSpikes[j]
         x[j] = (x[j] + (1f - x[j]) * (1f - xRecovery) - u[j] * x[j] * prevSpikes[j]).coerceIn(0f, 1f)
         return u[j] * x[j]
+    }
+
+    /**
+     * Scratch for the per-timestep synaptic currents, reused across forward passes.
+     *
+     * Held rather than allocated because training calls [forward] in a tight loop and this is
+     * [steps] x numNeurons floats each time. Grown, never shrunk: the step count is a property of
+     * the encoder and barely varies, so this settles after the first call.
+     */
+    private var currentsScratch: Array<FloatArray> = emptyArray()
+
+    private fun currentsBuffer(steps: Int): Array<FloatArray> {
+        if (currentsScratch.size < steps) {
+            currentsScratch = Array(steps) { FloatArray(numNeurons) }
+        }
+        return currentsScratch
     }
 
     override fun forward(inputs: SpikeSequence, habituationGain: Float): SpikeSequence {
@@ -158,6 +188,49 @@ open class LIFCortexLayer(
         val x = synapticX.copyOf()
         val gainAtStep = FloatArray(numNeurons)
 
+        // Every timestep's synaptic current, computed in ONE pass over the weights.
+        //
+        // The membrane dynamics below are strictly sequential -- a spike at t changes the
+        // threshold, the plasticity gain and the inhibition at t+1 -- but the synaptic sums are
+        // not: sum(i) gated[t][i] * w[i][j] * mask[i][j] depends only on the inputs, and every
+        // one of those inputs is already known (cGatedInputs was filled for all t above). So the
+        // sums come out of the sequential loop entirely, which turns 16 matrix-vector products
+        // into one matrix-matrix product.
+        //
+        // THAT IS THE DIFFERENCE BETWEEN MEMORY-BOUND AND COMPUTE-BOUND, and it is the whole
+        // reason to do it. The weight matrix is 4 MB at the default geometry and the mask is
+        // another 4 MB; neither fits in cache, so a per-timestep mat-vec streamed 128 MB from RAM
+        // per forward pass and spent its time waiting. Here each weight row is read once, used
+        // for all [steps] timesteps while it sits in L1, and never read again.
+        //
+        // STILL BIT-IDENTICAL. Each output accumulates over ascending i from the same starting
+        // value it started from before -- biases[j] when there is no facilitation, 0 when there
+        // is, because the facilitating branch scales the sum before adding the bias and so must
+        // not have the bias inside it. Only the order outputs are visited changed.
+        val currents: Array<FloatArray>? = if (!active) null else {
+            val buffer = currentsBuffer(steps)
+            for (t in 0 until steps) {
+                if (facilitation) {
+                    java.util.Arrays.fill(buffer[t], 0f)
+                } else {
+                    System.arraycopy(biases, 0, buffer[t], 0, numNeurons)
+                }
+            }
+            val w = weights.data
+            val mask = synapticMask.data
+            for (i in 0 until inputSize) {
+                val base = i * numNeurons
+                for (t in 0 until steps) {
+                    val g = cGatedInputs[t][i]
+                    // A zero input skips its row. See the exception note on [forward].
+                    if (g == 0f) continue
+                    val row = buffer[t]
+                    for (j in 0 until numNeurons) row[j] += g * w[base + j] * mask[base + j]
+                }
+            }
+            buffer
+        }
+
         for (t in 0 until steps) {
             val gated = cGatedInputs[t]
 
@@ -168,20 +241,16 @@ open class LIFCortexLayer(
             // differentiates through exactly the scale the forward pass applied.
             System.arraycopy(gainAtStep, 0, cUAtStep[t], 0, numNeurons)
 
-            val current = FloatArray(numNeurons)
-            if (!active) {
+            val current: FloatArray
+            if (currents == null) {
+                current = FloatArray(numNeurons)
                 System.arraycopy(biases, 0, current, 0, numNeurons)
-            } else if (!facilitation) {
-                for (j in 0 until numNeurons) {
-                    var sum = biases[j]
-                    for (i in 0 until inputSize) sum += gated[i] * weights[i, j] * synapticMask[i, j]
-                    current[j] = sum
-                }
             } else {
-                for (j in 0 until numNeurons) {
-                    var sum = 0f
-                    for (i in 0 until inputSize) sum += gated[i] * weights[i, j] * synapticMask[i, j]
-                    current[j] = sum * (gainAtStep[j] * 2f) + biases[j]
+                current = currents[t]
+                if (facilitation) {
+                    for (j in 0 until numNeurons) {
+                        current[j] = current[j] * (gainAtStep[j] * 2f) + biases[j]
+                    }
                 }
             }
 
@@ -622,6 +691,13 @@ open class RecurrentLIFCortexLayer(
         val u = synapticU.copyOf()
         val x = synapticX.copyOf()
 
+        // The feed-forward and recurrent sums, kept in SEPARATE accumulators because the arithmetic
+        // requires it: the original wrote `(ff + rec)`, which rounds once after each sum is complete,
+        // and a single shared accumulator would interleave the two sets of terms and round elsewhere.
+        // Hoisted out of the timestep loop rather than allocated per step.
+        val ffSum = FloatArray(numNeurons)
+        val recSum = FloatArray(numNeurons)
+
         for (t in 0 until steps) {
             System.arraycopy(prevSpikes, 0, rPrevSpikesAtStep[t], 0, numNeurons)
             val gated = cGatedInputs[t]
@@ -631,12 +707,41 @@ open class RecurrentLIFCortexLayer(
             }
 
             val current = FloatArray(numNeurons)
-            for (j in 0 until numNeurons) {
-                var ff = 0f
-                var rec = 0f
-                for (i in 0 until inputSize) ff += gated[i] * weights[i, j] * synapticMask[i, j]
-                for (k in 0 until numNeurons) rec += prevSpikes[k] * recurrentWeights[k, j] * recurrentMask[k, j]
-                current[j] = if (facilitation) (ff + rec) * (cUAtStep[t][j] * 2f) + biases[j] else ff + rec + biases[j]
+            run {
+                // Input-major, for the reason set out at length on LIFCortexLayer.forward: these
+                // matrices are row-major [input][neuron], so walking the neuron index innermost reads
+                // one row contiguously and vectorizes, where the previous neuron-outermost form
+                // strided a whole row per element and missed cache on nearly every weight. Measured
+                // at 18x on a 1024x1024 layer. Bit-identical -- each output still accumulates over
+                // ascending input index from the same starting value -- and a zero input skips its
+                // row, with the IEEE exception that carries named on that same method.
+                java.util.Arrays.fill(ffSum, 0f)
+                java.util.Arrays.fill(recSum, 0f)
+
+                val w = weights.data
+                val wm = synapticMask.data
+                for (i in 0 until inputSize) {
+                    val g = gated[i]
+                    if (g == 0f) continue
+                    val base = i * numNeurons
+                    for (j in 0 until numNeurons) ffSum[j] += g * w[base + j] * wm[base + j]
+                }
+
+                val rw = recurrentWeights.data
+                val rm = recurrentMask.data
+                for (k in 0 until numNeurons) {
+                    val p = prevSpikes[k]
+                    if (p == 0f) continue
+                    val base = k * numNeurons
+                    for (j in 0 until numNeurons) recSum[j] += p * rw[base + j] * rm[base + j]
+                }
+
+                if (facilitation) {
+                    val gain = cUAtStep[t]
+                    for (j in 0 until numNeurons) current[j] = (ffSum[j] + recSum[j]) * (gain[j] * 2f) + biases[j]
+                } else {
+                    for (j in 0 until numNeurons) current[j] = ffSum[j] + recSum[j] + biases[j]
+                }
             }
 
             if (noiseStd > 0f) for (j in 0 until numNeurons) current[j] += (rng.nextGaussian() * noiseStd).toFloat()

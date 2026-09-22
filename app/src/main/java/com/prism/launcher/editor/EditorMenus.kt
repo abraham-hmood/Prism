@@ -116,6 +116,7 @@ object EditorMenus {
     const val A_CONFIGURE_BUILD_TASK = "term.configureBuildTask"
 
     const val A_MARKETPLACE = "marketplace.open"
+    const val A_NODE_RUNTIME = "marketplace.nodeRuntime"
 
     private const val NO_DEBUGGER =
         "No debug adapter is installed. Debugging needs a separate debugger process, which Prism's " +
@@ -244,7 +245,11 @@ object EditorMenus {
             // One entry, not two. Browsing and managing what is installed are the same screen in
             // every editor that has them, and splitting them here meant two menu items that opened
             // views of the same thing.
-            Item("Extensions", "", action = A_MARKETPLACE),
+            Item("Extensions", "", action = A_MARKETPLACE, separatorAfter = true),
+            // The runtime desktop extensions need. Its own entry rather than something buried in
+            // the marketplace, because installing it is a decision about the device -- a download
+            // and a few hundred megabytes -- and not about any one extension.
+            Item("Node.js Runtime...", "", action = A_NODE_RUNTIME),
         )),
     )
 

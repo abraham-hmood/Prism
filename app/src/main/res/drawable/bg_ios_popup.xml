@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The card a popup menu is drawn on.
+
+  Smaller radius than an alert (12dp against 14dp), which is the relationship iOS keeps between a
+  context menu and a full alert. Opaque rather than translucent on purpose: the editor's menus were
+  drawn on a 24%-alpha fill and every row was legible straight through to the rail underneath it. A
+  menu has to hide what it covers.
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <corners android:radius="12dp" />
+    <solid android:color="?attr/prismSurface" />
+    <stroke
+        android:width="1dp"
+        android:color="?attr/prismDivider" />
+</shape>

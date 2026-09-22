@@ -201,6 +201,7 @@ class VmController private constructor(private val context: Context) {
      * Sends a request to PrismOS to open [cn].
      * If the VM is still booting the request is queued and replayed once RUNNING.
      */
+
     fun sendAppIntent(cn: ComponentName) {
         when (state) {
             State.RUNNING -> executor.execute { sendViaAdb(cn) }
@@ -443,6 +444,7 @@ class VmController private constructor(private val context: Context) {
         } else {
             cmd += listOf("-drive", "if=virtio,format=raw,file=$isoPath")
         }
+
         // The "virt" machine has no boot ROM of its own — without UEFI firmware handing off to
         // the disk's bootloader, QEMU just sits at a black framebuffer forever. Optional because
         // we can't bundle a firmware binary ourselves; if present, use it.

@@ -20,6 +20,10 @@
         <item name="prismOverlay">#E6FFFFFF</item>
         <item name="prismAccent">#007AFF</item>
         <item name="prismCardColor">#FFFFFF</item>
+        <item name="alertDialogTheme">@style/Theme.Prism.Dialog</item>
+        <item name="materialAlertDialogTheme">@style/Theme.Prism.Dialog</item>
+        <item name="android:popupMenuStyle">@style/Prism.PopupMenu</item>
+        <item name="popupMenuStyle">@style/Prism.PopupMenu</item>
     </style>
 
     <style name="Theme.PrismSettings" parent="Theme.Material3.DayNight.NoActionBar">
@@ -38,7 +42,78 @@
         <item name="prismOverlay">#E6FFFFFF</item>
         <item name="prismAccent">#007AFF</item>
         <item name="prismCardColor">#E1E1E6</item>
+        <item name="alertDialogTheme">@style/Theme.Prism.Dialog</item>
+        <item name="materialAlertDialogTheme">@style/Theme.Prism.Dialog</item>
+        <item name="android:popupMenuStyle">@style/Prism.PopupMenu</item>
+        <item name="popupMenuStyle">@style/Prism.PopupMenu</item>
     </style>
+
+    <!--
+      iOS-style alerts, applied centrally.
+
+      WHY A THEME RATHER THAN SEVENTY EDITS. Prism has roughly seventy AlertDialog.Builder call
+      sites across twenty-six files. Restyling each one by hand would be a large diff, would miss
+      some, and would leave every dialog written afterwards back on Material. Every one of those
+      builders resolves `alertDialogTheme` off the context, so one theme reaches all of them —
+      including the ones that do not exist yet.
+
+      WHAT MAKES AN ALERT LOOK LIKE iOS. In order of how much each contributes: the rounded card
+      floating clear of the screen edges, a centred bold title over centred body text, and buttons
+      that are plain blue text rather than uppercase Material labels. Those are what this sets.
+
+      WHAT IT DOES NOT DO. A real UIAlertController lays its buttons out full-width, separated by
+      hairlines, with destructive actions in red. AlertDialog's button bar is a right-aligned row
+      and cannot be made to do that without replacing the layout entirely. Dialogs that want the
+      genuine article build their own card — see LykeDescriptionDialog, which is what that looks
+      like — and this theme is what everything else gets for free.
+    -->
+    <style name="Theme.Prism.Dialog" parent="ThemeOverlay.Material3.MaterialAlertDialog">
+        <item name="android:windowBackground">@drawable/bg_ios_dialog</item>
+        <item name="android:backgroundDimAmount">0.4</item>
+        <item name="android:windowMinWidthMajor">70%</item>
+        <item name="android:windowMinWidthMinor">80%</item>
+
+        <item name="android:textColorPrimary">?attr/prismTextPrimary</item>
+        <item name="android:textColorSecondary">?attr/prismTextSecondary</item>
+        <item name="colorAccent">?attr/prismAccent</item>
+
+        <item name="materialAlertDialogTitleTextStyle">@style/Prism.Dialog.Title</item>
+        <item name="materialAlertDialogBodyTextStyle">@style/Prism.Dialog.Body</item>
+        <item name="buttonBarPositiveButtonStyle">@style/Prism.Dialog.Button</item>
+        <item name="buttonBarNegativeButtonStyle">@style/Prism.Dialog.Button</item>
+        <item name="buttonBarNeutralButtonStyle">@style/Prism.Dialog.Button</item>
+    </style>
+
+    <style name="Prism.Dialog.Title" parent="MaterialAlertDialog.Material3.Title.Text">
+        <item name="android:textColor">?attr/prismTextPrimary</item>
+        <item name="android:textSize">17sp</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:gravity">center</item>
+        <item name="android:textAlignment">center</item>
+    </style>
+
+    <style name="Prism.Dialog.Body" parent="MaterialAlertDialog.Material3.Body.Text">
+        <item name="android:textColor">?attr/prismTextSecondary</item>
+        <item name="android:textSize">13sp</item>
+        <item name="android:gravity">center</item>
+        <item name="android:textAlignment">center</item>
+    </style>
+
+    <!-- Plain blue text, sentence case. Uppercase button labels are the Material tell. -->
+    <style name="Prism.Dialog.Button" parent="Widget.Material3.Button.TextButton.Dialog">
+        <item name="android:textColor">?attr/prismAccent</item>
+        <item name="android:textSize">16sp</item>
+        <item name="android:textAllCaps">false</item>
+        <item name="textAllCaps">false</item>
+        <item name="android:letterSpacing">0</item>
+    </style>
+
+    <!-- The same card shape for menus that pop up from a tap. -->
+    <style name="Prism.PopupMenu" parent="Widget.Material3.PopupMenu">
+        <item name="android:popupBackground">@drawable/bg_ios_popup</item>
+        <item name="android:textColor">?attr/prismTextPrimary</item>
+    </style>
+
     <style name="CircleImage">
         <item name="cornerFamily">rounded</item>
         <item name="cornerSize">50%</item>

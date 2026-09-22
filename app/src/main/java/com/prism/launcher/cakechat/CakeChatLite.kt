@@ -89,9 +89,33 @@ class CakeChatLite private constructor(
                 val vocabulary = CakeChatVocabulary.load(dir)
                     ?: error("${CakeChatVocabulary.META_NAME} is missing or unreadable")
 
-                // Two threads. The launcher has to keep drawing while this runs, and the models are
-                // small enough that more threads buy little.
-                val options = Interpreter.Options().apply { numThreads = 2 }
+                // XNNPACK, and threads scaled to the big cores.
+                //
+                // XNNPACK IS THE ONE THAT MATTERS. It replaces TFLite's reference float kernels with
+                // vectorized ones, and for a float32 GRU model that is most of the arithmetic. It is
+                // requested explicitly rather than left to the default because the default has moved
+                // between TFLite versions and across ABIs -- being implicit here means nobody can
+                // tell from the code whether the fast kernels are in use, which is exactly the
+                // situation the GGUF path was in when it turned out to be running baseline ARMv8
+                // kernels on a CPU with dot-product instructions.
+                //
+                // The thread count was 2, with the reasoning that the launcher has to keep drawing
+                // and the models are small. Half of that holds: the decoder runs one token at a time
+                // through small matrices, so this does not scale like a batch GEMM. But 2 was chosen
+                // for a 2-big-core world, and a current phone has four or more. Using half the cores
+                // keeps the UI responsive -- the original concern -- without leaving three of them
+                // idle, and the floor of 2 keeps the old behaviour on a small device.
+                //
+                // NOT MEASURED ON DEVICE. Converting a CakeChat checkpoint is a prerequisite and no
+                // converted model existed on the test phone, so unlike the GGUF and Aether changes
+                // this one rests on how TFLite is documented to behave rather than on a number from
+                // this hardware. Worth revisiting with a real model.
+                val cores = Runtime.getRuntime().availableProcessors()
+                val threads = (cores / 2).coerceIn(2, 4)
+                val options = Interpreter.Options().apply {
+                    numThreads = threads
+                    setUseXNNPACK(true)
+                }
                 val encoder = Interpreter(map(File(dir, "cakechat_encoder.tflite")), options)
                 val decoder = Interpreter(map(File(dir, "cakechat_decoder.tflite")), options)
 

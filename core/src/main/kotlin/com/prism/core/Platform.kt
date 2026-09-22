@@ -44,6 +44,20 @@ interface PlatformHost {
     fun prefs(name: String): KeyValueStore
 
     /**
+     * Where this platform keeps the native libraries, when it keeps them somewhere unusual.
+     *
+     * Null means "the loader's own defaults are correct", which is the case on desktop: the
+     * libraries sit next to the binary and ggml's backend scan finds them without help.
+     *
+     * Android is the exception, and the reason this exists. Prism's ggml is built with
+     * GGML_CPU_ALL_VARIANTS, so the CPU kernels live in several libggml-cpu-*.so files and the
+     * right one is chosen at startup by scanning a directory and asking each what the current CPU
+     * can run. The directory is ApplicationInfo.nativeLibraryDir; ggml would otherwise look beside
+     * the executable, which in an Android app is /system/bin/app_process64, and find nothing.
+     */
+    fun nativeLibraryDir(): File? = null
+
+    /**
      * Whether Prism may read and write arbitrary user files.
      *
      * Android gates this behind MANAGE_EXTERNAL_STORAGE, which the user grants in system

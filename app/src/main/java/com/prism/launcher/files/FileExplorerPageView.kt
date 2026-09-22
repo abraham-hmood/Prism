@@ -633,12 +633,28 @@ class FileExplorerAdapter(
         var startY = 0f
         val touchSlop = android.view.ViewConfiguration.get(ctx).scaledTouchSlop
         
-        val showMenuRunnable = Runnable { if (!isDragging) showOptions(entry) }
+        /**
+         * Set once the long-press menu has opened, so the release that follows is not also a tap.
+         *
+         * THE BUG THIS FIXES: ACTION_UP fired onEntryClick for any gesture that was not a drag, and
+         * a long press is not a drag -- so holding a file showed its menu and then opened the file
+         * underneath it. Three states share this handler (tap, long press, drag) and only two of
+         * them were being told apart.
+         */
+        var menuShown = false
+
+        val showMenuRunnable = Runnable {
+            if (!isDragging) {
+                menuShown = true
+                showOptions(entry)
+            }
+        }
 
         holder.itemView.setOnTouchListener { v, event ->
             when (event.action) {
                 android.view.MotionEvent.ACTION_DOWN -> {
                     isDragging = false
+                    menuShown = false
                     startX = event.rawX; startY = event.rawY
                     handler.postDelayed(showMenuRunnable, 500)
                 }
@@ -659,7 +675,7 @@ class FileExplorerAdapter(
                 }
                 android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> {
                     handler.removeCallbacks(showMenuRunnable)
-                    if (!isDragging && event.action == android.view.MotionEvent.ACTION_UP) {
+                    if (!isDragging && !menuShown && event.action == android.view.MotionEvent.ACTION_UP) {
                         onEntryClick(entry)
                     }
                 }

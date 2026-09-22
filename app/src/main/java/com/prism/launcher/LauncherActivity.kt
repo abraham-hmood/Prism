@@ -215,6 +215,96 @@ class LauncherActivity : PrismBaseActivity() {
         }
     }
 
+    /**
+     * Widget updates only arrive while the host is listening, and only matter while it is on screen.
+     *
+     * Without startListening a placed widget draws once and then never changes, which is
+     * indistinguishable from a broken widget; without stopListening the process keeps receiving
+     * updates for a screen nobody is looking at.
+     */
+    override fun onStart() {
+        super.onStart()
+        com.prism.launcher.widgets.PrismWidgetHost.startListening(this)
+        // Keeps Prism's presence in the "Open with" list for .exe files matched to whether a
+        // virtualization page exists. Here rather than only at the moment a page is added, because
+        // pages are also added and removed from the page picker and from Settings.
+        com.prism.launcher.virtualization.ExeLaunchActivity.syncHandlerRegistration(this)
+    }
+
+    override fun onStop() {
+        com.prism.launcher.widgets.PrismWidgetHost.stopListening(this)
+        super.onStop()
+    }
+
+    @Deprecated("Widget binding and configuration only report back this way")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
+        // AppWidgetManager's bind and configure flows predate the Activity Result APIs and still
+        // deliver here, so this override exists for them specifically.
+        val handled = com.prism.launcher.widgets.WidgetPlacement.onActivityResult(
+            this, requestCode, resultCode, data,
+        ) {
+            (findPageViewAt(binding.desktopPager.currentItem) as? DesktopGridPage)?.let { page ->
+                page.refreshFromStore()
+                page.refreshWidgets()
+            }
+        }
+        if (!handled) {
+            @Suppress("DEPRECATION")
+            super.onActivityResult(requestCode, resultCode, data)
+        }
+    }
+
+    /**
+     * Places a widget on the first desktop page, then goes there.
+     *
+     * The other way in is dragging a widget out of the drawer, which is the gesture people know from
+     * every other launcher. This exists alongside it because that gesture has to cross a page
+     * boundary -- the drawer and the desktop are different pages of the same pager -- and dragging to
+     * the edge to flip pages and then releasing is fiddly on a phone and impossible to do by
+     * accident. Tapping is the discoverable version of the same intent.
+     */
+    fun placeWidgetOnDesktop(flattenedProvider: String) {
+        val provider = com.prism.launcher.widgets.WidgetPlacement.providerFor(this, flattenedProvider)
+        if (provider == null) {
+            android.widget.Toast.makeText(this, "That widget is no longer installed", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val assignments = slotPreferences.getAssignments()
+        val desktopPosition = assignments.indexOfFirst {
+            it is SlotAssignment.DesktopGrid || it is SlotAssignment.Default
+        }
+        if (desktopPosition < 0) {
+            android.widget.Toast.makeText(this, "There is no desktop page to place it on", android.widget.Toast.LENGTH_LONG).show()
+            return
+        }
+
+        // A cell's size in dp decides how many cells the widget asks for, so it is measured from a
+        // real cell where one is laid out and estimated from the screen only as a fallback.
+        val metrics = resources.displayMetrics
+        val page = findPageViewAt(desktopPosition) as? DesktopGridPage
+        val cellWidthDp = page?.cellWidthDp() ?: ((metrics.widthPixels / metrics.density) / 4).toInt()
+        val cellHeightDp = page?.cellHeightDp() ?: ((metrics.heightPixels / metrics.density) / 6).toInt()
+
+        com.prism.launcher.widgets.WidgetPlacement.begin(
+            activity = this,
+            provider = provider,
+            pageIndex = desktopPosition,
+            cellIndex = 0,
+            cellWidthDp = cellWidthDp,
+            cellHeightDp = cellHeightDp,
+            cellCount = DesktopShortcutStore.GRID_SIZE,
+        ) {
+            binding.desktopPager.setCurrentItem(desktopPosition, true)
+            binding.desktopPager.post {
+                (findPageViewAt(desktopPosition) as? DesktopGridPage)?.let {
+                    it.refreshFromStore()
+                    it.refreshWidgets()
+                }
+            }
+        }
+    }
+
     fun requestMessagingPermissions() {
         smsPermissionLauncher.launch(arrayOf(
             Manifest.permission.READ_SMS,
@@ -286,6 +376,15 @@ class LauncherActivity : PrismBaseActivity() {
                     window.setBackgroundBlurRadius(blurRadius)
                 }
             }
+
+            override fun onPageSelected(position: Int) {
+                // The notifications page is a snapshot of a list that changes while the page is off
+                // screen, and ViewPager2 keeps neighbouring pages alive rather than rebuilding them.
+                // Without this the page shows whatever was true when it was first constructed, which
+                // on a fresh start is "nothing yet" -- the listener has not captured the backlog.
+                (findPageViewAt(position) as? com.prism.launcher.notifications.NotificationsPageView)
+                    ?.refresh()
+            }
         })
 
         binding.pickerMainPager.orientation = ViewPager2.ORIENTATION_VERTICAL
@@ -308,6 +407,7 @@ class LauncherActivity : PrismBaseActivity() {
                         tryConsumeNebulaSocialBack() -> Unit
                         tryConsumeWalletBack() -> Unit
                         tryConsumeEditorBack() -> Unit
+                        tryConsumeMinigamesBack() -> Unit
                         else -> {
                             isEnabled = false
                             onBackPressedDispatcher.onBackPressed()
@@ -382,6 +482,10 @@ class LauncherActivity : PrismBaseActivity() {
         // Home cannot be intercepted, but Prism IS home -- so a press of it lands here, and this is
         // where a lock that was dismissed that way gets put back.
         com.prism.launcher.lock.LockGate.showIfLocked(this)
+
+        // The tour, once. Shown from onResume rather than onCreate so it lands after the pager has
+        // laid out -- an overlay added to an empty root flickers as the pages inflate behind it.
+        com.prism.launcher.onboarding.OnboardingOverlay.showIfNeeded(binding.root)
 
         shakeDetector.start()
         // Back in Prism, so the floating copy has nothing left to do — the real feed is on screen
@@ -513,6 +617,20 @@ class LauncherActivity : PrismBaseActivity() {
      * Found by scanning the pager rather than held as a field, for the reason the wallet lookup
      * gives: the page can sit in any slot and is created and recycled by the adapter.
      */
+    /**
+     * Back inside the Minigames page: closes a sheet, a map, or a battle before leaving the page.
+     *
+     * Without this, back from inside a battle drops the user all the way out of the launcher, which
+     * is a surprising amount of distance to travel from "I wanted to stop looking at this map".
+     */
+    private fun tryConsumeMinigamesBack(): Boolean {
+        val position = slotPreferences.getAssignments().indexOfFirst { it is SlotAssignment.Minigames }
+        if (position < 0) return false
+        if (binding.desktopPager.currentItem != position) return false
+        return (findPageViewAt(position) as? com.prism.launcher.minigames.MinigamesPageView)
+            ?.onBack() ?: false
+    }
+
     private fun tryConsumeEditorBack(): Boolean {
         val position = slotPreferences.getAssignments().indexOfFirst { it is SlotAssignment.Editor }
         if (position < 0) return false
@@ -591,7 +709,28 @@ class LauncherActivity : PrismBaseActivity() {
     }
 
     private fun launchComponent(cn: ComponentName) {
+        // Virtualized app launches go to the guest, whatever else is configured.
+        //
+        // Checked before the PrismOS routing below because it is a stronger statement: that routing
+        // is "send app intents to a guest that happens to be running", while this is "this app runs
+        // in the guest, and its APK and data live in Prism's vault". See VirtualizedAppLauncher.
+        if (PrismSettings.getVirtualizeAndroidApps() &&
+            com.prism.launcher.virtualization.VirtualizedAppLauncher.shouldVirtualize(this, cn)
+        ) {
+            com.prism.launcher.virtualization.VirtualizedAppLauncher.launch(this, cn)
+            logLaunchStat(cn)
+            return
+        }
+
+        // Routing an ANDROID app into the virtualization page only makes sense while that page is
+        // running a guest OS that can receive it. In Windows mode the page runs .exe files under
+        // Wine and has no way to start an Android activity, so sending one there means paging away
+        // from the user's tap and then doing nothing -- which is exactly what it looked like.
+        //
+        // The two halves of that page are exclusive (VirtualizationPageView says so), and this is
+        // the other side of the same rule as the boot check in bootFromSettings.
         if (PrismSettings.getVirtualizationEnabled() &&
+            !PrismSettings.getWindowsMode() &&
             PrismSettings.getVirtualizationMode() == PrismSettings.VIRT_MODE_PRISM_OS) {
             val virtPos = findVirtualizationOsPosition()
             if (virtPos != -1) {
@@ -788,6 +927,9 @@ class LauncherActivity : PrismBaseActivity() {
             PagePickChoice.Models -> SlotAssignment.Models
             PagePickChoice.Editor -> SlotAssignment.Editor
             PagePickChoice.Science -> SlotAssignment.Science
+            PagePickChoice.Language -> SlotAssignment.Language
+            PagePickChoice.Minigames -> SlotAssignment.Minigames
+            PagePickChoice.Notifications -> SlotAssignment.Notifications
             PagePickChoice.ModelStore -> SlotAssignment.ModelStore
             PagePickChoice.AgenticTools -> SlotAssignment.AgenticTools
             PagePickChoice.Wallet -> SlotAssignment.Wallet
@@ -865,6 +1007,29 @@ class LauncherActivity : PrismBaseActivity() {
 
     fun findVirtualizationOsPosition(): Int =
         slotPreferences.getAssignments().indexOfFirst { it is SlotAssignment.VirtualizationOs }
+
+    /**
+     * Turns to the virtualization page and shows a virtualized app on it.
+     *
+     * Returns false when there is no virtualization page assigned to any slot, which is the caller's
+     * cue to fall back to opening the app in a window of its own -- there is nowhere to put it here.
+     *
+     * The app's code does not run in this process: the page shows a surface produced by the
+     * `:virtualapp` process. See VirtualAppHostService.
+     */
+    fun showVirtualizedApp(packageName: String): Boolean {
+        val position = findVirtualizationOsPosition()
+        if (position < 0) return false
+
+        binding.desktopPager.setCurrentItem(position, true)
+        // Posted for the same reason every other hand-off to a page is: the view for a slot does not
+        // exist until the pager has laid it out, and the request can arrive before that.
+        binding.root.postDelayed({
+            (findPageViewAt(position) as? com.prism.launcher.virtualization.VirtualizationPageView)
+                ?.hostVirtualApp(packageName)
+        }, 350)
+        return true
+    }
 
     /** Turns the pager to [position]. Public so a page can hand off to another page. */
     fun goToPage(position: Int) {

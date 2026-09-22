@@ -1,68 +1,87 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+    FITS SYSTEM WINDOWS, which is the whole of the "it does not fit the screen" fix. Without it the
+    title sat under the status bar and the last row of the list ran beneath the gesture bar, so the
+    page was taller than the space it had. Every other full-page layout here (page_desktop_root)
+    already declares it.
+-->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="?attr/prismBackground"
+    android:fitsSystemWindows="true"
     android:clipChildren="false"
     android:clipToPadding="false"
     android:orientation="vertical">
 
-    <!--
-        Title row rather than a bare title, so the section switcher has somewhere to live.
-        Nebula builds its chevron in code because it shares a RelativeLayout with other screens;
-        this layout belongs to one page, so the row is declared here where it can be read.
-    -->
-    <LinearLayout
-        android:id="@+id/modelsTitleRow"
+    <TextView
+        android:id="@+id/modelsTitle"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:gravity="center_vertical"
-        android:orientation="horizontal"
+        android:alpha="0.9"
+        android:fontFamily="sans-serif-medium"
         android:paddingStart="16dp"
         android:paddingTop="12dp"
-        android:paddingEnd="16dp">
+        android:paddingEnd="16dp"
+        android:paddingBottom="8dp"
+        android:text="AI Models"
+        android:textColor="@color/white"
+        android:textSize="22sp" />
+
+    <!--
+        Collapsible sections, the way a VS Code sidebar stacks EXPLORER over SEARCH: every section
+        header stays visible and the open one takes the room that is left.
+
+        An accordion rather than independent toggles because both bodies want the whole remaining
+        height. Two open at once would mean splitting it, which leaves neither list tall enough to be
+        useful on a phone. A collapsed body is GONE, so its layout_weight stops counting and the open
+        one expands into the space with no arithmetic anywhere.
+    -->
+    <LinearLayout
+        android:id="@+id/sectionModelsHeader"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="?android:attr/selectableItemBackground"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="12dp"
+        android:paddingTop="10dp"
+        android:paddingEnd="16dp"
+        android:paddingBottom="10dp">
 
         <TextView
-            android:id="@+id/modelsSectionSwitch"
-            android:layout_width="32dp"
-            android:layout_height="40dp"
-            android:contentDescription="Switch between Models and Quant"
+            android:id="@+id/chevronModels"
+            android:layout_width="24dp"
+            android:layout_height="wrap_content"
             android:gravity="center"
-            android:text="›"
-            android:textColor="@color/prism_accent"
-            android:textSize="26sp" />
+            android:text="▾"
+            android:textColor="@color/prism_text_muted"
+            android:textSize="14sp" />
 
-        <LinearLayout
+        <TextView
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:orientation="vertical">
+            android:fontFamily="sans-serif-medium"
+            android:letterSpacing="0.06"
+            android:text="MODELS"
+            android:textAllCaps="true"
+            android:textColor="@color/white"
+            android:textSize="12sp" />
 
-            <TextView
-                android:id="@+id/modelsTitle"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:alpha="0.9"
-                android:fontFamily="sans-serif-medium"
-                android:text="Models"
-                android:textColor="@color/white"
-                android:textSize="20sp" />
-
-            <TextView
-                android:id="@+id/modelsSubtitle"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="Models imported to this device"
-                android:textColor="@color/prism_text_muted"
-                android:textSize="13sp" />
-        </LinearLayout>
+        <TextView
+            android:id="@+id/modelsCount"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textColor="@color/prism_text_muted"
+            android:textSize="12sp" />
     </LinearLayout>
 
     <TextView
         android:id="@+id/modelsEmptyState"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="48dp"
+        android:layout_marginTop="24dp"
         android:gravity="center"
         android:paddingHorizontal="32dp"
         android:text="No models imported yet. Import one from Settings → Local AI Model."
@@ -70,14 +89,6 @@
         android:textSize="14sp"
         android:visibility="gone" />
 
-    <!--
-        Both sections take the remaining height and one of them is always gone, so the page is
-        exactly as tall as the screen whichever is showing.
-
-        The list's bottom padding was 80dp, which on a short screen pushed the last model under the
-        gesture bar with nothing below it to explain the gap. 24dp clears the bar without eating a
-        row of content.
-    -->
     <androidx.recyclerview.widget.RecyclerView
         android:id="@+id/modelsRecycler"
         android:layout_width="match_parent"
@@ -85,7 +96,47 @@
         android:layout_weight="1"
         android:clipToPadding="false"
         android:paddingHorizontal="16dp"
-        android:paddingBottom="24dp" />
+        android:paddingBottom="16dp" />
+
+    <LinearLayout
+        android:id="@+id/sectionQuantHeader"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="?android:attr/selectableItemBackground"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="12dp"
+        android:paddingTop="10dp"
+        android:paddingEnd="16dp"
+        android:paddingBottom="10dp">
+
+        <TextView
+            android:id="@+id/chevronQuant"
+            android:layout_width="24dp"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:text="▸"
+            android:textColor="@color/prism_text_muted"
+            android:textSize="14sp" />
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:fontFamily="sans-serif-medium"
+            android:letterSpacing="0.06"
+            android:text="QUANT"
+            android:textAllCaps="true"
+            android:textColor="@color/white"
+            android:textSize="12sp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Shrink a model"
+            android:textColor="@color/prism_text_muted"
+            android:textSize="12sp" />
+    </LinearLayout>
 
     <FrameLayout
         android:id="@+id/modelsQuantContainer"

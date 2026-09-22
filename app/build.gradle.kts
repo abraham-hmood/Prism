@@ -18,15 +18,42 @@ android {
         versionName = "1.0"
 
         ndk {
-            // All four Android ABIs, so RandomX ships everywhere -- it is the one mining algorithm
-            // a CPU competes at, and it builds for every architecture.
-            //
-            // NOT everything native is built for all four: llama.cpp/OpenCL stays arm64-only (see
-            // cpp/CMakeLists.txt for why), so a non-arm64 device gets RandomX and Nora's kernels
-            // but no local GGUF inference, which GgufInferenceService already degrades to
-            // gracefully. arm64-v8a is what essentially every real device runs; the other three
-            // are legacy 32-bit ARM, emulators and a few Chromebooks.
-            abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64"))
+            /**
+             * Which architectures go in the APK.
+             *
+             * ALL FOUR BY DEFAULT, so nothing is lost: RandomX is the reason -- it is the one
+             * mining algorithm a CPU competes at, and it builds everywhere. Not everything native
+             * is built for all four; llama.cpp and OpenCL stay arm64-only (see cpp/CMakeLists.txt),
+             * so a non-arm64 device gets RandomX and Nora's kernels but no local GGUF inference,
+             * which GgufInferenceService already degrades to gracefully.
+             *
+             * BUT A UNIVERSAL APK IS MOSTLY DEAD WEIGHT ON ANY GIVEN PHONE. Measured on this
+             * project:
+             *
+             *     native libs     184 MB arm64 · 46 MB x86 · 44 MB x86_64 · 28 MB armeabi-v7a
+             *     Python wheels    86 MB arm64 · 93 MB x86 · 102 MB x86_64 · 77 MB armeabi-v7a
+             *
+             * -- roughly two thirds of what a device downloads is for hardware it does not have.
+             * TensorFlow, SciPy and pandas are per-ABI native wheels, which is why the Python side
+             * rivals the native side.
+             *
+             * So: build for one architecture when you are installing to a known device.
+             *
+             *     ./gradlew assembleDebug -Pprism.abi=arm64-v8a
+             *
+             * WHY NOT `splits { abi { ... } }`, WHICH IS THE NORMAL ANSWER. Chaquopy requires
+             * `ndk.abiFilters` to be set explicitly, and AGP refuses to allow abiFilters and a
+             * splits ABI set at the same time -- "Conflicting configuration ... cannot be present
+             * when splits abi filters are set". The two are mutually exclusive here, so the
+             * selection is a build property instead. For distribution, `bundleRelease` produces an
+             * App Bundle, which splits per ABI on Google's side without either mechanism.
+             */
+            val requested = providers.gradleProperty("prism.abi").orNull
+            val all = listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
+            abiFilters.addAll(
+                if (requested.isNullOrBlank()) all
+                else requested.split(",").map { it.trim() }.filter { it in all }.ifEmpty { all }
+            )
         }
     }
 
@@ -88,7 +115,22 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            /**
+             * R8, with the keep rules in proguard-rules.pro doing the load-bearing work.
+             *
+             * About 30 MB of this APK is dex, unminified. Shrinking is worth roughly two thirds of
+             * that -- small against the native and Python payloads, but free once the rules are
+             * right.
+             *
+             * THE RULES ARE THE RISK, NOT THE SHRINKING. Prism reaches for classes by name in more
+             * places than most apps: JNI callbacks, Room, Chaquopy's Python bridge, BouncyCastle
+             * provider lookup, jgit's service loaders, and every plugin page loaded reflectively
+             * from another APK. R8 cannot see any of those, so anything not kept explicitly
+             * disappears and fails at runtime rather than at build time. Test a release build
+             * before trusting it.
+             */
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -116,17 +158,63 @@ android {
         // rather than dlopen()'d as a JNI library.
         jniLibs {
             useLegacyPackaging = true
-            // AGP strips native libraries on the way into the APK by default, same as the build
-            // script's own (now-disabled) llvm-strip pass -- without this, gdb still shows a bare
-            // "?? ()" with no module name at the crash site even once the build itself keeps
-            // debug info, since Gradle would strip it right back out during packaging.
-            keepDebugSymbols += "**/libqemu-system-aarch64.so"
+
+            /**
+             * QEMU's debug symbols, off by default.
+             *
+             * MEASURED: libqemu-system-aarch64.so is 107 MB, of which about 73 MB is `.debug_info`,
+             * `.debug_loc`, `.debug_line` and friends. Keeping them meant every install of Prism
+             * carried seventy-odd megabytes of DWARF for a binary almost nobody is going to attach
+             * gdb to -- on arm64 alone that is more than the entire rest of the native payload.
+             *
+             * It was kept for a real reason: AGP strips native libraries on the way into the APK,
+             * so without this entry gdb shows a bare "?? ()" with no module name at the crash site
+             * even when the build itself kept debug info. That reason still holds, so the switch
+             * remains -- it is simply no longer the default.
+             *
+             *     ./gradlew assembleDebug -Pprism.qemuSymbols=true
+             */
+            if (providers.gradleProperty("prism.qemuSymbols").orNull == "true") {
+                keepDebugSymbols += "**/libqemu-system-aarch64.so"
+            }
+        }
+    }
+
+    testOptions {
+        unitTests {
+            // The unit tests here cover logic that happens to live in an Android module rather
+            // than logic that uses Android. They still touch PrismLogger on their error paths,
+            // and android.util.Log throws "Stub!" from a plain JVM unless its methods are allowed
+            // to return defaults.
+            isReturnDefaultValues = true
         }
     }
 }
 
 dependencies {
     implementation(project(":core"))
+
+    // Hidden-API access, for app virtualization only.
+    //
+    // Hosting another app's code means standing where the framework expects that app to stand --
+    // ActivityThread, LoadedApk, Instrumentation -- none of which is public API. The exemption this
+    // needs cannot be reached by hand any more: the classic double-reflection trick was closed in
+    // Android 11, when ART started skipping java.lang.Class frames while attributing a caller, so
+    // laundering the lookup through getDeclaredMethod stopped working. Verified on this device
+    // (API 34), where it fails exactly that way.
+    //
+    // A 30 KB Apache-2.0 library maintained against each release is a better answer than a
+    // reimplementation of the same trick from memory, given that the trick is undocumented,
+    // version-specific, and fails closed in a way that reads as "the app crashed".
+    implementation("org.lsposed.hiddenapibypass:hiddenapibypass:4.3")
+
+    // ONNX Runtime, for Kokoro-82M speech.
+    //
+    // Kokoro publishes PyTorch weights only, which Android cannot load; the ONNX export of the same
+    // model is what actually runs here (see KokoroInstall). TFLite is already in this build but
+    // cannot help -- there is no TFLite conversion of Kokoro, and the model's control flow does not
+    // survive one cleanly. This is the runtime the published artefact needs.
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
 
     // TFLite, for running a trained CakeChat without TensorFlow.
     //
@@ -180,8 +268,17 @@ dependencies {
     // git servers) instead of fetching every file over plain HTTP one at a time.
     implementation("org.eclipse.jgit:org.eclipse.jgit:6.10.0.202406032230-r")
 
+    // DocumentFile, for walking a folder the user picked through the storage picker. A tree
+    // Uri has no path, so importing a dataset folder cannot be done with java.io.File alone.
+    implementation("androidx.documentfile:documentfile:1.0.1")
+
     // BouncyCastle for on-device SSL certificate generation (.p2p domains)
     implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
     implementation("org.bouncycastle:bcpkix-jdk18on:1.78.1")
+
+    // Plain JVM tests, for the logic in this module that has no Android in it. WineInstaller
+    // parses tar archives and Debian version strings, and both are the kind of thing that is
+    // either exactly right or silently corrupts a 30,000-file root filesystem.
+    testImplementation(kotlin("test"))
 }
 

@@ -204,7 +204,7 @@ class MarketplaceActivity : PrismBaseActivity() {
                     ExtensionStore.RUNTIME_WORKER -> "Runs in the web extension host"
                     ExtensionStore.RUNTIME_NODE -> "Runs in the Node host"
                     else -> if (extension.nodeEntry != null)
-                        "Needs Node, which this build has no runtime for"
+                        "Needs the Node.js runtime — install it from Marketplace ▸ Node.js Runtime"
                     else "Declarative — a theme, grammar or snippets; nothing to run"
                 }
                 textSize = 11f

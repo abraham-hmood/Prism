@@ -1,0 +1,18 @@
+{
+  "hasSubscriptions": true,
+  "extensionPath": "F:\\AndroidStudioProjects\\Prism\\tools\\editor-host-test\\ext",
+  "globalStorageFsPath": "F:\\AndroidStudioProjects\\Prism\\tools\\editor-host-test\\global-storage",
+  "storagePath": "F:\\AndroidStudioProjects\\Prism\\tools\\editor-host-test\\storage",
+  "logPath": "F:\\AndroidStudioProjects\\Prism\\tools\\editor-host-test\\logs",
+  "hasSecrets": true,
+  "hasEnvCollection": true,
+  "manifestName": "probe",
+  "globalStateSeeded": "from-disk",
+  "asAbsolute": "F:\\AndroidStudioProjects\\Prism\\tools\\editor-host-test\\ext/main.js",
+  "dirname": "F:\\AndroidStudioProjects\\Prism\\tools\\editor-host-test\\ext",
+  "childProcess": "spawned",
+  "canReadOwnFile": true,
+  "hasCommands": true,
+  "hasWindow": true,
+  "hasWorkspace": true
+}

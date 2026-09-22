@@ -110,13 +110,37 @@ class TerminalPanel(context: Context) : LinearLayout(context) {
     fun start(workingDirectory: File) {
         if (shell?.isAlive == true) return
 
+        // Inside the Linux guest when there is one. That is not a preference: it is the difference
+        // between a shell where `node`, `npm` and an extension's own tools exist and one where
+        // they do not. Android's shell has none of them and cannot execute anything in app
+        // storage, which is exactly where all of them live.
+        val guest = NodeInstaller.isInstalled(context)
+        val directory =
+            if (workingDirectory.isDirectory) workingDirectory else workingDirectory.parentFile
+
         append("Prism shell · ${workingDirectory.absolutePath}\n")
-        append("Running as this app -- no root, and no pty, so full-screen programs will not draw.\n\n")
+        append(
+            if (guest) {
+                "Linux guest · node ${NodeInstaller.installedVersion(context).orEmpty()} · " +
+                    "no pty, so full-screen programs will not draw.\n\n"
+            } else {
+                "Running as this app -- no root, and no pty, so full-screen programs will not " +
+                    "draw. Install the Node.js runtime for a Linux shell with node and npm.\n\n"
+            }
+        )
 
         runCatching {
-            val builder = ProcessBuilder("/system/bin/sh")
-                .directory(if (workingDirectory.isDirectory) workingDirectory else workingDirectory.parentFile)
-                .redirectErrorStream(true)
+            val builder = if (guest) {
+                // Paths are bound at their own names inside the guest, so the directory the editor
+                // handed over is the directory the shell opens in — no translation needed.
+                ProcessBuilder(NodeRuntime.guestShellCommand(context, directory?.absolutePath))
+                    .redirectErrorStream(true)
+                    .also { NodeRuntime.applyGuestEnvironment(context, it) }
+            } else {
+                ProcessBuilder("/system/bin/sh")
+                    .directory(directory)
+                    .redirectErrorStream(true)
+            }
             builder.environment()["HOME"] = context.filesDir.absolutePath
             builder.environment()["TMPDIR"] = context.cacheDir.absolutePath
             builder.environment()["TERM"] = "dumb"       // honest: there is no terminal to emulate

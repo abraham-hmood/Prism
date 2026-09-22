@@ -60,6 +60,16 @@ object GgufInferenceService {
 
         return try {
             System.loadLibrary("gguf_bridge")
+
+            // Before anything asks for a backend. The CPU kernels are separate libraries now (one
+            // per ARM feature set, chosen by what this phone can actually execute -- see
+            // CMakeLists.txt), and they are found by scanning a directory that only the platform
+            // knows. Getting this wrong does not fail loudly: discovery simply finds nothing and
+            // inference has no backend, so it is done here rather than at first use.
+            com.prism.core.PrismPlatform.host.nativeLibraryDir()?.let { dir ->
+                nativeSetBackendDir(dir.absolutePath)
+            }
+
             com.prism.core.PrismPlatform.log.info("Prism/gguf", "gguf_bridge loaded")
             true
         } catch (t: Throwable) {
@@ -85,6 +95,9 @@ object GgufInferenceService {
     fun interface TokenCallback {
         fun onToken(piece: String)
     }
+
+    /** Where the ggml backend libraries live. Call before any backend is used; see [loadBridge]. */
+    private external fun nativeSetBackendDir(dir: String)
 
     private external fun nativeLoadModel(
         modelPath: String, nCtx: Int, nThreads: Int, kvCacheMode: Int, gpuMode: Int,
@@ -200,6 +213,7 @@ object GgufInferenceService {
         maxTokens: Int = 512,
     ): String {
         if (handle == 0L) return ""
+        inFlight.incrementAndGet()
         return runCatching {
             val raw = if (onToken != null) {
                 val splitter = ThinkTagSplitter(onAnswer = onToken, onReasoning = null)
@@ -210,7 +224,7 @@ object GgufInferenceService {
                 nativeGenerate(handle, userText, maxTokens, 0.7f, 0.05f)
             }
             stripThinkTags(raw)
-        }.getOrDefault("")
+        }.also { inFlight.decrementAndGet() }.getOrDefault("")
     }
 
     /** Releases a handle from [loadDistributed]. Never pass the cached local handle to this. */
@@ -235,6 +249,7 @@ object GgufInferenceService {
         val loadError = ensureLoaded(modelPath)
         if (loadError != null) return loadError
 
+        inFlight.incrementAndGet()
         return try {
             val result = nativeGenerate(handle, userText, 512, 0.7f, 0.05f)
             val stripped = stripThinkTags(result)
@@ -242,6 +257,8 @@ object GgufInferenceService {
         } catch (e: Exception) {
             PrismPlatform.log.error("GgufInferenceService", "Generation failed for $modelPath", e)
             "Local AI Error: ${e.message}"
+        } finally {
+            inFlight.decrementAndGet()
         }
     }
 
@@ -264,9 +281,23 @@ object GgufInferenceService {
         }
 
         val splitter = ThinkTagSplitter(onAnswer = onToken, onReasoning = onReasoning)
+        inFlight.incrementAndGet()
+        // Counted here rather than from the text: a token is what the engine emitted, and the
+        // callback fires exactly once per token, so this is the rate the engine actually achieved
+        // rather than one inferred from characters.
+        var tokens = 0
+        val startedAt = System.currentTimeMillis()
         return try {
-            val result = nativeGenerateStreaming(handle, userText, maxTokens, 0.7f, 0.05f, TokenCallback { splitter.feed(it) })
+            val result = nativeGenerateStreaming(handle, userText, maxTokens, 0.7f, 0.05f, TokenCallback { tokens++; splitter.feed(it) })
             splitter.flush()
+            val elapsed = System.currentTimeMillis() - startedAt
+            if (elapsed > 0 && tokens > 0) {
+                lastTokensPerSecond = tokens * 1000.0 / elapsed
+                PrismPlatform.log.info(
+                    "GgufInferenceService",
+                    "Generated $tokens tokens in $elapsed ms (${"%.1f".format(lastTokensPerSecond)} tok/s)"
+                )
+            }
             val stripped = stripThinkTags(result)
             if (stripped.isBlank()) "The model returned an empty response." else stripped
         } catch (e: Exception) {
@@ -275,6 +306,11 @@ object GgufInferenceService {
             val error = "Local AI Error: ${e.message}"
             onToken(error)
             error
+        } finally {
+            // MUST be in a finally. A counter that leaks on the error path never returns to zero,
+            // and releaseIfIdle would then refuse forever -- the failure would look like the memory
+            // fix simply not working, with nothing pointing at the cause.
+            inFlight.decrementAndGet()
         }
     }
 
@@ -285,6 +321,23 @@ object GgufInferenceService {
 
     @Volatile
     var lastLoadDegradedMode: DegradedMode = DegradedMode.NONE
+        private set
+
+    /**
+     * How long the last native model load took, and how fast the last generation ran.
+     *
+     * Here because "the AI is slow" was, for a long time, unanswerable: the engine benchmarks at
+     * ~19 tok/s generation on this hardware, so every report of slowness was actually a report
+     * about something OUTSIDE the engine -- a reload that should not have happened, a degraded
+     * tier, a cold page cache -- and none of it left a trace. A load time and a token rate on
+     * every turn is what tells those apart without building a benchmark first.
+     */
+    @Volatile
+    var lastLoadMillis: Long = 0L
+        private set
+
+    @Volatile
+    var lastTokensPerSecond: Double = 0.0
         private set
 
     /** Loads (or reuses the already-loaded) model for [modelPath]. Returns an error message on
@@ -315,8 +368,11 @@ object GgufInferenceService {
             currentModelPath = null
         }
 
-        val cores = Runtime.getRuntime().availableProcessors()
-        val threads = if (cores <= 4) cores else (cores * 0.8).toInt()
+        // The performance cores, not a fraction of every core. See PrismCpu for the measurement and
+        // for why 0.8 x core count was the wrong shape on a big.LITTLE phone: it lands in the little
+        // cluster, and ggml synchronises its threads at every graph node, so the slowest thread sets
+        // the pace of the whole graph.
+        val threads = com.prism.core.PrismCpu.inferenceThreads()
 
         onStage?.invoke("Checking available memory...")
         val deficit = ramDeficitBytes(modelPath)
@@ -396,10 +452,16 @@ object GgufInferenceService {
             "Loading GGUF model $modelPath (threads=$threads, kvCacheMode=$kvCacheMode, gpuMode=$gpuMode, " +
                 "forceMmapFallback=$forceMmapFallback, swap=${swapBuffer != null})"
         )
+        val startedAt = System.currentTimeMillis()
         val loaded = nativeLoadModel(modelPath, nCtx, threads, kvCacheMode, gpuMode, forceMmapFallback, swapBuffer)
         if (loaded == 0L) {
             return "Error: Failed to load GGUF model. It may be corrupted, quantized in an unsupported way, or use an unsupported architecture."
         }
+        lastLoadMillis = System.currentTimeMillis() - startedAt
+        PrismPlatform.log.info(
+            "GgufInferenceService",
+            "Loaded $modelPath in ${lastLoadMillis} ms"
+        )
         handle = loaded
         currentModelPath = modelPath
         currentKvCacheMode = kvCacheMode
@@ -474,6 +536,42 @@ object GgufInferenceService {
         }
     }
 
+    /**
+     * How many generations are running right now.
+     *
+     * EXISTS SO MEMORY PRESSURE CANNOT FREE A MODEL MID-SENTENCE. `nativeFreeModel` releases the
+     * llama context while a generate call may still be inside it, which is a use-after-free in
+     * native code -- a hard crash of the launcher, from a callback whose entire purpose was to
+     * avoid being killed. Counted rather than a boolean because streaming and non-streaming
+     * generation can overlap on different threads.
+     */
+    private val inFlight = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** True while any generation is running. */
+    val isGenerating: Boolean get() = inFlight.get() > 0
+
+    /**
+     * Frees the resident model if nothing is using it.
+     *
+     * Returns the number of bytes it is likely to have released, for logging -- the file size,
+     * which is the right order of magnitude since the weights dominate.
+     *
+     * The model reloads on the next request. That costs seconds of mmap and page-in, which is the
+     * correct trade when the alternative is the system killing the launcher: a slow first reply is
+     * recoverable, and being killed while serving as the home screen is not.
+     */
+    fun releaseIfIdle(): Long {
+        if (isGenerating) return 0L
+        synchronized(this) {
+            if (handle == 0L || isGenerating) return 0L
+            val size = currentModelPath?.let { runCatching { File(it).length() }.getOrDefault(0L) } ?: 0L
+            nativeFreeModel(handle)
+            handle = 0L
+            currentModelPath = null
+            return size
+        }
+    }
+
     /** Frees the loaded native context if it currently belongs to [path] — used when a model is deleted. */
     @Synchronized
     fun unload(path: String) {
@@ -497,29 +595,75 @@ object GgufInferenceService {
      * -- so this is deliberately conservative on desktop: it compares against the JVM's own free
      * heap headroom as well, which is the number that actually constrains a JVM process.
      */
-    private fun availableRamGb(): Double {
-        val runtime = Runtime.getRuntime()
-        val jvmFree = runtime.maxMemory() - (runtime.totalMemory() - runtime.freeMemory())
-        val physical = PrismPlatform.host.deviceRamBytes()
-        // Whichever is scarcer is the one that will stop you.
-        return minOf(jvmFree, physical) / (1024.0 * 1024.0 * 1024.0)
+    /**
+     * Physical RAM free right now.
+     *
+     * NOT the Java heap. This used to be `min(Runtime.maxMemory() - used, deviceRam)`, and the heap
+     * term dominated every time: Android caps an app's Java heap at a few hundred megabytes, while a
+     * GGUF model is loaded by llama.cpp into NATIVE memory where that cap does not apply. The result
+     * was that available RAM read as ~0.3 GB on an 8 GB phone, every model looked like it did not
+     * fit, and every single load went down the degraded ladder -- reduced context, forced mmap, and
+     * in the worst case building a multi-gigabyte swapfile before the first token. That is why small
+     * models were no faster than large ones: the size of the model never entered into it.
+     */
+    private fun availableRamBytes(): Long {
+        val reported = PrismPlatform.host.availableRamBytes()
+        return if (reported > 0) reported else PrismPlatform.host.deviceRamBytes()
     }
 
-    private fun requiredGb(modelPath: String): Double = when {
-        modelPath.lowercase().contains("gemma") -> 1.2
-        modelPath.lowercase().contains("phi") -> 1.2
-        modelPath.lowercase().contains("qwen") -> 1.0
-        else -> 0.8
+    private fun availableRamGb(): Double = availableRamBytes() / (1024.0 * 1024.0 * 1024.0)
+
+    /**
+     * What loading [modelPath] needs RESIDENT, which is not the same as how big it is.
+     *
+     * Both engines mmap the weights. Mapped pages are page cache: the kernel can evict them under
+     * pressure and fault them back in, so they are not an allocation that can fail. What genuinely
+     * has to fit is the part that cannot be evicted -- the KV cache, the compute buffers, and the
+     * runtime's own bookkeeping.
+     *
+     * This matters because the first version of this function counted the whole file, which made a
+     * 1.6 GB model "need" 1.93 GB on a phone reporting 2.08 GB free. It passed by a hair when the
+     * phone was idle and failed the moment anything else was open -- reported to the user as
+     * "Insufficient RAM" for a model that would have loaded and run.
+     *
+     * Weights still matter, but to SPEED rather than to success: a model larger than free memory
+     * pages in and out as it generates, which is slow, not fatal. [weightsExceedRam] reports that
+     * separately so it can be explained rather than prevented.
+     */
+    fun requiredBytes(modelPath: String, nCtx: Int = 2048): Long {
+        // ~1 MB per 1k of context across key and value at the quantised sizes Prism loads with.
+        val kvCache = (nCtx / 1024L).coerceAtLeast(1L) * (1L shl 20)
+
+        // Compute buffers, the tokenizer, and the runtime's own structures.
+        val overhead = 320L shl 20
+
+        // Headroom so a load does not succeed and then immediately push the app into a kill.
+        val headroom = 256L shl 20
+
+        return kvCache + overhead + headroom
     }
+
+    /**
+     * True when the weights are bigger than the RAM available to hold them.
+     *
+     * Not a failure -- the model still loads and answers. It is the honest explanation for why a
+     * model much larger than the phone's free memory generates slowly, which otherwise looks like
+     * Prism being slow rather than the device being small.
+     */
+    fun weightsExceedRam(modelPath: String): Boolean =
+        File(modelPath).length() > availableRamBytes()
+
+    private fun requiredGb(modelPath: String): Double =
+        requiredBytes(modelPath) / (1024.0 * 1024.0 * 1024.0)
 
     /** Bytes short of what [modelPath] needs to load normally, or null if it already fits. Pure
      * (no side effects) -- used by [ensureLoaded]'s retry ladder and by
      * `AiManager.onLocalTextModelActivated`'s post-import/activation auto-configuration, which
      * needs the same number to size Prism Swap's slider without actually loading anything. */
     fun ramDeficitBytes(modelPath: String): Long? {
-        val availableGb = availableRamGb()
-        val neededGb = requiredGb(modelPath)
-        if (availableGb >= neededGb) return null
-        return ((neededGb - availableGb) * 1024.0 * 1024.0 * 1024.0).toLong()
+        val available = availableRamBytes()
+        val needed = requiredBytes(modelPath)
+        if (available >= needed) return null
+        return needed - available
     }
 }

@@ -27,6 +27,9 @@ sealed class SlotAssignment {
     data object Wallet : SlotAssignment()
     data object Editor : SlotAssignment()
     data object Science : SlotAssignment()
+    data object Notifications : SlotAssignment()
+    data object Language : SlotAssignment()
+    data object Minigames : SlotAssignment()
 
     fun serialize(): String = when (this) {
         is Default -> "default"
@@ -44,6 +47,9 @@ sealed class SlotAssignment {
         is Wallet -> "wallet"
         is Editor -> "editor"
         is Science -> "science"
+        is Notifications -> "notifications"
+        is Language -> "language"
+        is Minigames -> "minigames"
         is Custom -> "custom|$packageName|$viewClassName"
     }
 
@@ -64,6 +70,9 @@ sealed class SlotAssignment {
             if (raw == "wallet") return Wallet
             if (raw == "editor") return Editor
             if (raw == "science") return Science
+            if (raw == "notifications") return Notifications
+            if (raw == "language") return Language
+            if (raw == "minigames") return Minigames
             val parts = raw.split("|")
             if (parts.size == 3 && parts[0] == "custom") {
                 return Custom(parts[1], parts[2])
@@ -81,6 +90,9 @@ class SlotPreferences {
 
         private const val KEY_LIST = "page_assignments_v2"
 
+        /** Records that the notifications page has been offered once. See [addNotificationsOnce]. */
+        private const val KEY_NOTIFICATIONS_ADDED = "notifications_page_added_v1"
+
         // Legacy keys for migration
         private const val LEGACY_L = "slot_browser"
         private const val LEGACY_C = "slot_desktop"
@@ -90,7 +102,8 @@ class SlotPreferences {
     fun getAssignments(): MutableList<SlotAssignment> {
         val raw = prefs.getString(KEY_LIST, null)
         if (raw != null) {
-            return raw.split(";").map { SlotAssignment.deserialize(it) }.toMutableList()
+            val saved = raw.split(";").map { SlotAssignment.deserialize(it) }.toMutableList()
+            return addNotificationsOnce(saved)
         }
 
         // Migration from v1
@@ -100,12 +113,51 @@ class SlotPreferences {
         
         // If all are default, return the standard start set
         if (L is SlotAssignment.Default && C is SlotAssignment.Default && R is SlotAssignment.Default) {
-            return mutableListOf(SlotAssignment.Browser, SlotAssignment.DesktopGrid, SlotAssignment.AppDrawer)
+            // Notifications sits to the right of the app drawer. Only the fresh-install set is
+            // touched: anyone with a saved layout keeps it exactly as they arranged it, and adds the
+            // page themselves if they want it. Rewriting an existing layout to insert a page would
+            // move every page the user had already placed.
+            //
+            // THE OFFER IS RECORDED HERE TOO, and leaving it out was a bug. A fresh install got the
+            // page in its default set but never set the flag, so the first time the user saved any
+            // layout, the next read took the `raw != null` branch above, found the offer unmade, and
+            // appended notifications a second time -- including to a layout the user had just
+            // removed it from. The page came back, and there was no way to say no to it.
+            prefs.edit().putBoolean(KEY_NOTIFICATIONS_ADDED, true).apply()
+            return mutableListOf(
+                SlotAssignment.Browser,
+                SlotAssignment.DesktopGrid,
+                SlotAssignment.AppDrawer,
+                SlotAssignment.Notifications,
+            )
         }
         
         val migrated = mutableListOf(L, C, R)
         saveAssignments(migrated)
         return migrated
+    }
+
+    /**
+     * Appends the notifications page to a layout saved before that page existed. Once.
+     *
+     * APPENDED, NOT INSERTED, and that is the whole design. A new page belongs to the right of what
+     * is already there: inserting one would renumber every page after it, and page numbers are what
+     * `DesktopShortcutStore` keys its `cells_page_N` on -- so an insert would silently hand each
+     * desktop page the contents of its neighbour. Appending changes nobody's existing page.
+     *
+     * Once, because removing the page has to stick. A migration that ran every time would put it
+     * back on the next launch, which is worse than never adding it: the user would have no way to say
+     * no. The flag records that the offer was made rather than that the page is present.
+     */
+    private fun addNotificationsOnce(list: MutableList<SlotAssignment>): MutableList<SlotAssignment> {
+        if (prefs.getBoolean(KEY_NOTIFICATIONS_ADDED, false)) return list
+        prefs.edit().putBoolean(KEY_NOTIFICATIONS_ADDED, true).apply()
+
+        if (list.none { it is SlotAssignment.Notifications }) {
+            list.add(SlotAssignment.Notifications)
+            saveAssignments(list)
+        }
+        return list
     }
 
     fun saveAssignments(list: List<SlotAssignment>) {

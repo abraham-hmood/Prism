@@ -258,10 +258,45 @@ class ConversationActivity : AppCompatActivity() {
      * The submit action is the send button's own click, not a copy of the send logic, so a
      * dictated message goes down exactly the path a typed one does.
      */
+    /**
+     * The call button, on the three threads that can hold a conversation.
+     *
+     * Hidden rather than disabled on an SMS thread: there is no version of "call" that Prism could
+     * offer there, so a greyed-out control would only raise a question it cannot answer. The three
+     * AI threads get it because each of them can be spoken to and can speak back, in its own voice.
+     */
+    private fun setUpCallButton(isAiThread: Boolean) {
+        val button = binding.conversationCallBtn
+        if (!isAiThread) {
+            button.visibility = android.view.View.GONE
+            return
+        }
+
+        val speaker = when (threadId) {
+            com.prism.launcher.nora.NoraChat.THREAD_ID -> com.prism.launcher.PrismSettings.VOICE_SPEAKER_NORA
+            com.prism.launcher.aether.AetherChat.THREAD_ID -> com.prism.launcher.PrismSettings.VOICE_SPEAKER_AETHER
+            else -> com.prism.launcher.PrismSettings.VOICE_SPEAKER_SAM
+        }
+        val name = when (threadId) {
+            com.prism.launcher.nora.NoraChat.THREAD_ID -> com.prism.launcher.nora.NoraChat.DISPLAY_NAME
+            com.prism.launcher.aether.AetherChat.THREAD_ID -> "Aether"
+            else -> "Sam"
+        }
+
+        button.visibility = android.view.View.VISIBLE
+        button.setOnClickListener {
+            startActivity(
+                com.prism.launcher.speech.CallModeActivity.intentFor(this, speaker, name)
+            )
+        }
+    }
+
     private fun setUpDictation() {
         val isAiThread = threadId == SAM_THREAD_ID ||
             threadId == com.prism.launcher.nora.NoraChat.THREAD_ID ||
             threadId == com.prism.launcher.aether.AetherChat.THREAD_ID
+
+        setUpCallButton(isAiThread)
 
         voice = com.prism.launcher.voice.VoiceInputController(
             micButton = binding.conversationMicBtn,

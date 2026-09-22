@@ -33,6 +33,15 @@ class AndroidHost(context: Context) : PlatformHost {
     override fun cacheDir(): File = app.cacheDir
 
     /**
+     * Where the APK's native libraries were unpacked.
+     *
+     * Read from ApplicationInfo rather than assembled from the package name: the path carries an
+     * install-specific suffix on modern Android, and the split-APK and app-bundle cases move it
+     * again. Only the framework knows it.
+     */
+    override fun nativeLibraryDir(): File = File(app.applicationInfo.nativeLibraryDir)
+
+    /**
      * The user-visible folder, kept exactly where the Android build has always put it.
      *
      * `Prism` on external storage rather than anywhere newer or tidier, because existing

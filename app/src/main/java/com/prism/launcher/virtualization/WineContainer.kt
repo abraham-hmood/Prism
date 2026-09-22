@@ -54,6 +54,9 @@ object WineContainer {
     /** PRoot, shipped as a native library so Android permits executing it. */
     const val PROOT_LIBRARY = "libproot.so"
 
+    /** PRoot's loader stub -- statically linked, because it runs before any dynamic linker does. */
+    const val PROOT_LOADER_LIBRARY = "libproot-loader.so"
+
     /** Where the Ubuntu rootfs is unpacked. Data, never executed directly -- only entered via PRoot. */
     fun imageFs(context: Context): File = File(context.filesDir, "wine/imagefs")
 
@@ -78,6 +81,27 @@ object WineContainer {
 
     fun prootBinary(context: Context): File? =
         File(context.applicationInfo.nativeLibraryDir, PROOT_LIBRARY).takeIf { it.exists() }
+
+    /**
+     * The environment every PRoot child needs, wherever it is launched from.
+     *
+     * PROOT_LOADER is the one that is not optional and not obvious. PRoot cannot execute a binary
+     * out of the rootfs directly -- that is the whole restriction it exists to work around -- so it
+     * substitutes a tiny static loader from the native library directory, which then maps the real
+     * ELF. Without this variable PRoot looks for that loader next to its own argv[0] under a name
+     * Android's packaging does not produce, and every exec inside the container fails.
+     */
+    fun applyProotEnvironment(context: Context, builder: ProcessBuilder) {
+        val environment = builder.environment()
+        environment["HOME"] = context.filesDir.absolutePath
+        environment["TMPDIR"] = context.cacheDir.absolutePath
+        // Where PRoot puts its own working files; without it PRoot tries /tmp, which an Android app
+        // cannot write to.
+        environment["PROOT_TMP_DIR"] =
+            File(context.cacheDir, "proot").apply { mkdirs() }.absolutePath
+        environment["PROOT_LOADER"] =
+            File(context.applicationInfo.nativeLibraryDir, PROOT_LOADER_LIBRARY).absolutePath
+    }
 
     /**
      * Why Windows programs cannot run yet, or null when they can.

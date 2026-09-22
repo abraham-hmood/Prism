@@ -1,9 +1,14 @@
 /*
  * The Node extension host.
  *
- * This is the script the in-process Node.js runtime boots. It runs VS Code extensions that declare
- * `main` -- which is most of the marketplace -- in a real Node, with `fs`, `child_process`, native
- * addons and their own `node_modules`, none of which a Web Worker can offer.
+ * This is the script Prism's Node.js runtime boots. It runs VS Code extensions that declare `main`
+ * -- which is most of the marketplace -- in a real Node, with `fs`, `child_process`, native addons
+ * and their own `node_modules`, none of which a Web Worker can offer.
+ *
+ * Node runs inside a PRoot guest, not in Prism's own process. That is what makes `child_process`
+ * genuinely work: Android refuses to execute a file stored in an app's data directory, and PRoot is
+ * the loader, so the kernel is never handed such a path. An extension that spawns its own bundled
+ * language server, `tsc`, `esbuild` or `ripgrep` works here, and did not before.
  *
  * ## It does not reimplement the `vscode` API
  *
@@ -22,10 +27,10 @@
  *
  * ## What still does not work here
  *
- * Android refuses to execute binaries stored in an app's data directory, so an extension that
- * ships its own executable and spawns it still fails -- `child_process` works for anything already
- * executable on the device, and not for a bundled CLI. That is a kernel rule, not a gap in this
- * file.
+ * There is no pty. An extension that allocates one -- a terminal integration, mostly -- gets pipes
+ * instead, so anything that draws with cursor control will not render. And the guest is a minimal
+ * Ubuntu: an extension that shells out to a tool it assumed the system had, rather than one it
+ * bundled, finds it missing until somebody `apt install`s it.
  */
 'use strict';
 
@@ -92,6 +97,21 @@ Module._load = function (request, parent, isMain) {
 let socket = null;
 const outbox = [];
 
+/**
+ * Whether the token has been written and the channel is ours to use.
+ *
+ * NOT the same question as "is `socket` non-null", and the difference was a real bug. `net.connect`
+ * returns a socket object immediately and connects later, so a `send` between those two moments
+ * wrote a message onto a stream where Kotlin was still waiting to read the first line as a token.
+ * Kotlin saw `{"type":"host-ready"}`, decided it was an impostor, and closed the connection — and
+ * because the timing depended on how long the shared host source took to evaluate, it happened on
+ * some launches and not others.
+ *
+ * The flag is set after the token is written and before the backlog is flushed, which is the only
+ * ordering that makes the first line on the wire the token every time.
+ */
+let authenticated = false;
+
 function send(msg) {
   let line;
   try {
@@ -101,7 +121,7 @@ function send(msg) {
     // losing the message, so the type survives and the value does not.
     line = JSON.stringify({ type: msg && msg.type, id: msg && msg.id, value: null });
   }
-  if (socket && !socket.destroyed) socket.write(line + '\n');
+  if (authenticated && socket && !socket.destroyed) socket.write(line + '\n');
   else outbox.push(line);
 }
 
@@ -146,7 +166,9 @@ function loadSharedHost() {
 
 function connect() {
   socket = net.connect({ host: '127.0.0.1', port: PORT }, function () {
+    // The token first, alone, before anything else can reach the stream. See `authenticated`.
     socket.write(TOKEN + '\n');
+    authenticated = true;
     while (outbox.length) socket.write(outbox.shift() + '\n');
   });
 

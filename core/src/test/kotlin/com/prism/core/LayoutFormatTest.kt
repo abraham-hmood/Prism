@@ -147,12 +147,24 @@ class LayoutFormatTest {
         assertEquals(SlotAssignment.Default, SlotAssignment.deserialize(null))
     }
 
-    /** A fresh install gets browser / grid / drawer, and saves are `;`-joined. */
+    /**
+     * A fresh install gets browser / grid / drawer / notifications, and saves are `;`-joined.
+     *
+     * Notifications is fourth because it is appended by a ONE-TIME migration the first time any
+     * layout is read (see `SlotPreferences.addNotificationsOnce`), not because it is part of the
+     * historical default set. That migration is why this assertion changed, and why the mutation
+     * test below settles it before asserting anything.
+     */
     @Test
     fun `slot preferences default and persist`() {
         val prefs = SlotPreferences()
         assertEquals(
-            listOf(SlotAssignment.Browser, SlotAssignment.DesktopGrid, SlotAssignment.AppDrawer),
+            listOf(
+                SlotAssignment.Browser,
+                SlotAssignment.DesktopGrid,
+                SlotAssignment.AppDrawer,
+                SlotAssignment.Notifications,
+            ),
             prefs.getAssignments(),
         )
 
@@ -196,6 +208,12 @@ class LayoutFormatTest {
     @Test
     fun `slot mutation keeps at least one page`() {
         val prefs = SlotPreferences()
+
+        // Read once before saving anything, so the one-time notifications offer is recorded and
+        // cannot append a page in the middle of the mutations below. Without this the test depended
+        // on whether another test had already triggered that migration.
+        prefs.getAssignments()
+
         prefs.saveAssignments(listOf(SlotAssignment.Browser))
         prefs.removeAt(0)
         assertEquals(1, prefs.getAssignments().size, "the last page must survive removal")

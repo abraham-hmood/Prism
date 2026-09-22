@@ -143,7 +143,10 @@
       "Bash(./gradlew :core:test --tests \"com.prism.launcher.aether.DeconvGradientTest\" --console=plain)",
       "Bash(./gradlew :core:test --tests \"com.prism.launcher.aether.DeconvGradientTest\" --rerun-tasks --console=plain -i)",
       "Bash(./gradlew :core:test --console=plain)",
-      "Bash(./gradlew --stop)"
+      "Bash(./gradlew --stop)",
+      "Bash(./gradlew *)",
+      "Bash(./gradlew.bat *)",
+      "Bash(gradlew.bat *)"
     ],
     "additionalDirectories": [
       "Z:\\Projects\\AetherCortex\\network\\"

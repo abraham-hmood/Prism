@@ -37,6 +37,36 @@ import java.io.File
  */
 class ExeLaunchActivity : PrismBaseActivity() {
 
+    companion object {
+
+        /**
+         * Puts Prism in, or takes it out of, Android's "Open with" list for `.exe` files.
+         *
+         * BOTH CONDITIONS. A virtualization page has to exist, because that is where the executable
+         * ends up running and there is nowhere to send it otherwise; and Windows mode has to be on,
+         * because that is the switch that says this page runs .exe files rather than booting a guest
+         * OS. Either one alone leaves Prism volunteering for a file it would then have to refuse.
+         *
+         * Called from LauncherActivity on every start and from Settings when the switch moves, so
+         * the chooser entry follows both without anyone having to keep them in step by hand.
+         */
+        fun syncHandlerRegistration(context: android.content.Context) {
+            val slotted = com.prism.launcher.SlotPreferences().getAssignments()
+                .any { it is SlotAssignment.VirtualizationOs }
+            val enabled = slotted && PrismSettings.getWindowsMode()
+            runCatching {
+                context.packageManager.setComponentEnabledSetting(
+                    android.content.ComponentName(context, ExeLaunchActivity::class.java),
+                    if (enabled) android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+                    else android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                    android.content.pm.PackageManager.DONT_KILL_APP,
+                )
+            }.onFailure {
+                PrismLogger.logWarning("Prism", "Could not change the .exe handler: ${it.message}")
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(buildBusyView())
@@ -47,15 +77,31 @@ class ExeLaunchActivity : PrismBaseActivity() {
             return
         }
 
+        // Not turned on from here. Prism is only offered in the chooser while Windows mode is
+        // already on (see syncHandlerRegistration), so reaching this with it off means the setting
+        // changed underneath a chooser that was already on screen -- rare, and not a licence to
+        // change a setting the user did not touch.
         if (!PrismSettings.getWindowsMode()) {
             finishWith("Windows mode is off. Turn it on in Settings > OS Virtualization.")
             return
         }
 
-        WineContainer.unavailableReason(this)?.let {
-            finishWith(it)
+        // The filter accepts application/octet-stream so Prism appears in the chooser at all (see
+        // the manifest), so this is where a file that merely shares that type is turned away.
+        // Checked on the display name: it is the only thing a content:// URI carries that says what
+        // the file actually is.
+        val name = displayNameOf(uri)
+        if (!name.endsWith(".exe", true) && !name.endsWith(".msi", true)) {
+            finishWith("$name is not a Windows executable.")
             return
         }
+
+        // DELIBERATELY NOT CHECKED HERE. This used to refuse when the Windows layer was missing,
+        // which is the commonest case on a phone that has never run a .exe -- so picking Prism from
+        // the chooser showed a toast and vanished, and the file never reached the page that could
+        // have offered to install it. VirtualizationPageView already handles a missing layer by
+        // prompting to install and then running the executable it was given, so the honest thing is
+        // to hand the file over and let the page ask.
 
         stageAndLaunch(uri)
     }

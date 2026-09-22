@@ -202,6 +202,27 @@
             android:theme="@style/Theme.PrismSettings"
             android:windowSoftInputMode="adjustResize" />
 
+        <!-- Notification history.
+
+             EXPORTED AND PERMISSION-GUARDED, which looks wrong and is required: the system binds
+             this service, not Prism, so it has to be visible outside the app, and
+             BIND_NOTIFICATION_LISTENER_SERVICE is what makes the system the only thing that can bind
+             it. Declaring it any other way means Android never offers Prism in the notification
+             access list at all.
+
+             There is no runtime permission for this. The user grants it by hand on the system's
+             notification-access screen; PrismNotificationListener.requestAccess opens that screen and
+             isEnabled reports whether it has happened. -->
+        <service
+            android:name=".notifications.PrismNotificationListener"
+            android:exported="true"
+            android:label="Prism notification history"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
         <!-- Training and generation both run here, not in an activity, so a long run survives
              the screen turning off, rotation, and the activity being destroyed. -->
         <service
@@ -429,6 +450,32 @@
                 <data android:mimeType="application/x-msdownload" />
                 <data android:mimeType="application/vnd.microsoft.portable-executable" />
                 <data android:mimeType="application/x-msi" />
+                <data android:mimeType="application/x-dosexec" />
+                <!--
+                    application/octet-stream is the one that makes this work at all. Android's
+                    MimeTypeMap has no entry for "exe", so a file manager opening one has nothing
+                    specific to declare and sends the generic binary type; a filter listing only the
+                    Windows types never matched a real chooser, which is why Prism did not appear.
+
+                    The cost is being offered for other unrecognised binaries too. An intent filter
+                    cannot express "octet-stream whose name ends in .exe" — a content:// URI has no
+                    filename to pattern-match — so ExeLaunchActivity checks the display name and
+                    declines anything that is not a Windows executable.
+                -->
+                <data android:mimeType="application/octet-stream" />
+                <!--
+                    application/* , and the reason is that no two file managers agree what a .exe is.
+                    Samsung My Files sends an application subtype that nothing declares explicitly, so
+                    the only apps offered were the ones with a wildcard in that tree — Termux and
+                    DeepSeek both declare StaticType "application" for exactly this reason. Listing
+                    specific Windows types matched nothing in a real chooser.
+
+                    Narrower than */* on purpose: Prism is never offered for an image, a video or a
+                    text file. Within application/* it is offered for things it cannot run, and
+                    ExeLaunchActivity declines anything whose name is not .exe or .msi rather than
+                    pretending otherwise.
+                -->
+                <data android:mimeType="application/*" />
             </intent-filter>
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
@@ -441,6 +488,71 @@
                 <data android:pathPattern=".*\.msi" />
             </intent-filter>
         </activity>
+
+        <!--
+            The window a virtualized app's UI runs inside. See VirtualAppActivity for why a stub is
+            needed at all: the system only knows about activities declared in THIS manifest, and a
+            virtualized app's activities are declared in its own.
+
+            Its own process, so a virtualized app that crashes takes itself down and not the
+            launcher, and so its loaded classes leave when it does.
+        -->
+        <!--
+            Holds the vault key, in the MAIN process. A virtualized app runs in its own process, so
+            it cannot read this one's memory; the key therefore never sits in an address space that
+            hosted third-party code shares. That separation is what makes "no virtualized app can
+            reach the passphrase" a structural fact rather than a promise.
+        -->
+        <service
+            android:name=".virtualapp.VaultService"
+            android:exported="false" />
+
+        <!--
+            Runs a virtualized app and hands its rendered window to the launcher, so the app appears
+            ON the virtualization page instead of in a screen of its own. In the SAME process as the
+            stub activity below, and deliberately not in the main one: that is where the vault key
+            lives, and hosted third-party code must not share an address space with it.
+        -->
+        <service
+            android:name=".virtualapp.VirtualAppHostService"
+            android:exported="false"
+            android:process=":virtualapp" />
+
+        <activity
+            android:name=".virtualapp.VirtualAppActivity"
+            android:exported="false"
+            android:process=":virtualapp"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:theme="@style/Theme.PrismSettings" />
+
+        <!-- Spoken conversation with Sam, Nora or Aether. Portrait-locked like a phone call:
+             there is nothing on the screen that benefits from landscape, and a rotation mid-call
+             would tear down the recogniser. -->
+        <activity
+            android:name=".speech.CallModeActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:theme="@style/Theme.PrismSettings" />
+
+        <activity
+            android:name=".speech.KokoroSettingsActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:theme="@style/Theme.PrismSettings" />
+
+        <activity
+            android:name=".language.LanguageSetupActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.PrismSettings" />
+
+        <activity
+            android:name=".language.LessonActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.PrismSettings" />
 
         <activity
             android:name=".editor.MarketplaceActivity"

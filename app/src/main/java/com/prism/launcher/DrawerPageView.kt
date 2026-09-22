@@ -1,5 +1,6 @@
 package com.prism.launcher
 
+
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -14,6 +15,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.GridLayoutManager
 import com.prism.launcher.databinding.PageDrawerRootBinding
+import com.prism.launcher.notifications.NotificationHistory
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collectLatest
 
@@ -44,7 +46,16 @@ class DrawerPageView(
         val layoutManager = GridLayoutManager(context, 4)
         layoutManager.spanSizeLookup = object : GridLayoutManager.SpanSizeLookup() {
             override fun getSpanSize(position: Int): Int {
-                return if (adapter.getItemViewType(position) == DrawerAppsAdapter.VIEW_TYPE_GROUP) 4 else 1
+                // Apps are grid cells; everything else is a full-width row. A section heading or a
+                // notification left at one span is squeezed into a quarter of the width, which
+                // wraps "NOTIFICATIONS" down the screen one letter at a time.
+                return when (adapter.getItemViewType(position)) {
+                    DrawerAppsAdapter.VIEW_TYPE_GROUP,
+                    DrawerAppsAdapter.VIEW_TYPE_SECTION,
+                    DrawerAppsAdapter.VIEW_TYPE_NOTIFICATION,
+                    DrawerAppsAdapter.VIEW_TYPE_WIDGET -> 4
+                    else -> 1
+                }
             }
         }
         binding.drawerList.layoutManager = layoutManager
@@ -254,8 +265,64 @@ class DrawerPageView(
                 it.label.contains(query, ignoreCase = true)
             }
             val grouped = groupDrawerApps(filtered)
-            adapter.submitList(grouped)
+
+            // Notifications, under the apps.
+            //
+            // Read off the main thread: the store reads its file the first time it is asked, and
+            // that file can hold a hundred thousand entries. Apps come first because a launcher's
+            // search box is still mostly used to launch something, and the section heading only
+            // appears when there is something under it.
+            val notifications = withContext(Dispatchers.IO) {
+                NotificationHistory.search(query, limit = NOTIFICATION_RESULT_LIMIT)
+            }
+
+            // Widgets, matched on the widget's own label and on the app it came from -- "google"
+            // should find the search bar even though the widget is called "Search".
+            val widgets = withContext(Dispatchers.IO) {
+                com.prism.launcher.widgets.PrismWidgetHost.installedProviders(context)
+                    .mapNotNull { info ->
+                        val label = runCatching { info.loadLabel(context.packageManager) }.getOrNull().orEmpty()
+                        val appLabel = com.prism.launcher.notifications.PrismNotificationListener
+                            .appLabel(context, info.provider?.packageName)
+                        if (!label.contains(query, true) && !appLabel.contains(query, true)) return@mapNotNull null
+                        DrawerItem.Widget(
+                            provider = info.provider?.flattenToString() ?: return@mapNotNull null,
+                            label = label.ifBlank { appLabel },
+                            appLabel = appLabel,
+                            previewImage = info.previewImage,
+                            icon = info.icon,
+                        )
+                    }
+                    .take(WIDGET_RESULT_LIMIT)
+            }
+
+            val results = buildList {
+                addAll(grouped)
+                if (widgets.isNotEmpty()) {
+                    add(DrawerItem.Section("Widgets"))
+                    widgets.forEach { add(it) }
+                }
+                if (notifications.isNotEmpty()) {
+                    add(DrawerItem.Section("Notifications"))
+                    notifications.forEach { add(DrawerItem.Notification(it)) }
+                }
+            }
+            adapter.submitList(results)
         }
+    }
+
+    private companion object {
+        /**
+         * How many notifications the drawer search shows.
+         *
+         * Short on purpose. This is a launcher's search box, not the notifications page -- someone
+         * who wants to read through their history goes to that page, and burying the apps under
+         * forty matched notifications would make the search worse at the thing it is mainly for.
+         */
+        const val NOTIFICATION_RESULT_LIMIT = 8
+
+        /** Same reasoning as the notification limit: this is a launcher's search box. */
+        const val WIDGET_RESULT_LIMIT = 6
     }
 
     // -----------------------------------------------------------------------

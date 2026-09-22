@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The card an iOS alert is drawn on.
+
+  14dp is the corner radius UIAlertController has used since iOS 7; the shape is the single most
+  recognisable thing about the style, more than the colours are. Inset so the dialog floats as a
+  card rather than spanning the screen, which is what makes a Material dialog read as Material even
+  after its colours are changed.
+
+  The fill is ?attr/prismSurface, so light and dark come from the theme that already defines them
+  rather than from a second set of colours here that could drift out of step.
+-->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:insetLeft="24dp"
+    android:insetRight="24dp"
+    android:insetTop="24dp"
+    android:insetBottom="24dp">
+
+    <shape android:shape="rectangle">
+        <corners android:radius="14dp" />
+        <solid android:color="?attr/prismSurface" />
+    </shape>
+</inset>

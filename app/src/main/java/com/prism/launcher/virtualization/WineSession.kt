@@ -113,13 +113,7 @@ class WineSession(private val context: Context) {
 
     private fun spawn(command: List<String>, tag: String): Process {
         val builder = ProcessBuilder(command).redirectErrorStream(true)
-        builder.environment()["HOME"] = context.filesDir.absolutePath
-        builder.environment()["TMPDIR"] = context.cacheDir.absolutePath
-        // PROOT_TMP_DIR is where PRoot puts its own working files; without it PRoot tries /tmp,
-        // which an Android app cannot write to.
-        builder.environment()["PROOT_TMP_DIR"] = File(context.cacheDir, "proot").apply { mkdirs() }.absolutePath
-        builder.environment()["PROOT_LOADER"] =
-            File(context.applicationInfo.nativeLibraryDir, "libproot-loader.so").absolutePath
+        WineContainer.applyProotEnvironment(context, builder)
 
         val process = builder.start()
         drain(process, tag)

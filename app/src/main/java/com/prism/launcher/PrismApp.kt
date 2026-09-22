@@ -21,11 +21,6 @@ class PrismApp : Application(), ComponentCallbacks2 {
         super.onCreate()
         instance = this
 
-        // SCREEN_ON and SCREEN_OFF cannot be declared in a manifest -- Android requires them to be
-        // registered at runtime -- so the lock's watcher is installed from here, where it lives as
-        // long as the launcher process does.
-        runCatching { com.prism.launcher.lock.LockGate.install(this) }
-
         // Initialize Terminal Diagnostics & Crash Interceptor
         PrismLogger.init(this)
 
@@ -71,6 +66,28 @@ class PrismApp : Application(), ComponentCallbacks2 {
      * enqueues. Skipped entirely in the `:aether` process; see [isAetherProcess].
      */
     private fun onCreateMainProcess() {
+        // The other half of the deferred model release (see onTrimMemory). Any activity of this
+        // process becoming visible again means the user came back, so the pending release is
+        // called off -- which is what makes "leave the chat, open an app, come back" free.
+        registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
+            override fun onActivityStarted(activity: android.app.Activity) = cancelDeferredRelease()
+            override fun onActivityCreated(activity: android.app.Activity, savedInstanceState: android.os.Bundle?) {}
+            override fun onActivityResumed(activity: android.app.Activity) {}
+            override fun onActivityPaused(activity: android.app.Activity) {}
+            override fun onActivityStopped(activity: android.app.Activity) {}
+            override fun onActivitySaveInstanceState(activity: android.app.Activity, outState: android.os.Bundle) {}
+            override fun onActivityDestroyed(activity: android.app.Activity) {}
+        })
+
+        // SCREEN_ON and SCREEN_OFF cannot be declared in a manifest -- Android requires them to be
+        // registered at runtime -- so the lock's watcher is installed from here, where it lives as
+        // long as the launcher process does.
+        //
+        // Main process only: a secondary process registering the same watcher would race the
+        // launcher to raise the lock screen, and the `:virtualapp` process doing it means a
+        // virtualized app's own process can put the lock up over the launcher.
+        runCatching { com.prism.launcher.lock.LockGate.install(this) }
+
         // MediaPipe is Android-only, so :core's agentic engine asks a LocalTextGenerator and
         // Android supplies the one that can also run .task models. Without this the agentic
         // local path would silently fall back to GGUF-only.
@@ -282,14 +299,27 @@ class PrismApp : Application(), ComponentCallbacks2 {
     }
 
     /**
-     * Whether this `Application.onCreate()` call is running in the `:aether` process rather than
-     * the app's default one. `getProcessName()` is API 28+; below that (down to `minSdk` 26) the
-     * `ActivityManager.RunningAppProcessInfo` list is the only way to ask, since there is no
-     * per-process API before it.
+     * Whether this `Application.onCreate()` call is running in one of Prism's secondary processes
+     * rather than the app's default one. `getProcessName()` is API 28+; below that (down to
+     * `minSdk` 26) the `ActivityManager.RunningAppProcessInfo` list is the only way to ask, since
+     * there is no per-process API before it.
+     *
+     * `:virtualapp` belongs on this list for a harder reason than the other two. Its omission was
+     * not a missed optimisation -- [onCreateMainProcess] asks WorkManager for its singleton, the
+     * manifest disables WorkManager's own initializer, and only the main process ever calls
+     * `initialize`. So the virtualized-app process died in `Application.onCreate` with
+     * "WorkManager is not initialized properly" before its activity had been constructed, which
+     * from the launcher looked exactly like tapping an app doing nothing at all.
+     *
+     * Everything above the guard in [onCreate] -- the logger and the platform install -- still runs
+     * here, because a virtualized app's process needs both.
      */
     private fun isHelperProcess(): Boolean {
         val name = currentProcessName()
-        return name != null && (name.endsWith(":aether") || name.endsWith(":cakechat"))
+        return name != null &&
+            (name.endsWith(":aether") ||
+                name.endsWith(":cakechat") ||
+                name.endsWith(":virtualapp"))
     }
 
     private fun currentProcessName(): String? =
@@ -321,8 +351,44 @@ class PrismApp : Application(), ComponentCallbacks2 {
      * state, not a cache -- evicting it out from under an in-progress generation or training run
      * would be a crash, not a memory optimization.
      */
+    /**
+     * Two tiers, because the two kinds of cache cost three orders of magnitude apart.
+     *
+     * THE CACHES ARE NOT WHERE THE MEMORY IS. Icons and resolved paths are hundreds of kilobytes
+     * between them; a resident GGUF model is hundreds of MEGABYTES, and an Aether connectome is
+     * tens. Trimming only the small ones under pressure meant the launcher gave up everything it
+     * could see and none of what was actually filling the heap, and was then killed anyway -- while
+     * being the home screen, which is the one process on the device whose death the user cannot
+     * route around.
+     *
+     * So the heavy tier waits for CRITICAL or for the UI having been hidden a while, and the light
+     * tier keeps its old threshold. A model reloads in seconds on the next request; being killed
+     * does not.
+     *
+     * ## Why UI_HIDDEN does not free the model IMMEDIATELY
+     *
+     * It used to, and that single line was why talking to Sam felt orders of magnitude slower than
+     * a dedicated AI app on the same phone with the same model.
+     *
+     * `TRIM_MEMORY_UI_HIDDEN` is not a memory signal. It fires whenever the process has no visible
+     * UI left -- and this process is the HOME SCREEN, so it fires every time the user opens any
+     * app, and again every time the screen turns off. Freeing there meant the model was thrown away
+     * between essentially every pair of messages.
+     *
+     * The cost is not only the reload. `nativeFreeModel` destroys the llama context, which is where
+     * the KV cache and the running chat history live (see gguf_bridge.cpp's GgufContext). So the
+     * next message paid a cold load AND started Sam from a blank context -- she had forgotten the
+     * conversation, and the reload happened at exactly the worst moment, with another app in the
+     * foreground competing for page cache.
+     *
+     * [UI_HIDDEN_RELEASE_DELAY_MS] is the whole fix: leaving the launcher for a moment costs
+     * nothing, and genuinely walking away still gives the memory back. Any UI coming back cancels
+     * the pending release, so the common "open an app, come back to the chat" round trip keeps the
+     * model exactly where it was.
+     */
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
+
         if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
             IconPackEngine.trimCache()
             // The icon-pack cache this used to trim alone is a map of component name to drawable
@@ -332,11 +398,87 @@ class PrismApp : Application(), ComponentCallbacks2 {
             DesktopGridAdapter.trimIconCache()
             com.prism.launcher.browser.PrismWebHost.trimCaches()
         }
+
+        // Real pressure: give the memory back now, whatever is on screen.
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL) {
+            cancelDeferredRelease()
+            releaseModels()
+            return
+        }
+
+        // Merely out of sight: schedule it, and let coming back cancel it. See the doc comment.
+        if (level == ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
+            scheduleDeferredRelease()
+        }
+    }
+
+    /**
+     * The grace period between the launcher's UI going away and its models being released.
+     *
+     * Long enough to cover leaving the chat to look something up in another app, short enough that
+     * a phone in a pocket is not still holding a gigabyte of weights.
+     */
+    private val deferredReleaseHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+    private val deferredRelease = Runnable {
+        PrismLogger.logInfo("PrismApp", "UI hidden for ${UI_HIDDEN_RELEASE_DELAY_MS / 1000}s — releasing models")
+        releaseModels()
+    }
+
+    private fun scheduleDeferredRelease() {
+        deferredReleaseHandler.removeCallbacks(deferredRelease)
+        deferredReleaseHandler.postDelayed(deferredRelease, UI_HIDDEN_RELEASE_DELAY_MS)
+    }
+
+    /** Called when any UI comes back, so a quick trip to another app costs nothing. */
+    fun cancelDeferredRelease() {
+        deferredReleaseHandler.removeCallbacks(deferredRelease)
+    }
+
+    override fun onLowMemory() {
+        super.onLowMemory()
+        releaseModels()
+    }
+
+    /**
+     * Gives back the resident models.
+     *
+     * NEITHER CALL INTERRUPTS WORK IN PROGRESS. `releaseIfIdle` refuses while a generation is in
+     * flight, because freeing a llama context from under a running generate call is a
+     * use-after-free in native code -- a hard crash caused by the very callback that exists to
+     * prevent one. Aether's is dropped the same way, through the studio's own busy flag.
+     */
+    private fun releaseModels() {
+        runCatching {
+            val freed = com.prism.launcher.messaging.GgufInferenceService.releaseIfIdle()
+            if (freed > 0) {
+                PrismLogger.logInfo(
+                    "PrismApp",
+                    "Released the resident model under memory pressure (~${freed / (1024 * 1024)} MB)"
+                )
+            }
+        }
+
+        runCatching {
+            if (!com.prism.launcher.aether.AetherStudio.busy) {
+                com.prism.launcher.aether.AetherStudio.reload(this)
+            }
+        }
     }
 
     companion object {
         lateinit var instance: PrismApp
             private set
+
+        /**
+         * How long the launcher's UI must stay hidden before its models are released.
+         *
+         * Five minutes, chosen against the behaviour this exists for rather than a round number:
+         * leaving a chat to check something in another app and coming back is seconds, so it must
+         * comfortably cover that; a phone put down and forgotten is minutes, so it must not cover
+         * that. See [onTrimMemory] for why releasing on the signal itself was so costly.
+         */
+        private const val UI_HIDDEN_RELEASE_DELAY_MS = 5 * 60 * 1000L
 
         fun get(app: android.app.Application) = (app as PrismApp).tunnelEngine
     }
