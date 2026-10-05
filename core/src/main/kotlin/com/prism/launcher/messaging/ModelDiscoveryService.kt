@@ -72,7 +72,7 @@ object ModelDiscoveryService {
             val searchUrl = "https://huggingface.co/api/models?search=$query$tagParam&limit=10"
             
             try {
-                val response = URL(searchUrl).openConnection().getInputStream().bufferedReader().use { it.readText() }
+                val response = com.prism.core.Urls.of(searchUrl).openConnection().getInputStream().bufferedReader().use { it.readText() }
                 val repos = JSONArray(response)
                 for (i in 0 until repos.length()) {
                     val repo = repos.getJSONObject(i)
@@ -98,7 +98,7 @@ object ModelDiscoveryService {
             val files = mutableListOf<Pair<String, Long>>()
             try {
                 val treeUrl = "https://huggingface.co/api/models/$repoId/tree/main"
-                val response = URL(treeUrl).openConnection().getInputStream().bufferedReader().use { it.readText() }
+                val response = com.prism.core.Urls.of(treeUrl).openConnection().getInputStream().bufferedReader().use { it.readText() }
                 val tree = JSONArray(response)
                 for (i in 0 until tree.length()) {
                     val item = tree.getJSONObject(i)
@@ -120,7 +120,7 @@ object ModelDiscoveryService {
             val searchUrl = "https://api.github.com/search/code?q=$q"
             
             try {
-                val conn = URL(searchUrl).openConnection() as HttpURLConnection
+                val conn = com.prism.core.Urls.of(searchUrl).openConnection() as HttpURLConnection
                 conn.setRequestProperty("Accept", "application/vnd.github.v3+json")
                 conn.setRequestProperty("User-Agent", "Prism-Launcher")
                 

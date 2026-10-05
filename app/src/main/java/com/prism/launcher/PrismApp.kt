@@ -37,8 +37,198 @@ class PrismApp : Application(), ComponentCallbacks2 {
             scheduler = com.prism.launcher.platform.AndroidTaskScheduler(),
             notifier = com.prism.launcher.platform.AndroidNotifier(this),
             apps = com.prism.launcher.platform.AndroidAppCatalog(this),
-            downloader = com.prism.launcher.platform.AndroidDownloader(this)
+            downloader = com.prism.launcher.platform.AndroidDownloader(this),
+            // PHASE 100. Kokoro is portable; AudioTrack is not, so it arrives as a platform slot.
+            audio = com.prism.launcher.speech.AndroidAudioSink(),
+            main = com.prism.launcher.speech.AndroidMainThread
         )
+
+        // The system voice underneath whatever the settings chose. A factory rather than an instance
+        // because TextToSpeech takes a Context and is slow to initialise -- PrismSpeaker builds it on
+        // first need and keeps it, which is what the language lessons rely on when a tutor's line goes
+        // through Kokoro and the word being taught has to go through the system engine.
+        com.prism.launcher.speech.PrismSpeaker.systemEngineFactory = {
+            com.prism.launcher.speech.SystemTtsEngine(this)
+        }
+
+        // Whether a Node extension can be given a real runtime (PHASE 93). A hook because the two
+        // platforms get Node completely differently -- an Ubuntu rootfs under PRoot here, the
+        // system binary on a desktop -- and ExtensionStore only needs the yes-or-no.
+        com.prism.launcher.editor.ExtensionStore.nodeHostAvailable = {
+            com.prism.launcher.editor.NodeRuntime.isInstalled(this)
+        }
+
+        // The capability registries (PHASES 34, 35, 36). Registered here rather than lazily on first
+        // use so the pages can LIST what this build can do, including the routes that are unavailable
+        // and why -- a page that discovered engines on demand would show an empty list until something
+        // had already worked.
+        //
+        // Android registers the same portable engines desktop does. The MediaPipe image generator and
+        // SpeechRecognizer are NOT among them: both are Android-only verticals that own their own
+        // capture or their own pipeline, and they keep their existing call sites.
+        com.prism.launcher.messaging.ImageGeneration.register(
+            com.prism.launcher.messaging.CloudImageGenerator()
+        )
+        com.prism.launcher.messaging.ImageGeneration.register(
+            com.prism.launcher.messaging.NoraImageGenerator()
+        )
+        com.prism.launcher.messaging.Vision.register(
+            com.prism.launcher.messaging.CloudVisionEngine()
+        )
+        com.prism.launcher.messaging.Vision.register(
+            com.prism.launcher.messaging.NoraVisionEngine()
+        )
+        // Whisper first: the same model transcribes identically here and on a desktop, which is the
+        // consistency PHASE 36 is about.
+        com.prism.launcher.messaging.Dictation.register(
+            com.prism.launcher.messaging.WhisperCppEngine()
+        )
+        com.prism.launcher.messaging.Dictation.register(
+            com.prism.launcher.messaging.CloudTranscriptionEngine()
+        )
+
+        // The PrismCoin node's own chain figures, for WalletNetwork. A hook because the node takes a
+        // Context for its storage and is not portable yet -- see WalletNetwork.localChainStats.
+        com.prism.launcher.wallet.WalletNetwork.localChainStats = {
+            runCatching {
+                val node = com.prism.launcher.wallet.psc.PrismCoinNode
+                val consensus = com.prism.launcher.wallet.psc.PrismCoinConsensus
+                val target = node.chain.targetForNext(node.chain.tip)
+                val difficulty = consensus.difficultyOf(target)
+                if (difficulty <= 0.0) {
+                    null
+                } else {
+                    com.prism.launcher.wallet.WalletNetwork.ChainStats(
+                        difficulty,
+                        java.math.BigDecimal(consensus.blockReward(target))
+                            .divide(java.math.BigDecimal(consensus.ONE_PSC)),
+                        node.chain.height(),
+                    )
+                }
+            }.getOrNull()
+        }
+
+        // A whole-site download, once it is on disk: filed with the mirror manager, which registers
+        // its DNS record and starts serving it. The downloader itself is portable now -- only this
+        // last step needs a Context.
+        com.prism.launcher.browser.PrismSiteDownloader.onSiteSaved = { host, path ->
+            com.prism.launcher.browser.PrismMirrorManager.registerDownloadedSite(this, host, path)
+        }
+        com.prism.launcher.browser.PrismSiteDownloader.onProgress = { host, percent ->
+            com.prism.launcher.browser.PrismMirrorManager.reportProgress(host, percent)
+        }
+
+        // The inference thread count, if the user has set one.
+        com.prism.core.PrismCpu.applySettings(PrismSettings.getInferenceThreads())
+
+        // THE MESH BRIDGES (PHASE 98). Installed BEFORE anything that might broadcast, because a
+        // feature in :core reaching MeshTransport before this runs would go out through MeshCore's own
+        // socket -- and two sockets on UDP 8081 in one process fight over the same port.
+        com.prism.launcher.mesh.AndroidMeshBridges.install(this)
+
+        // Nebula and Lyke share across the mesh from here too. The transport is installed just above,
+        // so the first announcement goes out through this build's own service rather than MeshCore.
+        com.prism.launcher.social.SocialMeshSync.startAnnouncing()
+
+        // Trusted devices (PHASE 48's reason for existing). The feature lives in :core so one
+        // implementation serves both platforms, and on Android its transport is THIS build's mesh service
+        // rather than MeshCore's own socket -- two sockets on UDP 8081 in one process would fight.
+        com.prism.launcher.trusted.TrustedDevices.install(java.io.File(filesDir, "trust"))
+        com.prism.launcher.trusted.TrustedDevices.localPlatform =
+            com.prism.launcher.mesh.MeshComputeRegistry.PLATFORM_ANDROID
+        com.prism.launcher.trusted.TrustedDevices.localName = {
+            android.os.Build.MODEL?.takeIf { it.isNotBlank() } ?: "Android device"
+        }
+        com.prism.launcher.trusted.TrustedDevices.sender = { peerIp, opcode, payload ->
+            com.prism.launcher.mesh.PrismMeshService.sendToPeer(peerIp, opcode, payload)
+        }
+        com.prism.launcher.trusted.TrustedDevices.peerCheck = { ip ->
+            com.prism.launcher.mesh.PrismMeshService.isPeer(ip)
+        }
+
+        // Browser history, both directions, from :core -- the store is portable, so the bridge is too and
+        // neither platform writes its own copy of the payload shape.
+        com.prism.launcher.trusted.TrustedSharing.install()
+
+        // Models other devices host. Android's own mesh service collects those announcements, so the
+        // portable registry reads across rather than listening a second time on the same port.
+        com.prism.launcher.messaging.MeshModels.extraSource = {
+            com.prism.launcher.mesh.P2pModelRegistry.getAll().map {
+                com.prism.launcher.messaging.MeshModels.Hosted(it.peerIp, it.modelName, it.timestamp)
+            }
+        }
+
+        // The catalogue of apps other devices offer, and the things only Android can do with one.
+        com.prism.launcher.trusted.TrustedApps.install(java.io.File(filesDir, "trust"))
+        com.prism.launcher.trusted.TrustedApps.iconFetcher = { app, target ->
+            com.prism.launcher.trusted.TrustedAppTransfer.fetchIcon(app, target)
+        }
+        com.prism.launcher.trusted.TrustedApps.apkFetcher = { app ->
+            com.prism.launcher.trusted.TrustedAppTransfer.fetch(this, app)
+        }
+        // A phone CAN run one, which is the whole difference from the desktop side of this feature.
+        com.prism.launcher.trusted.TrustedApps.canVirtualize = true
+        com.prism.launcher.trusted.TrustedApps.launcher = { app ->
+            com.prism.launcher.trusted.TrustedAppTransfer.virtualize(this, app)
+        }
+
+        // Text messages, both directions. The inbox is the same file the SMS relay writes, so a text
+        // that arrived over the relay and one that arrived from a trusted device end up in one place.
+        com.prism.launcher.trusted.TrustedMessages.inboxRoot = { java.io.File(filesDir, "relay") }
+        com.prism.launcher.trusted.TrustedMessages.radioSender = { address, body ->
+            com.prism.launcher.trusted.TrustedRadio.send(this, address, body)
+        }
+        com.prism.launcher.trusted.TrustedMessages.historyProvider = {
+            com.prism.launcher.trusted.TrustedRadio.history(this)
+        }
+
+        // What a new pairing sends that :core cannot produce: this phone's app catalogue.
+        com.prism.launcher.trusted.TrustedSharing.extraBackfill = { device ->
+            com.prism.launcher.trusted.TrustedAppTransfer.announceTo(this, device.fingerprint)
+        }
+        com.prism.launcher.trusted.TrustedSharing.clipboardReader = {
+            runCatching {
+                val manager = getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                    as android.content.ClipboardManager
+                manager.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text?.toString()
+            }.getOrNull()
+        }
+
+        // The one consumer that is genuinely platform-specific. Messages, history and the app catalogue
+        // are registered by :core now -- consume() holds one consumer per kind, so registering a second
+        // here would silently replace theirs.
+        com.prism.launcher.trusted.TrustedDevices.consume(
+            com.prism.launcher.trusted.TrustedDevices.Kind.CLIPBOARD
+        ) { received ->
+            val text = received.body.optString("text")
+            if (text.isNotEmpty()) {
+                // On the main thread: ClipboardManager is a UI service and setting it from a background
+                // thread is undefined on some OEM builds.
+                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    runCatching {
+                        val manager = getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                            as android.content.ClipboardManager
+                        manager.setPrimaryClip(
+                            android.content.ClipData.newPlainText("Prism (${received.fromName})", text)
+                        )
+                    }
+                }
+            }
+        }
+
+        // CakeChat, for the shared conversation router. Android CAN generate with it -- Chaquopy runs
+        // the model in-process -- so the responder is installed here; desktop leaves it null and
+        // SamConversation then says it cannot answer rather than quietly using a different model.
+        //
+        // The dialog is passed as TURNS, which is what CakeChatEngine.respond takes and what a seq2seq
+        // dialogue model actually wants: its context is the exchange, not a block of prose.
+        com.prism.launcher.messaging.SamConversation.cakeChatResponder = { prompt, history ->
+            if (com.prism.launcher.cakechat.CakeChatEngine.isReady(this)) {
+                com.prism.launcher.cakechat.CakeChatEngine.respond(this, history + prompt)
+            } else {
+                null
+            }
+        }
 
         // Aether's brain size and every tunable constant -- read at connectome-construction
         // time, so this has to win the race against the first access. Genuinely needed in EVERY
@@ -247,7 +437,7 @@ class PrismApp : Application(), ComponentCallbacks2 {
         //
         // It goes here, in the main-process startup, ahead of the miner and ahead of any mesh
         // traffic that could trigger a save.
-        runCatching { com.prism.launcher.wallet.psc.PrismCoinNode.load(this) }
+        runCatching { com.prism.launcher.wallet.psc.PrismCoinNode.load() }
             .onFailure { PrismLogger.logError("PrismCoin", "Could not replay the chain", it) }
 
         // A device set to mesh pooling answers other people's coordinators even when it is not
@@ -264,7 +454,7 @@ class PrismApp : Application(), ComponentCallbacks2 {
         // complete -- so without this a seller's own listings would quietly disappear every time
         // Prism was reopened, and they would have to list everything again.
         if (PrismSettings.getMeshEnabled()) {
-            runCatching { ModelListingStore.announce(this) }
+            runCatching { ModelListingStore.announce() }
                 .onFailure { PrismLogger.logError("ModelShop", "Could not re-announce listings", it) }
         }
     }
@@ -283,11 +473,11 @@ class PrismApp : Application(), ComponentCallbacks2 {
      * behaviour: it is the buyer's own coins that are waiting.
      */
     private fun settleModelPurchases() {
-        if (ModelPurchaseLedger.held(this).isEmpty()) return
-        if (!ModelListingScanner.dueNow(this)) return
+        if (ModelPurchaseLedger.held().isEmpty()) return
+        if (!ModelListingScanner.dueNow()) return
         Thread({
             runCatching {
-                val (settled, cancelled) = ModelListingScanner.runOnce(this)
+                val (settled, cancelled) = ModelListingScanner.runOnce()
                 if (settled > 0 || cancelled > 0) {
                     PrismLogger.logInfo(
                         "ModelShop",
@@ -386,6 +576,16 @@ class PrismApp : Application(), ComponentCallbacks2 {
      * the pending release, so the common "open an app, come back to the chat" round trip keeps the
      * model exactly where it was.
      */
+    /**
+     * Memory pressure.
+     *
+     * DEPRECATED IN API 35 ALONG WITH THE LEVELS IT COMPARES AGAINST -- Android now delivers only
+     * TRIM_MEMORY_UI_HIDDEN and expects applications to use onTrimMemory's replacement, which for a
+     * process that holds a language model in memory is not enough to act on. The older levels still
+     * arrive on every version below 35, and acting on them is the difference between Prism releasing a
+     * model under pressure and being killed while holding it.
+     */
+    @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
 
@@ -435,6 +635,7 @@ class PrismApp : Application(), ComponentCallbacks2 {
         deferredReleaseHandler.removeCallbacks(deferredRelease)
     }
 
+    @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
     override fun onLowMemory() {
         super.onLowMemory()
         releaseModels()

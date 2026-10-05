@@ -37,5 +37,8 @@ object AetherTrainingState {
     fun publish(p: AetherTrainer.Progress) { _progress.value = p }
     fun markStarted() { _summary.value = null; _running.value = true }
     fun markFinished(summary: String) { _summary.value = summary; _running.value = false; _progress.value = null }
+    // Experimental only in its concurrent semantics; this is a user pressing "clear" on a log
+    // nothing is writing to at that instant.
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     fun clearLog() { _log.resetReplayCache() }
 }

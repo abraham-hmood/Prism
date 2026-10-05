@@ -27,6 +27,7 @@ sealed interface PagePickChoice {
     data object Notifications : PagePickChoice
     data object Language : PagePickChoice
     data object Minigames : PagePickChoice
+    data object Cloud : PagePickChoice
 }
 
 class PositionPickerAdapter(
@@ -170,6 +171,7 @@ class VerticalPageOptionsAdapter(
         add(Option("Model Store", "Browse, search, and download AI models", PagePickChoice.ModelStore))
         add(Option("Agentic Tools", "Manage AI tool-calling and custom syntaxes", PagePickChoice.AgenticTools))
         add(Option("Wallet", "Local crypto wallet and miner", PagePickChoice.Wallet))
+        add(Option("Cloud", "Mesh cloud computing, encrypted storage, and cloud gaming", PagePickChoice.Cloud))
         for (p in plugins) add(Option(p.label, p.packageName, PagePickChoice.PluginPage(p)))
     }
 

@@ -33,6 +33,13 @@ class ChessBoardView(
     private val match: MinigameMesh.Match?,
     private val onStatus: (String) -> Unit,
     private val onFinished: (won: Boolean?) -> Unit,
+    /**
+     * Training: the engine's own choice is shown on the player's own turn, against the computer
+     * only -- a hinted move against a real opponent on the mesh would not be a game either of them
+     * agreed to, which is why [MinigamesPageView] disables the mesh button while this is on rather
+     * than passing `training = true` alongside a [match].
+     */
+    private val training: Boolean = false,
 ) : View(context) {
 
     private val density = resources.displayMetrics.density
@@ -53,6 +60,12 @@ class ChessBoardView(
     private var finished = false
     private val moveList = mutableListOf<String>()
 
+    /** The actual moves, in order -- what a review needs to replay the game. See [playedMoves]. */
+    private val played = mutableListOf<Chess.Move>()
+
+    /** The engine's own suggestion for the player's current turn, while [training] is on. */
+    private var hint: Chess.Move? = null
+
     /** The move this device last sent, repeated until the opponent answers. UDP drops packets. */
     private var unacknowledged: String? = null
     private var lastResend = 0L
@@ -67,6 +80,7 @@ class ChessBoardView(
         }
         announce()
         maybeMoveComputer()
+        maybeShowHint()
     }
 
     override fun onDetachedFromWindow() {
@@ -87,8 +101,11 @@ class ChessBoardView(
                 outcome is Chess.Outcome.Threefold -> "Draw by repetition."
                 outcome is Chess.Outcome.InsufficientMaterial -> "Draw: not enough material to mate."
                 thinking -> "Thinking…"
-                position.sideToMove == mySide ->
-                    if (Chess.isInCheck(position, mySide)) "Your move — you are in check." else "Your move."
+                position.sideToMove == mySide -> {
+                    val base = if (Chess.isInCheck(position, mySide)) "Your move — you are in check." else "Your move."
+                    val suggestion = hint?.let { " Try ${Chess.describe(position, it)}." } ?: ""
+                    base + suggestion
+                }
                 match != null -> "Waiting for your opponent…"
                 else -> "${difficulty.label} is thinking…"
             }
@@ -107,13 +124,41 @@ class ChessBoardView(
 
     private fun play(move: Chess.Move) {
         moveList.add(Chess.describe(position, move))
+        played.add(move)
         position = Chess.apply(position, move)
         lastMove = move
         selected = null
         legalFromSelected = emptyList()
+        hint = null
         invalidate()
         announce()
-        if (!finished) maybeMoveComputer()
+        if (!finished) {
+            maybeMoveComputer()
+            maybeShowHint()
+        }
+    }
+
+    /**
+     * Training's whole feature: the engine's own move for the position the player is about to
+     * choose from, found the same way [maybeMoveComputer] finds the opponent's -- off the UI
+     * thread, because a useful hint is searched as deep as an opponent's move is, not skimmed.
+     */
+    private fun maybeShowHint() {
+        if (!training || match != null || finished) return
+        if (position.sideToMove != mySide) return
+
+        val snapshot = position
+        Thread({
+            val line = Chess.bestLine(snapshot, HINT_DEPTH)
+            post {
+                if (position == snapshot) {
+                    hint = line?.first
+                    invalidate()
+                    // The status text quotes the hint, and it was already written without one.
+                    announce()
+                }
+            }
+        }, "chess-hint").start()
     }
 
     /**
@@ -290,6 +335,16 @@ class ChessBoardView(
             PencilStyle.circleAround(canvas, cellRect(move.to, board), red, seed = 62)
         }
 
+        // Training's suggestion: green, and an arrow rather than two circles, because a hint has
+        // to read as "go this way" at a glance, not as two separate squares to puzzle over.
+        hint?.let { move ->
+            val green = PencilStyle.pencil(2.2f * density, PencilStyle.GREEN_PENCIL, alpha = 200)
+            val from = cellRect(move.from, board)
+            val to = cellRect(move.to, board)
+            PencilStyle.line(canvas, from.centerX(), from.centerY(), to.centerX(), to.centerY(), green, seed = 90, amount = 1.6f)
+            PencilStyle.circleAround(canvas, to, green, seed = 91)
+        }
+
         // Where the selected piece can go.
         selected?.let { from ->
             val blue = PencilStyle.pencil(2.4f * density, PencilStyle.BLUE_PENCIL)
@@ -347,6 +402,20 @@ class ChessBoardView(
 
     /** The move list, for the panel beside the board. */
     fun moves(): List<String> = moveList.toList()
+
+    /** The actual moves played, in order -- what [ChessReview.review] and "Review Match" replay. */
+    fun playedMoves(): List<Chess.Move> = played.toList()
+
+    private companion object {
+        /**
+         * How deep a live training hint looks.
+         *
+         * Matched to [ChessReview.REVIEW_DEPTH] rather than to the opponent's own [difficulty]: a
+         * hint is a teaching tool, and a hint that is only as strong as a "Gentle" opponent is not
+         * teaching anything a Gentle opponent would not already have shown by winning.
+         */
+        const val HINT_DEPTH = ChessReview.REVIEW_DEPTH
+    }
 
     fun resign() {
         if (finished) return

@@ -30,6 +30,7 @@ sealed class SlotAssignment {
     data object Notifications : SlotAssignment()
     data object Language : SlotAssignment()
     data object Minigames : SlotAssignment()
+    data object Cloud : SlotAssignment()
 
     fun serialize(): String = when (this) {
         is Default -> "default"
@@ -50,6 +51,7 @@ sealed class SlotAssignment {
         is Notifications -> "notifications"
         is Language -> "language"
         is Minigames -> "minigames"
+        is Cloud -> "cloud"
         is Custom -> "custom|$packageName|$viewClassName"
     }
 
@@ -73,6 +75,7 @@ sealed class SlotAssignment {
             if (raw == "notifications") return Notifications
             if (raw == "language") return Language
             if (raw == "minigames") return Minigames
+            if (raw == "cloud") return Cloud
             val parts = raw.split("|")
             if (parts.size == 3 && parts[0] == "custom") {
                 return Custom(parts[1], parts[2])

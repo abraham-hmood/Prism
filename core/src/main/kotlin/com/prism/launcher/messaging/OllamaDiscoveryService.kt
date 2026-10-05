@@ -66,7 +66,7 @@ object OllamaDiscoveryService {
     private suspend fun probe(ip: String): OllamaServer? {
         return withTimeoutOrNull(PROBE_TIMEOUT_MS) {
             try {
-                val url = URL("http://$ip:$OLLAMA_PORT/api/tags")
+                val url = com.prism.core.Urls.of("http://$ip:$OLLAMA_PORT/api/tags")
                 val conn = url.openConnection() as HttpURLConnection
                 conn.connectTimeout = PROBE_TIMEOUT_MS.toInt()
                 conn.readTimeout = PROBE_TIMEOUT_MS.toInt()

@@ -139,7 +139,7 @@ object PrismCrawler {
         repeat(MAX_REDIRECTS) {
             var conn: HttpURLConnection? = null
             try {
-                conn = (URL(current).openConnection() as HttpURLConnection).apply {
+                conn = (com.prism.core.Urls.of(current).openConnection() as HttpURLConnection).apply {
                     requestMethod = "GET"
                     connectTimeout = CONNECT_TIMEOUT_MS
                     readTimeout = READ_TIMEOUT_MS
@@ -181,7 +181,7 @@ object PrismCrawler {
     /** Fetches and parses `/robots.txt`, taking the `*` group plus any group naming PrismSearch. */
     private fun fetchRobots(anyUrlOnHost: String): Robots {
         val root = try {
-            val u = URL(anyUrlOnHost)
+            val u = com.prism.core.Urls.of(anyUrlOnHost)
             "${u.protocol}://${u.authority}/robots.txt"
         } catch (e: Exception) {
             return Robots.PERMISSIVE
@@ -208,7 +208,7 @@ object PrismCrawler {
     private fun fetchRaw(urlStr: String): String? {
         var conn: HttpURLConnection? = null
         return try {
-            conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+            conn = (com.prism.core.Urls.of(urlStr).openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
                 connectTimeout = CONNECT_TIMEOUT_MS
                 readTimeout = READ_TIMEOUT_MS
@@ -285,27 +285,27 @@ object PrismCrawler {
         .replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&apos;", "'")
 
     fun absolutize(href: String, baseUrl: String): String? = try {
-        URL(URL(baseUrl), href).toString()
+        com.prism.core.Urls.resolve(baseUrl, href).toString()
     } catch (e: Exception) {
         null
     }
 
     private fun hostOf(url: String): String? = try {
-        URL(url).host?.lowercase()?.takeIf { it.isNotBlank() }
+        com.prism.core.Urls.hostOf(url)
     } catch (e: Exception) {
         null
     }
 
     /** `scheme://host` -- the front door of whatever site a link pointed into. */
     fun originOf(url: String): String? = try {
-        val u = URL(url)
+        val u = com.prism.core.Urls.of(url)
         if (u.host.isNullOrBlank()) null else "${u.protocol}://${u.authority}"
     } catch (e: Exception) {
         null
     }
 
     private fun pathOf(url: String): String = try {
-        URL(url).path.ifEmpty { "/" }
+        com.prism.core.Urls.of(url).path.ifEmpty { "/" }
     } catch (e: Exception) {
         "/"
     }

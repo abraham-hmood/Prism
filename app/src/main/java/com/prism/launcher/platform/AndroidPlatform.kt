@@ -170,6 +170,8 @@ private class SharedPrefsStore(context: Context, name: String) : KeyValueStore {
         prefs.edit().clear().apply()
     }
 
+    override fun keys(): Set<String> = prefs.all.keys
+
     override fun flush() = Unit
 
     /** Delegates to the platform's own editor rather than the generic buffering one. */

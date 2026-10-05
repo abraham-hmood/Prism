@@ -163,6 +163,40 @@ if (ANDROID_ABI STREQUAL "arm64-v8a")
         ${log-lib}
     )
 
+    # whisper.cpp, for local dictation (PHASE 36).
+    #
+    # INSIDE THIS BLOCK BECAUSE IT NEEDS THE ggml TARGET that add_subdirectory(llama.cpp) above
+    # defines. Only whisper's own translation unit is vendored, not its bundled ggml -- two ggml
+    # revisions in one process is a crash inside tensor code that names neither library. The same
+    # reasoning, and the same three vendored files, as the desktop build; see
+    # desktop/src/main/cpp/whisper/CMakeLists.txt.
+    #
+    # THIS IS WHAT MAKES THE PLAN'S CLAIM TRUE: the same model transcribes identically here and on a
+    # desktop, which SpeechRecognizer -- a different implementation on every OEM build -- cannot.
+    add_library(whisper_bridge SHARED
+        whisper.cpp/src/whisper.cpp
+        # Included unconditionally by whisper.cpp, unlike the guarded CoreML/OpenVINO backends. Its
+        # body is guarded by __APPLE__ && __aarch64__, so on Android it compiles to stubs -- but the
+        # symbols still have to link.
+        whisper.cpp/src/aneforge/whisper-aneforge.cpp
+        whisper_bridge.cpp
+    )
+
+    target_include_directories(whisper_bridge PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        whisper.cpp/include
+        whisper.cpp/src
+    )
+
+    # WHISPER_VERSION is defined by upstream's CMakeLists, which is not vendored. Pinned to the
+    # revision actually here, so whisper_version() reports the truth.
+    target_compile_definitions(whisper_bridge PRIVATE WHISPER_VERSION="1.9.4")
+
+    target_link_libraries(whisper_bridge
+        ggml
+        ${log-lib}
+    )
+
 endif()
 
 # Nora's predictive-coding kernels. Deliberately a separate library with no llama.cpp or ggml

@@ -142,6 +142,15 @@ interface KeyValueStore {
     fun putStringSet(key: String, value: Set<String>)
     fun remove(key: String)
     fun clear()
+
+    /**
+     * Every key currently stored.
+     *
+     * Added for the profile archive (PHASE 73), which carries settings between platforms and must not
+     * be a hand-written list of key names -- a setting added later would silently stop being backed up,
+     * and nobody would notice until a restore came back missing something.
+     */
+    fun keys(): Set<String>
     /** Persists pending writes. A no-op where writes are already durable. */
     fun flush()
 
@@ -281,6 +290,34 @@ object PrismPlatform {
     var downloader: Downloader = JvmDownloader()
 
     /**
+     * Frames to a playable video file. See [VideoEncoder].
+     *
+     * Defaults to refusing rather than to a fallback: a platform that has not installed one should say so,
+     * and desktop installs a real encoder at startup. Nora's frame generation is portable and has been
+     * since Phase 2 -- this is only the muxing.
+     */
+    @Volatile
+    var video: VideoEncoder = NoOpVideoEncoder
+
+    /**
+     * Sound out. See [AudioSink] -- the whole of speech synthesis is portable except this.
+     *
+     * Defaults to refusing rather than to silence, because a machine that cannot play audio and one
+     * whose voice is broken look identical if the sink quietly succeeds.
+     */
+    @Volatile
+    var audio: AudioSink = NoAudioSink
+
+    /**
+     * Where a completion callback is allowed to touch the UI. See [MainThread].
+     *
+     * Defaults to running inline, which is right for tests and the console and wrong for a GUI, so
+     * both GUIs install their own.
+     */
+    @Volatile
+    var main: MainThread = InlineMainThread
+
+    /**
      * Installs a platform. Called once, early -- from `Application.onCreate` on Android, from
      * `main` on desktop.
      */
@@ -292,7 +329,9 @@ object PrismPlatform {
         scheduler: TaskScheduler = JvmTaskScheduler(),
         notifier: Notifier = NoOpNotifier,
         apps: AppCatalog = defaultAppCatalog(),
-        downloader: Downloader = JvmDownloader()
+        downloader: Downloader = JvmDownloader(),
+        audio: AudioSink = NoAudioSink,
+        main: MainThread = InlineMainThread
     ) {
         this.host = host
         this.log = log
@@ -302,6 +341,8 @@ object PrismPlatform {
         this.notifier = notifier
         this.apps = apps
         this.downloader = downloader
+        this.audio = audio
+        this.main = main
     }
 }
 
@@ -580,6 +621,9 @@ private class PropertiesStore(private val file: File) : KeyValueStore {
         dirty = true
         flush()
     }
+
+    @Synchronized
+    override fun keys(): Set<String> = props.stringPropertyNames().toSet()
 
     @Synchronized
     override fun flush() {

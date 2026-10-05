@@ -37,55 +37,21 @@ object NoraChat {
         val takesPrompt: Boolean
     )
 
-    val COMMANDS = listOf(
-        Command("/diffuser", "<prompt>", "Real diffusion sampling, with my cortex as the denoiser", true),
-        Command("/sample", "<prompt>", "Sample stochastically — different image every time", true),
-        Command("/coarse", "<prompt>", "Coarse-to-fine — global structure first, detail last", true),
-        Command("/video", "<prompt>", "Generate a clip instead of a still", true),
-        Command(
-            "/hallucinate", "<prompt>",
-            "Recursive video — no fixation, each frame dreamed from the last one I drew", true
-        ),
-        Command(
-            "/expose", "<prompt>",
-            "One long held gaze -- the prompt fades and I free-associate from where it left off", true
-        ),
-        Command("/motion", "<template>", "Camera motion for the next clip", false),
-        Command("/denoise", "on | off", "Train on corrupted images (better supervision)", false),
-        Command("/status", "", "What my brain is currently doing", false),
-        Command("/brain", "", "How I'm put together", false),
-        Command("/train", "", "Open my training page", false),
-        Command("/forget", "", "Erase everything I've learned", false),
-        Command("/help", "", "Show this list", false)
-    )
+    /**
+     * Projected from [com.prism.launcher.nora.NoraCommands.ALL] rather than listed again.
+     *
+     * THE ONE THING THIS MUST NOT BECOME IS TWO LISTS. The definitions moved to :core for PHASE 40 so
+     * that the desktop build shows the same commands; keeping a second literal here would mean a command
+     * could exist in one build and not the other, which is exactly the failure the comment above warns
+     * about. The local [Command] type is kept because the popup and the dispatcher are written against
+     * it -- only the DATA is shared.
+     */
+    val COMMANDS: List<Command> = com.prism.launcher.nora.NoraCommands.ALL.map { shared ->
+        Command(shared.trigger, shared.argHint, shared.summary, shared.takesPrompt)
+    }
 
-    private fun helpText(): String = buildString {
-        appendLine("I generate images and video with a simulated visual cortex — retina, LGN, V1,")
-        appendLine("V2, V4, IT, MT and MST, wired as a predictive-coding hierarchy. Generation is")
-        appendLine("mental imagery: I clamp a concept in IT and run the same hierarchy backwards")
-        appendLine("that I use to see.")
-        appendLine()
-        appendLine("Just type what you want and I'll picture it — that uses saccadic refinement,")
-        appendLine("my default: several fixations stitched onto one canvas. /sample, /coarse and")
-        appendLine("/diffuser still stitch fixations the same way, they just settle each one")
-        appendLine("differently. /hallucinate and /expose don't stitch anything — one held gaze,")
-        appendLine("no eye movement at all:")
-        appendLine()
-        val width = COMMANDS.maxOf { it.trigger.length + it.argHint.length + 1 }
-        for (c in COMMANDS) {
-            val left = (c.trigger + (if (c.argHint.isEmpty()) "" else " ${c.argHint}")).padEnd(width + 2)
-            appendLine("  $left${c.summary}")
-        }
-        appendLine()
-        appendLine("Rate what I make. Thumbs up potentiates the pathway that produced it and")
-        appendLine("promotes it for replay; thumbs down depresses it and makes me start somewhere")
-        appendLine("else next time. Tapping a picture is a quick thumbs up and puts the buttons")
-        appendLine("away — hold it to bring them back.")
-        appendLine()
-        appendLine("Fair warning: I'm trained from scratch on whatever you give me, on a phone,")
-        appendLine("with no backpropagation. Early results look like a visual system dreaming,")
-        appendLine("not like a photo.")
-    }.trimEnd()
+    /** Delegated for the same reason [COMMANDS] is: one source, so the two builds cannot differ. */
+    private fun helpText(): String = com.prism.launcher.nora.NoraCommands.helpText()
 
     private val BRAIN = """
         Signal path, and what each stage actually does:

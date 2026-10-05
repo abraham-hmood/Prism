@@ -118,7 +118,28 @@ object WalletVault {
             .apply()
     }
 
+    /**
+     * The seed phrase, or null.
+     *
+     * REFUSES WHILE PRISM IS LOCKED (PHASE 101). This is the single most valuable thing Prism stores
+     * and it is reachable from the console harness and from several pages, so gating the UI would not
+     * gate it -- the check belongs at the one place that reads the phrase out.
+     *
+     * Null is already this function's answer for "not available", so a locked vault is indisting-
+     * uishable to a caller from an uninitialised one, which is the right amount of information to
+     * give code that was not supposed to be reading it yet.
+     */
     fun phrase(): List<String>? {
+        if (!com.prism.launcher.lock.PrismLockScope.permit(
+                com.prism.launcher.lock.PrismLockScope.Gate.WALLET,
+            )
+        ) {
+            return null
+        }
+        return phraseUnlocked()
+    }
+
+    private fun phraseUnlocked(): List<String>? {
         val stored = prefs().getString(KEY_PHRASE, null) ?: return null
         val plain = cipher?.decrypt(stored) ?: return null
         return Bip39.splitPhrase(plain)

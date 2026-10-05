@@ -1,3 +1,11 @@
+/*
+ * AssetManager.newInstance() is deprecated and hidden, and is precisely what this file needs: a
+ * SEPARATE asset manager for a virtualized package, so its resources resolve against its own APK
+ * rather than against Prism's. The public API offers no way to construct one, which is why the
+ * VirtualApp approach has always gone through this call.
+ */
+@file:Suppress("DEPRECATION")
+
 package com.prism.launcher.virtualapp
 
 import android.content.Context

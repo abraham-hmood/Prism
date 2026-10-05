@@ -18,6 +18,8 @@ import android.widget.Toast
 import androidx.core.view.isVisible
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
@@ -100,13 +102,19 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
         host.attachBrowserPage(this)
 
         // Observe P2P DNS Resolution State
-        (context as? LifecycleOwner)?.lifecycleScope?.launchWhenStarted {
-            P2pDnsManager.resolutionState.collect { states ->
-                val activeTab = tabs.firstOrNull { it.id == activeTabId } ?: return@collect
-                val hostName = try { java.net.URL(activeTab.lastUrl).host } catch (e: Exception) { null }
-                val source = states[hostName] ?: P2pDnsManager.ResolutionSource.UNKNOWN
-                
-                updateOriginIcon(activeTab.lastUrl, states[hostName])
+        (context as? LifecycleOwner)?.let { owner ->
+            owner.lifecycleScope.launch {
+                owner.repeatOnLifecycle(androidx.lifecycle.Lifecycle.State.STARTED) {
+                    P2pDnsManager.resolutionState.collect { states ->
+                        val activeTab = tabs.firstOrNull { it.id == activeTabId } ?: return@collect
+                        val hostName = try {
+                            java.net.URL(activeTab.lastUrl).host
+                        } catch (e: Exception) {
+                            null
+                        }
+                        updateOriginIcon(activeTab.lastUrl, states[hostName])
+                    }
+                }
             }
         }
     }
@@ -544,7 +552,7 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
             }
             PrismMirrorManager.mirrorSite(context, engine, hostName)
         } else {
-            PrismSiteDownloader.download(context, active.lastUrl)
+            PrismSiteDownloader.download(active.lastUrl)
         }
         Toast.makeText(context, "Downloading $hostName for the mesh\u2026", Toast.LENGTH_SHORT).show()
     }

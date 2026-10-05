@@ -84,7 +84,7 @@ object NetworkStorage {
     private fun browseFtp(storage: PrismSettings.NetworkStorage, path: String): Result {
         val url = urlFor(storage, path, directory = true)
         return try {
-            val connection = java.net.URL(url).openConnection().apply {
+            val connection = com.prism.core.Urls.of(url).openConnection().apply {
                 connectTimeout = 8_000
                 readTimeout = 12_000
             }
@@ -153,7 +153,7 @@ object NetworkStorage {
      */
     fun download(url: String, destination: File): Boolean = try {
         destination.parentFile?.mkdirs()
-        java.net.URL(url).openStream().use { input ->
+        com.prism.core.Urls.of(url).openStream().use { input ->
             destination.outputStream().use { output -> input.copyTo(output) }
         }
         true

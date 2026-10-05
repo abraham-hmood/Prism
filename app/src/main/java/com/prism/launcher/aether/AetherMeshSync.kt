@@ -38,7 +38,23 @@ object AetherMeshSync {
      *  domain to `AetherConnectomeHost` instead of PrismWebHost/PrismAiHost. */
     const val AETHER_HOST_DOMAIN = "aether-knowledge.prism.p2p"
 
-    const val OPCODE_AETHER_ANNOUNCE: Byte = 0x0D
+    /**
+     * The opcode Aether announces on.
+     *
+     * MOVED FROM 0x0D TO 0x30 ON 2026-09-24, AND IT NEVER WORKED ON 0x0D. That byte was already taken
+     * by `P2pModelListings.OPCODE_LISTINGS`, which is dispatched EARLIER in `PrismMeshService`'s
+     * `when (command)`. Kotlin takes the first matching branch, so every Aether announcement that ever
+     * arrived was handed to the model-listings parser, failed to parse as a listings payload, and was
+     * dropped. The branch for Aether further down the same `when` was unreachable code.
+     *
+     * Nothing is lost by changing it. A wire format can only break compatibility if it used to work,
+     * and this did not: two Prism devices have never successfully exchanged an Aether announcement.
+     * 0x0E had the identical problem -- see `NebulaMeshSync` -- because both were chosen by counting
+     * up from 0x0C without checking what the mesh market had already claimed.
+     *
+     * 0x30 is free, and deliberately a long way clear of the 0x0C-0x0F run that caused this.
+     */
+    const val OPCODE_AETHER_ANNOUNCE: Byte = 0x30
 
     private const val STALE_MS = 10 * 60 * 1000L
 

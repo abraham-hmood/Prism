@@ -102,6 +102,7 @@ class MainDesktopPagerAdapter(
             SlotAssignment.Science -> com.prism.launcher.science.SciencePageView(activity)
             SlotAssignment.Language -> com.prism.launcher.language.LanguagePageView(activity)
             SlotAssignment.Minigames -> com.prism.launcher.minigames.MinigamesPageView(activity)
+            SlotAssignment.Cloud -> com.prism.launcher.cloud.CloudPageView(activity)
             SlotAssignment.Notifications ->
                 com.prism.launcher.notifications.NotificationsPageView(activity)
 

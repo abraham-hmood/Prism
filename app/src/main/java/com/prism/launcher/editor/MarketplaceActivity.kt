@@ -160,7 +160,7 @@ class MarketplaceActivity : PrismBaseActivity() {
      */
     private fun renderInstalled() {
         installedList.removeAllViews()
-        val installed = ExtensionStore.installed(this)
+        val installed = ExtensionStore.installed()
 
         if (installed.isEmpty()) {
             installedList.addView(TextView(this).apply {
@@ -215,7 +215,7 @@ class MarketplaceActivity : PrismBaseActivity() {
             card.addView(
                 IosUi.tintedButton(this, "Remove", IosUi.destructive(this)).apply {
                     setOnClickListener {
-                        ExtensionStore.uninstall(this@MarketplaceActivity, extension.id)
+                        ExtensionStore.uninstall(extension.id)
                         renderInstalled()
                         android.widget.Toast.makeText(
                             this@MarketplaceActivity,
@@ -266,7 +266,7 @@ class MarketplaceActivity : PrismBaseActivity() {
 
         lifecycleScope.launch {
             val error = withContext(Dispatchers.IO) {
-                ExtensionStore.install(this@MarketplaceActivity, listing) { _, message ->
+                ExtensionStore.install(listing) { _, message ->
                     lifecycleScope.launch { status.text = message }
                 }
             }
@@ -334,11 +334,11 @@ class MarketplaceActivity : PrismBaseActivity() {
                 "${formatDownloads(listing.downloads)} installs"
             holder.description.text = listing.description.ifBlank { "No description." }
 
-            val installed = ExtensionStore.isInstalled(this@MarketplaceActivity, listing.id)
+            val installed = ExtensionStore.isInstalled(listing.id)
             holder.action.text = if (installed) "Uninstall" else "Install"
             holder.action.setOnClickListener {
                 if (installed) {
-                    ExtensionStore.uninstall(this@MarketplaceActivity, listing.id)
+                    ExtensionStore.uninstall(listing.id)
                     Toast.makeText(this@MarketplaceActivity, "Removed ${listing.displayName}", Toast.LENGTH_SHORT).show()
                     notifyItemChanged(position)
                 } else {

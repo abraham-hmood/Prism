@@ -83,7 +83,10 @@ object WeaponCatalog {
      * The two things a country can do to another country without invading it.
      *
      * @param label what it is called on the button.
-     * @param destruction the share of the target's buildings it takes off the map.
+     * @param destruction the share of the target's buildings it takes off the map. Both kinds are
+     *   total -- a warhead that only flattened half a city was not doing the one thing a player
+     *   reaches for a weapon of mass destruction to do. What tells [NUCLEAR] and [ANTIMATTER] apart
+     *   is everything else: how long the wreckage takes to clear ([burnHours]) and what it costs.
      * @param burnHours how long the target is left burning and rebuilding afterwards.
      * @param xpCost what it costs to build and deliver one, as a multiple of the target's XP.
      */
@@ -94,8 +97,8 @@ object WeaponCatalog {
         val burnHours: Double,
         val xpCostFactor: Double,
     ) {
-        NUCLEAR("Nuclear", "Nuke", destruction = 0.55, burnHours = 6.0, xpCostFactor = 0.45),
-        ANTIMATTER("Antimatter", "Antimatter drop", destruction = 0.88, burnHours = 18.0, xpCostFactor = 1.1),
+        NUCLEAR("Nuclear", "Nuke", destruction = 1.0, burnHours = 6.0, xpCostFactor = 0.45),
+        ANTIMATTER("Antimatter", "Antimatter drop", destruction = 1.0, burnHours = 18.0, xpCostFactor = 1.1),
     }
 
     /**

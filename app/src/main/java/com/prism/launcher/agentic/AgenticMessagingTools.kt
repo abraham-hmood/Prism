@@ -59,6 +59,17 @@ object AgenticMessagingTools {
         return null
     }
 
+    /**
+     * The most recent message from a contact.
+     *
+     * COMPARES NUMBERS WITH A DEPRECATED CALL, AND EVERY ALTERNATIVE IS ALSO DEPRECATED. Android
+     * deprecated PhoneNumberUtils.compare in both its forms; the successor, areSamePhoneNumber, needs
+     * an ISO country code, and the only thing available to supply one here is the SIM's country --
+     * which is wrong for exactly the case the comparison exists to handle, a number stored in one
+     * format and received in another while roaming. The Context overload is used because it at least
+     * consults the user's own region rather than guessing, and the deprecation is acknowledged here.
+     */
+    @Suppress("DEPRECATION")
     suspend fun readMostRecentText(context: Context, contact: String): String = withContext(Dispatchers.IO) {
         if (!hasPermission(context, Manifest.permission.READ_SMS)) {
             return@withContext "Error: READ_SMS permission not granted. Grant it in Settings > Apps > Prism > Permissions."
@@ -82,7 +93,7 @@ object AgenticMessagingTools {
                 while (cursor.moveToNext() && scanned < 2000) {
                     scanned++
                     val address = if (addressIdx >= 0) cursor.getString(addressIdx) else null
-                    if (address != null && PhoneNumberUtils.compare(address, number)) {
+                    if (address != null && PhoneNumberUtils.compare(context, address, number)) {
                         val body = if (bodyIdx >= 0) cursor.getString(bodyIdx).orEmpty() else ""
                         val when_ = if (dateIdx >= 0) DateFormat.getDateTimeInstance()
                             .format(Date(cursor.getLong(dateIdx))) else "unknown time"

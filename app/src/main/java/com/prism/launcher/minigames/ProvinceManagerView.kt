@@ -266,8 +266,8 @@ class ProvinceManagerView(
                     addView(
                         PaperUi.note(
                             context,
-                            "$owned/$cap · ${PaperUi.shortNumber(type.buildCost)} XP · " +
-                                PaperUi.shortDuration(type.buildSeconds * 1000L),
+                            "$owned/$cap · ${PaperUi.shortNumber(base.effectiveBuildCost(type))} XP · " +
+                                PaperUi.shortDuration((base.effectiveBuildSeconds(type) * 1000L).toLong()),
                         )
                     )
                 },

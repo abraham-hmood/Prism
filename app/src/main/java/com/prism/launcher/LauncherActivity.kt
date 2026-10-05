@@ -408,6 +408,7 @@ class LauncherActivity : PrismBaseActivity() {
                         tryConsumeWalletBack() -> Unit
                         tryConsumeEditorBack() -> Unit
                         tryConsumeMinigamesBack() -> Unit
+                        tryConsumeCloudBack() -> Unit
                         else -> {
                             isEnabled = false
                             onBackPressedDispatcher.onBackPressed()
@@ -486,6 +487,12 @@ class LauncherActivity : PrismBaseActivity() {
         // The tour, once. Shown from onResume rather than onCreate so it lands after the pager has
         // laid out -- an overlay added to an empty root flickers as the pages inflate behind it.
         com.prism.launcher.onboarding.OnboardingOverlay.showIfNeeded(binding.root)
+
+        // A device asking to pair. Asked from onResume, and behind the lock and the tour above, because
+        // it is a consent question: it should arrive when somebody is actually looking at Prism and can
+        // judge whether they recognise the device, not while the lock screen is still up. An offer that
+        // is not answered stays pending and the far side re-sends it.
+        com.prism.launcher.trusted.TrustedDeviceOffers.promptIfPending(this)
 
         shakeDetector.start()
         // Back in Prism, so the floating copy has nothing left to do — the real feed is on screen
@@ -623,6 +630,21 @@ class LauncherActivity : PrismBaseActivity() {
      * Without this, back from inside a battle drops the user all the way out of the launcher, which
      * is a surprising amount of distance to travel from "I wanted to stop looking at this map".
      */
+    /**
+     * Back ends a cloud gaming session before it leaves the page.
+     *
+     * Worth consuming: the session holds a socket and a render thread pointed at a peer, and swiping
+     * or backing out of the page without closing it leaves both running against a game the user has
+     * stopped watching.
+     */
+    private fun tryConsumeCloudBack(): Boolean {
+        val position = slotPreferences.getAssignments().indexOfFirst { it is SlotAssignment.Cloud }
+        if (position < 0) return false
+        if (binding.desktopPager.currentItem != position) return false
+        return (findPageViewAt(position) as? com.prism.launcher.cloud.CloudPageView)
+            ?.onBackPressed() ?: false
+    }
+
     private fun tryConsumeMinigamesBack(): Boolean {
         val position = slotPreferences.getAssignments().indexOfFirst { it is SlotAssignment.Minigames }
         if (position < 0) return false
@@ -929,6 +951,7 @@ class LauncherActivity : PrismBaseActivity() {
             PagePickChoice.Science -> SlotAssignment.Science
             PagePickChoice.Language -> SlotAssignment.Language
             PagePickChoice.Minigames -> SlotAssignment.Minigames
+            PagePickChoice.Cloud -> SlotAssignment.Cloud
             PagePickChoice.Notifications -> SlotAssignment.Notifications
             PagePickChoice.ModelStore -> SlotAssignment.ModelStore
             PagePickChoice.AgenticTools -> SlotAssignment.AgenticTools

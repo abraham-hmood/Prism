@@ -13,6 +13,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -61,8 +62,17 @@ import kotlinx.coroutines.launch
  * is; one that shows what is missing and why is a status report you can act on.
  */
 @Composable
-fun PrismWindow() {
-    var selected by remember { mutableStateOf(PageId.NORA_CHAT) }
+fun PrismWindow(startOn: PageId = PageId.NORA_CHAT) {
+    // The starting page is a parameter so a page can be opened directly, which is how a Compose page gets
+    // checked without a human driving the rail -- `prism gui nebula` opens on it.
+    var selected by remember { mutableStateOf(startOn) }
+
+    // Settings rows that open another page need a way to change the selection, and this composable is
+    // the only thing that owns it. Installed as a side effect rather than threaded through the page's
+    // signature, because the rows are built by a catalog in :core that must not know about PageId.
+    androidx.compose.runtime.SideEffect {
+        SettingsActions.navigate = { page -> selected = page }
+    }
     // Read once into state rather than polled: the setting is changed from inside this window, so
     // the toggle updates it directly and there is nothing else that could change it underneath.
     var launcherMode by remember { mutableStateOf(PrismSettings.getDesktopMobileMode()) }
@@ -80,6 +90,26 @@ fun PrismWindow() {
             LocalDragController provides dragController,
             LocalIconCache provides iconCache,
         ) {
+            // Mounted for the whole window, outside either shell: a trust offer is a consent question
+            // that has to be asked wherever the user happens to be, including on a page that knows
+            // nothing about pairing. See TrustedDeviceOfferWatcher.
+            TrustedDeviceOfferWatcher()
+
+            // THE LOCK (PHASE 101), mounted LAST so it draws over everything including the trust
+            // watcher and the tour. A lock that a consent dialog could appear on top of would be a
+            // lock somebody could be talked past.
+            //
+            // It locks Prism and not the computer, and the overlay says so in those words. See
+            // PrismLockScope for the decision and its caveats.
+            LockOverlay()
+
+        // THE FIRST-RUN TOUR (PHASE 109), window-wide for the same reason the watcher is: it has to cover
+        // whatever page Prism opened on, and it has to appear exactly once regardless of navigation.
+        var tourDone by remember { mutableStateOf(com.prism.launcher.onboarding.OnboardingTour.seen()) }
+        if (!tourDone) {
+            OnboardingOverlay(onDone = { tourDone = true })
+        }
+
             Surface(color = MaterialTheme.colorScheme.background) {
                 if (launcherMode) {
                     LauncherShell(onExit = {
@@ -90,10 +120,18 @@ fun PrismWindow() {
                     Row(Modifier.fillMaxSize()) {
                         NavigationRail(selected = selected, onSelect = { selected = it })
                         Box(Modifier.weight(1f).fillMaxHeight()) {
-                            PageBody(selected, launcherMode) {
-                                launcherMode = it
-                                PrismSettings.setDesktopMobileMode(it)
-                            }
+                            PageBody(
+                                page = selected,
+                                launcherMode = launcherMode,
+                                onLauncherModeChange = {
+                                    launcherMode = it
+                                    PrismSettings.setDesktopMobileMode(it)
+                                },
+                                // Lets a page move the window. Only the thread list uses it so far, and
+                                // it is a callback rather than a shared navigation object because one
+                                // consumer does not justify a router.
+                                onNavigate = { selected = it },
+                            )
                         }
                     }
                 }
@@ -104,7 +142,12 @@ fun PrismWindow() {
 
 /** The page itself, identical in both shells -- only the chrome around it differs. */
 @Composable
-private fun PageBody(page: PageId, launcherMode: Boolean, onLauncherModeChange: (Boolean) -> Unit) {
+private fun PageBody(
+    page: PageId,
+    launcherMode: Boolean,
+    onLauncherModeChange: (Boolean) -> Unit,
+    onNavigate: (PageId) -> Unit = {},
+) {
     when (page) {
         PageId.NORA_CHAT -> NoraChatPage()
         PageId.NORA_TRAIN -> NoraTrainingPage()
@@ -118,6 +161,37 @@ private fun PageBody(page: PageId, launcherMode: Boolean, onLauncherModeChange: 
         PageId.BLOCKLIST -> BlocklistPage()
         PageId.AGENTIC -> AgenticToolsPage()
         PageId.MODELS -> ModelsPage()
+        PageId.IMAGE_GEN -> ImageGenPage()
+        PageId.SAM -> ConversationPage()
+        PageId.MESSAGES_PAGE -> MessagesPage(onOpenThread = { requested -> onNavigate(requested) })
+        PageId.NORA_TOOLS -> NoraExtrasPage()
+        PageId.NEBULA -> NebulaPage()
+        PageId.TRUSTED -> TrustedDevicesPage()
+        PageId.WALLET -> WalletPage()
+        PageId.WALLET_EXTRAS -> WalletExtrasPage()
+        PageId.SEARCH -> SearchPage()
+        PageId.ACCESS_POINT -> AccessPointPage()
+        PageId.TUNNEL -> TunnelPage()
+        PageId.MESH -> MeshPage()
+        PageId.NOTIFICATIONS -> NotificationsPage()
+        PageId.QUANTIZE -> QuantizePage()
+        PageId.PLUGINS -> PluginsPage()
+        PageId.CHARACTERS -> CharactersPage()
+        PageId.STREMIO -> StremioPage()
+        PageId.SPEECH -> SpeechPage()
+        PageId.LANGUAGE -> LanguagePage()
+        PageId.GAMES -> MinigamesPage()
+        PageId.EDITOR -> EditorPage()
+        PageId.SCIENCE -> SciencePage()
+        PageId.PROTEINS -> ProteinPage()
+        PageId.LOCK -> LockPage()
+        PageId.LYKE -> LykePage()
+        PageId.WRITER -> WriterPage()
+        PageId.MODEL_SHOP -> ModelShopPage()
+        PageId.NODES -> NodesPage()
+        PageId.GAME_HOST -> GameHostPage()
+        PageId.VIRTUALIZATION -> VirtualizationPage()
+        PageId.AETHER -> AetherPage()
         PageId.APPS -> AppDrawerPage()
         PageId.FILES -> FileExplorerPage()
         PageId.SETTINGS -> PrismSettingsPage(launcherMode, onLauncherModeChange)
@@ -137,6 +211,7 @@ enum class PageId(
     NORA_TRAIN("Training", Icons.Filled.School),
     MODEL_TEST("Model Test", Icons.Filled.Science),
     NORA_SETTINGS("Nora Settings", Icons.Filled.Tune),
+    AETHER("Aether", Icons.Filled.Hub),
 
     DESKTOP("Desktop", Icons.Filled.GridView),
     BROWSER("Browser", Icons.Filled.Public),
@@ -144,37 +219,46 @@ enum class PageId(
     BLOCKLIST("Blocked domains", Icons.Filled.Block),
     AGENTIC("Agentic Tools", Icons.Filled.Build),
     MODELS("Models", Icons.Filled.Inventory2),
+    IMAGE_GEN("Image generation", Icons.Filled.Brush),
+    SAM("Sam", Icons.AutoMirrored.Filled.Chat),
+    MESSAGES_PAGE("Messages", Icons.Filled.Forum),
+    NEBULA("Nebula", Icons.Filled.Groups),
+    TRUSTED("Trusted devices", Icons.Filled.Devices),
+    WALLET("Wallet", Icons.Filled.AccountBalanceWallet),
+    WALLET_EXTRAS("Wallet extras", Icons.Filled.Savings),
+    SEARCH("Search", Icons.Filled.Search),
+    ACCESS_POINT("Access Point", Icons.Filled.Wifi),
+    TUNNEL("Tunnel", Icons.Filled.VpnKey),
+    VIRTUALIZATION("Virtualization", Icons.Filled.Computer),
+    NORA_TOOLS("Nora tools", Icons.Filled.Psychology),
     APPS("Apps", Icons.Filled.Apps),
     FILES("Files", Icons.Filled.Folder),
     SETTINGS("Prism Settings", Icons.Filled.Settings),
     DIAGNOSTICS("Diagnostics", Icons.Filled.Terminal),
 
     MESSAGES(
-        "Messages", Icons.Filled.Chat, ported = false,
+        "Messages", Icons.AutoMirrored.Filled.Chat, ported = false,
         blocker = "AI conversations port directly. SMS/MMS does not exist on desktop -- Windows " +
             "has no public API and Linux needs a cellular modem. Messages here will be AI-only."
     ),
-    NEBULA(
-        "Nebula", Icons.Filled.Groups, ported = false,
-        blocker = "Storage is done -- the Room schema runs on desktop, so the feed, bots, " +
-            "comments and DMs all read and write here. What is left is the UI: " +
-            "NebulaSocialPageView is 675 lines of imperative Android views."
-    ),
-    MESH(
-        "Mesh", Icons.Filled.Hub, ported = false,
-        blocker = "The gossip protocol is plain UDP and its JSON is portable now; the VPN tunnel " +
-            "needs WinTun on Windows and CAP_NET_ADMIN on Linux."
-    ),
-    ACCESS_POINT(
-        "Access Point", Icons.Filled.Wifi, ported = false,
-        blocker = "LocalOnlyHotspot has no direct equivalent. Windows uses netsh wlan " +
-            "hostednetwork, Linux uses nmcli or hostapd -- different implementations, same feature."
-    ),
-    VIRTUALIZATION(
-        "Virtualization", Icons.Filled.Computer, ported = false,
-        blocker = "Android Virtualization Framework is Android-only. Desktop would use QEMU or " +
-            "libvirt directly, which is a reimplementation rather than a port."
-    );
+    MESH("Mesh", Icons.Filled.Hub),
+    NOTIFICATIONS("Notifications", Icons.Filled.Notifications),
+    QUANTIZE("Quantize", Icons.Filled.Compress),
+    PLUGINS("Plugins", Icons.Filled.Extension),
+    CHARACTERS("Characters", Icons.Filled.Face),
+    STREMIO("Stremio", Icons.Filled.Movie),
+    SPEECH("Speech", Icons.Filled.RecordVoiceOver),
+    LANGUAGE("Language", Icons.Filled.Translate),
+    GAMES("Games", Icons.Filled.SportsEsports),
+    EDITOR("Editor", Icons.Filled.Code),
+    SCIENCE("Science", Icons.Filled.Biotech),
+    PROTEINS("Proteins", Icons.Filled.Hub),
+    LOCK("Lock", Icons.Filled.Lock),
+    LYKE("Lyke", Icons.Filled.Videocam),
+    WRITER("Prism Writer", Icons.Filled.Keyboard),
+    MODEL_SHOP("Model market", Icons.Filled.Storefront),
+    NODES("Nodes", Icons.Filled.AccountTree),
+    GAME_HOST("Game host", Icons.Filled.SportsEsports),
 }
 
 @Composable

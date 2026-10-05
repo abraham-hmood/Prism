@@ -276,31 +276,81 @@ class MinigamesPageView(context: Context) : FrameLayout(context) {
             }
             body.addView(row)
             body.addView(PaperUi.note(context, "${chosen.label} looks ${chosen.depth} moves ahead."))
+            body.addView(PaperUi.spacer(context, 10f))
+
+            // Training: the engine's own move shown on the player's own turn, against the computer
+            // only. Checking it disables the mesh button rather than hiding it, so it stays visible
+            // that a hinted game and an honest one against a real opponent are different things.
+            val training = MinigameStore.chessTrainingMode()
+            body.addView(
+                PaperUi.button(
+                    context,
+                    if (training) "✓ Training" else "Training",
+                    filled = training,
+                    colour = PencilStyle.GREEN_PENCIL,
+                    seed = 350,
+                ) {
+                    MinigameStore.setChessTrainingMode(!training)
+                    openChessMenu()
+                }
+            )
+            body.addView(
+                PaperUi.note(
+                    context,
+                    if (training) {
+                        "The best move is suggested on your turn, and every game is folded into how the app reads your play."
+                    } else {
+                        "Shows the engine's own suggestion on your turn, and learns from how you play against it."
+                    },
+                )
+            )
             body.addView(PaperUi.spacer(context, 12f))
 
             body.addView(PaperUi.button(context, "Play the computer", filled = true) {
-                startChess(null)
+                startChess(null, training = training)
             })
-            if (MinigameMesh.isAvailable()) {
-                body.addView(PaperUi.spacer(context, 8f))
+            body.addView(PaperUi.spacer(context, 8f))
+            val meshButton = PaperUi.button(context, "Play someone on the mesh", colour = PencilStyle.BLUE_PENCIL) {
+                findOpponent(MinigameMesh.GAME_CHESS) { match -> startChess(match, training = false) }
+            }
+            // Disabled, not hidden -- see the doc comment on the Training button above.
+            meshButton.isEnabled = MinigameMesh.isAvailable() && !training
+            meshButton.alpha = if (meshButton.isEnabled) 1f else 0.4f
+            if (MinigameMesh.isAvailable()) body.addView(meshButton)
+
+            if (MinigameStore.lastChessGame() != null) {
+                body.addView(PaperUi.spacer(context, 12f))
+                body.addView(PaperUi.divider(context))
                 body.addView(
-                    PaperUi.button(context, "Play someone on the mesh", colour = PencilStyle.BLUE_PENCIL) {
-                        findOpponent(MinigameMesh.GAME_CHESS) { match -> startChess(match) }
+                    PaperUi.button(context, "Review last match", colour = PencilStyle.RED_PENCIL) {
+                        openChessReview()
                     }
                 )
+                MinigameStore.chessStyle()?.let { style ->
+                    body.addView(PaperUi.spacer(context, 6f))
+                    body.addView(PaperUi.note(context, style.summary()))
+                }
             }
         }
         show(menu)
     }
 
-    private fun startChess(match: MinigameMesh.Match?) {
+    private fun startChess(match: MinigameMesh.Match?, training: Boolean) {
         val container = FrameLayout(context)
-        val board = ChessBoardView(
+        lateinit var board: ChessBoardView
+        board = ChessBoardView(
             context,
             difficulty = MinigameStore.chessDifficulty(),
             match = match,
+            training = training,
             onStatus = { status.text = it },
-            onFinished = { openChessMenu() },
+            onFinished = {
+                // Kept the moment the game ends, so "Review last match" always has THIS game to
+                // open, whether or not training mode is what asked for the learning below.
+                MinigameStore.setLastChessGame(board.playedMoves())
+                if (training) reviewInBackground(board.playedMoves())
+                openChessMenu()
+            },
         )
         container.addView(board, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
@@ -313,6 +363,29 @@ class MinigamesPageView(context: Context) : FrameLayout(context) {
             ).apply { setMargins(0, 0, PaperUi.dp(context, 14f), PaperUi.dp(context, 14f)) },
         )
         show(container)
+    }
+
+    /**
+     * Folds a finished game into [MinigameStore.chessStyle] without the player having to press
+     * "Review last match" first -- the "automatically learns" half of training mode. Runs the same
+     * search [ChessReviewView] does, off the UI thread, and simply does not show its working.
+     */
+    private fun reviewInBackground(moves: List<Chess.Move>) {
+        if (moves.isEmpty()) return
+        Thread({
+            val reviews = ChessReview.review(moves)
+            MinigameStore.accumulateChessStyleOnce(moves, reviews)
+        }, "chess-style").start()
+    }
+
+    private fun openChessReview() {
+        val moves = MinigameStore.lastChessGame() ?: return
+        show(
+            ChessReviewView(context, moves) { reviews ->
+                MinigameStore.accumulateChessStyleOnce(moves, reviews)
+                openChessMenu()
+            }
+        )
     }
 
     // -- Pong -----------------------------------------------------------------

@@ -38,7 +38,7 @@ class CharacterCreatorActivity : PrismBaseActivity() {
      * the obvious way to get this wrong.
      */
     private val editing: CharacterStore.Character? by lazy {
-        intent.getStringExtra(EXTRA_EDIT_ID)?.let { CharacterStore.find(this, it) }
+        intent.getStringExtra(EXTRA_EDIT_ID)?.let { CharacterStore.find(it) }
     }
 
     private val characterId: String by lazy { editing?.id ?: CharacterStore.newId() }
@@ -59,14 +59,22 @@ class CharacterCreatorActivity : PrismBaseActivity() {
     private val pickModel = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri ?: return@registerForActivityResult
         val name = displayName(uri) ?: "model.pskn"
-        modelPath = CharacterStore.importAsset(this, characterId, uri, name)
+        // The store takes a stream rather than a URI, so it could move to :core -- opening a
+        // content:// URI is the one part of this that only Android can do.
+        modelPath = CharacterStore.importAsset(characterId, name) {
+            contentResolver.openInputStream(uri)
+        }
         refreshBackdropRows()
     }
 
     private val pickImage = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri ?: return@registerForActivityResult
         val name = displayName(uri) ?: "portrait.png"
-        imagePath = CharacterStore.importAsset(this, characterId, uri, name)
+        // The store takes a stream rather than a URI, so it could move to :core -- opening a
+        // content:// URI is the one part of this that only Android can do.
+        imagePath = CharacterStore.importAsset(characterId, name) {
+            contentResolver.openInputStream(uri)
+        }
         refreshBackdropRows()
     }
 
@@ -224,9 +232,7 @@ class CharacterCreatorActivity : PrismBaseActivity() {
             nameField.error = "Give the character a name"
             return
         }
-        CharacterStore.save(
-            this,
-            CharacterStore.Character(
+        CharacterStore.save(CharacterStore.Character(
                 id = characterId,
                 name = name,
                 description = descriptionField.text.toString().trim(),

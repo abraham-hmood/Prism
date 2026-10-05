@@ -127,7 +127,7 @@ object LockGate {
     }
 
     private fun enabled(context: Context): Boolean =
-        PrismSettings.getLockScreenEnabled() && LockStore.isEnabled(context)
+        PrismSettings.getLockScreenEnabled() && LockStore.isEnabled()
 
     /**
      * Whether this device has a usable fingerprint or face sensor.

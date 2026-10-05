@@ -271,24 +271,32 @@ object AiManager {
         userText: String,
         onToken: ((String) -> Unit)?,
     ): String? {
-        if (!com.prism.launcher.mesh.MeshInference.shouldOffload()) return null
+        // The payment gate, not just the availability one. A generation on somebody else's phone is
+        // billed, and if the wallet cannot cover it the user has to have agreed to pay later --
+        // which is what turns on the mining that funds it. Blocked means this runs locally, which is
+        // the same fallback every other failure here takes.
+        val verdict = com.prism.launcher.mesh.MeshInference.offloadVerdict()
+        if (verdict is com.prism.launcher.mesh.PayLaterPolicy.Verdict.Blocked) {
+            com.prism.launcher.PrismLogger.logInfo("MeshCompute", "Staying local: ${verdict.reason}")
+            return null
+        }
         val peers = com.prism.launcher.mesh.MeshInference.selectedPeers()
 
         if (peers.size == 1) {
-            return com.prism.launcher.mesh.MeshInference.runOnPeer(context, peers.first(), userText, onToken)
+            return com.prism.launcher.mesh.MeshInference.runOnPeer(peers.first(), userText, onToken)
         }
 
         val handle = com.prism.launcher.mesh.MeshInference.loadDistributed(
             // 2048 is what every local load uses (see GgufInferenceService.ensureLoaded); the
             // context window is a property of the model and the device's memory, not of where the
             // layers happen to live.
-            context, modelPath, 2048
+            modelPath, 2048
         )
         if (handle == 0L) return null
 
         return try {
             val answer = GgufInferenceService.generateWithHandle(handle, userText, onToken)
-            com.prism.launcher.mesh.MeshInference.billDistributed(context, peers, answer.length)
+            com.prism.launcher.mesh.MeshInference.billDistributed(peers, answer.length)
             answer.ifBlank { null }
         } finally {
             // Freed after every distributed generation rather than kept warm. The peers' buffers

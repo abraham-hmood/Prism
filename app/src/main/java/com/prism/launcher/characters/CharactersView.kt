@@ -144,7 +144,7 @@ class CharactersView(
             "This removes the character and any model or image imported for it. It cannot be undone.",
             positiveText = "Delete",
             onPositive = {
-                CharacterStore.delete(context, character.id)
+                CharacterStore.delete(character.id)
                 refresh()
             },
         )
@@ -165,7 +165,7 @@ class CharactersView(
      * stopped; anything cached here would come back showing the list as it was before.
      */
     fun refresh() {
-        val characters = CharacterStore.all(context)
+        val characters = CharacterStore.all()
         adapter.update(characters)
         empty.visibility = if (characters.isEmpty()) VISIBLE else GONE
     }

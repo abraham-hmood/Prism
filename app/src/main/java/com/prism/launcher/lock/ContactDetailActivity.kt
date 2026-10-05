@@ -89,7 +89,7 @@ class ContactDetailActivity : FragmentActivity() {
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = IosUi.dp(this@ContactDetailActivity, 14f) })
 
-        val already = EmergencyContacts.isEmergency(this, contactNumber)
+        val already = EmergencyContacts.isEmergency(contactNumber)
 
         content.addView(
             if (already) {
@@ -156,7 +156,7 @@ class ContactDetailActivity : FragmentActivity() {
     }
 
     private fun askForDuress(action: () -> Unit) {
-        if (!LockStore.hasDuress(this)) {
+        if (!LockStore.hasDuress()) {
             toast(
                 "This needs your fingerprint or your emergency code, and this device has neither " +
                     "set up. Add an emergency code in Settings > Medical first."
@@ -164,7 +164,7 @@ class ContactDetailActivity : FragmentActivity() {
             return
         }
 
-        val mechanism = LockStore.mechanism(this)
+        val mechanism = LockStore.mechanism()
         if (mechanism == LockStore.Mechanism.PATTERN) {
             askForDuressPattern(action)
             return
@@ -189,7 +189,7 @@ class ContactDetailActivity : FragmentActivity() {
             .setPositiveButton("Confirm") { _, _ ->
                 // DURESS ONLY. Checking it here never fires the alert -- verify() reports which
                 // credential was entered and this path acts on nothing else.
-                if (LockStore.verify(this, field.text.toString()) == LockStore.Outcome.DURESS) {
+                if (LockStore.verify(field.text.toString()) == LockStore.Outcome.DURESS) {
                     action()
                 } else {
                     toast("That was not your emergency code")
@@ -208,7 +208,7 @@ class ContactDetailActivity : FragmentActivity() {
 
         view.minimumHeight = IosUi.dp(this, 300f)
         view.onPattern = { drawn ->
-            if (LockStore.verify(this, drawn) == LockStore.Outcome.DURESS) {
+            if (LockStore.verify(drawn) == LockStore.Outcome.DURESS) {
                 dialog.dismiss()
                 action()
             } else {
@@ -222,7 +222,7 @@ class ContactDetailActivity : FragmentActivity() {
     // ── The change ─────────────────────────────────────────────────────────
 
     private fun addEmergency() {
-        EmergencyContacts.add(this, contactName, contactNumber)
+        EmergencyContacts.add(contactName, contactNumber)
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.SEND_SMS)
             != PackageManager.PERMISSION_GRANTED
         ) {
@@ -237,7 +237,7 @@ class ContactDetailActivity : FragmentActivity() {
     }
 
     private fun removeEmergency() {
-        EmergencyContacts.remove(this, contactNumber)
+        EmergencyContacts.remove(contactNumber)
         toast("$contactName is no longer an emergency contact")
         render()
     }

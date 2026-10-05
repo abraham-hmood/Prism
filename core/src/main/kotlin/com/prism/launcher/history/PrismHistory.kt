@@ -88,6 +88,16 @@ object PrismHistory {
     private const val MAX_TEXT_CHARS = 2_000
     private const val MAX_TITLE_CHARS = 300
 
+    /**
+     * Called after an entry is recorded locally. Installed by [com.prism.launcher.trusted.TrustedSharing].
+     *
+     * NOT called for an entry that arrived from another device -- see [ingest]. A listener that fired on
+     * both would send every received entry straight back, and two paired devices would trade the same
+     * page visit until one of them was switched off.
+     */
+    @Volatile
+    var onRecorded: ((Entry) -> Unit)? = null
+
     private val lock = Any()
 
     /** Newest last. Null until the file has been read. Deliberately NOT named `entries`: that
@@ -142,7 +152,48 @@ object PrismHistory {
             runCatching { file().appendText(encode(entry) + "\n") }
                 .onFailure { PrismPlatform.log.warn("Prism/history", "Could not record: ${it.message}") }
         }
+
+        // Outside the lock: a listener may do network work, and holding the history lock across that
+        // would block every other page visit on this device until it finished.
+        runCatching { onRecorded?.invoke(entry) }
     }
+
+    /**
+     * Stores an entry that came from somewhere else, such as a trusted device.
+     *
+     * Separate from [record] for three reasons, all of which matter. It keeps the ORIGINAL timestamp,
+     * because when the page was seen is the useful fact and the moment it arrived here is not. It does not
+     * fire [onRecorded], so a received entry is not re-shared. And it respects the history setting the same
+     * way -- somebody who has turned history off has not agreed to keep somebody else's.
+     */
+    fun ingest(entry: Entry): Boolean {
+        if (!PrismSettings.getHistoryEnabled()) return false
+        if (entry.title.isBlank() && entry.uri.isBlank()) return false
+
+        val trimmed = entry.copy(
+            title = entry.title.take(MAX_TITLE_CHARS).trim(),
+            uri = entry.uri.trim(),
+            text = entry.text.take(MAX_TEXT_CHARS).trim(),
+            source = entry.source.take(120).trim(),
+        )
+        synchronized(lock) {
+            // Same URI at the same instant is the same visit arriving twice, which happens when two
+            // paired devices both relay it. Anything else is kept: the same page seen twice IS two visits.
+            val existing = all()
+            if (existing.any { it.kind == trimmed.kind && it.uri == trimmed.uri && it.at == trimmed.at }) {
+                return false
+            }
+            records?.add(trimmed)
+            runCatching { file().appendText(encode(trimmed) + "\n") }
+                .onFailure { PrismPlatform.log.warn("Prism/history", "Could not ingest: ${it.message}") }
+        }
+        return true
+    }
+
+    /** [Entry] as the wire carries it, and back. Public so the trust layer can use the same shape. */
+    fun toJson(entry: Entry): JSONObject = JSONObject(encode(entry))
+
+    fun fromJson(json: JSONObject): Entry? = decode(json.toString())
 
     // ── Reading ────────────────────────────────────────────────────────────
 

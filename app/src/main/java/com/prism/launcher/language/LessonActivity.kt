@@ -96,7 +96,7 @@ class LessonActivity : PrismBaseActivity() {
         super.onCreate(savedInstanceState)
 
         val lessonId = intent.getStringExtra(EXTRA_LESSON_ID)
-        val built = lessonId?.let { LessonRunner.forLesson(this, it) }
+        val built = lessonId?.let { LessonRunner.forLesson(it) }
         if (built == null) {
             toast("That lesson is no longer part of your plan.")
             finish()
@@ -504,14 +504,18 @@ class LessonActivity : PrismBaseActivity() {
     }
 
     private fun showPicture(item: LessonSpec.PictureItem) {
-        when (val picture = PictureBank.picture(this, item)) {
+        when (val picture = PictureBank.picture(item)) {
             is PictureBank.Picture.Emoji -> {
                 stagePicture.text = picture.glyph
                 stagePicture.visibility = View.VISIBLE
                 stageImage.visibility = View.GONE
             }
             is PictureBank.Picture.Photo -> {
-                PictureBank.bitmap(picture.file)?.let {
+                // Decoded here rather than in PictureBank, which hands back BYTES now so it can
+                // live in :core -- see PictureBank.bytes. This is the only Android-specific step.
+                PictureBank.bytes(picture.file)
+                    ?.let { android.graphics.BitmapFactory.decodeByteArray(it, 0, it.size) }
+                    ?.let {
                     stageImage.setImageBitmap(it)
                     stageImage.scaleType = ImageView.ScaleType.CENTER_CROP
                     stageImage.visibility = View.VISIBLE
@@ -554,7 +558,6 @@ class LessonActivity : PrismBaseActivity() {
             return
         }
         PrismSpeaker.speakAs(
-            context = this,
             text = turn.say,
             voiceId = LanguageVoices.tutorVoice(runner.spec.nativeCode, tutor),
             speed = LanguageProfile.speakingSpeed(),
@@ -566,7 +569,6 @@ class LessonActivity : PrismBaseActivity() {
     private fun speakNative(text: String) {
         PrismSpeaker.stop()
         PrismSpeaker.speakAs(
-            context = this,
             text = text,
             voiceId = LanguageVoices.tutorVoice(runner.spec.nativeCode, tutor),
             speed = LanguageProfile.speakingSpeed(),
@@ -578,7 +580,6 @@ class LessonActivity : PrismBaseActivity() {
     private fun speakTarget(text: String) {
         PrismSpeaker.stop()
         PrismSpeaker.speakAs(
-            context = this,
             text = text,
             // Null when Kokoro has no voice of this tutor's gender in this language: the system
             // engine then takes it with the locale below, rather than the word being read aloud by

@@ -207,7 +207,7 @@ data class PaperBase(
         level < type.unlockLevel -> Placement.Locked(type.unlockLevel)
         countOwned(type.id) >= type.capAtLevel(level) -> Placement.AtCap(type.capAtLevel(level))
         freeBuilders <= 0 -> Placement.NoBuilder
-        xp < type.buildCost -> Placement.NotEnoughXp(type.buildCost - xp)
+        xp < effectiveBuildCost(type) -> Placement.NotEnoughXp(effectiveBuildCost(type) - xp)
         else -> Placement.Allowed
     }
 
@@ -267,6 +267,9 @@ data class PaperBase(
     fun place(type: BuildingCatalog.BuildingType, x: Int, y: Int, now: Long): PaperBase {
         if (canPlace(type) != Placement.Allowed) return this
 
+        val cost = effectiveBuildCost(type)
+        val millis = (effectiveBuildSeconds(type) * 1000L).toLong()
+
         if (isRoadType(type)) {
             val (from, to) = roadEndsNear(x, y) ?: return this
             val road = PlacedBuilding(
@@ -278,11 +281,11 @@ data class PaperBase(
                 hitPoints = type.hitPoints,
                 maxHitPoints = type.hitPoints,
                 startedAt = now,
-                finishesAt = now + (type.buildSeconds * 1000L * lawEffects.buildSpeed).toLong(),
+                finishesAt = now + millis,
                 connectsFrom = from.id,
                 connectsTo = to.id,
             )
-            return copy(xp = xp - type.buildCost, buildings = buildings + road)
+            return copy(xp = xp - cost, buildings = buildings + road)
         }
 
         val placed = PlacedBuilding(
@@ -293,9 +296,9 @@ data class PaperBase(
             hitPoints = type.hitPoints,
             maxHitPoints = type.hitPoints,
             startedAt = now,
-            finishesAt = now + (type.buildSeconds * 1000L * lawEffects.buildSpeed).toLong(),
+            finishesAt = now + millis,
         )
-        return copy(xp = xp - type.buildCost, buildings = buildings + placed)
+        return copy(xp = xp - cost, buildings = buildings + placed)
     }
 
     /** Anything whose timer has run out becomes real, and pays its completion XP. */
@@ -340,13 +343,19 @@ data class PaperBase(
     fun lawCost(law: Ideology.Law): Long =
         (law.cost * lawEffects.researchCost).toLong().coerceAtLeast(1)
 
-    /** Begins deliberating a law. It takes effect when the timer runs out. */
+    /**
+     * Begins deliberating a law. It takes effect when the timer runs out.
+     *
+     * How long that is depends on how much of a legislature the country actually has: CIVIC is
+     * guildhalls, courthouses, town halls and the rest of the catalogue's governance buildings, and
+     * more of them is a bigger, faster-moving assembly. See [civicLawSpeed].
+     */
     fun beginLaw(law: Ideology.Law, now: Long): PaperBase {
         if (!canEnact(law)) return this
         return copy(
             xp = xp - lawCost(law),
             lawInProgress = law.id,
-            lawFinishesAt = now + law.seconds * 1000L,
+            lawFinishesAt = now + (law.seconds * civicLawSpeed * 1000L).toLong(),
         )
     }
 
@@ -401,6 +410,116 @@ data class PaperBase(
         get() = if (foodDemand <= 0.0) (if (foodProduction > 0) 2.0 else 1.0)
         else foodProduction / foodDemand
 
+    // -- What the rest of the catalogue is FOR --------------------------------
+    //
+    // AGRICULTURE feeds people and HOUSING shelters them, and until now that was where the
+    // catalogue's usefulness stopped: RESOURCE, INDUSTRY, TRADE and CIVIC together are getting on
+    // for half of every building the game has ever offered, and none of the four did anything a
+    // player could point to. A country with three hundred mines and workshops played identically to
+    // one with none, which is exactly the complaint "these are just there" describes.
+    //
+    // Each gets ONE clear, catalogue-wide lever rather than an individual effect per building --
+    // the same shape [foodProduction] already uses for AGRICULTURE, and for the same reason: nine
+    // hundred bespoke numbers would be unmaintainable and, worse, arbitrary, where one formula per
+    // category is a rule a player can learn and rely on. Together the five economic categories cover
+    // five different things a country can be good at, and none of them overlap:
+    //
+    //   RESOURCE        -> building is CHEAPER        (raw material, see [resourceBuildDiscount])
+    //   INDUSTRY        -> building is FASTER          (manufacturing, [industryBuildSpeed])
+    //   INFRASTRUCTURE  -> research is CHEAPER          (logistics, [infrastructureResearchDiscount])
+    //   TRADE           -> tax income is HIGHER         (commerce, [tradeIncomeBonus])
+    //   CIVIC           -> laws are decided FASTER      (governance, [civicLawSpeed])
+    //
+    // Every one is diminishing and floored (or capped) well short of the extreme, the same guard
+    // [densityMultiplier] and [schooling] already use, so a country cannot mine, build or legislate
+    // its way to something free.
+
+    /** How much cheaper a resource-rich country builds. Mines and quarries supply the materials. */
+    val resourceBuildDiscount: Double
+        get() {
+            val count = standing.count { it.type?.category == BuildingCatalog.Category.RESOURCE }
+            return (1.0 - count * 0.012).coerceIn(0.55, 1.0)
+        }
+
+    /** How much faster an industrial country builds. Mills, forges and workshops are throughput. */
+    val industryBuildSpeed: Double
+        get() {
+            val count = standing.count { it.type?.category == BuildingCatalog.Category.INDUSTRY }
+            return (1.0 - count * 0.012).coerceIn(0.5, 1.0)
+        }
+
+    /**
+     * How much cheaper research is, for a country with the logistics to move specialists,
+     * instruments and results around it. Bridges, aqueducts and canals, not the roads -- a road's
+     * job is joining two particular buildings, and it already does that job; this is everything
+     * else INFRASTRUCTURE builds.
+     */
+    val infrastructureResearchDiscount: Double
+        get() {
+            val count = standing.count {
+                it.type?.category == BuildingCatalog.Category.INFRASTRUCTURE && !it.isRoad
+            }
+            return (1.0 - count * 0.01).coerceIn(0.6, 1.0)
+        }
+
+    /** How much more a trading country's civilians are worth in tax. Markets sell their labour. */
+    val tradeIncomeBonus: Double
+        get() {
+            val count = standing.count { it.type?.category == BuildingCatalog.Category.TRADE }
+            return 1.0 + count * 0.02
+        }
+
+    /** How much faster a civic-minded country makes up its mind. Guildhalls are the legislature. */
+    val civicLawSpeed: Double
+        get() {
+            val count = standing.count { it.type?.category == BuildingCatalog.Category.CIVIC }
+            return (1.0 - count * 0.015).coerceIn(0.4, 1.0)
+        }
+
+    /**
+     * How much stronger this base's own army fights, from its MILITARY buildings that are not the
+     * training camp itself -- barracks, stables, archery and drill grounds, drone hangars, and the
+     * rest of the catalogue's military infrastructure that used to do nothing. The training camp
+     * already answers HOW MANY soldiers a base can field ([armyCapacity]); this is how good the
+     * ones it fields actually are, applied to the army's hit points when it goes out to attack.
+     */
+    val militaryBonus: Double
+        get() {
+            val count = standing.count {
+                it.type?.category == BuildingCatalog.Category.MILITARY &&
+                    it.typeId != BuildingCatalog.TRAINING_CAMP.id
+            }
+            return (1.0 + count * 0.012).coerceAtMost(2.5)
+        }
+
+    /**
+     * A second, smaller discount on weapon research, from the RESEARCH buildings that are not
+     * [SCHOOL_IDS] or the weapons research hall itself -- observatories, libraries, engineers'
+     * halls, printing presses, the rest of the catalogue that only ever unlocked something by being
+     * built, never by doing anything afterward.
+     *
+     * Stacks with [infrastructureResearchDiscount] rather than replacing it: a country can be
+     * research-strong for two different reasons -- good logistics (INFRASTRUCTURE) and a deep
+     * research tradition (RESEARCH itself) -- and both are true at once for a country that has both.
+     */
+    val researchInstituteDiscount: Double
+        get() {
+            val count = standing.count {
+                it.type?.category == BuildingCatalog.Category.RESEARCH &&
+                    it.typeId !in SCHOOL_IDS &&
+                    it.typeId != "weapons_research"
+            }
+            return (1.0 - count * 0.008).coerceIn(0.65, 1.0)
+        }
+
+    /** What placing [type] actually costs here, resource discount included. */
+    fun effectiveBuildCost(type: BuildingCatalog.BuildingType): Long =
+        (type.buildCost * resourceBuildDiscount).toLong().coerceAtLeast(1)
+
+    /** How long placing [type] actually takes here, the build-speed law and industry included. */
+    fun effectiveBuildSeconds(type: BuildingCatalog.BuildingType): Double =
+        (type.buildSeconds * lawEffects.buildSpeed * industryBuildSpeed).coerceAtLeast(1.0)
+
     /** Schooling, from the schools that are standing. Raises what a family is worth. */
     val schooling: Double
         get() {
@@ -411,8 +530,8 @@ data class PaperBase(
     /** People per household. Schooling makes for smaller, better-off families. */
     fun familySize(): Double = (4.0 / schooling).coerceAtLeast(2.0)
 
-    /** What one civilian pays, before the tax law. Schooling makes them worth more. */
-    fun taxPerCivilian(): Double = BASE_TAX_PER_CIVILIAN * schooling
+    /** What one civilian pays, before the tax law. Schooling and trade both make them worth more. */
+    fun taxPerCivilian(): Double = BASE_TAX_PER_CIVILIAN * schooling * tradeIncomeBonus
 
     /**
      * XP the civilians pay each minute.
@@ -531,9 +650,15 @@ data class PaperBase(
             xp >= researchCost(weapon) &&
             countStanding("weapons_research") > 0
 
-    /** What studying [weapon] costs here. Education law is most of the difference. */
+    /**
+     * What studying [weapon] costs here: the education law, the logistics INFRASTRUCTURE gives it,
+     * and a country's own research institutes on top of both.
+     */
     fun researchCost(weapon: WeaponCatalog.Weapon): Long =
-        (weapon.researchCost * lawEffects.researchCost).toLong().coerceAtLeast(1)
+        (
+            weapon.researchCost * lawEffects.researchCost *
+                infrastructureResearchDiscount * researchInstituteDiscount
+            ).toLong().coerceAtLeast(1)
 
     fun research(weapon: WeaponCatalog.Weapon): PaperBase {
         if (!canResearch(weapon)) return this
@@ -784,6 +909,39 @@ data class PaperBase(
         if (builders <= 0 || buildings.none { it.complete && it.hitPoints < it.maxHitPoints }) return this
         val fraction = (builders * 0.10).coerceIn(0.0, 0.75)
         return repair(fraction)
+    }
+
+    /**
+     * A WMD strike: [fraction] of every finished building's hit points are gone, all at once.
+     *
+     * ## Why this is not [applyDamage]
+     *
+     * [applyDamage] is ordinary battle damage and never lets a building fall below one hit point,
+     * because that method runs on the player's own persisted base and the bug that once erased an
+     * entire save by doing exactly that is the reason it never will again (see the history on
+     * [WorldMap.addMissingEssentials]). A nuke or an antimatter drop is a different kind of event:
+     * [WeaponCatalog.Wmd.destruction] is total, and a strike that quietly stopped one point short of
+     * actually flattening the target would not be doing what a player who chose to use one expects.
+     *
+     * So this DOES take a building to zero. That is still not deletion — the entry stays in
+     * [buildings], excluded from [standing] the same way any wrecked building already is, and
+     * [repair] already handles bringing a building back from zero exactly as well as it handles
+     * bringing one back from half; nothing about "the building is gone" needs the game to remember
+     * what it used to be, because it is still sitting right there in the list waiting to be rebuilt.
+     * Nothing under this roof is ever actually forgotten.
+     *
+     * A building site (not yet [PlacedBuilding.complete]) is left alone: there is no standing
+     * structure there yet for a warhead to flatten.
+     */
+    fun devastate(fraction: Double): PaperBase {
+        if (fraction <= 0.0) return this
+        return copy(
+            buildings = buildings.map { building ->
+                if (!building.complete) return@map building
+                val left = (building.hitPoints * (1.0 - fraction.coerceIn(0.0, 1.0))).toInt().coerceAtLeast(0)
+                building.copy(hitPoints = left)
+            }
+        )
     }
 
     /** The number the world map shows next to a country's name. */

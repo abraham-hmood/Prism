@@ -319,11 +319,29 @@ void randomx_prism_free_exec(void *ptr, size_t bytes) {
 	(void)bytes;
 }
 #else
+/*
+ * WINDOWS, CYGWIN AND macOS: NO SHIM NEEDED, AND THE JIT IS STILL AVAILABLE.
+ *
+ * Everything above exists for ANDROID, which enforces W^X on app memory -- a page cannot be writable and
+ * executable at once, so RandomX's JIT needs a dual mapping to write through one address and execute
+ * through another. None of that applies here: VirtualAlloc with PAGE_EXECUTE_READWRITE on Windows, and
+ * mmap with PROT_EXEC on macOS, do exactly what RandomX's own allocator already asks for.
+ *
+ * randomx_prism_exec_supported() USED TO RETURN 0 HERE, AND THAT WAS A REAL BUG rather than a cautious
+ * default. The JNI bridge treats it as "will this device execute memory the app allocated", and a 0 makes
+ * it drop RANDOMX_FLAG_JIT and fall back to the interpreter -- measured at 2.0 H/s on a Ryzen 5 2600, where
+ * the JIT does two to three orders of magnitude better. The desktop build looked like it worked and mined
+ * at a rate that would never find a share.
+ *
+ * It returns 1, and the other three stay stubs: reporting "yes, executable memory works" while allocating
+ * none of it is exactly right, because RandomX then uses ITS OWN allocator -- randomx_prism_is_managed
+ * returning 0 is what tells the rest of this file to leave those pointers alone.
+ */
 int randomx_prism_is_managed(const void *ptr) { (void)ptr; return 0; }
 ptrdiff_t randomx_prism_exec_offset(const void *ptr) { (void)ptr; return 0; }
 void *randomx_prism_alloc_exec(size_t bytes) { (void)bytes; return NULL; }
 void randomx_prism_free_exec(void *ptr, size_t bytes) { (void)ptr; (void)bytes; }
-int randomx_prism_exec_supported(void) { return 0; }
+int randomx_prism_exec_supported(void) { return 1; }
 #endif
 
 void* allocMemoryPages(size_t bytes) {

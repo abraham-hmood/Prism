@@ -71,15 +71,34 @@ dependencies {
     //
     // `api` rather than `implementation` because wallet signing on the Android side hands these
     // types across the module boundary.
+    // OkHttp, for WalletNetwork -- balances, prices, fees and broadcast. It moved here from :app
+    // because it had no Android imports at all: it is HTTP and JSON, and the desktop wallet page
+    // (PHASE 82) needs exactly the same calls. `api` so both platforms see it.
+    api("com.squareup.okhttp3:okhttp:4.12.0")
+
     api("org.bouncycastle:bcprov-jdk18on:1.78.1")
+    // bcpkix holds the certificate builders (org.bouncycastle.cert.*) and the content signers
+    // (org.bouncycastle.operator.*). bcprov alone is the algorithms; minting an X.509 leaf for a mesh
+    // domain needs both. See MeshTls (PHASE 51).
+    api("org.bouncycastle:bcpkix-jdk18on:1.78.1")
 
     // The SQLite driver for non-Android JVMs. Android supplies its own through the framework,
     // which is why this is `compileOnly` for the core's own compilation and a real dependency
     // only where a desktop actually opens the database.
     compileOnly("androidx.sqlite:sqlite-bundled:$sqliteVersion")
 
+    // ONNX Runtime, for Kokoro speech (PHASE 100). compileOnly for the same reason SQLite is: the two
+    // platforms ship DIFFERENT ARTIFACTS for the same API. :app depends on
+    // `onnxruntime-android`, which carries the arm64/x86 native libraries and an AndroidManifest;
+    // :desktop depends on `onnxruntime`, which carries Windows/Linux/macOS ones. The Kotlin this
+    // module compiles only needs `ai.onnxruntime.*`, which both provide identically -- so compiling
+    // against either and letting each platform supply its own is correct, and depending on one of
+    // them here would put an Android AAR on the desktop classpath or the reverse.
+    compileOnly("com.microsoft.onnxruntime:onnxruntime:1.20.0")
+
     testImplementation(kotlin("test"))
     testImplementation("androidx.sqlite:sqlite-bundled:$sqliteVersion")
+    testImplementation("com.microsoft.onnxruntime:onnxruntime:1.20.0")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
 }
 

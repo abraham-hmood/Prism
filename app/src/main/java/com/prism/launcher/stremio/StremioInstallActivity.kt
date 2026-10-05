@@ -88,7 +88,7 @@ class StremioInstallActivity : PrismBaseActivity() {
             .setNegativeButton("Cancel") { _, _ -> finish() }
             .setPositiveButton("Install") { _, _ ->
                 Thread({
-                    val error = StremioStore.install(this, url)
+                    val error = StremioStore.install(url)
                     runOnUiThread {
                         finishWith(error ?: "${addon.name} installed")
                     }

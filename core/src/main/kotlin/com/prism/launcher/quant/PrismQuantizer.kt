@@ -118,9 +118,18 @@ object PrismQuantizer {
      * Bits per weight of the model already on disk, read off its filename.
      *
      * The filename is where this information actually lives for a downloaded GGUF -- they are named
-     * `...Q4_K_M.gguf` by convention, and every model store in the app relies on that already. Reading
-     * the GGUF header would be more rigorous, but this figure only feeds a progress estimate, and an
-     * unrecognised name falls back to treating the file as F16.
+     * `...Q4_K_M.gguf` by convention, and every model store in the app relies on that already.
+     *
+     * THIS IS NO LONGER ONLY A PROGRESS ESTIMATE. [quantize] refuses an already-quantised source on the
+     * strength of this figure, because the native quantiser aborts the process rather than failing on one.
+     * That raises the cost of being wrong in each direction, and the fallback is chosen accordingly: an
+     * UNRECOGNISED name is treated as F16, so a file Prism cannot classify is allowed through rather than
+     * blocked. A wrongly-allowed file is the crash this is guarding against, which argues for the other
+     * default -- but a wrongly-BLOCKED file makes the feature unusable for anybody whose model is named
+     * unconventionally, and the crash is at least loud and immediate.
+     *
+     * Reading the GGUF header's file type would settle it properly and is the right next step if this
+     * proves to misclassify anything in practice.
      */
     private fun sourceBitsPerWeight(fileName: String): Double {
         val upper = fileName.uppercase()
@@ -148,6 +157,11 @@ object PrismQuantizer {
         if (!ensureLoaded()) return "The native quantiser is not available on this device"
         if (!source.isFile) return "${source.name} is not a file"
 
+        // NO SOURCE-PRECISION CHECK HERE, AND THAT IS DELIBERATE. Requantising an already-quantised
+        // model used to abort the process inside ggml, and the first fix was a refusal on this side --
+        // which contradicted the bridge's own reasoning: almost nobody has an F16 GGUF, so refusing
+        // quantised sources makes the feature inapplicable to every model it will be pointed at. The
+        // real fix is in gguf_bridge.cpp, which no longer forces `pure` mode on a quantised source.
         destination.parentFile?.mkdirs()
         // A leftover from an abandoned run would otherwise be appended to or half-overwritten, and
         // the result would be a file that looks finished and cannot be opened.

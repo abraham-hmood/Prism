@@ -98,7 +98,7 @@ class JvmDownloader(
             destination.parentFile?.mkdirs()
             val already = if (part.isFile) part.length() else 0L
 
-            val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+            val connection = (Urls.of(url).openConnection() as HttpURLConnection).apply {
                 connectTimeout = 15_000
                 readTimeout = 30_000
                 instanceFollowRedirects = true

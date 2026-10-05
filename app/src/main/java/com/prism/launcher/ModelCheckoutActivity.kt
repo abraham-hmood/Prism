@@ -92,15 +92,15 @@ class ModelCheckoutActivity : PrismBaseActivity() {
             text = "Check GitHub and Hugging Face now"
             textSize = 14f
             setTextColor(IosUi.label(this@ModelCheckoutActivity))
-            isChecked = ModelListingScanner.verifyOnPurchase(this@ModelCheckoutActivity)
+            isChecked = ModelListingScanner.verifyOnPurchase()
             setOnCheckedChangeListener { _, checked ->
-                ModelListingScanner.setVerifyOnPurchase(this@ModelCheckoutActivity, checked)
+                ModelListingScanner.setVerifyOnPurchase(checked)
             }
         }
         root.addView(verifyNow)
         root.addView(TextView(this).apply {
             text = "Runs the check on both devices the moment you buy, instead of waiting up to " +
-                ModelListingScanner.intervalHours(this@ModelCheckoutActivity) +
+                ModelListingScanner.intervalHours() +
                 " hours for the next sweep. Your side decides your payment; the seller's side is " +
                 "asked to re-check its own listing, which it does against the real sources rather " +
                 "than taking your word for it."
@@ -113,8 +113,8 @@ class ModelCheckoutActivity : PrismBaseActivity() {
         // again for nothing -- the transfer can fail, the file can be deleted, the phone can be
         // replaced -- and a checkout that only ever offers to buy would charge for the same model
         // twice. The ledger is the record of ownership, not the presence of the file.
-        val existing = ModelPurchaseLedger.find(this, listing.id)
-        val owned = ModelPurchaseLedger.owns(this, listing.id)
+        val existing = ModelPurchaseLedger.find(listing.id)
+        val owned = ModelPurchaseLedger.owns(listing.id)
 
         // A destructive-tinted iOS button: handing a model back is not the happy path, and it
         // should not look like the same affordance as buying.
@@ -122,13 +122,13 @@ class ModelCheckoutActivity : PrismBaseActivity() {
 
         val action = IosUi.filledButton(this, if (owned) "Download" else "Buy").apply {
             setOnClickListener {
-                if (ModelPurchaseLedger.owns(this@ModelCheckoutActivity, listing.id)) {
+                if (ModelPurchaseLedger.owns(listing.id)) {
                     isEnabled = false
                     status.text = "Downloading — you already own this model, so nothing is charged."
                     beginDownload(listing)
                     return@setOnClickListener
                 }
-                when (val result = ModelPayments.commit(this@ModelCheckoutActivity, listing)) {
+                when (val result = ModelPayments.commit(listing)) {
                     is ModelPayments.Result.Ok -> {
                         isEnabled = false
                         text = "Purchased"
@@ -139,7 +139,7 @@ class ModelCheckoutActivity : PrismBaseActivity() {
                         } else {
                             status.text = "Committed " + formatPsc(listing.priceMinor) + " PSC. " +
                                 "Your coins stay put until the next check, which runs every " +
-                                ModelListingScanner.intervalHours(this@ModelCheckoutActivity) +
+                                ModelListingScanner.intervalHours() +
                                 " hours; if the listing fails, nothing is sent."
                         }
                         beginDownload(listing)
@@ -209,7 +209,7 @@ class ModelCheckoutActivity : PrismBaseActivity() {
         }.getOrNull()
         // Spendable, not raw: coins already committed to purchases awaiting their first check
         // are not available again, and showing the gross figure would invite double-committing.
-        val balance = ModelPayments.spendable(this)
+        val balance = ModelPayments.spendable()
 
         card.addView(secondary(12f).apply { text = "Your PrismCoin" })
         card.addView(label(20f).apply { text = formatPsc(balance) + " PSC" })
@@ -286,7 +286,7 @@ class ModelCheckoutActivity : PrismBaseActivity() {
         status: TextView,
         listing: com.prism.launcher.mesh.P2pModelListings.Listing,
     ) {
-        val purchase = ModelPurchaseLedger.find(this, listing.id)
+        val purchase = ModelPurchaseLedger.find(listing.id)
         if (purchase == null || !ModelRefunds.isRefundable(purchase)) {
             button.isVisible = false
             return
@@ -311,7 +311,7 @@ class ModelCheckoutActivity : PrismBaseActivity() {
                 onPositive = {
                     button.isEnabled = false
                     Thread({
-                        val outcome = ModelRefunds.refund(applicationContext, purchase)
+                        val outcome = ModelRefunds.refund(purchase)
                         runOnUiThread {
                             when (outcome) {
                                 is ModelRefunds.Outcome.Cancelled -> {
@@ -344,7 +344,7 @@ class ModelCheckoutActivity : PrismBaseActivity() {
         status: TextView,
     ) {
         Thread({
-            val purchase = ModelPurchaseLedger.held(applicationContext)
+            val purchase = ModelPurchaseLedger.held()
                 .firstOrNull { it.listingId == listing.id }
             val outcome = if (purchase == null) {
                 // Committed but not held means it already settled or was cancelled elsewhere.
@@ -352,7 +352,7 @@ class ModelCheckoutActivity : PrismBaseActivity() {
                     "This purchase is no longer awaiting a check."
                 )
             } else {
-                ModelListingScanner.verifyPurchaseNow(applicationContext, purchase)
+                ModelListingScanner.verifyPurchaseNow(purchase)
             }
 
             runOnUiThread {
@@ -373,8 +373,7 @@ class ModelCheckoutActivity : PrismBaseActivity() {
         // Transfer rides the same peer channel model hosting already uses; the shop only says
         // which peer and which model.
         Thread({
-            val file = com.prism.launcher.mesh.P2pModelTransfer.download(
-                applicationContext, listing
+            val file = com.prism.launcher.mesh.P2pModelTransfer.download(listing
             ) { done, total ->
                 // The notification is the real progress display -- a transfer runs for minutes and
                 // nobody keeps this screen open for it. The label here is only for whoever stayed.

@@ -14,6 +14,8 @@ import androidx.compose.ui.composed
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.pointer.isSecondaryPressed
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
@@ -200,6 +202,30 @@ private fun Modifier.commitOn(commit: () -> Unit): Modifier = this
         } else false
     }
     .onFocusChanged { if (!it.isFocused) commit() }
+
+/**
+ * A secondary-click handler, for the per-item context menus a desktop expects.
+ *
+ * THROUGH THE POINTER EVENT AND NOT `combinedClickable`, which offers a long press rather than a right
+ * click -- a touch idiom that a mouse user will never discover. `awaitPointerEventScope` sees the actual
+ * button, so this fires on press of the secondary button and nothing else.
+ *
+ * THE PASS IS `Main` RATHER THAN `Initial`, so a child that wants the secondary button for itself gets it
+ * first. A context menu that swallowed right clicks meant for a text field inside the row would be a
+ * strictly worse row.
+ */
+fun Modifier.rightClickable(onRightClick: () -> Unit): Modifier = this.pointerInput(onRightClick) {
+    awaitPointerEventScope {
+        while (true) {
+            val event = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Main)
+            val secondary = event.buttons.isSecondaryPressed
+            if (secondary && event.type == androidx.compose.ui.input.pointer.PointerEventType.Press) {
+                event.changes.forEach { it.consume() }
+                onRightClick()
+            }
+        }
+    }
+}
 
 fun Modifier.alphaIf(enabled: Boolean): Modifier = if (enabled) this else this.alpha(0.4f)
 

@@ -1,3 +1,11 @@
+/*
+ * android.app.Fragment is deprecated in favour of the AndroidX one, and this file cannot use the
+ * AndroidX one. It reaches into the framework's own activity plumbing -- the VirtualApp/VirtualXposed
+ * approach -- and the objects on the other side of that boundary are framework Fragments. Passing an
+ * AndroidX Fragment where the platform expects its own is not a migration, it is a ClassCastException.
+ */
+@file:Suppress("DEPRECATION")
+
 package com.prism.launcher.virtualapp
 
 import android.app.Activity

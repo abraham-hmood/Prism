@@ -45,6 +45,23 @@ sealed class DesktopItem {
     data class Widget(val appWidgetId: Int, val spanX: Int, val spanY: Int) : DesktopItem()
 
     /**
+     * A widget supplied by a Prism plugin. PHASE 106.
+     *
+     * SEPARATE FROM [Widget] BECAUSE IT IS A DIFFERENT THING WITH A DIFFERENT IDENTITY. An AppWidget is
+     * identified by an integer the platform's AppWidgetHost allocated, and losing that integer orphans a
+     * running widget forever. A plugin widget is identified by its CLASS NAME, because that is what the
+     * plugin loader can find it by -- there is no host allocating ids, and there is nothing to orphan: the
+     * plugin either loads or it does not.
+     *
+     * Merging the two into one item with a nullable id would have meant every site that touches a widget
+     * asking which kind it was holding, and the AppWidget cleanup path -- deleteAppWidgetId on removal --
+     * running against a plugin widget that has no id to delete.
+     *
+     * The spans are in grid cells, as for [Widget], and occupancy is held the same way through [Occupied].
+     */
+    data class PluginWidget(val className: String, val spanX: Int, val spanY: Int) : DesktopItem()
+
+    /**
      * A cell covered by a widget whose top-left is elsewhere.
      *
      * WHY OCCUPANCY IS STORED RATHER THAN DERIVED. It could be recomputed by walking the grid and
@@ -66,6 +83,10 @@ sealed class DesktopItem {
             is Folder -> "folder|$name|$folderId"
             is NetworkedFolder -> "network|$url|$name|$type"
             is Widget -> "widget|$appWidgetId|$spanX|$spanY"
+            // A distinct tag rather than reusing "widget": a class name is not an integer, and an old
+            // build reading a new grid must fall through to "unrecognised" rather than parse a class name
+            // as an id and place a widget that does not exist.
+            is PluginWidget -> "pluginwidget|$className|$spanX|$spanY"
             is Occupied -> "occupied|$ownerIndex"
         }
     }
@@ -84,6 +105,14 @@ sealed class DesktopItem {
                 "widget" -> parts.getOrNull(1)?.toIntOrNull()?.let {
                     Widget(it, parts.getOrNull(2)?.toIntOrNull() ?: 1, parts.getOrNull(3)?.toIntOrNull() ?: 1)
                 }
+                "pluginwidget" -> parts.getOrNull(1)?.takeIf { it.isNotBlank() }?.let { name ->
+                    PluginWidget(
+                        className = name,
+                        spanX = parts.getOrNull(2)?.toIntOrNull() ?: 2,
+                        spanY = parts.getOrNull(3)?.toIntOrNull() ?: 2,
+                    )
+                }
+
                 "occupied" -> Occupied(parts.getOrNull(1)?.toIntOrNull() ?: -1)
                 else -> {
                     // Legacy migration: before the tagged format, a cell was a bare flattened
@@ -157,6 +186,8 @@ class DesktopShortcutStore(private val pageIndex: Int = 1) {
                         null -> Unit
                         is DesktopItem.Occupied -> if (existing.ownerIndex != ignoreOwner) return false
                         is DesktopItem.Widget -> if (cell != ignoreOwner) return false
+                        // Same rule for a plugin widget: its own top-left cell does not block it.
+                        is DesktopItem.PluginWidget -> if (cell != ignoreOwner) return false
                         else -> return false
                     }
                 }
@@ -166,29 +197,87 @@ class DesktopShortcutStore(private val pageIndex: Int = 1) {
 
         /** Writes a widget at [index] and marks the cells it covers. Assumes [fits] already said yes. */
         fun placeWidget(grid: MutableList<DesktopItem?>, index: Int, widget: DesktopItem.Widget) {
+            occupy(grid, index, widget, widget.spanX, widget.spanY)
+        }
+
+        /** The same, for a plugin's widget. PHASE 106. */
+        fun placeWidget(grid: MutableList<DesktopItem?>, index: Int, widget: DesktopItem.PluginWidget) {
+            occupy(grid, index, widget, widget.spanX, widget.spanY)
+        }
+
+        /**
+         * Writes [owner] at [index] and fills the cells it covers with [DesktopItem.Occupied].
+         *
+         * SHARED BY BOTH WIDGET KINDS rather than copied, because the occupancy invariant -- every cell has
+         * exactly one owner, and a covered cell points back at its owner's index -- is what the whole grid,
+         * the drag-and-drop and the delete zone depend on. Two implementations of it is two places for it to
+         * be got subtly wrong.
+         */
+        private fun occupy(
+            grid: MutableList<DesktopItem?>,
+            index: Int,
+            owner: DesktopItem,
+            spanX: Int,
+            spanY: Int,
+        ) {
             val column = index % COLUMNS
             val row = index / COLUMNS
-            for (y in 0 until widget.spanY) {
-                for (x in 0 until widget.spanX) {
+            for (y in 0 until spanY) {
+                for (x in 0 until spanX) {
                     val cell = (row + y) * COLUMNS + (column + x)
                     if (cell < grid.size) {
-                        grid[cell] = if (cell == index) widget else DesktopItem.Occupied(index)
+                        grid[cell] = if (cell == index) owner else DesktopItem.Occupied(index)
                     }
                 }
             }
         }
 
-        /** Clears a widget and every cell it covered. */
+        /** Clears a widget of either kind and every cell it covered. */
         fun clearWidget(grid: MutableList<DesktopItem?>, index: Int) {
-            val widget = grid.getOrNull(index) as? DesktopItem.Widget ?: return
+            val spans = when (val item = grid.getOrNull(index)) {
+                is DesktopItem.Widget -> item.spanX to item.spanY
+                is DesktopItem.PluginWidget -> item.spanX to item.spanY
+                else -> return
+            }
             val column = index % COLUMNS
             val row = index / COLUMNS
-            for (y in 0 until widget.spanY) {
-                for (x in 0 until widget.spanX) {
+            for (y in 0 until spans.second) {
+                for (x in 0 until spans.first) {
                     val cell = (row + y) * COLUMNS + (column + x)
                     if (cell < grid.size) grid[cell] = null
                 }
             }
+        }
+
+        /**
+         * Finds room for a plugin's widget on any desktop page and places it. PHASE 106.
+         *
+         * SEARCHES EVERY PAGE, not just the first, and returns false rather than evicting anything. A
+         * placement that displaced an icon to make room would be a widget silently rearranging somebody's
+         * desktop, and the user has no way to know what used to be there.
+         *
+         * @return true when it was placed.
+         */
+        fun placePluginWidget(className: String, spanX: Int, spanY: Int): Boolean {
+            val widget = DesktopItem.PluginWidget(className, spanX, spanY)
+            // EVERY SLOT THE USER ACTUALLY HAS, from their own assignments, rather than a fixed page
+            // count -- the number of desktop pages is whatever they arranged, and a constant here would
+            // either miss pages or write grids for slots that are not desktops.
+            val slots = runCatching { SlotPreferences().getAssignments().size }.getOrDefault(3)
+            for (pageIndex in 0 until slots.coerceAtLeast(1)) {
+                val store = DesktopShortcutStore(pageIndex)
+                val grid = store.readGrid(GRID_SIZE)
+                for (index in grid.indices) {
+                    // The top-left cell has to be free and the run has to fit inside the row, which `fits`
+                    // already checks -- including not wrapping onto the next row.
+                    if (grid[index] != null) continue
+                    if (!fits(grid, index, spanX, spanY)) continue
+                    placeWidget(grid, index, widget)
+                    store.writeGrid(grid)
+                    return true
+                }
+            }
+            return false
         }
 
         /** Adds an item specifically to the given desktop page index. */

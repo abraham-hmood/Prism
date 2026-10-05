@@ -105,6 +105,7 @@ object GgufInferenceService {
     ): Long
     private external fun nativeGenerate(handle: Long, userText: String, maxTokens: Int, temperature: Float, minP: Float): String
     private external fun nativeGenerateStreaming(handle: Long, userText: String, maxTokens: Int, temperature: Float, minP: Float, callback: TokenCallback): String
+    private external fun nativeResetConversation(handle: Long)
     private external fun nativeFreeModel(handle: Long)
     private external fun nativeHasHexagonSupport(): Boolean
     private external fun nativeAcceleratorMemoryBytes(): Long
@@ -230,6 +231,19 @@ object GgufInferenceService {
     /** Releases a handle from [loadDistributed]. Never pass the cached local handle to this. */
     fun freeHandle(handle: Long) {
         if (handle != 0L) runCatching { nativeFreeModel(handle) }
+    }
+
+    /**
+     * Forgets the current conversation, keeping the model loaded.
+     *
+     * For callers that generate independent things rather than hold a conversation -- see the native
+     * function's comment. A no-op when nothing is loaded, so a caller does not have to check.
+     */
+    @Synchronized
+    fun resetConversation() {
+        if (handle == 0L) return
+        runCatching { nativeResetConversation(handle) }
+            .onFailure { PrismPlatform.log.warn("GgufInferenceService", "Could not reset: ${it.message}") }
     }
 
     fun isGgufFile(path: String): Boolean {

@@ -282,3 +282,57 @@ dependencies {
     testImplementation(kotlin("test"))
 }
 
+/**
+ * Makes Chaquopy's pip step survive a second run.
+ *
+ * ## The failure this prevents
+ *
+ * `generateDebugPythonRequirements` installs the wheels with `pip install --target`, and pip
+ * implements `--target` by unpacking into a temporary directory and then MOVING each item into place.
+ * On this project that move crosses a drive: TEMP is on C: and the build directory is on F:. Windows
+ * cannot rename across volumes, so `shutil.move` gets
+ *
+ *     OSError: [WinError 17] The system cannot move the file to a different disk drive
+ *
+ * and falls back to `copytree`, which calls `os.makedirs(dst, exist_ok=False)` and therefore FAILS
+ * OUTRIGHT if the destination already exists:
+ *
+ *     FileExistsError: [WinError 183] Cannot create a file when that file already exists:
+ *     '...\app\build\python\pip\debug\arm64-v8a\absl'
+ *
+ * ## Why it is self-perpetuating, which is the part that wastes an afternoon
+ *
+ * The copy is not atomic. Any run that is interrupted -- a failure, a cancelled build, two builds
+ * racing into the same directory -- leaves the target PARTIALLY populated, and every subsequent run
+ * then hits the existing directory and dies at the same point. The reported error names a missing
+ * package, so it reads like a dependency problem rather than the leftover state it actually is, and
+ * `--rerun-tasks` makes it worse rather than better: it forces the install to happen again into the
+ * same dirty directory.
+ *
+ * ## The fix, and why it is a delete rather than something cleverer
+ *
+ * A clean destination makes the copytree fallback work, so the directory is emptied before pip runs.
+ * The better fix would be to keep pip's temporary directory on the same drive, which would make the
+ * move a rename again -- atomic, and far quicker than copying 100 MB of TensorFlow -- but pip takes
+ * that location only from TMPDIR/TEMP in its own environment, and Chaquopy's task is an OutputDirTask
+ * rather than an Exec, so a build script cannot set it. Anyone who wants the faster path can point
+ * TEMP at the build drive before starting Gradle.
+ *
+ * This only runs when the task actually executes; an up-to-date build does not reinstall anything.
+ */
+tasks.matching { it.name.matches(Regex("generate(Debug|Release)PythonRequirements")) }.configureEach {
+    doFirst {
+        // "generateDebugPythonRequirements" -> "debug"
+        val variant = name.removePrefix("generate").removeSuffix("PythonRequirements")
+            .replaceFirstChar { it.lowercase() }
+        val target = layout.buildDirectory.dir("python/pip/" + variant).get().asFile
+        if (target.exists()) {
+            logger.lifecycle(
+                "Clearing " + target.path + " before pip: its --target move is a cross-drive copy " +
+                    "here, which cannot write over a partial previous run."
+            )
+            target.deleteRecursively()
+        }
+    }
+}
+

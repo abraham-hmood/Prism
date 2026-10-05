@@ -315,7 +315,7 @@ class MiningService : Service() {
     private fun beginPrismCoin(cfg: Config) {
         State.mode = "prismcoin"
         val node = com.prism.launcher.wallet.psc.PrismCoinNode
-        node.load(applicationContext)
+        node.load()
 
         if (!node.isEligible()) {
             State.status = "Wallet page not on a desktop slot — not a PrismCoin node"
@@ -338,7 +338,7 @@ class MiningService : Service() {
                 State.hashes.addAndGet(now - lastCounted)
                 lastCounted = now
 
-                if (found != null && node.submitMined(applicationContext, found)) {
+                if (found != null && node.submitMined(found)) {
                     State.shares.incrementAndGet()
                     // The difficulty the block was actually mined at, not a placeholder: the yield
                     // estimate multiplies by this, so a constant 1.0 would under-report every

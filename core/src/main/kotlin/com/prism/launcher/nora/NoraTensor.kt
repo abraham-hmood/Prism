@@ -19,7 +19,7 @@ class Tensor3(val c: Int, val h: Int, val w: Int) {
     val plane = h * w
     val data = FloatArray(c * plane)
 
-    inline fun at(ci: Int, y: Int, x: Int): Int = ci * plane + y * w + x
+    fun at(ci: Int, y: Int, x: Int): Int = ci * plane + y * w + x
 
     operator fun get(ci: Int, y: Int, x: Int): Float = data[ci * plane + y * w + x]
 

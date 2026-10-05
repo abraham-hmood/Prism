@@ -141,7 +141,7 @@ class StremioAddonsActivity : PrismBaseActivity() {
                 if (url.isBlank()) return@setPositiveButton
                 busy.visibility = View.VISIBLE
                 Thread({
-                    val error = StremioStore.install(this, url)
+                    val error = StremioStore.install(url)
                     runOnUiThread {
                         busy.visibility = View.GONE
                         if (error != null) toast(error) else {
@@ -161,7 +161,7 @@ class StremioAddonsActivity : PrismBaseActivity() {
     private fun renderInstalled() {
         list.removeAllViews()
         busy.visibility = View.GONE
-        val addons = StremioStore.installed(this)
+        val addons = StremioStore.installed()
 
         if (addons.isEmpty()) {
             list.addView(emptyNote(
@@ -183,7 +183,7 @@ class StremioAddonsActivity : PrismBaseActivity() {
     private fun renderAvailable() {
         list.removeAllViews()
 
-        if (StremioStore.repositories(this).isEmpty()) {
+        if (StremioStore.repositories().isEmpty()) {
             list.addView(emptyNote(
                 "No repositories configured.\n\nStremio publishes its community add-on list " +
                     "openly — no account needed. Add it below, or add your own in " +
@@ -192,7 +192,7 @@ class StremioAddonsActivity : PrismBaseActivity() {
             list.addView(
                 IosUi.filledButton(this, "Add Stremio's community catalogue").apply {
                     setOnClickListener {
-                        val error = StremioStore.addCommunityCatalog(this@StremioAddonsActivity)
+                        val error = StremioStore.addCommunityCatalog()
                         if (error != null) toast(error) else {
                             available = null
                             renderAvailable()
@@ -215,7 +215,7 @@ class StremioAddonsActivity : PrismBaseActivity() {
         list.addView(emptyNote("Asking the repositories…"))
 
         Thread({
-            val found = StremioStore.available(this)
+            val found = StremioStore.available()
             runOnUiThread {
                 busy.visibility = View.GONE
                 available = found
@@ -306,7 +306,7 @@ class StremioAddonsActivity : PrismBaseActivity() {
             if (installed) {
                 IosUi.tintedButton(this, "Remove", IosUi.destructive(this)).apply {
                     setOnClickListener {
-                        StremioStore.uninstall(this@StremioAddonsActivity, addon.id)
+                        StremioStore.uninstall(addon.id)
                         available = null            // it belongs back in the available list
                         renderInstalled()
                         toast("${addon.name} removed")
@@ -333,7 +333,7 @@ class StremioAddonsActivity : PrismBaseActivity() {
         button.isEnabled = false
         button.text = "Installing…"
         Thread({
-            val error = StremioStore.install(this, addon.transportUrl)
+            val error = StremioStore.install(addon.transportUrl)
             runOnUiThread {
                 if (error != null) {
                     button.isEnabled = true
@@ -351,7 +351,10 @@ class StremioAddonsActivity : PrismBaseActivity() {
     private fun loadLogo(url: String, into: ImageView) {
         if (url.isBlank()) return
         Thread({
-            val bitmap = StremioStore.fetchImage(url)
+            val bytes = StremioStore.fetchImage(url)
+            val bitmap = bytes?.let {
+                android.graphics.BitmapFactory.decodeByteArray(it, 0, it.size)
+            }
             if (bitmap != null) runOnUiThread { into.setImageBitmap(bitmap) }
         }, "stremio-logo").apply { isDaemon = true; start() }
     }

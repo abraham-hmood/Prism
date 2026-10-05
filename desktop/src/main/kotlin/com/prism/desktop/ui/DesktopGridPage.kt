@@ -3,11 +3,14 @@ package com.prism.desktop.ui
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -127,6 +130,23 @@ fun DesktopGridPage(pageIndex: Int = 1) {
             is DesktopItem.NetworkedFolder -> PrismPlatform.log.info(
                 "Prism/grid", "Network shares open in the Files page, which is not wired up yet"
             )
+
+            // Widgets are Android AppWidgets -- remote views hosted out of another app's process,
+            // which has no desktop equivalent at all. A saved layout containing one still has to
+            // LOAD here, though, or a user with widgets on their phone cannot open their desktop
+            // at all. So the cells are inert rather than absent. See PHASE 106.
+            is DesktopItem.Widget -> PrismPlatform.log.info(
+                "Prism/grid", "Android AppWidgets are Android-only; this cell is a placeholder"
+            )
+
+            // A PLUGIN WIDGET IS NOT LAUNCHED, IT IS DRAWN. Clicking one does nothing here on purpose:
+            // its buttons are its own and are handled by the renderer, so a click that reached this
+            // function is a click on the widget's background. PHASE 106.
+            is DesktopItem.PluginWidget -> Unit
+
+            // A cell covered by a widget whose top-left is elsewhere. Never launchable on any
+            // platform -- the owning Widget entry is what holds the interaction.
+            is DesktopItem.Occupied -> Unit
         }
     }
 
@@ -352,6 +372,14 @@ fun CellFace(
     icons: MutableMap<String, ImageBitmap?>,
     iconSize: androidx.compose.ui.unit.Dp = 40.dp,
 ) {
+    // A PLUGIN WIDGET IS NOT AN ICON. PHASE 106. Everything else in a cell is a picture with a caption
+    // under it; a widget is content, so it takes the whole cell and draws its own tree. Handled before the
+    // icon path rather than inside it, because there is no icon to load and no label to centre.
+    if (item is DesktopItem.PluginWidget) {
+        PluginWidgetFace(item)
+        return
+    }
+
     val entry = (item as? DesktopItem.App)?.let { byId[it.appId] }
     entry?.let { IconLoader(it, icons) }
 
@@ -367,6 +395,96 @@ fun CellFace(
             fontSize = 10.sp, maxLines = 2, overflow = TextOverflow.Ellipsis,
             textAlign = TextAlign.Center, color = Color(0xFFE8E8F0), lineHeight = 12.sp,
         )
+    }
+}
+
+/**
+ * A plugin's widget, drawn in the cells it was given. PHASE 106.
+ *
+ * ## Why the plugin is loaded here and not by the grid
+ *
+ * The grid holds a CLASS NAME, not an instance -- that is all that survives being written to the slot
+ * store and read back. So the widget resolves its own plugin on first composition and keeps it for as long
+ * as it is on screen. A grid that loaded plugins would have to know which of its cells were plugins and
+ * when to unload them; this way a widget scrolled off screen simply stops existing.
+ *
+ * ## Failure is drawn, not logged
+ *
+ * A widget whose JAR has been deleted, or whose class no longer implements the contract, shows a short
+ * message in its own cells. The alternative is an empty rectangle on somebody's desktop with the
+ * explanation in a log file they have no reason to open.
+ */
+@Composable
+private fun PluginWidgetFace(item: DesktopItem.PluginWidget) {
+    val colors = LocalPrismColors.current
+    var plugin by remember(item.className) { mutableStateOf<com.prism.launcher.plugins.PrismPlugin?>(null) }
+    var tree by remember(item.className) { mutableStateOf<com.prism.launcher.plugins.PluginNode?>(null) }
+    var failure by remember(item.className) { mutableStateOf("") }
+
+    val context = remember(item.className) {
+        com.prism.launcher.plugins.DefaultPluginContext(item.className, item.className.substringAfterLast('.'))
+    }
+
+    LaunchedEffect(item.className) {
+        val loaded = withContext(Dispatchers.IO) {
+            runCatching {
+                val page = com.prism.launcher.PluginPages.discover()
+                    .firstOrNull { it.className == item.className }
+                    ?: error("no JAR in the plugins folder provides " + item.className)
+                val cls = com.prism.launcher.PluginPages.load(page)
+                    ?: error("loading is off, or the class is missing")
+                cls.getDeclaredConstructor().newInstance() as? com.prism.launcher.plugins.PrismPlugin
+                    ?: error("it does not implement PrismPlugin")
+            }.onFailure { failure = it.message ?: it::class.java.simpleName }.getOrNull()
+        }
+        plugin = loaded
+
+        // The widget's own interval, not the page's: a clock widget wants a second where its page might
+        // want a minute, and PluginWidget carries a separate figure for exactly that.
+        val seconds = runCatching { loaded?.widget?.refreshSeconds ?: 0 }.getOrDefault(0)
+        while (loaded != null) {
+            tree = withContext(Dispatchers.IO) {
+                runCatching { loaded.content(context) }
+                    .onFailure { failure = "it threw while drawing: " + (it.message ?: "") }
+                    .getOrNull()
+            } ?: tree
+            if (seconds <= 0) break
+            kotlinx.coroutines.delay(seconds.coerceAtLeast(1) * 1000L)
+        }
+    }
+
+    Surface(
+        color = Color(0xCC1A1A22),
+        shape = RoundedCornerShape(10.dp),
+        modifier = Modifier.fillMaxSize().padding(3.dp),
+    ) {
+        Column(Modifier.fillMaxSize().padding(8.dp)) {
+            val current = tree
+            when {
+                failure.isNotEmpty() && current == null -> Text(
+                    item.className.substringAfterLast('.') + ": " + failure,
+                    fontSize = 9.sp,
+                    color = Color(0xFFFFC46B),
+                    lineHeight = 12.sp,
+                    maxLines = 5,
+                    overflow = TextOverflow.Ellipsis,
+                )
+
+                current == null -> Text("Loading…", fontSize = 10.sp, color = colors.faint)
+
+                else -> Column(
+                    Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
+                ) {
+                    // The same renderer the full page uses, so a widget cannot look like a different
+                    // product from the page it came with.
+                    PluginNodeView(current, context.storage()) { _, _ ->
+                        // Deliberately inert. A widget's job is to show; anything that acts belongs on the
+                        // page, where a mis-click is not one cell away from a drag that rearranges the
+                        // desktop.
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -601,7 +719,7 @@ private fun FolderDialog(folder: DesktopItem.Folder, onDismiss: () -> Unit, onOp
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Icon(
-                                if (file.isDirectory) Icons.Filled.Folder else Icons.Filled.InsertDriveFile,
+                                if (file.isDirectory) Icons.Filled.Folder else Icons.AutoMirrored.Filled.InsertDriveFile,
                                 null, tint = Color(0xFF9A9AA6), modifier = Modifier.size(17.dp),
                             )
                             Spacer(Modifier.width(10.dp))
@@ -683,14 +801,24 @@ fun labelOf(item: DesktopItem, byId: Map<String, AppEntry>): String = when (item
     is DesktopItem.DirectoryRef -> item.name
     is DesktopItem.Folder -> item.name
     is DesktopItem.NetworkedFolder -> item.name
+    is DesktopItem.Widget -> "Widget"
+    // The plugin's own label would be better and needs the plugin loaded to know it; the class's simple
+    // name is what is available without loading code to draw a caption.
+    is DesktopItem.PluginWidget -> item.className.substringAfterLast('.')
+    // Labelled as nothing on purpose: this cell is covered by a neighbour, and drawing a caption
+    // under it would put text in the middle of the widget it belongs to.
+    is DesktopItem.Occupied -> ""
 }
 
 fun fallbackIcon(item: DesktopItem): androidx.compose.ui.graphics.vector.ImageVector = when (item) {
     is DesktopItem.App -> Icons.Filled.Android
-    is DesktopItem.FileRef -> Icons.Filled.InsertDriveFile
+    is DesktopItem.FileRef -> Icons.AutoMirrored.Filled.InsertDriveFile
     is DesktopItem.DirectoryRef -> Icons.Filled.Folder
     is DesktopItem.Folder -> Icons.Filled.FolderSpecial
     is DesktopItem.NetworkedFolder -> Icons.Filled.Cloud
+    is DesktopItem.Widget -> Icons.Filled.Widgets
+    is DesktopItem.PluginWidget -> Icons.Filled.Extension
+    is DesktopItem.Occupied -> Icons.Filled.Widgets
 }
 
 /** Files a dropped item into a folder, when it refers to something on disk. */

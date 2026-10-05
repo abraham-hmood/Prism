@@ -114,7 +114,12 @@ void ensure_backend_init() {
     if (g_backend_initialized) return;
 
     llama_log_set([](enum ggml_log_level level, const char* text, void* /* user_data */) {
-        if (level >= GGML_LOG_LEVEL_ERROR) {
+        // EQUALITY, NOT >=. GGML_LOG_LEVEL_CONT is 5 and ERROR is 4, so a `>=` filter also matches
+        // every CONTINUATION fragment -- and continuations are how llama.cpp emits its model-loading
+        // progress. The result was one "[ERROR] GgufBridge: ." line per dot of a progress meter,
+        // hundreds of them per load, drowning the console and the log file in errors that were not
+        // errors. CONT is not a severity; it means "append to the previous message".
+        if (level == GGML_LOG_LEVEL_ERROR) {
             LOGE("%s", text);
         }
     }, nullptr);
@@ -1231,6 +1236,27 @@ Java_com_prism_launcher_messaging_GgufInferenceService_nativeGenerateStreaming(
     return env->NewStringUTF(response.c_str());
 }
 
+// Forgets the conversation without unloading the model.
+//
+// WHY THIS EXISTS. run_generation appends every call to gguf->messages and feeds the whole thing
+// through the chat template, so successive calls on one handle are ONE conversation -- which is
+// right for a chat and wrong for anything that generates independent things. Nebula invents a
+// persona, then writes a post as that persona, then writes a comment as a different one: without a
+// reset the second call sees the first call's prompt still in the KV cache and continues it, which
+// in practice means handing the instruction back rewritten. Reloading the model between calls would
+// also work and costs a load each time; this costs a memset.
+extern "C" JNIEXPORT void JNICALL
+Java_com_prism_launcher_messaging_GgufInferenceService_nativeResetConversation(
+        JNIEnv* /* env */, jobject /* thiz */, jlong handle) {
+
+    auto* gguf = reinterpret_cast<GgufContext*>(handle);
+    if (!gguf) return;
+
+    free_messages(gguf->messages);
+    gguf->prev_len = 0;
+    if (gguf->ctx) llama_memory_clear(llama_get_memory(gguf->ctx), true);
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_prism_launcher_messaging_GgufInferenceService_nativeFreeModel(
         JNIEnv* /* env */, jobject /* thiz */, jlong handle) {
@@ -1393,6 +1419,36 @@ PC_EXPORT void pc_free_calibration_model(void* handle) {
 // animation: the file only grows as tensors are finished.
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * Whether a GGUF on disk is already quantised, read from its header.
+ *
+ * FROM THE HEADER AND NOT THE FILENAME, unlike the Kotlin-side estimate. This decides whether `pure` is
+ * safe, and getting it wrong aborts the process -- so it reads the file's declared general.file_type
+ * rather than trusting a name somebody may have changed. A file that cannot be read at all is reported as
+ * quantised, which is the cautious direction: the worst outcome is llama.cpp mixing tensor types on an
+ * F16 model, against a process abort the other way.
+ */
+static bool source_is_quantized(const std::string& path) {
+    gguf_init_params gp{};
+    gp.no_alloc = true;
+    gp.ctx = nullptr;
+
+    gguf_context* ctx = gguf_init_from_file(path.c_str(), gp);
+    if (ctx == nullptr) {
+        return true;
+    }
+
+    bool quantized = true;
+    const int64_t key = gguf_find_key(ctx, "general.file_type");
+    if (key >= 0) {
+        const uint32_t ftype = gguf_get_val_u32(ctx, key);
+        // 0 is all-F32 and 1 is mostly-F16; 32 is BF16. Everything else is a quantised arrangement.
+        quantized = !(ftype == 0 || ftype == 1 || ftype == 32);
+    }
+    gguf_free(ctx);
+    return quantized;
+}
+
 extern "C" JNIEXPORT jint JNICALL
 Java_com_prism_launcher_quant_PrismQuantizer_nativeQuantize(
         JNIEnv* env, jobject /* thiz */, jstring jInPath, jstring jOutPath, jint jFtype, jint jThreads) {
@@ -1426,12 +1482,29 @@ Java_com_prism_launcher_quant_PrismQuantizer_nativeQuantize(
     // "quantise to Q2_K" means the model, not a k-quant recipe that leaves some tensors at Q4_K --
     // and for the low-bit types (binary, ternary, quinary) the mixing logic has opinions of its own
     // that would quietly override the choice.
-    params.pure = true;
+    //
+    // NOT WHEN THE SOURCE IS ALREADY QUANTISED, AND THIS IS A CRASH FIX RATHER THAN A PREFERENCE.
+    // `pure` sends every tensor through the chosen type including ones whose source blocks ggml cannot
+    // dequantize in that path, and it does not fail -- it asserts:
+    //
+    //     ggml.c:7791: GGML_ASSERT(start % type_traits[type].blck_size == 0) failed
+    //
+    // GGML_ASSERT calls abort(). Not an exception, not a return code: the process dies. On a phone that
+    // means the launcher dies. Reproduced by requantising a Q4_K_M model to Q2_K.
+    //
+    // So requantisation keeps llama.cpp's own per-tensor mixing, which knows which combinations it can
+    // actually perform. The user's choice is still honoured for the bulk of the weights; what changes is
+    // that a few tensors llama.cpp refuses to put in that type are left in one it can, instead of the
+    // whole operation killing the process. Quantising from F16 -- where `pure` is safe -- is unaffected.
+    params.pure = !source_is_quantized(inPath);
 
     const uint32_t rc = llama_model_quantize(inPath.c_str(), outPath.c_str(), &params);
     if (rc != 0) {
-        __android_log_print(ANDROID_LOG_ERROR, "PrismQuant",
-                            "llama_model_quantize failed (%u) for %s", rc, inPath.c_str());
+        // Through LOGE, not __android_log_print. This one call used the Android logging API directly,
+        // which made the whole file fail to compile on a desktop -- so gguf_bridge could not be rebuilt
+        // for the host at all, and the DLL in nativeLibs was whatever an earlier source had produced.
+        // The macro is defined for both platforms at the head of this file; that is what it is for.
+        LOGE("llama_model_quantize failed (%u) for %s", rc, inPath.c_str());
     }
     return static_cast<jint>(rc);
 }

@@ -76,7 +76,7 @@ object DuressResponder {
     // ── The message ────────────────────────────────────────────────────────
 
     private fun sendAlerts(context: Context) {
-        val contacts = EmergencyContacts.all(context)
+        val contacts = EmergencyContacts.all()
         if (contacts.isEmpty()) {
             PrismLogger.logWarning(TAG, "Duress entered with no emergency contacts set")
             return

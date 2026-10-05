@@ -94,6 +94,8 @@ object WorldMap {
          * -- the attacker, the defender watching it happen, and a mesh spectator.
          */
         val attackerSupportIds: List<String> = emptyList(),
+        /** The attacker's own [PaperBase.militaryBonus], carried the same way for the same reason. */
+        val attackerMilitaryBonus: Double = 1.0,
     )
 
     /**

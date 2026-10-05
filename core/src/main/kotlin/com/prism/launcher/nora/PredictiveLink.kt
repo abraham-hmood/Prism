@@ -229,7 +229,7 @@ class PredictiveLink(
         }
     }
 
-    private inline fun wIdx(ct: Int, cb: Int, ky: Int, kx: Int) =
+    private fun wIdx(ct: Int, cb: Int, ky: Int, kx: Int) =
         ct * perTop + cb * kk + ky * kernel + kx
 
     /**

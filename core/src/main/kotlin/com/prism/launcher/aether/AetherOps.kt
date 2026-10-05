@@ -29,7 +29,7 @@ object SurrogateSpike {
 /** Dense weight matrix: flat, row-major [rows][cols]. Rows = inputs, cols = neurons, matching TF's `(input_size, num_neurons)` layout. */
 class Matrix(val rows: Int, val cols: Int) {
     val data = FloatArray(rows * cols)
-    inline fun idx(r: Int, c: Int) = r * cols + c
+    fun idx(r: Int, c: Int) = r * cols + c
     operator fun get(r: Int, c: Int): Float = data[idx(r, c)]
     operator fun set(r: Int, c: Int, v: Float) { data[idx(r, c)] = v }
     fun fill(v: Float) = java.util.Arrays.fill(data, v)

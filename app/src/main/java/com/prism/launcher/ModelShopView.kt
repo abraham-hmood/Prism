@@ -140,7 +140,7 @@ class ModelShopView @JvmOverloads constructor(
             imageTintList = android.content.res.ColorStateList.valueOf(IosUi.accent(context))
             setPadding(dp(8), dp(8), dp(8), dp(8))
             setOnClickListener {
-                ModelListingStore.announce(context.applicationContext)
+                ModelListingStore.announce()
                 refresh()
             }
         }

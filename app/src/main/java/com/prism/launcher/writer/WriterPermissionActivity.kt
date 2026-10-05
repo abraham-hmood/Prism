@@ -92,7 +92,15 @@ class WriterPermissionActivity : Activity() {
     }
 
     override fun finish() {
-        super.finish()
-        overridePendingTransition(0, 0)
+        // Registered before the transition on 34+, and immediately after it below -- each API wants
+        // the opposite side of super.finish(), and the new one is simply ignored if it comes late.
+        if (android.os.Build.VERSION.SDK_INT >= 34) {
+            overrideActivityTransition(OVERRIDE_TRANSITION_CLOSE, 0, 0)
+            super.finish()
+        } else {
+            super.finish()
+            @Suppress("DEPRECATION")
+            overridePendingTransition(0, 0)
+        }
     }
 }

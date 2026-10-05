@@ -79,7 +79,7 @@ class PrismLockActivity : FragmentActivity() {
 
         showOverKeyguard()
 
-        if (!LockStore.isConfigured(this)) {
+        if (!LockStore.isConfigured()) {
             // Nothing to ask for. Failing open is the only safe default: a lock with no credential
             // that refused to dismiss would brick the launcher.
             //
@@ -243,7 +243,7 @@ class PrismLockActivity : FragmentActivity() {
             textSize = 14f
             setTextColor(0xCCFFFFFF.toInt())
             gravity = Gravity.CENTER
-            text = when (LockStore.mechanism(this@PrismLockActivity)) {
+            text = when (LockStore.mechanism()) {
                 LockStore.Mechanism.PIN -> "Enter your PIN"
                 LockStore.Mechanism.PASSWORD -> "Enter your password"
                 LockStore.Mechanism.PATTERN -> "Draw your pattern"
@@ -270,7 +270,7 @@ class PrismLockActivity : FragmentActivity() {
 
     private fun buildEntry() {
         entryArea.removeAllViews()
-        when (LockStore.mechanism(this)) {
+        when (LockStore.mechanism()) {
             LockStore.Mechanism.PATTERN -> buildPattern()
             LockStore.Mechanism.PASSWORD -> buildPassword()
             else -> buildPin()
@@ -371,14 +371,14 @@ class PrismLockActivity : FragmentActivity() {
         // WRONG PIN never submitted at all. The pad simply accumulated digits and never said no,
         // which reads as a frozen screen. Length is the only honest trigger, and LockStore forces
         // the duress PIN to share it so both submit identically.
-        val expected = LockStore.credentialLength(this).coerceAtLeast(MIN_PIN_LENGTH)
+        val expected = LockStore.credentialLength().coerceAtLeast(MIN_PIN_LENGTH)
         if (pinEntry.length >= expected) submit(pinEntry.toString())
     }
 
     // ── Unlocking ──────────────────────────────────────────────────────────
 
     private fun submit(secret: String) {
-        when (LockStore.verify(this, secret)) {
+        when (LockStore.verify(secret)) {
             LockStore.Outcome.NORMAL -> unlock(duress = false)
             LockStore.Outcome.DURESS -> unlock(duress = true)
             LockStore.Outcome.WRONG -> reject()
@@ -421,8 +421,18 @@ class PrismLockActivity : FragmentActivity() {
     private fun unlock(duress: Boolean) {
         if (duress) DuressResponder.trigger(this) else DuressResponder.standDown(this)
         LockGate.markUnlocked()
-        finish()
-        overridePendingTransition(0, android.R.anim.fade_out)
+        // THE TWO CALLS GO ON OPPOSITE SIDES OF finish(), which is not a style choice.
+        // overrideActivityTransition must be registered BEFORE the transition is started or it is
+        // ignored; overridePendingTransition must be called immediately AFTER. Putting the new one
+        // after finish() compiles and silently does nothing on Android 14 and up.
+        if (android.os.Build.VERSION.SDK_INT >= 34) {
+            overrideActivityTransition(OVERRIDE_TRANSITION_CLOSE, 0, android.R.anim.fade_out)
+            finish()
+        } else {
+            finish()
+            @Suppress("DEPRECATION")
+            overridePendingTransition(0, android.R.anim.fade_out)
+        }
     }
 
     // ── Fingerprint ────────────────────────────────────────────────────────
@@ -456,7 +466,7 @@ class PrismLockActivity : FragmentActivity() {
                 BiometricPrompt.PromptInfo.Builder()
                     .setTitle("Unlock Prism")
                     .setNegativeButtonText(
-                        LockStore.mechanism(this)?.label?.let { "Use $it" } ?: "Cancel"
+                        LockStore.mechanism()?.label?.let { "Use $it" } ?: "Cancel"
                     )
                     .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_WEAK)
                     .build()
@@ -474,8 +484,8 @@ class PrismLockActivity : FragmentActivity() {
      */
     private fun addMedicalCard() {
         if (!PrismSettings.getMedicalOnLock()) return
-        val record = MedicalRecord.get(this)
-        val contacts = EmergencyContacts.all(this)
+        val record = MedicalRecord.get()
+        val contacts = EmergencyContacts.all()
         if (record.isEmpty && contacts.isEmpty()) return
 
         val card = LinearLayout(this).apply {

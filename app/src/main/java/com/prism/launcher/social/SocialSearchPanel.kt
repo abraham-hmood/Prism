@@ -168,12 +168,12 @@ class SocialSearchPanel(context: Context) : LinearLayout(context) {
         // Local first, immediately. A peer's video is already in the store -- it is known about
         // before it is held -- so there is nothing to wait for here.
         val videos = matchingVideos(query)
-        renderResults(videos, emptyList(), searching = StremioStore.installed(context).isNotEmpty())
+        renderResults(videos, emptyList(), searching = StremioStore.installed().isNotEmpty())
 
-        if (StremioStore.installed(context).isEmpty()) return
+        if (StremioStore.installed().isEmpty()) return
 
         Thread({
-            val metas = runCatching { StremioStore.search(context, query) }.getOrDefault(emptyList())
+            val metas = runCatching { StremioStore.search(query) }.getOrDefault(emptyList())
             post {
                 if (mine != generation) return@post      // the query moved on while we waited
                 renderResults(videos, metas, searching = false)
@@ -198,7 +198,7 @@ class SocialSearchPanel(context: Context) : LinearLayout(context) {
 
     private fun renderIdle() {
         results.removeAllViews()
-        val addons = StremioStore.installed(context)
+        val addons = StremioStore.installed()
         val onMesh = runCatching { PrismMeshService.isOnMesh() }.getOrDefault(false)
 
         if (addons.isEmpty()) {
@@ -212,7 +212,7 @@ class SocialSearchPanel(context: Context) : LinearLayout(context) {
 
         status.text = "${addons.size} add-on(s) installed · tap a catalogue to browse it"
 
-        val shelves = StremioStore.shelves(context)
+        val shelves = StremioStore.shelves()
         if (shelves.isEmpty()) {
             results.addView(note(
                 "None of your add-ons publish a browsable catalogue — several only answer searches " +
@@ -352,7 +352,7 @@ class SocialSearchPanel(context: Context) : LinearLayout(context) {
         row.alpha = 0.5f
         Thread({
             val detail = runCatching {
-                StremioStore.meta(context, meta.type, meta.id, meta.addonId)
+                StremioStore.meta(meta.type, meta.id, meta.addonId)
             }.getOrNull() ?: meta
 
             post {
@@ -383,7 +383,7 @@ class SocialSearchPanel(context: Context) : LinearLayout(context) {
         status.text = "Finding sources for $title…"
         Thread({
             val streams = runCatching {
-                StremioStore.streamsFor(context, meta.type, streamId)
+                StremioStore.streamsFor(meta.type, streamId)
             }.getOrDefault(emptyList())
 
             post {
@@ -518,7 +518,12 @@ class SocialSearchPanel(context: Context) : LinearLayout(context) {
         if (url.isBlank()) return
         thumbnails[url]?.let { into.setImageBitmap(it); return }
         Thread({
-            val bitmap = StremioStore.fetchImage(url)
+            // The store fetches bytes and this decodes them: BitmapFactory is Android's, and keeping it
+            // here is what let StremioStore move to :core.
+            val bytes = StremioStore.fetchImage(url)
+            val bitmap = bytes?.let {
+                android.graphics.BitmapFactory.decodeByteArray(it, 0, it.size)
+            }
             if (bitmap != null) post {
                 thumbnails[url] = bitmap
                 into.setImageBitmap(bitmap)

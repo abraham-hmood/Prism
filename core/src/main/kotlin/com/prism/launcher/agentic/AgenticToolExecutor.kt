@@ -29,7 +29,7 @@ object AgenticToolExecutor {
     private fun executeHttp(exec: ToolExecutorConfig.Http, argumentsJson: String): String {
         val args = try { JSONObject(argumentsJson) } catch (e: Exception) { JSONObject() }
 
-        val url = URL(substitute(exec.url, args, urlEncode = true))
+        val url = com.prism.core.Urls.of(substitute(exec.url, args, urlEncode = true))
         val conn = url.openConnection() as HttpURLConnection
         return try {
             conn.requestMethod = exec.method.ifBlank { "GET" }.uppercase()

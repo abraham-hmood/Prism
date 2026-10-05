@@ -35,13 +35,26 @@ abstract class PrismBaseActivity : AppCompatActivity() {
         val nightNow = (resources.configuration.uiMode and
             android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
             android.content.res.Configuration.UI_MODE_NIGHT_YES
-        if (nightNow) {
-            window.statusBarColor = android.graphics.Color.BLACK
-            window.decorView.systemUiVisibility = 0
-        } else {
-            window.statusBarColor = android.graphics.Color.WHITE
-            window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
-        }
+        applyStatusBarColor(
+            if (nightNow) android.graphics.Color.BLACK else android.graphics.Color.WHITE
+        )
+        // The modern form of SYSTEM_UI_FLAG_LIGHT_STATUS_BAR: dark icons on a light bar.
+        androidx.core.view.WindowInsetsControllerCompat(window, window.decorView)
+            .isAppearanceLightStatusBars = !nightNow
+    }
+
+    /**
+     * Colours the status bar.
+     *
+     * SUPPRESSED RATHER THAN MIGRATED, deliberately. `statusBarColor` was deprecated in API 35 to push
+     * applications towards edge-to-edge, and the replacement is not another setter -- it is drawing the
+     * content behind the bar and insetting it by hand, on every screen. That is a change to how Prism
+     * lays out, worth doing on its own terms, and not something to slip in while clearing a compiler
+     * warning. The setter still works on every version this app supports.
+     */
+    @Suppress("DEPRECATION")
+    private fun applyStatusBarColor(color: Int) {
+        window.statusBarColor = color
     }
 
     protected fun resolveAttr(attr: Int): Int {

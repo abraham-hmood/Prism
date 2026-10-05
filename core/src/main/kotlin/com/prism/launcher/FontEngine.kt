@@ -78,7 +78,7 @@ object FontEngine {
             try {
                 target.parentFile?.mkdirs()
                 val temp = File(target.parentFile, "${target.name}.part")
-                URL(NASALIZATION_URL).openConnection().apply {
+                com.prism.core.Urls.of(NASALIZATION_URL).openConnection().apply {
                     connectTimeout = 12_000
                     readTimeout = 30_000
                 }.getInputStream().use { input ->

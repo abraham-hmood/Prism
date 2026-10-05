@@ -183,15 +183,15 @@ class KokoroSettingsActivity : PrismBaseActivity() {
     private fun downloadOrRemove() {
         if (downloading) return
 
-        if (KokoroInstall.isModelInstalled(this)) {
+        if (KokoroInstall.isModelInstalled()) {
             androidx.appcompat.app.AlertDialog.Builder(this)
                 .setTitle("Remove Kokoro?")
                 .setMessage(
-                    "This frees ${KokoroInstall.installedBytes(this) shr 20} MB. Prism will fall " +
+                    "This frees ${KokoroInstall.installedBytes() shr 20} MB. Prism will fall " +
                         "back to the system voice until it is downloaded again."
                 )
                 .setPositiveButton("Remove") { _, _ ->
-                    KokoroInstall.uninstall(this)
+                    KokoroInstall.uninstall()
                     PrismSpeaker.invalidate()
                     refresh()
                 }
@@ -205,7 +205,7 @@ class KokoroSettingsActivity : PrismBaseActivity() {
 
         val variant = PrismSettings.getKokoroVariant()
         Thread({
-            val error = KokoroInstall.downloadModel(this, variant) { copied, total ->
+            val error = KokoroInstall.downloadModel(variant) { copied, total ->
                 if (total > 0) {
                     val pct = (copied * 100 / total).toInt()
                     runOnUiThread { modelRow.text = "Downloading Kokoro… $pct%" }
@@ -214,7 +214,7 @@ class KokoroSettingsActivity : PrismBaseActivity() {
             // The chosen voice is useless without its tensor, so it comes along with the model
             // rather than waiting for the user to open the picker again.
             if (error == null) {
-                KokoroInstall.downloadVoice(this, PrismSettings.getKokoroVoice(PrismSettings.VOICE_SPEAKER_SAM))
+                KokoroInstall.downloadVoice(PrismSettings.getKokoroVoice(PrismSettings.VOICE_SPEAKER_SAM))
             }
             runOnUiThread {
                 downloading = false
@@ -228,16 +228,16 @@ class KokoroSettingsActivity : PrismBaseActivity() {
     // -- Painting -------------------------------------------------------------
 
     private fun refresh() {
-        val installed = KokoroInstall.isModelInstalled(this)
+        val installed = KokoroInstall.isModelInstalled()
 
         statusLine.text = buildString {
             append("Speaking with: ")
-            append(PrismSpeaker.describeEngine(this@KokoroSettingsActivity))
+            append(PrismSpeaker.describeEngine())
             if (installed) {
                 append("\nInstalled: ")
-                append(KokoroInstall.installedBytes(this@KokoroSettingsActivity) shr 20)
+                append(KokoroInstall.installedBytes() shr 20)
                 append(" MB, ")
-                append(KokoroInstall.installedVoices(this@KokoroSettingsActivity).size)
+                append(KokoroInstall.installedVoices().size)
                 append(" voice(s)")
             }
         }

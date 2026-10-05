@@ -1,12 +1,17 @@
 package com.prism.desktop.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -71,6 +76,9 @@ fun BrowserPage() {
     var progress by remember { mutableStateOf(100) }
     var p2pActive by remember { mutableStateOf(false) }
     var menuOpen by remember { mutableStateOf(false) }
+    var listsOpen by remember { mutableStateOf(false) }
+    var note by remember { mutableStateOf("") }
+    var bookmarked by remember { mutableStateOf(false) }
     var unlockPrompt by remember { mutableStateOf(false) }
 
     DisposableEffect(Unit) {
@@ -256,14 +264,70 @@ fun BrowserPage() {
                     onReload = { menuOpen = false; active?.browser?.reload() },
                     onMirror = {
                         menuOpen = false
-                        active?.url?.let { u ->
-                            PrismCefHandlers.hostOf(u)?.let { h ->
-                                PrismPlatform.log.info("Prism/browser", "Mirror requested for $h")
+                        val url = active?.url.orEmpty()
+                        val host = PrismCefHandlers.hostOf(url)
+                        if (host != null) {
+                            note = "Saving " + host + "…"
+                            // THE TWO ARE DIFFERENT OPERATIONS AND THE CHOICE IS BY DOMAIN, which is
+                            // the distinction PHASE 80 exists to preserve. A mesh site is MIRRORED
+                            // from its published manifest -- exact, hashed, quick. An ordinary site
+                            // has no manifest and has to be CRAWLED within bounds. Using the wrong
+                            // one fails on every site of the other kind, which is how this broke on
+                            // Android.
+                            kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
+                                note = if (PrismCefHandlers.isP2pDomain(host)) {
+                                    com.prism.launcher.browser.MeshMirror.mirror(host)
+                                        ?: (host + " mirrored and now served from this machine.")
+                                } else {
+                                    com.prism.launcher.browser.PrismSiteDownloader.download(url)
+                                    "Downloading " + host + ". It is a bounded crawl, so it stops at " +
+                                        "the page and byte caps rather than following the whole web."
+                                }
                             }
                         }
                     },
+                    isBookmarked = bookmarked,
+                    onBookmark = {
+                        menuOpen = false
+                        val url = active?.url.orEmpty()
+                        if (url.isNotBlank()) {
+                            if (PrismSettings.isBookmarked(url)) {
+                                PrismSettings.removeBookmark(url)
+                                note = "Bookmark removed."
+                            } else {
+                                PrismSettings.addBookmark(active?.title.orEmpty(), url)
+                                note = "Bookmarked."
+                            }
+                            bookmarked = PrismSettings.isBookmarked(url)
+                        }
+                    },
+                    onShowLists = { menuOpen = false; listsOpen = true },
                     onDismiss = { menuOpen = false },
                 )
+            }
+
+            if (listsOpen) {
+                SavedListsOverlay(
+                    onOpen = { url -> listsOpen = false; active?.browser?.loadURL(url) },
+                    onDismiss = { listsOpen = false },
+                )
+            }
+
+            if (note.isNotBlank()) {
+                Surface(
+                    color = Color(0xFF1C1C24),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 18.dp),
+                ) {
+                    Text(
+                        note,
+                        fontSize = 12.sp,
+                        color = Color(0xFFB9B9C4),
+                        modifier = Modifier
+                            .clickableRow { note = "" }
+                            .padding(horizontal = 16.dp, vertical = 9.dp),
+                    )
+                }
             }
 
             if (overlayOpen) {
@@ -318,11 +382,20 @@ private data class BrowserTab(
     val url: String,
 )
 
+/**
+ * Mirrors a mesh site automatically, when the setting is on.
+ *
+ * ONLY MESH SITES. Auto-mirroring an ordinary website would start a bounded crawl of somebody's
+ * server every time a page was opened, which is rude at best; a mesh site is already published with a
+ * manifest by a peer who meant it to be copied.
+ */
 private fun maybeAutoMirror(url: String) {
     if (!PrismSettings.getAutoMirror()) return
     val host = PrismCefHandlers.hostOf(url) ?: return
-    if (PrismCefHandlers.isP2pDomain(host)) {
-        PrismPlatform.log.info("Prism/browser", "Auto-mirror queued for $host")
+    if (!PrismCefHandlers.isP2pDomain(host)) return
+    kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
+        val error = com.prism.launcher.browser.MeshMirror.mirror(host)
+        if (error == null) PrismPlatform.log.info("Prism/browser", "Auto-mirrored $host")
     }
 }
 
@@ -350,8 +423,8 @@ private fun BrowserChrome(
             .padding(horizontal = 8.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, "Back", Modifier.size(18.dp)) }
-        IconButton(onClick = onForward) { Icon(Icons.Filled.ArrowForward, "Forward", Modifier.size(18.dp)) }
+        IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", Modifier.size(18.dp)) }
+        IconButton(onClick = onForward) { Icon(Icons.AutoMirrored.Filled.ArrowForward, "Forward", Modifier.size(18.dp)) }
         IconButton(onClick = onReload) { Icon(Icons.Filled.Refresh, "Reload", Modifier.size(18.dp)) }
 
         // The resolution-source indicator, as on Android: a handshake for mesh-resolved, a globe
@@ -393,18 +466,181 @@ private fun BrowserChrome(
     }
 }
 
+
 /**
- * The browser menu: reload, and mirror-this-site.
+ * Bookmarks and saved sites, in one overlay. PHASE 79.
  *
- * MIRROR IS DISABLED, NOT HIDDEN, when the current page is not a `.p2p` domain -- the same
- * choice the Android sheet makes. A hidden action teaches nobody it exists; a greyed one tells
- * you the capability is there and that this page is not eligible for it.
+ * ## Why removing is two different things
+ *
+ * Android's semantics, kept deliberately. Removing a BOOKMARK forgets a URL. Removing a SAVED SITE
+ * deletes files and un-hosts it from the mesh — and only ever files under the mirrors directory, never
+ * a folder the user pointed at themselves. Getting that wrong would delete somebody's own documents
+ * because they had hosted them, so the two are separate lists with separate wording.
+ */
+@Composable
+private fun SavedListsOverlay(onOpen: (String) -> Unit, onDismiss: () -> Unit) {
+    val colors = LocalPrismColors.current
+    var revision by remember { mutableStateOf(0) }
+    val bookmarks = remember(revision) { PrismSettings.getBookmarks() }
+    val saved = remember(revision) { com.prism.launcher.browser.MeshMirror.all() }
+
+    Box(Modifier.fillMaxSize().background(Color(0xCC000000)).clickableRow { onDismiss() }) {
+        Surface(
+            color = Color(0xFF14141A),
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier.align(Alignment.Center).width(620.dp).padding(24.dp),
+        ) {
+            Column(Modifier.padding(20.dp).verticalScroll(rememberScrollState())) {
+                Text("Bookmarks", fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(8.dp))
+                if (bookmarks.isEmpty()) {
+                    Text("None yet.", fontSize = 12.sp, color = colors.faint)
+                } else {
+                    bookmarks.forEach { bookmark ->
+                        Row(
+                            Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(
+                                Modifier.weight(1f).clickableRow { onOpen(bookmark.url) },
+                            ) {
+                                Text(bookmark.title.ifBlank { bookmark.url }, fontSize = 13.sp)
+                                Text(bookmark.url, fontSize = 11.sp, color = colors.faint, maxLines = 1)
+                            }
+                            Text(
+                                "remove",
+                                fontSize = 11.sp,
+                                color = Color(0xFFFF6B6B),
+                                modifier = Modifier.clickableRow {
+                                    PrismSettings.removeBookmark(bookmark.url)
+                                    revision++
+                                },
+                            )
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(18.dp))
+                Text("Downloads", fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "Saved into " + com.prism.desktop.browser.DesktopDownloads.directory().absolutePath +
+                        ". Removing one deletes the file, as it does on the phone.",
+                    fontSize = 11.sp,
+                    color = colors.faint,
+                )
+                Spacer(Modifier.height(8.dp))
+                val downloads = com.prism.desktop.browser.DesktopDownloads.all()
+                if (downloads.isEmpty()) {
+                    Text("None yet.", fontSize = 12.sp, color = colors.faint)
+                } else {
+                    downloads.forEach { download ->
+                        Row(
+                            Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(download.name, fontSize = 13.sp)
+                                Text(
+                                    when {
+                                        download.cancelled -> "cancelled"
+                                        download.done -> (download.totalBytes shr 10).toString() + " KB"
+                                        else -> download.percent.toString() + "%  of " +
+                                            (download.totalBytes shr 10) + " KB"
+                                    },
+                                    fontSize = 11.sp,
+                                    color = colors.faint,
+                                )
+                            }
+                            Text(
+                                if (download.done || download.cancelled) "remove" else "cancel",
+                                fontSize = 11.sp,
+                                color = Color(0xFFFF6B6B),
+                                modifier = Modifier.clickableRow {
+                                    if (download.done || download.cancelled) {
+                                        com.prism.desktop.browser.DesktopDownloads.remove(download.id)
+                                    } else {
+                                        com.prism.desktop.browser.DesktopDownloads.cancel(download.id)
+                                    }
+                                    revision++
+                                },
+                            )
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(18.dp))
+                Text("Saved sites", fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "Downloaded or mirrored, and served from this machine while Prism is running.",
+                    fontSize = 11.sp,
+                    color = colors.faint,
+                )
+                Spacer(Modifier.height(8.dp))
+                if (saved.isEmpty()) {
+                    Text("None yet.", fontSize = 12.sp, color = colors.faint)
+                } else {
+                    saved.forEach { site ->
+                        Row(
+                            Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(
+                                Modifier.weight(1f).clickableRow { onOpen("http://" + site.domain + "/") },
+                            ) {
+                                Text(site.domain, fontSize = 13.sp)
+                                Text(
+                                    site.files.toString() + " file(s), " + (site.bytes shr 10) + " KB",
+                                    fontSize = 11.sp,
+                                    color = colors.faint,
+                                )
+                            }
+                            Text(
+                                "delete",
+                                fontSize = 11.sp,
+                                color = Color(0xFFFF6B6B),
+                                modifier = Modifier.clickableRow {
+                                    // Un-hosts it and deletes ONLY what is under the mirrors
+                                    // directory -- see MeshMirror.remove.
+                                    com.prism.launcher.browser.MeshMirror.remove(site.domain)
+                                    revision++
+                                },
+                            )
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(16.dp))
+                Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
+                    Text(
+                        "Close",
+                        fontSize = 13.sp,
+                        color = colors.accent,
+                        modifier = Modifier.clickableRow { onDismiss() }.padding(6.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * The browser menu: reload, bookmark, save the site, and the saved lists.
+ *
+ * SAVE IS NEVER DISABLED NOW, and that is the PHASE 80 change. It used to be greyed out for anything
+ * that was not a `.p2p` domain, because the only thing behind it was mirroring -- which cannot copy an
+ * ordinary website. There are two operations now and the page picks between them by domain, so the
+ * action applies everywhere and the LABEL says which one it will be.
  */
 @Composable
 private fun BrowserMenu(
     canMirror: Boolean,
+    isBookmarked: Boolean,
     onReload: () -> Unit,
     onMirror: () -> Unit,
+    onBookmark: () -> Unit,
+    onShowLists: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     val colors = LocalPrismColors.current
@@ -422,19 +658,36 @@ private fun BrowserMenu(
                     onClick = onReload,
                 )
                 MenuRow(
+                    icon = Icons.Filled.Star,
+                    label = if (isBookmarked) "Remove bookmark" else "Bookmark this page",
+                    enabled = true,
+                    onClick = onBookmark,
+                )
+                MenuRow(
                     icon = Icons.Filled.CloudDownload,
-                    label = "Mirror this site",
-                    enabled = canMirror,
+                    label = if (canMirror) "Mirror this site" else "Download this site",
+                    enabled = true,
                     onClick = onMirror,
                 )
-                if (!canMirror) {
-                    Text(
-                        "Mirroring is only available for sites hosted on the P2P mesh.",
-                        fontSize = 10.sp,
-                        color = colors.faint,
-                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp),
-                    )
-                }
+                Text(
+                    if (canMirror) {
+                        "A mesh site is copied exactly from its published manifest, hash by hash, and " +
+                            "then served from this machine too."
+                    } else {
+                        "An ordinary site has no manifest, so it is crawled within bounds: same host " +
+                            "only, capped pages and bytes, with a pause between requests."
+                    },
+                    fontSize = 10.sp,
+                    color = colors.faint,
+                    lineHeight = 14.sp,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp),
+                )
+                MenuRow(
+                    icon = Icons.AutoMirrored.Filled.List,
+                    label = "Bookmarks and downloads",
+                    enabled = true,
+                    onClick = onShowLists,
+                )
             }
         }
     }

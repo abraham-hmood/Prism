@@ -186,7 +186,7 @@ class LanguageSetupActivity : PrismBaseActivity() {
             // fetch them is now — the learner is on wifi finishing setup, not on a train opening
             // their first picture lesson. Fire-and-forget: every path through PictureBank degrades
             // to the emoji and then to the word, so a failure here costs nothing.
-            Thread({ runCatching { PictureBank.prefetchAll(applicationContext) } }, "language-pictures")
+            Thread({ runCatching { PictureBank.prefetchAll() } }, "language-pictures")
                 .apply { isDaemon = true; priority = Thread.MIN_PRIORITY }
                 .start()
             setResult(RESULT_OK)
@@ -561,7 +561,7 @@ class LanguageSetupActivity : PrismBaseActivity() {
                     syncButton()
                     // Hearing them is the entire basis for the choice, so selecting plays a line.
                     PrismSpeaker.stop()
-                    PrismSpeaker.preview(this@LanguageSetupActivity, tutor.voice)
+                    PrismSpeaker.preview(tutor.voice)
                 }
                 cards[tutor.id] = card
                 row.addView(card, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {

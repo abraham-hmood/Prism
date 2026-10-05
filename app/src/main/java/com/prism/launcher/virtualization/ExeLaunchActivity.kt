@@ -71,7 +71,11 @@ class ExeLaunchActivity : PrismBaseActivity() {
         super.onCreate(savedInstanceState)
         setContentView(buildBusyView())
 
-        val uri = intent?.data ?: intent?.getParcelableExtra(Intent.EXTRA_STREAM)
+        // The typed form, which on API 33+ checks the class rather than casting blind -- an extra
+        // of the wrong type used to surface as a ClassCastException at the use site instead.
+        val uri = intent?.data ?: intent?.let {
+            androidx.core.content.IntentCompat.getParcelableExtra(it, Intent.EXTRA_STREAM, Uri::class.java)
+        }
         if (uri == null) {
             finishWith("No file was passed in")
             return

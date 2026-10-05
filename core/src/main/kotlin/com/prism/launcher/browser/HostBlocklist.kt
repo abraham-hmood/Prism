@@ -137,7 +137,7 @@ class HostBlocklist {
 
     private fun tryDownloadStevenBlack() {
         try {
-            val url = URL(STEVENBLACK_RAW)
+            val url = com.prism.core.Urls.of(STEVENBLACK_RAW)
             val conn = (url.openConnection() as HttpURLConnection).apply {
                 connectTimeout = 12_000
                 readTimeout = 20_000

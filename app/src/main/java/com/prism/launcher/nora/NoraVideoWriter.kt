@@ -1,3 +1,14 @@
+/*
+ * MediaCodecInfo.CodecCapabilities marks the COLOR_Format constants deprecated, pointing at
+ * MediaFormat colour standards instead -- which describe a format but cannot be handed to
+ * configure() as the encoder's input colour format. Every hardware H.264 encoder on Android still
+ * reports and expects these integers, including the QCOM one this file probes for by name because
+ * some Qualcomm encoders report only their vendor variant.
+ *
+ * So they are deprecated and they are also the only thing that works. Suppressed once, here.
+ */
+@file:Suppress("DEPRECATION")
+
 package com.prism.launcher.nora
 
 import android.graphics.Bitmap

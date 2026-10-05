@@ -22,6 +22,7 @@ import com.prism.core.Downloader
 import com.prism.core.PrismPlatform
 import com.prism.desktop.cakechat.DesktopCakeChat
 import com.prism.launcher.PrismSettings
+import com.prism.launcher.messaging.MeshModels
 import com.prism.launcher.messaging.GgufInferenceService
 import com.prism.launcher.messaging.ModelDiscoveryService
 import kotlinx.coroutines.Dispatchers
@@ -63,6 +64,20 @@ fun ModelsPage() {
         mutableStateOf(DesktopCakeChat.state() == DesktopCakeChat.State.TRAINED)
     }
     var status by remember { mutableStateOf<String?>(null) }
+
+    // Models other devices are offering. Polled rather than observed: announcements arrive on a mesh
+    // thread that knows nothing about Compose, and the set changes when a machine wakes or sleeps.
+    var meshModels by remember { mutableStateOf<List<MeshModels.Hosted>>(emptyList()) }
+    var meshRevision by remember { mutableStateOf(0) }
+    var hosting by remember { mutableStateOf(PrismSettings.getP2pModelHostingEnabled()) }
+    val selectedMesh = remember(meshRevision) { PrismSettings.getSelectedP2pModel() }
+
+    LaunchedEffect(meshRevision) {
+        while (true) {
+            meshModels = MeshModels.available()
+            kotlinx.coroutines.delay(3_000)
+        }
+    }
     var confirmDelete by remember { mutableStateOf<PrismSettings.ImportedModel?>(null) }
     var importPath by remember { mutableStateOf("") }
 
@@ -79,6 +94,9 @@ fun ModelsPage() {
     }
 
     fun reload() {
+        // Reconciled first: a download that completed while this page was closed was registered by
+        // ModelRegistry, and a file dropped into the folder by hand was not registered by anything.
+        runCatching { com.prism.launcher.messaging.ModelRegistry.reconcile() }
         installed = PrismSettings.getImportedModels()
         activeText = PrismSettings.getLocalAiModelPath()
         activeImage = PrismSettings.getLocalImageModelPath()
@@ -196,6 +214,94 @@ fun ModelsPage() {
             SectionFooter(
                 "Click a model to make it active. Text and image models are tracked separately, " +
                     "so activating one does not deactivate the other."
+            )
+
+            Spacer(Modifier.height(14.dp))
+
+            // ── Models on other devices ───────────────────────────────────
+            //
+            // LISTED WITH THE LOCAL ONES, because from here they are the same decision: which model
+            // answers when you ask something. That one of them lives on another machine is a property
+            // of the model, like its size, rather than a different feature.
+            SectionHeader("ON YOUR MESHNET")
+            Card {
+                Row(
+                    Modifier.fillMaxWidth()
+                        .clickableRow {
+                            PrismSettings.clearSelectedP2pModel()
+                            status = "Back to this machine's own models"
+                            meshRevision++
+                        }
+                        .padding(horizontal = 16.dp, vertical = 11.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("Use this machine's own models", fontSize = 14.sp, modifier = Modifier.weight(1f))
+                    if (selectedMesh == null) {
+                        Text("active", fontSize = 11.sp, color = colors.accent)
+                    }
+                }
+
+                meshModels.forEach { model ->
+                    Hairline()
+                    val active = selectedMesh?.peerIp == model.peerIp &&
+                        selectedMesh?.modelName == model.modelName
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .clickableRow {
+                                PrismSettings.setSelectedP2pModel(model.peerIp, model.modelName)
+                                // CakeChat is checked before everything else among the local engines,
+                                // so it has to be released or the choice would appear to do nothing --
+                                // the same trap the local list above documents.
+                                PrismSettings.setUseCakeChat(false)
+                                status = model.modelName + " on " + model.peerIp +
+                                    " will now answer everywhere in Prism"
+                                meshRevision++
+                            }
+                            .padding(horizontal = 16.dp, vertical = 11.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(model.modelName, fontSize = 14.sp)
+                            Text(
+                                "on " + model.peerIp + " — the weights stay there",
+                                fontSize = 11.sp,
+                                color = colors.faint,
+                            )
+                        }
+                        if (active) Text("active", fontSize = 11.sp, color = colors.accent)
+                    }
+                }
+
+                if (meshModels.isEmpty()) {
+                    Hairline()
+                    Text(
+                        "No other device is offering one. A device offers its active model by turning " +
+                            "on model hosting; the announcement arrives with the next gossip round.",
+                        fontSize = 12.sp,
+                        color = colors.faint,
+                        modifier = Modifier.padding(16.dp),
+                    )
+                }
+            }
+            SectionFooter(
+                "Choosing one of these points Sam, Nebula and everything else in Prism at that machine " +
+                    "— nothing is downloaded and nothing is copied, which is the point: the phone that " +
+                    "wants a 14B model is exactly the device that cannot hold one. If that machine stops " +
+                    "answering, Prism says so rather than quietly using a different model."
+            )
+
+            Spacer(Modifier.height(8.dp))
+            ToggleRow(
+                title = "Share this machine's model",
+                detail = "Other devices on your meshnet can use whichever text model is active here. " +
+                    "It is their prompts running on your processor, so it is off until you say so.",
+                checked = hosting,
+                onChange = { on ->
+                    PrismSettings.setP2pModelHostingEnabled(on)
+                    MeshModels.announce()
+                    hosting = on
+                    meshRevision++
+                },
             )
 
             Spacer(Modifier.height(14.dp))
@@ -390,15 +496,21 @@ fun ModelsPage() {
                             Text("installed", fontSize = 11.sp, color = colors.faint)
                         } else {
                             TextButton(onClick = {
-                                val dir = File(PrismPlatform.host.documentsDir(), "Models")
+                                // Through ModelRegistry, so the store, the mesh and the reconcile scan
+                                // all agree on one folder. This page deciding for itself is how the two
+                                // diverged in the first place.
+                                val dir = com.prism.launcher.messaging.ModelRegistry.directory()
                                 val target = File(dir, model.downloadUrl.substringAfterLast('/'))
                                 PrismPlatform.downloader.enqueue(model.name, model.downloadUrl, target)
                                 downloads = PrismPlatform.downloader.active()
                                 status = "Downloading ${model.name}"
-                                // Registered when the download completes, not now -- registering
-                                // a file that does not exist yet produces a model the user can
-                                // select and that fails to load.
-                                scope.launch { watchAndImport(target, model.name) { reload() } }
+                                // REGISTRATION IS NOT THIS PAGE'S JOB ANY MORE. It used to launch a
+                                // watcher in this composition scope, which meant navigating away
+                                // cancelled it while the download carried on -- the file landed and
+                                // nothing recorded it, so it vanished on restart. ModelRegistry
+                                // watches the downloader for the life of the process instead. This
+                                // only refreshes the list once the file appears, which is cosmetic.
+                                scope.launch { watchForDisplay(target) { reload() } }
                             }) { Text("Get") }
                         }
                     }
@@ -454,25 +566,20 @@ fun ModelsPage() {
 }
 
 /**
- * Waits for a download to land, then registers it.
+ * Refreshes the list once a download has landed.
  *
- * Polls the file rather than hooking completion because the Downloader's callback is global and
- * this needs to react to one specific file; a per-download listener would be a nicer API and is
- * worth adding if a second caller ever needs it.
+ * COSMETIC ONLY, AND THAT IS THE POINT. This used to be where a completed download got REGISTERED, in a
+ * coroutine owned by the page -- so closing the page or opening another one cancelled it, the download
+ * finished anyway, and nothing wrote the entry. The model then showed for the rest of the session (the
+ * downloader still listed it) and was gone after a restart.
+ *
+ * Registration now belongs to `ModelRegistry.watchDownloads`, which lives as long as the process. If this
+ * coroutine is cancelled, the only thing lost is a list that refreshes a moment later than it could have.
  */
-private suspend fun watchAndImport(target: File, name: String, onDone: () -> Unit) {
+private suspend fun watchForDisplay(target: File, onDone: () -> Unit) {
     withContext(Dispatchers.IO) {
         repeat(3600) {
             if (target.isFile) {
-                val isGguf = GgufInferenceService.isGgufFile(target.absolutePath)
-                PrismSettings.addImportedModel(
-                    PrismSettings.ImportedModel(
-                        path = target.absolutePath,
-                        displayName = name,
-                        type = if (isGguf) PrismSettings.MODEL_TYPE_TEXT
-                        else PrismSettings.MODEL_TYPE_IMAGE,
-                    )
-                )
                 onDone()
                 return@withContext
             }

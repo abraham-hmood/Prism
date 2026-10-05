@@ -286,7 +286,7 @@ class DesktopGridPage(
                     // A widget is not moved between pages by this path: its host view lives in the
                     // overlay and its id belongs to the page that allocated it, so it is removed
                     // through DesktopWidgetLayer instead, which also releases the id.
-                    is DesktopItem.Widget, is DesktopItem.Occupied -> Unit
+                    is DesktopItem.Widget, is DesktopItem.PluginWidget, is DesktopItem.Occupied -> Unit
                     is DesktopItem.App -> adapter.removeByComponentName(item.component)
                     is DesktopItem.FileRef -> adapter.removeByFilePath(item.absolutePath)
                     is DesktopItem.DirectoryRef -> adapter.removeByFilePath(item.absolutePath)
@@ -336,7 +336,7 @@ class DesktopGridPage(
         val name = when (item) {
             // A widget cannot be put inside a folder -- it is a live view bound to a set of cells,
             // not a shortcut -- and a covered cell is not an item at all. Neither has a filename.
-            is DesktopItem.Widget, is DesktopItem.Occupied -> return
+            is DesktopItem.Widget, is DesktopItem.PluginWidget, is DesktopItem.Occupied -> return
             is DesktopItem.App -> "app_${item.component.packageName}_$id.link"
             is DesktopItem.FileRef -> "file_$id.link"
             is DesktopItem.DirectoryRef -> "dir_$id.link"
@@ -382,9 +382,9 @@ class DesktopGridPage(
 
     private fun applyDropMatrix(dragged: DesktopItem, target: DesktopItem, srcPos: Int, dstPos: Int) {
         when (dragged) {
-            is DesktopItem.Widget, is DesktopItem.Occupied -> Unit  // widgets are not folder members; covered cells are not targets
+            is DesktopItem.Widget, is DesktopItem.PluginWidget, is DesktopItem.Occupied -> Unit  // widgets are not folder members; covered cells are not targets
             is DesktopItem.App -> when (target) {
-                is DesktopItem.Widget, is DesktopItem.Occupied -> Unit  // widgets are not folder members; covered cells are not targets
+                is DesktopItem.Widget, is DesktopItem.PluginWidget, is DesktopItem.Occupied -> Unit  // widgets are not folder members; covered cells are not targets
                 is DesktopItem.App, is DesktopItem.FileRef, is DesktopItem.NetworkedFolder -> {
                     val f = combineIntoFolder(dragged, target)
                     adapter.placeAt(dstPos, f)
@@ -421,7 +421,7 @@ class DesktopGridPage(
             }
 
             is DesktopItem.DirectoryRef -> when (target) {
-                is DesktopItem.Widget, is DesktopItem.Occupied -> Unit  // widgets are not folder members; covered cells are not targets
+                is DesktopItem.Widget, is DesktopItem.PluginWidget, is DesktopItem.Occupied -> Unit  // widgets are not folder members; covered cells are not targets
                 is DesktopItem.App, is DesktopItem.FileRef, is DesktopItem.NetworkedFolder -> {
                     val f = combineIntoFolder(dragged, target)
                     adapter.placeAt(dstPos, f)
@@ -439,7 +439,7 @@ class DesktopGridPage(
             }
 
             is DesktopItem.FileRef -> when (target) {
-                is DesktopItem.Widget, is DesktopItem.Occupied -> Unit  // widgets are not folder members; covered cells are not targets
+                is DesktopItem.Widget, is DesktopItem.PluginWidget, is DesktopItem.Occupied -> Unit  // widgets are not folder members; covered cells are not targets
                 is DesktopItem.App, is DesktopItem.FileRef, is DesktopItem.NetworkedFolder -> {
                     val f = combineIntoFolder(dragged, target)
                     adapter.placeAt(dstPos, f)

@@ -80,6 +80,27 @@ object PrismAiHost {
                 return@withContext
             }
 
+            // An app being handed to a trusted device, over the same tunnel for the same reason a model
+            // is: it is a file going to a peer that is already connected. Authorised inside
+            // TrustedAppTransfer against the peer's address -- this route is reachable by anything that
+            // can open the tunnel, so the check cannot live out here.
+            if (requestLine.startsWith("GET /trusted-app/")) {
+                if (!preLines.isNotEmpty()) {
+                    while (true) {
+                        val line = readLine(input) ?: break
+                        if (line.isEmpty()) break
+                    }
+                }
+                val path = requestLine.removePrefix("GET ").substringBefore(" ").trim()
+                com.prism.launcher.trusted.TrustedAppTransfer.serve(
+                    context,
+                    socket.inetAddress?.hostAddress.orEmpty(),
+                    path,
+                    output,
+                )
+                return@withContext
+            }
+
             if (!requestLine.startsWith("POST")) {
                 sendError(output, 405, "Method Not Allowed — POST a prompt to /generate, or GET /model/<name>")
                 return@withContext
@@ -116,6 +137,24 @@ object PrismAiHost {
                 if (n == -1) break
                 read += n
             }
+            // Protein work shares this tunnel with generation, for the same reason a model sale
+            // does: it is the same socket to the same peer on the same port, and the mesh routing,
+            // the VPN protection and the PRISM_CONNECT handshake are all already working here.
+            // Dispatched after the body is read because both protein routes take a body, and the
+            // binary one must not be run through the prompt path's trim() and String().
+            val meshPath = requestLine.split(' ').getOrNull(1).orEmpty()
+            if (com.prism.launcher.science.ProteinHost.handles(meshPath)) {
+                com.prism.launcher.science.ProteinHost.serve(meshPath, bodyBytes.copyOf(read), output,
+                )
+                return@withContext
+            }
+            if (com.prism.launcher.cloud.CloudHost.handles(meshPath)) {
+                com.prism.launcher.cloud.CloudHost.serve(
+                    context, meshPath, bodyBytes.copyOf(read), output,
+                )
+                return@withContext
+            }
+
             val prompt = String(bodyBytes, 0, read).trim()
             if (prompt.isEmpty()) {
                 sendError(output, 400, "Empty prompt")

@@ -533,7 +533,7 @@ object AetherKnowledgeSync {
     private fun httpGetText(url: String): String = String(httpGetBytes(url), Charsets.UTF_8)
 
     private fun httpGetBytes(urlStr: String): ByteArray {
-        val url = java.net.URL(urlStr)
+        val url = com.prism.core.Urls.of(urlStr)
         val conn = url.openConnection() as java.net.HttpURLConnection
         conn.connectTimeout = 8000
         conn.readTimeout = 15000

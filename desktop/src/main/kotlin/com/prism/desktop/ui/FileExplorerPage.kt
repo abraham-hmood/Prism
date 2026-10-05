@@ -6,6 +6,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Sort
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -337,7 +339,7 @@ private fun ExplorerToolbar(
             )
 
             Box {
-                ToolButton(Icons.Filled.Sort, "${sort.label}${if (descending) " ↓" else " ↑"}", true) {
+                ToolButton(Icons.AutoMirrored.Filled.Sort, "${sort.label}${if (descending) " ↓" else " ↑"}", true) {
                     sortMenu = true
                 }
                 DropdownMenu(sortMenu, onDismissRequest = { sortMenu = false }) {
@@ -601,7 +603,7 @@ private fun FileRow(file: File, selected: Boolean, onOpen: () -> Unit, onToggle:
         Checkbox(checked = selected, onCheckedChange = { onToggle() }, modifier = Modifier.size(20.dp))
         Spacer(Modifier.width(12.dp))
         Icon(
-            if (file.isDirectory) Icons.Filled.Folder else Icons.Filled.InsertDriveFile,
+            if (file.isDirectory) Icons.Filled.Folder else Icons.AutoMirrored.Filled.InsertDriveFile,
             null,
             tint = if (file.isDirectory) colors.accent else colors.faint,
             modifier = Modifier.size(17.dp),

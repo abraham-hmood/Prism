@@ -184,7 +184,7 @@ object DatasetDownloader {
 
     private fun downloadTo(url: String, target: File) {
         target.parentFile?.mkdirs()
-        val conn = URL(url).openConnection() as HttpURLConnection
+        val conn = com.prism.core.Urls.of(url).openConnection() as HttpURLConnection
         conn.setRequestProperty("User-Agent", "Prism-Launcher")
         conn.connectTimeout = 15_000
         conn.readTimeout = 30_000

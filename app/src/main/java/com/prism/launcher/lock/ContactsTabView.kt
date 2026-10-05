@@ -150,7 +150,7 @@ class ContactsTabView(context: Context) : LinearLayout(context) {
             return
         }
 
-        val emergency = filtered.filter { EmergencyContacts.isEmergency(context, it.number) }
+        val emergency = filtered.filter { EmergencyContacts.isEmergency(it.number) }
         val rest = filtered - emergency.toSet()
 
         if (emergency.isNotEmpty()) {

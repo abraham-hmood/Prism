@@ -746,6 +746,14 @@ class SettingsActivity : PrismBaseActivity() {
         binding.settingsList.adapter = adapter
     }
 
+    /**
+     * Back inside Settings.
+     *
+     * OVERRIDES A DEPRECATED MEMBER. The replacement is OnBackPressedDispatcher, and adopting it is not
+     * a local change: the dispatcher and this override cannot both be authoritative, so every screen
+     * that handles back has to move at once or two mechanisms fight over the same gesture.
+     */
+    @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
     override fun onBackPressed() {
         // Backing out of a search returns to the group list rather than leaving Settings,
         // which is what a search field inside a screen is expected to do.
@@ -1355,9 +1363,9 @@ class SettingsActivity : PrismBaseActivity() {
                         val modelPath = PrismSettings.getLocalAiModelPath()
                         val displayName = PrismSettings.getImportedModels().find { it.path == modelPath }?.displayName
                             ?: modelPath.substringAfterLast('/').ifBlank { "Local Model" }
-                        com.prism.launcher.mesh.P2pModelRegistry.announce(this, displayName)
+                        com.prism.launcher.mesh.P2pModelRegistry.announce(displayName)
                     } else {
-                        com.prism.launcher.mesh.P2pModelRegistry.revoke(this)
+                        com.prism.launcher.mesh.P2pModelRegistry.revoke()
                     }
                     refresh()
                 },
@@ -1788,6 +1796,38 @@ class SettingsActivity : PrismBaseActivity() {
                 )
             },
 
+            // Trusted devices sits next to the mesh settings rather than under privacy, because what it
+            // configures is WHICH machines on the meshnet may receive this device's data -- it is a mesh
+            // relationship, and finding it under privacy would suggest it is a local toggle.
+            SettingItem.Header("Trusted devices"),
+            SettingItem.Nav(
+                "Manage trusted devices",
+                "Devices allowed to receive your texts, browsing, clipboard and apps",
+                {
+                    startActivity(
+                        android.content.Intent(
+                            this, com.prism.launcher.trusted.TrustedDevicesActivity::class.java
+                        )
+                    )
+                }
+            ),
+            run {
+                // The pairing code's length. A picker rather than free text: the useful range is small,
+                // and the interesting number is not the length but what it is worth, which is shown.
+                val lengths = listOf(4, 6, 8, 10, 12, 16, 24, 32)
+                val current = PrismSettings.getPairingCodeLength()
+                SettingItem.Picker(
+                    "Pairing code length",
+                    "Shown on the device that offers, typed on the device that accepts. Longer is " +
+                        "harder to guess and harder to type.",
+                    lengths.map { length ->
+                        "$length characters  (~${com.prism.launcher.trusted.PairingCode.strengthBits(length)} bits)"
+                    },
+                    lengths.indexOf(current).coerceAtLeast(0),
+                    { index -> PrismSettings.setPairingCodeLength(lengths[index]) }
+                )
+            },
+
             SettingItem.Header("Blocklist"),
             SettingItem.Nav(
                 "Manage blocklist",
@@ -2109,23 +2149,23 @@ class SettingsActivity : PrismBaseActivity() {
                     "the periodic sweep. If the model is not publicly downloadable the sale is " +
                     "approved and the buyer's payment is taken immediately. If it is, the listing " +
                     "is removed and you are told why — Prism only allows selling models you made.",
-                ModelListingScanner.verifyOnSale(this),
-                { ModelListingScanner.setVerifyOnSale(this, it); refresh() }
+                ModelListingScanner.verifyOnSale(),
+                { ModelListingScanner.setVerifyOnSale(it); refresh() }
             ),
             SettingItem.Picker(
                 "Check Interval",
                 // DISABLED RATHER THAN HIDDEN when checking on every sale. A control that
                 // disappears reads as a bug and hides what the fallback cadence would be; a greyed
                 // one with this subtitle says why it is not in use and what it would do if it were.
-                if (ModelListingScanner.verifyOnSale(this))
+                if (ModelListingScanner.verifyOnSale())
                     "Not used — every sale is checked as it happens"
                 else
                     "How often your listings are re-checked against GitHub and Hugging Face",
                 scannerIntervals.map { "$it hour${if (it == 1) "" else "s"}" },
-                scannerIntervals.indexOf(ModelListingScanner.intervalHours(this))
+                scannerIntervals.indexOf(ModelListingScanner.intervalHours())
                     .coerceAtLeast(0),
-                { idx -> ModelListingScanner.setIntervalHours(this, scannerIntervals[idx]); refresh() },
-                isEnabled = !ModelListingScanner.verifyOnSale(this)
+                { idx -> ModelListingScanner.setIntervalHours(scannerIntervals[idx]); refresh() },
+                isEnabled = !ModelListingScanner.verifyOnSale()
             ),
 
             SettingItem.TextInput(
@@ -2310,9 +2350,9 @@ class SettingsActivity : PrismBaseActivity() {
             SettingItem.Nav(
                 "Lock screen",
                 when {
-                    !com.prism.launcher.lock.LockStore.isConfigured(this) ->
+                    !com.prism.launcher.lock.LockStore.isConfigured() ->
                         "Off — set a PIN, password or pattern"
-                    com.prism.launcher.lock.LockStore.hasDuress(this) ->
+                    com.prism.launcher.lock.LockStore.hasDuress() ->
                         "On, with an emergency code set"
                     else -> "On — no emergency code yet"
                 },
@@ -2324,53 +2364,51 @@ class SettingsActivity : PrismBaseActivity() {
                     "Nothing is shown while every field below is empty.",
                 PrismSettings.getMedicalOnLock(),
                 { PrismSettings.setMedicalOnLock(it); refresh() },
-                isEnabled = com.prism.launcher.lock.LockStore.isConfigured(this)
+                isEnabled = com.prism.launcher.lock.LockStore.isConfigured()
             ),
             SettingItem.Picker(
                 "Blood type",
-                com.prism.launcher.lock.MedicalRecord.get(this).bloodType.ifBlank { "Not set" },
+                com.prism.launcher.lock.MedicalRecord.get().bloodType.ifBlank { "Not set" },
                 com.prism.launcher.lock.MedicalRecord.BLOOD_TYPES.map { it.ifBlank { "Not set" } },
                 com.prism.launcher.lock.MedicalRecord.BLOOD_TYPES
-                    .indexOf(com.prism.launcher.lock.MedicalRecord.get(this).bloodType)
+                    .indexOf(com.prism.launcher.lock.MedicalRecord.get().bloodType)
                     .coerceAtLeast(0),
                 { index ->
-                    val record = com.prism.launcher.lock.MedicalRecord.get(this)
-                    com.prism.launcher.lock.MedicalRecord.save(
-                        this,
-                        record.copy(bloodType = com.prism.launcher.lock.MedicalRecord.BLOOD_TYPES[index])
+                    val record = com.prism.launcher.lock.MedicalRecord.get()
+                    com.prism.launcher.lock.MedicalRecord.save(record.copy(bloodType = com.prism.launcher.lock.MedicalRecord.BLOOD_TYPES[index])
                     )
                     refresh()
                 }
             ),
             SettingItem.TextInput(
                 "Severe allergies",
-                com.prism.launcher.lock.MedicalRecord.get(this).allergies
+                com.prism.launcher.lock.MedicalRecord.get().allergies
                     .ifBlank { "Penicillin, peanuts, latex…" },
-                com.prism.launcher.lock.MedicalRecord.get(this).allergies,
+                com.prism.launcher.lock.MedicalRecord.get().allergies,
                 { value ->
-                    val record = com.prism.launcher.lock.MedicalRecord.get(this)
-                    com.prism.launcher.lock.MedicalRecord.save(this, record.copy(allergies = value))
+                    val record = com.prism.launcher.lock.MedicalRecord.get()
+                    com.prism.launcher.lock.MedicalRecord.save(record.copy(allergies = value))
                     refresh()
                 }
             ),
             SettingItem.TextInput(
                 "Conditions",
-                com.prism.launcher.lock.MedicalRecord.get(this).conditions
+                com.prism.launcher.lock.MedicalRecord.get().conditions
                     .ifBlank { "Epilepsy, diabetes, anticoagulants…" },
-                com.prism.launcher.lock.MedicalRecord.get(this).conditions,
+                com.prism.launcher.lock.MedicalRecord.get().conditions,
                 { value ->
-                    val record = com.prism.launcher.lock.MedicalRecord.get(this)
-                    com.prism.launcher.lock.MedicalRecord.save(this, record.copy(conditions = value))
+                    val record = com.prism.launcher.lock.MedicalRecord.get()
+                    com.prism.launcher.lock.MedicalRecord.save(record.copy(conditions = value))
                     refresh()
                 }
             ),
             SettingItem.TextInput(
                 "Medications",
-                com.prism.launcher.lock.MedicalRecord.get(this).medications.ifBlank { "None recorded" },
-                com.prism.launcher.lock.MedicalRecord.get(this).medications,
+                com.prism.launcher.lock.MedicalRecord.get().medications.ifBlank { "None recorded" },
+                com.prism.launcher.lock.MedicalRecord.get().medications,
                 { value ->
-                    val record = com.prism.launcher.lock.MedicalRecord.get(this)
-                    com.prism.launcher.lock.MedicalRecord.save(this, record.copy(medications = value))
+                    val record = com.prism.launcher.lock.MedicalRecord.get()
+                    com.prism.launcher.lock.MedicalRecord.save(record.copy(medications = value))
                     refresh()
                 }
             ),
@@ -2378,36 +2416,36 @@ class SettingsActivity : PrismBaseActivity() {
                 "Do not resuscitate",
                 "Shown on the lock card as your stated wish. A phone screen is not an advance " +
                     "directive and clinicians will treat it as information, not instruction.",
-                com.prism.launcher.lock.MedicalRecord.get(this).dnr,
+                com.prism.launcher.lock.MedicalRecord.get().dnr,
                 { value ->
-                    val record = com.prism.launcher.lock.MedicalRecord.get(this)
-                    com.prism.launcher.lock.MedicalRecord.save(this, record.copy(dnr = value))
+                    val record = com.prism.launcher.lock.MedicalRecord.get()
+                    com.prism.launcher.lock.MedicalRecord.save(record.copy(dnr = value))
                     refresh()
                 }
             ),
             SettingItem.Toggle(
                 "Organ donor",
                 "Shown alongside the rest of the card.",
-                com.prism.launcher.lock.MedicalRecord.get(this).organDonor,
+                com.prism.launcher.lock.MedicalRecord.get().organDonor,
                 { value ->
-                    val record = com.prism.launcher.lock.MedicalRecord.get(this)
-                    com.prism.launcher.lock.MedicalRecord.save(this, record.copy(organDonor = value))
+                    val record = com.prism.launcher.lock.MedicalRecord.get()
+                    com.prism.launcher.lock.MedicalRecord.save(record.copy(organDonor = value))
                     refresh()
                 }
             ),
             SettingItem.TextInput(
                 "Notes for a first responder",
-                com.prism.launcher.lock.MedicalRecord.get(this).notes.ifBlank { "Anything else that changes treatment" },
-                com.prism.launcher.lock.MedicalRecord.get(this).notes,
+                com.prism.launcher.lock.MedicalRecord.get().notes.ifBlank { "Anything else that changes treatment" },
+                com.prism.launcher.lock.MedicalRecord.get().notes,
                 { value ->
-                    val record = com.prism.launcher.lock.MedicalRecord.get(this)
-                    com.prism.launcher.lock.MedicalRecord.save(this, record.copy(notes = value))
+                    val record = com.prism.launcher.lock.MedicalRecord.get()
+                    com.prism.launcher.lock.MedicalRecord.save(record.copy(notes = value))
                     refresh()
                 }
             ),
             SettingItem.Nav(
                 "Emergency contacts",
-                com.prism.launcher.lock.EmergencyContacts.all(this).let { list ->
+                com.prism.launcher.lock.EmergencyContacts.all().let { list ->
                     when (list.size) {
                         0 -> "None — add them from Messaging > Contacts"
                         1 -> list.first().name
@@ -2432,7 +2470,7 @@ class SettingsActivity : PrismBaseActivity() {
             SettingItem.Header("Stremio"),
             SettingItem.Nav(
                 "Stremio repositories",
-                StremioStore.repositories(this).size.let { count ->
+                StremioStore.repositories().size.let { count ->
                     when (count) {
                         0 -> "None yet — a repository is a list of add-ons"
                         1 -> "1 repository"
@@ -2447,7 +2485,7 @@ class SettingsActivity : PrismBaseActivity() {
             ),
             SettingItem.Nav(
                 "Stremio add-ons",
-                StremioStore.installed(this).size.let { count ->
+                StremioStore.installed().size.let { count ->
                     when (count) {
                         0 -> "None installed — their catalogs appear in Lyke's search"
                         1 -> "1 add-on installed"
@@ -2849,6 +2887,16 @@ class SettingsActivity : PrismBaseActivity() {
      * content directory is hard to reverse. A one-tap "caption this folder" would have been less
      * code and would have thrown that away.
      */
+    /**
+     * Captions a folder of images, reporting progress.
+     *
+     * USES ProgressDialog, WHICH IS DEPRECATED AND IS KEPT ON PURPOSE. It was deprecated because a
+     * modal spinner blocks the user, and this is the one shape it is least bad at: a determinate bar
+     * over a job with a known step count that the user chose to start and should not interleave with
+     * other settings changes. The replacement is a dialog somebody has to design and lay out, and a
+     * visual change to a shipped screen does not belong in a pass that is clearing compiler warnings.
+     */
+    @Suppress("DEPRECATION")
     private fun startCaptionPreview(directory: java.io.File) {
         val captioner = com.prism.launcher.nora.VisionModelCaptioner()
         if (!captioner.isAvailable()) {

@@ -195,6 +195,7 @@ class SciencePageView(context: Context) : FrameLayout(context) {
                         "cosmic" -> CosmicRayPanel(context)
                         "notebook" -> LabNotebookPanel(context)
                         "rf" -> RfSurveyPanel(context)
+                        "protein" -> ProteinPanel(context)
                         else -> ClinicalPanel(context)
                     },
                     LinearLayout.LayoutParams(

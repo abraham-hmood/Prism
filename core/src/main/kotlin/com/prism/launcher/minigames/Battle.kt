@@ -135,6 +135,15 @@ object Battle {
         var targetId: String? = null,
         var orderX: Double? = null,
         var orderY: Double? = null,
+        /**
+         * The circle a flying, piloted weapon holds around whatever it is attacking, and how far
+         * round it currently is. Zero means "not orbiting yet" — every ground unit stays at zero
+         * for its whole life, and an aircraft's is reset to zero whenever it picks a new target, so
+         * the next time it is in range the circle is locked in from wherever it actually is rather
+         * than snapped to some fixed radius. See [stepAttacker].
+         */
+        var orbitRadius: Double = 0.0,
+        var orbitAngle: Double = 0.0,
     ) {
         val alive: Boolean get() = hitPoints > 0
         val weapon: WeaponCatalog.Weapon get() = WeaponCatalog.byId(weaponId) ?: WeaponCatalog.STARTER
@@ -273,6 +282,14 @@ object Battle {
          * still describes exactly the army it used to.
          */
         attackerSupportIds: List<String> = emptyList(),
+        /**
+         * How much better trained and equipped this army is, from the attacker's own MILITARY
+         * buildings -- barracks, stables, drill yards and the rest of the catalogue that is not
+         * the training camp itself. [PaperBase.militaryBonus] is where this actually comes from;
+         * it defaults to 1.0 (no change) so every existing caller and test describes exactly the
+         * army it always did.
+         */
+        attackerMilitaryBonus: Double = 1.0,
     ): Playback {
         val rng = Rng(seed)
         // Whatever this defender's own plot has grown to. A country that has expanded its
@@ -288,7 +305,7 @@ object Battle {
         val squads = 4
         val fighters = ArrayList<Fighter>(attackerSoldiers)
         val weapon = WeaponCatalog.byId(attackerWeaponId) ?: WeaponCatalog.STARTER
-        val fighterHp = 40 + attackerLevel * 7
+        val fighterHp = ((40 + attackerLevel * 7) * attackerMilitaryBonus).toInt().coerceAtLeast(1)
 
         /**
          * What each fighter is, worked out before the loop.
@@ -495,7 +512,12 @@ object Battle {
         if (f.cooldown > 0) f.cooldown--
 
         val current = f.targetId?.let { id -> targets.firstOrNull { it.id == id } }
-        val target = current ?: pickTarget(f, targets, grid, destroyed)?.also { f.targetId = it.id }
+        val target = current ?: pickTarget(f, targets, grid, destroyed)?.also {
+            f.targetId = it.id
+            // A new target means a new circle: locked in from scratch the next time this fighter
+            // is close enough to fly it, not carried over from whatever it was just attacking.
+            f.orbitRadius = 0.0
+        }
 
         if (target == null) {
             // Nothing left worth hitting: walk to the order point, or stand still.
@@ -509,6 +531,14 @@ object Battle {
         if (dist > reach) {
             moveToward(f, target.centreX(), target.centreY(), speed = SPEED, fieldSize = fieldSize)
             return
+        }
+
+        // A flying, piloted weapon does not stop dead the way infantry, armour and guns do — it
+        // circles the target and keeps firing on the way round, which is what an actual strafing
+        // run looks like. Every OTHER weapon class holds its ground once it is close enough to
+        // hit, which is still correct for something that walks, rolls or sits on a tripod.
+        if (f.weapon.weaponClass == WeaponCatalog.WeaponClass.AIRCRAFT) {
+            orbitTarget(f, target, dist, reach, fieldSize)
         }
 
         if (f.cooldown > 0) return
@@ -597,6 +627,30 @@ object Battle {
         if (d < 1e-6) return
         f.x = (f.x + dx / d * speed).coerceIn(0.0, fieldSize.toDouble())
         f.y = (f.y + dy / d * speed).coerceIn(0.0, fieldSize.toDouble())
+    }
+
+    /** Radians a fighter's orbit advances each tick. A touch under one full circle every four seconds. */
+    private const val ORBIT_ANGULAR_SPEED = 0.16
+
+    /**
+     * Holds an aircraft on a circle around [target] instead of letting it come to a stop.
+     *
+     * The circle is locked in the first tick the fighter is close enough to use — at whatever
+     * radius and bearing it actually arrived at, from [dist] and its real position — and only the
+     * ANGLE moves after that. Anything else (snapping to one fixed radius, or aiming straight at
+     * the centre every tick) would show up as the aircraft's position jumping the instant it enters
+     * range, which is the exact stop-dead behaviour this exists to replace.
+     */
+    private fun orbitTarget(f: Fighter, target: PlacedBuilding, dist: Double, reach: Double, fieldSize: Int) {
+        if (f.orbitRadius <= 0.0) {
+            f.orbitRadius = dist.coerceIn(1.2, (reach * 0.85).coerceAtLeast(1.2))
+            f.orbitAngle = kotlin.math.atan2(f.y - target.centreY(), f.x - target.centreX())
+        }
+        f.orbitAngle += ORBIT_ANGULAR_SPEED
+        f.x = (target.centreX() + f.orbitRadius * kotlin.math.cos(f.orbitAngle))
+            .coerceIn(0.0, fieldSize.toDouble())
+        f.y = (target.centreY() + f.orbitRadius * kotlin.math.sin(f.orbitAngle))
+            .coerceIn(0.0, fieldSize.toDouble())
     }
 
     /**

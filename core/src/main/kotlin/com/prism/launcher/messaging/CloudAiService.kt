@@ -48,7 +48,7 @@ object CloudAiService {
      */
     fun fetchResponse(baseUrl: String, apiKey: String, model: String, userText: String, base64Image: String? = null): String {
         return try {
-            val url = URL(baseUrl + "/chat/completions")
+            val url = com.prism.core.Urls.of(baseUrl + "/chat/completions")
             val conn = url.openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.setRequestProperty("Authorization", "Bearer $apiKey")
@@ -113,7 +113,7 @@ object CloudAiService {
      */
     fun fetchResponseStreaming(baseUrl: String, apiKey: String, model: String, userText: String, base64Image: String? = null, maxTokens: Int = -1, onToken: (String) -> Unit): String {
         return try {
-            val url = URL(baseUrl + "/chat/completions")
+            val url = com.prism.core.Urls.of(baseUrl + "/chat/completions")
             val conn = url.openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.setRequestProperty("Authorization", "Bearer $apiKey")
@@ -202,7 +202,7 @@ object CloudAiService {
      */
     fun fetchOllamaChatStreaming(host: String, port: Int, model: String, userText: String, onToken: (String) -> Unit): String {
         return try {
-            val url = URL("http://$host:$port/api/chat")
+            val url = com.prism.core.Urls.of("http://$host:$port/api/chat")
             val conn = url.openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.setRequestProperty("Content-Type", "application/json")
@@ -277,7 +277,7 @@ object CloudAiService {
      */
     fun fetchChatWithTools(baseUrl: String, apiKey: String, model: String, messages: JSONArray, tools: JSONArray?): JSONObject {
         return try {
-            val url = URL(baseUrl + "/chat/completions")
+            val url = com.prism.core.Urls.of(baseUrl + "/chat/completions")
             val conn = url.openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.setRequestProperty("Authorization", "Bearer $apiKey")
@@ -317,7 +317,7 @@ object CloudAiService {
      */
     fun fetchOllamaChatWithTools(host: String, port: Int, model: String, messages: JSONArray, tools: JSONArray?): JSONObject {
         return try {
-            val url = URL("http://$host:$port/api/chat")
+            val url = com.prism.core.Urls.of("http://$host:$port/api/chat")
             val conn = url.openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.setRequestProperty("Content-Type", "application/json")
@@ -361,7 +361,7 @@ object CloudAiService {
      */
     fun fetchImage(baseUrl: String, apiKey: String, prompt: String): PrismImage? {
         return try {
-            val url = URL(baseUrl + "images/generations")
+            val url = com.prism.core.Urls.of(baseUrl + "images/generations")
             val conn = url.openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.setRequestProperty("Authorization", "Bearer $apiKey")

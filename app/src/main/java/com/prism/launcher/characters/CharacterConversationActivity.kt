@@ -54,7 +54,7 @@ class CharacterConversationActivity : PrismBaseActivity() {
         super.onCreate(savedInstanceState)
 
         val id = intent.getStringExtra(EXTRA_ID).orEmpty()
-        val found = CharacterStore.find(this, id)
+        val found = CharacterStore.find(id)
         if (found == null) {
             setContentView(TextView(this).apply {
                 text = "That character no longer exists."

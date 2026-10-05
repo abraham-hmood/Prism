@@ -18,6 +18,16 @@ import java.io.File
  */
 object P2pDnsManager {
 
+    /**
+     * The resolver's own scope.
+     *
+     * NOT GlobalScope, which is delicate for two reasons that both apply here: nothing can cancel it,
+     * and it has no supervisor -- so a single probe that threw would cancel every other coroutine
+     * sharing it. This is process-lifetime by intent, which is exactly what makes the supervisor
+     * matter rather than the lifetime.
+     */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     private const val STORAGE_FILE = "p2p_dns_index.json"
     private val dnsIndex = mutableMapOf<String, DnsRecord>()
 
@@ -92,7 +102,7 @@ object P2pDnsManager {
      * disk I/O before it's even up.
      */
     fun init(context: Context) {
-        GlobalScope.launch(Dispatchers.IO) { initBlocking(context) }
+        scope.launch { initBlocking(context) }
     }
 
     private fun initBlocking(context: Context) {
@@ -197,7 +207,7 @@ object P2pDnsManager {
         if ((now - (lastProbeMap[ip] ?: 0L)) < 10000) return // Rate limit probes to 10s
         
         lastProbeMap[ip] = now
-        GlobalScope.launch(Dispatchers.IO) {
+        scope.launch {
             try {
                 val start = System.currentTimeMillis()
                 // Lightweight TCP probe on the mesh control port (defaulting to 8888 for heartbeats)

@@ -18,6 +18,19 @@ import kotlinx.coroutines.withContext
 
 class MessagingPageView(context: Context) : LinearLayout(context) {
 
+    companion object {
+        /**
+         * The id every relayed conversation carries.
+         *
+         * ONE id for all of them, not one each: the conversation is identified by its ADDRESS, which is
+         * what the relayed inbox is keyed on, and a per-thread id would be a second identity to keep in
+         * step with nothing to gain. It only has to be a value the system's own thread ids can never be,
+         * and those are positive.
+         */
+        const val RELAYED_THREAD_ID = -200L
+    }
+
+
     private val binding: PageMessagingRootBinding
     private val adapter = ConversationAdapter(emptyList()) { thread ->
         val intent = android.content.Intent(context, ConversationActivity::class.java).apply {
@@ -354,6 +367,31 @@ class MessagingPageView(context: Context) : LinearLayout(context) {
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
+            }
+
+            // 4. Conversations a trusted device shared with this one.
+            //
+            // LISTED BESIDE THE PHONE'S OWN, because to the person reading them they are the same kind
+            // of thing: a conversation with a person. Which device the radio is in is a detail of how
+            // they got here, and a separate list would make you remember it before you could find
+            // anyone. The synthetic id marks them so the conversation screen knows where to read from.
+            runCatching {
+                com.prism.launcher.messaging.SmsRelay.threads(
+                    com.prism.launcher.trusted.TrustedMessages.inboxRoot()
+                ).forEach { (key, relayed) ->
+                    val newest = relayed.maxByOrNull { it.receivedAt }
+                    // A thread this phone already shows from its own provider would appear twice.
+                    if (threads.none { it.address.equals(key, ignoreCase = true) }) {
+                        threads.add(
+                            ThreadInfo(
+                                RELAYED_THREAD_ID,
+                                key,
+                                newest?.body?.replace('\n', ' ').orEmpty(),
+                                newest?.receivedAt ?: 0L,
+                            )
+                        )
+                    }
+                }
             }
 
             allThreads = threads

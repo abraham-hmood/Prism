@@ -331,7 +331,7 @@ class CallModeActivity : PrismBaseActivity() {
         setStatus("Speaking…")
         transcriptLabel.text = text
 
-        PrismSpeaker.speak(this, text, speaker) { error ->
+        PrismSpeaker.speak(text, speaker) { error ->
             if (error != null) PrismLogger.logWarning(TAG, "Speech failed: $error")
             finishTurn()
         }

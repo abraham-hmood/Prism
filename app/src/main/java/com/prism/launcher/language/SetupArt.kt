@@ -44,7 +44,7 @@ object SetupArt {
         second: LanguageTutors.Tutor,
     ): View = when (art) {
         LanguageSetupFlow.Art.TUTOR_WAVE ->
-            portraitCard(ctx, tutor, TutorPortrait.Gesture.WAVE)
+            portraitCard(ctx, tutor, Gesture.WAVE)
 
         LanguageSetupFlow.Art.LEVEL_LADDER -> LadderView(ctx, tutor)
 
@@ -72,7 +72,7 @@ object SetupArt {
     fun portraitCard(
         ctx: Context,
         tutor: LanguageTutors.Tutor,
-        gesture: TutorPortrait.Gesture = TutorPortrait.Gesture.NONE,
+        gesture: Gesture = Gesture.NONE,
     ): View = ImageView(ctx).apply {
         setImageDrawable(
             TutorPortrait(tutor.portrait.copy(gesture = gesture), circular = false, withBackdrop = true)

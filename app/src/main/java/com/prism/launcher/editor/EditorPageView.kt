@@ -114,7 +114,7 @@ class EditorPageView(context: Context) : FrameLayout(context) {
             // Monaco is downloaded into filesDir, so it cannot be an asset handler; serving it
             // through the same origin is what lets the AMD loader and its workers load at all.
             .addPathHandler("/monaco/", WebViewAssetLoader.InternalStoragePathHandler(
-                context, EditorAssets.monacoDir(context)
+                context, EditorAssets.monacoDir()
             ))
             .build()
     }
@@ -137,7 +137,6 @@ class EditorPageView(context: Context) : FrameLayout(context) {
         webView.apply {
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
-            settings.databaseEnabled = true
             settings.allowFileAccess = false
             settings.allowContentAccess = false
             settings.useWideViewPort = false
@@ -441,7 +440,7 @@ class EditorPageView(context: Context) : FrameLayout(context) {
     }
 
     private fun renderSetup() {
-        if (EditorAssets.isInstalled(context)) {
+        if (EditorAssets.isInstalled()) {
             setupPanel.visibility = View.GONE
             if (!editorReady) loadEditor()
             return
@@ -467,7 +466,7 @@ class EditorPageView(context: Context) : FrameLayout(context) {
 
         scope.launch {
             val error = withContext(Dispatchers.IO) {
-                EditorAssets.install(context) { percent, message ->
+                EditorAssets.install { percent, message ->
                     scope.launch {
                         setupProgress.isIndeterminate = percent <= 0
                         setupProgress.progress = percent
@@ -671,7 +670,7 @@ class EditorPageView(context: Context) : FrameLayout(context) {
             openFolder?.canonicalFile,
             activePath?.let { File(it).parentFile?.canonicalFile },
             scratchRoot.canonicalFile,
-            ExtensionStore.root(context).canonicalFile,
+            ExtensionStore.root().canonicalFile,
         )
         return if (roots.any { file.path == it.path || file.path.startsWith(it.path + File.separator) }) file else null
     }
@@ -750,7 +749,7 @@ class EditorPageView(context: Context) : FrameLayout(context) {
     private fun loadExtensions() {
         scope.launch {
             val installed = withContext(Dispatchers.IO) {
-                ExtensionStore.installed(context).filter { it.enabled }
+                ExtensionStore.installed().filter { it.enabled }
             }
             if (installed.isEmpty()) return@launch
 

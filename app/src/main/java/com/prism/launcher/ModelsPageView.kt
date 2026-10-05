@@ -41,7 +41,7 @@ class ModelsPageView @JvmOverloads constructor(
     private val binding = PageModelsBinding.inflate(LayoutInflater.from(context), this, true)
     private val adapter = ModelsAdapter(
         this::setActive, this::confirmDelete, this::setActiveCloud, this::setActiveOllama,
-        this::setActiveCakeChat,
+        this::setActiveCakeChat, this::setActiveMesh,
     )
 
     /** Null when this page is previewed outside the launcher; only the export action needs it. */
@@ -243,6 +243,23 @@ class ModelsPageView @JvmOverloads constructor(
             )
         }
 
+        // Models on other devices. Listed after the local ones and before images, because it is a text
+        // model like the ones above it -- the only difference is which machine runs it.
+        val meshModels = com.prism.launcher.messaging.MeshModels.available()
+        val selectedMesh = PrismSettings.getSelectedP2pModel()
+        if (meshModels.isNotEmpty()) {
+            items.add(ModelListItem.Header("On Your Meshnet"))
+            meshModels.forEach { model ->
+                items.add(
+                    ModelListItem.MeshModel(
+                        model.peerIp,
+                        model.modelName,
+                        selectedMesh?.peerIp == model.peerIp && selectedMesh.modelName == model.modelName,
+                    )
+                )
+            }
+        }
+
         if (imageModels.isNotEmpty()) {
             items.add(ModelListItem.Header("Image Generation Models"))
             imageModels.forEach { items.add(ModelListItem.Model(it, it.path == activeImage)) }
@@ -308,6 +325,33 @@ class ModelsPageView @JvmOverloads constructor(
      * mode still pointed at a cloud endpoint would leave the selection visibly active while every
      * reply still came from the cloud.
      */
+    /**
+     * Points every part of Prism that uses a model at one hosted by another device.
+     *
+     * Tapping the ACTIVE one clears the choice, which is the only way back to this phone's own models
+     * without hunting for a separate control -- the same gesture, and the pill says which state it is in.
+     */
+    private fun setActiveMesh(peerIp: String, modelName: String) {
+        val selected = PrismSettings.getSelectedP2pModel()
+        if (selected?.peerIp == peerIp && selected.modelName == modelName) {
+            PrismSettings.clearSelectedP2pModel()
+            android.widget.Toast.makeText(
+                context, "Back to this phone's own models", android.widget.Toast.LENGTH_SHORT,
+            ).show()
+        } else {
+            PrismSettings.setSelectedP2pModel(peerIp, modelName)
+            // CakeChat is checked first among the local engines, so leaving it on would make this
+            // choice appear to do nothing.
+            PrismSettings.setUseCakeChat(false)
+            android.widget.Toast.makeText(
+                context,
+                modelName + " on " + peerIp + " will now answer everywhere in Prism",
+                android.widget.Toast.LENGTH_LONG,
+            ).show()
+        }
+        refreshList()
+    }
+
     private fun setActiveCakeChat() {
         PrismSettings.setUseCakeChat(true)
         PrismSettings.setAiMode(PrismSettings.AI_MODE_LOCAL)
@@ -382,6 +426,15 @@ sealed class ModelListItem {
      * Selecting it switches which engine Sam dispatches to, not which file it loads.
      */
     data class CakeChat(val isActive: Boolean) : ModelListItem()
+
+    /**
+     * A model another device on the meshnet is hosting.
+     *
+     * Carries an address rather than a path, because the weights are not here and are not going to be:
+     * choosing this sends prompts to that device and gets answers back. It belongs in this list because
+     * from the user's side it is the same decision as any other entry -- which model answers.
+     */
+    data class MeshModel(val peerIp: String, val modelName: String, val isActive: Boolean) : ModelListItem()
 }
 
 class ModelsAdapter(
@@ -389,7 +442,8 @@ class ModelsAdapter(
     private val onDelete: (PrismSettings.ImportedModel) -> Unit,
     private val onCloudClick: (PrismSettings.CloudModelProfile) -> Unit,
     private val onOllamaClick: (String, Int, String) -> Unit,
-    private val onCakeChatClick: () -> Unit
+    private val onCakeChatClick: () -> Unit,
+    private val onMeshClick: (String, String) -> Unit
 ) : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
 
     private var items: List<ModelListItem> = emptyList()
@@ -398,6 +452,8 @@ class ModelsAdapter(
         private const val TYPE_HEADER = 0
         private const val TYPE_MODEL = 1
         private const val TYPE_CLOUD = 2
+        // Reuses the cloud card, like Ollama does: an address and a name is the same shape.
+        private const val TYPE_MESH = 5
         private const val TYPE_OLLAMA = 3
         private const val TYPE_CAKECHAT = 4
     }
@@ -415,6 +471,7 @@ class ModelsAdapter(
         is ModelListItem.CloudModel -> TYPE_CLOUD
         is ModelListItem.OllamaModel -> TYPE_OLLAMA
         is ModelListItem.CakeChat -> TYPE_CAKECHAT
+        is ModelListItem.MeshModel -> TYPE_MESH
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
@@ -433,6 +490,7 @@ class ModelsAdapter(
             is ModelListItem.CloudModel -> bindCloud(holder as SelectableVH, item)
             is ModelListItem.OllamaModel -> bindOllama(holder as SelectableVH, item)
             is ModelListItem.CakeChat -> bindCakeChat(holder as SelectableVH, item)
+            is ModelListItem.MeshModel -> bindMesh(holder as SelectableVH, item)
         }
     }
 
@@ -492,6 +550,14 @@ class ModelsAdapter(
         b.cloudModelBaseUrl.text = "${item.host}:${item.port}"
         b.cloudModelActivePill.visibility = if (item.isActive) View.VISIBLE else View.GONE
         b.cloudModelRoot.setOnClickListener { onOllamaClick(item.host, item.port, item.modelName) }
+    }
+
+    private fun bindMesh(holder: SelectableVH, item: ModelListItem.MeshModel) {
+        val b = holder.binding
+        b.cloudModelId.text = item.modelName
+        b.cloudModelBaseUrl.text = item.peerIp + " · stays on that device"
+        b.cloudModelActivePill.visibility = if (item.isActive) View.VISIBLE else View.GONE
+        b.cloudModelRoot.setOnClickListener { onMeshClick(item.peerIp, item.modelName) }
     }
 
     private fun formatSize(bytes: Long): String {

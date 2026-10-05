@@ -294,6 +294,60 @@ internal class VncSurfaceRenderer(
     }
 
     /**
+     * Sends one RFB PointerEvent (message type 5).
+     *
+     * `[5][button-mask][x:2][y:2]`, coordinates in FRAMEBUFFER pixels, not screen pixels — the caller
+     * scales, because only the caller knows how its Surface maps onto the remote display. Passing view
+     * coordinates straight through is how a remote pointer ends up landing in the wrong place on any
+     * display whose size is not the view's size, which is all of them.
+     *
+     * The button mask is a bitfield, not a button number: bit 0 left, bit 1 middle, bit 2 right, bits
+     * 3 and 4 the wheel. A drag is therefore a stream of these with the bit held, and a release is the
+     * same message with the bit clear — there is no separate release message, which is why a caller
+     * that forgets the final zero leaves the remote button stuck down.
+     *
+     * Goes through the same single writer thread as [sendKeyEvent] for the reason given on `writer`:
+     * RFB is one byte stream, and two threads writing it interleave messages in a way that
+     * desynchronises the connection without raising an error.
+     */
+    fun sendPointerEvent(x: Int, y: Int, buttonMask: Int): Boolean {
+        val stream = out ?: return false
+        // Clamped rather than dropped. A touch that slides off the edge of the view is a real gesture
+        // and the guest should see it pinned to the border, which is what a mouse leaving a window
+        // does; discarding it would leave the button held with no further movement.
+        val px = x.coerceIn(0, 0xFFFF)
+        val py = y.coerceIn(0, 0xFFFF)
+        writer.execute {
+            try {
+                synchronized(stream) {
+                    stream.write(
+                        byteArrayOf(
+                            5,
+                            (buttonMask and 0xFF).toByte(),
+                            (px ushr 8).toByte(), px.toByte(),
+                            (py ushr 8).toByte(), py.toByte(),
+                        )
+                    )
+                    stream.flush()
+                }
+            } catch (e: Throwable) {
+                android.util.Log.w(
+                    "PrismVM",
+                    "pointer write failed: ${e.javaClass.name}: ${e.message ?: "(no message)"}",
+                    e,
+                )
+                out = null
+            }
+        }
+        return true
+    }
+
+    /** The remote framebuffer's size, so a caller can scale its touches onto it. */
+    val remoteWidth: Int get() = frameWidth
+
+    val remoteHeight: Int get() = frameHeight
+
+    /**
      * A complete keystroke: down, a real hold, then up.
      *
      * THE HOLD IS THE POINT. A press and release sent back to back last zero milliseconds, and a

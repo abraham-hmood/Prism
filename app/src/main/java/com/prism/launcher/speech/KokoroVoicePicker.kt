@@ -34,7 +34,7 @@ object KokoroVoicePicker {
      * row that displays it.
      */
     fun show(activity: Activity, speaker: String, onPicked: (voiceId: String) -> Unit = {}) {
-        val installed = KokoroInstall.installedVoices(activity)
+        val installed = KokoroInstall.installedVoices()
         val current = PrismSettings.getKokoroVoice(speaker)
 
         // Grouped by language, flattened back into one array because AlertDialog's single-choice
@@ -73,7 +73,7 @@ object KokoroVoicePicker {
             }
             .setNegativeButton("Cancel", null)
             .setNeutralButton("Preview") { _, _ ->
-                PrismSpeaker.preview(activity, current) { error ->
+                PrismSpeaker.preview(current) { error ->
                     if (error != null) Toast.makeText(activity, error, Toast.LENGTH_LONG).show()
                 }
             }
@@ -87,15 +87,15 @@ object KokoroVoicePicker {
      * it is going to take long enough that saying nothing would look broken.
      */
     fun ensureDownloaded(context: Context, voiceId: String, onComplete: () -> Unit = {}) {
-        if (KokoroInstall.isVoiceInstalled(context, voiceId)) {
+        if (KokoroInstall.isVoiceInstalled(voiceId)) {
             onComplete()
             return
         }
-        if (!KokoroInstall.isModelInstalled(context)) return
+        if (!KokoroInstall.isModelInstalled()) return
 
         Toast.makeText(context, "Fetching the ${KokoroVoices.labelOf(voiceId)} voice…", Toast.LENGTH_SHORT).show()
         Thread({
-            val error = KokoroInstall.downloadVoice(context, voiceId)
+            val error = KokoroInstall.downloadVoice(voiceId)
             android.os.Handler(android.os.Looper.getMainLooper()).post {
                 if (error != null) Toast.makeText(context, error, Toast.LENGTH_LONG).show()
                 onComplete()
@@ -107,7 +107,7 @@ object KokoroVoicePicker {
     fun summaryFor(context: Context, speaker: String): String {
         val id = PrismSettings.getKokoroVoice(speaker)
         val voice = KokoroVoices.find(id) ?: return id
-        val installed = if (KokoroInstall.isVoiceInstalled(context, id)) "" else " — not downloaded yet"
+        val installed = if (KokoroInstall.isVoiceInstalled(id)) "" else " — not downloaded yet"
         return "${voice.displayName} · ${voice.language.display} · ${voice.quality}$installed"
     }
 }

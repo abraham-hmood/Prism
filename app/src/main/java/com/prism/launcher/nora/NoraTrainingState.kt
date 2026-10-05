@@ -69,6 +69,7 @@ object NoraTrainingState {
     }
 
     /** Clears the replayed log. Only the UI calls this, on an explicit user action. */
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     fun clearLog() {
         _log.resetReplayCache()
     }

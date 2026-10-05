@@ -227,8 +227,24 @@ class PaperWarView(context: Context) : FrameLayout(context), TopInsetAware {
 
         if (targetId == WorldMap.PLAYER_ID) {
             MinigameStore.setRelation(attacker.id, WorldMap.Relation.HOSTILE)
+            // Held back until the warhead actually lands -- see WorldMap.FLIGHT_MS and the missile
+            // drawn crossing the map in the meantime. Applied to the LIVE base at arrival, not to
+            // whatever was captured at launch, so a base that changed in those few seconds (a
+            // building finished, a raid landed first) is still the one actually hit.
             handler.postDelayed({
-                if (running) toast("${attacker.name} has launched a ${kind.label.lowercase()} strike at you.")
+                if (!running) return@postDelayed
+                val killed = base.civilianCasualties(WorldMap.aiWarConduct(attacker), kind.destruction)
+                commit(
+                    base.devastate(kind.destruction)
+                        .loseCivilians(killed)
+                        // The builders start on it the moment the smoke clears, same as after any
+                        // other attack -- see PaperBase.postBattleRepair.
+                        .postBattleRepair()
+                )
+                toast(
+                    "${attacker.name}'s ${kind.label.lowercase()} strike has flattened your country." +
+                        if (killed > 0) " $killed civilians killed." else ""
+                )
             }, WorldMap.FLIGHT_MS)
         }
     }
@@ -279,6 +295,7 @@ class PaperWarView(context: Context) : FrameLayout(context), TopInsetAware {
             attackerWeaponId = WeaponCatalog.unlockedAt(attacker.level).maxByOrNull { it.threat }?.id
                 ?: WeaponCatalog.STARTER.id,
             attackerSupportIds = WorldMap.aiDetachments(attacker.level),
+            attackerMilitaryBonus = WorldMap.aiBase(attacker).militaryBonus,
         )
         // A country that has come for you is hostile whether it wins or not.
         MinigameStore.setRelation(attacker.id, WorldMap.Relation.HOSTILE)
@@ -611,7 +628,7 @@ class PaperWarView(context: Context) : FrameLayout(context), TopInsetAware {
         baseView.placing = null
         endPlacement()
         PaperAudio.scratch()
-        toast("${type.name} started — ${PaperUi.shortDuration(type.buildSeconds * 1000L)}")
+        toast("${type.name} started — ${PaperUi.shortDuration((base.effectiveBuildSeconds(type) * 1000L).toLong())}")
     }
 
     private fun explain(type: BuildingCatalog.BuildingType, verdict: PaperBase.Placement): String = when (verdict) {
@@ -837,8 +854,8 @@ class PaperWarView(context: Context) : FrameLayout(context), TopInsetAware {
                         PaperUi.note(
                             context,
                             if (locked) "unlocks at level ${type.unlockLevel}"
-                            else "$owned/$cap · ${PaperUi.shortNumber(type.buildCost)} XP · " +
-                                PaperUi.shortDuration(type.buildSeconds * 1000L) +
+                            else "$owned/$cap · ${PaperUi.shortNumber(base.effectiveBuildCost(type))} XP · " +
+                                PaperUi.shortDuration((base.effectiveBuildSeconds(type) * 1000L).toLong()) +
                                 " · ${type.footprint}x${type.footprint}",
                         )
                     )
@@ -1320,6 +1337,22 @@ class PaperWarView(context: Context) : FrameLayout(context), TopInsetAware {
             body.addView(PaperUi.statLine(context, "Laws enacted", "${base.enactedLaws.size} of ${Ideology.ALL_LAWS.size}"))
             body.addView(PaperUi.statLine(context, "Civilians", "${base.civilians} of ${base.civilianCapacity}"))
             body.addView(PaperUi.statLine(context, "Taxes", "%.1f XP/min".format(base.civilianTaxPerMinute())))
+
+            // What the economy actually buys: the five categories that used to just sit on the
+            // page. Shown as percentages against the baseline (100%) so "more buildings, better
+            // number" reads at a glance the same way the law effects below it do.
+            body.addView(PaperUi.divider(context))
+            body.addView(PaperUi.body(context, "Economy").apply {
+                typeface = android.graphics.Typeface.create(android.graphics.Typeface.SERIF, android.graphics.Typeface.BOLD)
+            })
+            body.addView(PaperUi.statLine(context, "Building cost (Resource)", "${(base.resourceBuildDiscount * 100).toInt()}%"))
+            body.addView(PaperUi.statLine(context, "Building speed (Industry)", "${(100 / base.industryBuildSpeed).toInt()}%"))
+            body.addView(PaperUi.statLine(context, "Research cost (Infrastructure)", "${(base.infrastructureResearchDiscount * 100).toInt()}%"))
+            body.addView(PaperUi.statLine(context, "Research cost (Institutes)", "${(base.researchInstituteDiscount * 100).toInt()}%"))
+            body.addView(PaperUi.statLine(context, "Trade income (Trade)", "${(base.tradeIncomeBonus * 100).toInt()}%"))
+            body.addView(PaperUi.statLine(context, "Law speed (Civic)", "${(100 / base.civicLawSpeed).toInt()}%"))
+            body.addView(PaperUi.statLine(context, "Army strength (Military)", "${(base.militaryBonus * 100).toInt()}%"))
+
             if (base.annexed.isNotEmpty()) {
                 body.addView(PaperUi.statLine(context, "Provinces", base.annexed.size.toString()))
                 body.addView(PaperUi.statLine(context, "Tributary soldiers", base.tributarySoldiers.toString()))
@@ -1963,6 +1996,7 @@ class PaperWarView(context: Context) : FrameLayout(context), TopInsetAware {
             attackerWeaponId = weapon.id,
             // The tanks, aircraft and guns that go in with them. See PaperBase.supportWeapons.
             attackerSupportIds = base.supportWeapons().map { it.id },
+            attackerMilitaryBonus = base.militaryBonus,
         )
         MinigameMesh.announceBattle(ticket)
         MinigameStore.setRelation(country.id, WorldMap.Relation.HOSTILE)
@@ -2067,6 +2101,8 @@ class PaperWarView(context: Context) : FrameLayout(context), TopInsetAware {
             seed = Rng.seedOf("raider", worldSeed, seedOffset),
         ) ?: return target
 
+        val militaryBonus = WorldMap.aiBase(attacker).militaryBonus
+
         val (_, result) = Battle.simulate(
             defender = target,
             attackerLevel = attacker.level,
@@ -2076,6 +2112,7 @@ class PaperWarView(context: Context) : FrameLayout(context), TopInsetAware {
             orders = emptyList(),
             seed = Rng.seedOf("raid", attacker.id, seedOffset),
             attackerSupportIds = WorldMap.aiDetachments(attacker.level),
+            attackerMilitaryBonus = militaryBonus,
         ).let { it.frames to it.result }
 
         pendingRaidReport = attacker.name to result
@@ -2093,6 +2130,7 @@ class PaperWarView(context: Context) : FrameLayout(context), TopInsetAware {
             attackerWeaponId = WeaponCatalog.unlockedAt(attacker.level).maxByOrNull { it.threat }?.id
                 ?: WeaponCatalog.STARTER.id,
             attackerSupportIds = WorldMap.aiDetachments(attacker.level),
+            attackerMilitaryBonus = militaryBonus,
         )
         // A country that has come for you is hostile whether it won or not.
         MinigameStore.setRelation(attacker.id, WorldMap.Relation.HOSTILE)
@@ -2337,9 +2375,9 @@ class PaperWarView(context: Context) : FrameLayout(context), TopInsetAware {
             body.addView(
                 PaperUi.note(
                     context,
-                    "It takes about ${(kind.destruction * 100).toInt()}% of the country off the map " +
-                        "and leaves it burning for ${kind.burnHours.toInt()} hours. You gain nothing " +
-                        "from it — no land, no army, no XP. It will rebuild, and it will not forget.",
+                    "It levels the country — every building down, its own people paying for it — and " +
+                        "leaves it burning for ${kind.burnHours.toInt()} hours while it rebuilds. You " +
+                        "gain nothing from it — no land, no army, no XP. It will not forget.",
                 )
             )
             body.addView(PaperUi.divider(context))

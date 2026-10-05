@@ -296,9 +296,21 @@ class PrismCefHandlers(
             null
         }
 
-        /** `.p2p` is Prism's mesh TLD, matching P2pDnsManager.isP2pDomain. */
-        fun isP2pDomain(host: String): Boolean =
-            host.endsWith(".p2p") || host.endsWith(".p2p.remote")
+        /**
+         * Whether a name belongs to the mesh.
+         *
+         * NOT A SUFFIX TEST, and that is the correction: a mesh site can be called anything -- .p2p,
+         * .com, .gov, a suffix nobody has registered -- so what makes a name a mesh name is that a peer
+         * announced a record for it. MeshDns knows that; the end of the string does not.
+         *
+         * `.p2p` is still accepted outright because it cannot exist on the public internet, so a name
+         * ending in it can only ever have been meant for the mesh even before any record arrives.
+         */
+        fun isP2pDomain(host: String): Boolean {
+            if (host.isBlank()) return false
+            if (host.endsWith(".p2p") || host.endsWith(".p2p.remote")) return true
+            return com.prism.core.MeshDns.resolve(host, onlyP2p = false) != null
+        }
 
         /**
          * Where the local mesh proxy serves `.p2p` content.

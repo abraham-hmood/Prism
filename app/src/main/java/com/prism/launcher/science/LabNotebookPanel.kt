@@ -102,7 +102,7 @@ class LabNotebookPanel(context: Context) : LinearLayout(context) {
             toast("An entry needs at least a title.")
             return
         }
-        val entry = LabNotebook.append(context, title, bodyField.text.toString().trim())
+        val entry = LabNotebook.append(title, bodyField.text.toString().trim())
         titleField.setText("")
         bodyField.setText("")
         toast("Recorded as entry ${entry.index}")
@@ -110,7 +110,7 @@ class LabNotebookPanel(context: Context) : LinearLayout(context) {
     }
 
     private fun verify() {
-        integrity.text = when (val result = LabNotebook.verify(context)) {
+        integrity.text = when (val result = LabNotebook.verify()) {
             is LabNotebook.Integrity.Intact -> {
                 integrity.setTextColor(0xFF34C759.toInt())
                 "Chain intact. Every entry follows the one before it and none has changed since it was recorded."
@@ -125,7 +125,7 @@ class LabNotebookPanel(context: Context) : LinearLayout(context) {
 
     private fun refresh() {
         entryList.removeAllViews()
-        val entries = LabNotebook.all(context).reversed()
+        val entries = LabNotebook.all().reversed()
 
         if (entries.isEmpty()) {
             entryList.addView(TextView(context).apply {
@@ -199,7 +199,7 @@ class LabNotebookPanel(context: Context) : LinearLayout(context) {
                 MeshScience.requestWitness(entry.hash, entry.title)
                 toast("Asked ${MeshScience.peerCount()} device(s) to countersign")
                 postDelayed({
-                    LabNotebook.mergeWitnesses(context, entry.hash, MeshScience.witnessesFor(entry.hash))
+                    LabNotebook.mergeWitnesses(entry.hash, MeshScience.witnessesFor(entry.hash))
                     refresh()
                 }, 3_000)
             }

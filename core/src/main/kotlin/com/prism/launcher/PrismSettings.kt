@@ -321,6 +321,22 @@ object PrismSettings {
      */
     fun getSoloNodeCredentials(): String = prefs().getString(KEY_SOLO_NODE_AUTH, "") ?: ""
 
+    /**
+     * An extra directory to look for a node binary in. PHASE 86.
+     *
+     * Desktop only in practice, and empty by default, because PATH is where a node installed by a
+     * package manager or by Bitcoin Core's own installer lands. This is for somebody who built one
+     * themselves: `~/src/bitcoin/src` is not on anybody's PATH and naming it once is better than
+     * asking them to change their environment for Prism.
+     *
+     * Android ignores it entirely -- it cannot execute a downloaded binary at all, which is the gap
+     * `PrismNodeManager` reports rather than papers over.
+     */
+    fun getSoloNodeBinaryDir(): String = prefs().getString(KEY_SOLO_NODE_BIN_DIR, "") ?: ""
+
+    fun setSoloNodeBinaryDir(value: String) =
+        prefs().edit().putString(KEY_SOLO_NODE_BIN_DIR, value.trim()).apply()
+
     fun setSoloNodeCredentials(value: String) =
         prefs().edit().putString(KEY_SOLO_NODE_AUTH, value.trim()).apply()
 
@@ -436,6 +452,16 @@ object PrismSettings {
             .apply()
 
     /**
+     * Forgets a coin's baseline.
+     *
+     * REMOVED RATHER THAN SET TO ZERO, because zero is a real balance and a baseline of zero would make
+     * the next read announce the whole amount as a receipt -- which is exactly what a null baseline
+     * exists to prevent. See WalletReceipts.
+     */
+    fun clearLastSeenBalance(symbol: String) =
+        prefs().edit().remove(KEY_LAST_BALANCE_PREFIX + symbol.uppercase()).apply()
+
+    /**
      * A payout address the user supplied for a coin Prism cannot derive keys for.
      *
      * MONERO IS THE REASON THIS EXISTS. It uses ed25519 and a two-key address, so no BIP-39 phrase
@@ -513,6 +539,30 @@ object PrismSettings {
         prefs().edit().putString(KEY_COMPILED_LIB_PREFIX + symbol.uppercase(), path).apply()
 
     /** 0 means "decide from the core count", which is what the service does by default. */
+    /**
+     * Threads for local model inference. 0 means the detected default.
+     *
+     * A setting rather than a constant because the best value is a property of the machine that cannot be
+     * read from it -- see PrismCpu. On the desktop this was measured at 55 tok/s on 4 threads against
+     * 0.10 tok/s on 12, for the same model on the same machine.
+     */
+    /**
+     * How many characters a trusted-device pairing code has. Six by default.
+     *
+     * A setting because the trade is the user's: every extra character multiplies an attacker's work by
+     * the alphabet size and makes the code harder to read off one screen and type on another. See
+     * PairingCode for why six is adequate for what this protects and where it is not.
+     */
+    fun getPairingCodeLength(): Int = prefs().getInt(KEY_PAIRING_CODE_LENGTH, 6)
+
+    fun setPairingCodeLength(value: Int) =
+        prefs().edit().putInt(KEY_PAIRING_CODE_LENGTH, value.coerceIn(4, 32)).apply()
+
+    fun getInferenceThreads(): Int = prefs().getInt(KEY_INFERENCE_THREADS, 0)
+
+    fun setInferenceThreads(value: Int) =
+        prefs().edit().putInt(KEY_INFERENCE_THREADS, value.coerceIn(0, 64)).apply()
+
     fun getMiningThreads(): Int = prefs().getInt(KEY_MINING_THREADS, 0)
 
     fun setMiningThreads(value: Int) =
@@ -843,7 +893,7 @@ object PrismSettings {
         raw.split(Regex("[,\r\n]+")).map { it.trim() }.filter { it.startsWith("http") }
 
     private fun hostOfUrl(url: String): String? = try {
-        java.net.URL(url).host?.lowercase()?.takeIf { it.isNotBlank() }
+        com.prism.core.Urls.hostOf(url)
     } catch (e: Exception) {
         null
     }
@@ -1307,6 +1357,35 @@ object PrismSettings {
     fun setPrismVpnPassword(value: String) =
         prefs().edit().putString(KEY_PRISM_VPN_PASSWORD, value).apply()
 
+    /**
+     * Addresses Prism has blocked on the network it is sharing (PHASE 66).
+     *
+     * Recorded here rather than read back from the firewall because the two platforms report rules
+     * completely differently, and a list that can only be produced by parsing `netsh` output is a list
+     * that breaks on a localised Windows.
+     */
+    /** Where QEMU is, when it is not somewhere Prism would look. Empty means "search the usual places". */
+    fun getVmQemuPath(): String = prefs().getString(KEY_VM_QEMU_PATH, "") ?: ""
+
+    fun setVmQemuPath(value: String) = prefs().edit().putString(KEY_VM_QEMU_PATH, value).apply()
+
+    /** The disk or ISO the VM page last booted. */
+    fun getVmImagePath(): String = prefs().getString(KEY_VM_IMAGE_PATH, "") ?: ""
+
+    fun setVmImagePath(value: String) = prefs().edit().putString(KEY_VM_IMAGE_PATH, value).apply()
+
+    fun getVmMemoryMb(): Int = prefs().getInt(KEY_VM_MEMORY_MB, 2048)
+
+    fun setVmMemoryMb(value: Int) =
+        prefs().edit().putInt(KEY_VM_MEMORY_MB, value.coerceIn(256, 65536)).apply()
+
+    fun getBlockedMeshDevices(): List<String> =
+        (prefs().getString(KEY_BLOCKED_MESH_DEVICES, "") ?: "")
+            .split(",").map { it.trim() }.filter { it.isNotEmpty() }
+
+    fun setBlockedMeshDevices(value: List<String>) =
+        prefs().edit().putString(KEY_BLOCKED_MESH_DEVICES, value.joinToString(",")).apply()
+
     fun getAppWhitelist(): Set<String> =
         prefs().getStringSet(KEY_APP_WHITELIST, emptySet()) ?: emptySet()
 
@@ -1709,6 +1788,54 @@ object PrismSettings {
     fun setActiveCloudModelId(id: String?) =
         prefs().edit().putString(KEY_ACTIVE_CLOUD_MODEL_ID, id).apply()
 
+    /**
+     * Which image generator the user picked, by [com.prism.launcher.messaging.ImageGenerator.id].
+     *
+     * Stored as the engine's string id rather than an index into the registry: the registry's order
+     * depends on which platform registered what and in which order, so an index would silently
+     * select a different engine on a build that registered one more.
+     */
+    fun getImageEngineId(): String = prefs().getString(KEY_IMAGE_ENGINE, "").orEmpty()
+
+    fun setImageEngineId(value: String) =
+        prefs().edit().putString(KEY_IMAGE_ENGINE, value).apply()
+
+    /** Which vision engine describes an attached image. See [com.prism.launcher.messaging.Vision]. */
+    fun getVisionEngineId(): String = prefs().getString(KEY_VISION_ENGINE, "").orEmpty()
+
+    fun setVisionEngineId(value: String) =
+        prefs().edit().putString(KEY_VISION_ENGINE, value).apply()
+
+    /** Which engine turns speech into text. See [com.prism.launcher.messaging.Dictation]. */
+    fun getDictationEngineId(): String = prefs().getString(KEY_DICTATION_ENGINE, "").orEmpty()
+
+    fun setDictationEngineId(value: String) =
+        prefs().edit().putString(KEY_DICTATION_ENGINE, value).apply()
+
+    /**
+     * Where the local whisper.cpp model lives. Empty until one is downloaded.
+     *
+     * A path rather than a managed download id: the models are ordinary ggml files and a user may
+     * already have one from using whisper.cpp directly, in which case making them re-download it
+     * through Prism would be wasting a gigabyte to own the bookkeeping.
+     */
+    fun getWhisperModelPath(): String = prefs().getString(KEY_WHISPER_MODEL, "").orEmpty()
+
+    fun setWhisperModelPath(value: String) =
+        prefs().edit().putString(KEY_WHISPER_MODEL, value.trim()).apply()
+
+    /**
+     * Whether incoming texts are relayed to this user's other devices over the mesh.
+     *
+     * OFF BY DEFAULT and deliberately a setting rather than a consequence of the mesh being on. Even
+     * encrypted, even only to your own machines, forwarding somebody's texts off the phone is not
+     * something to enable on their behalf. See [com.prism.launcher.messaging.SmsRelay].
+     */
+    fun getSmsRelayEnabled(): Boolean = prefs().getBoolean(KEY_SMS_RELAY, false)
+
+    fun setSmsRelayEnabled(value: Boolean) =
+        prefs().edit().putBoolean(KEY_SMS_RELAY, value).apply()
+
     fun getActiveCloudModel(): CloudModelProfile? {
         val id = getActiveCloudModelId() ?: return null
         return getCloudModels().find { it.id == id }
@@ -1876,6 +2003,77 @@ object PrismSettings {
 
     fun setComputePeers(peers: List<String>) =
         prefs().edit().putString(KEY_COMPUTE_PEERS, peers.joinToString(",")).apply()
+
+    /**
+     * Whether training may leave this device.
+     *
+     * Separate from inference, and separate again from hosting, because they are three different
+     * decisions with three different costs. Inference on a peer is one request. Training on peers
+     * runs for as long as the run lasts and sends the model over the network repeatedly, which is a
+     * bigger thing to agree to and a bigger bill.
+     */
+    fun getDistributedTraining(): Boolean = prefs().getBoolean(KEY_DISTRIBUTED_TRAINING, false)
+
+    fun setDistributedTraining(value: Boolean) =
+        prefs().edit().putBoolean(KEY_DISTRIBUTED_TRAINING, value).apply()
+
+    /**
+     * Whether inference — LLM generation, protein folding — may run on peers.
+     *
+     * DEFAULTS TO TRUE, unlike training, and not for symmetry's sake. Selecting a peer in the compute
+     * market was already the act of consent for LLM generation and already caused offloading before
+     * this switch existed. Defaulting it off would have silently stopped working for everyone who had
+     * set peers up, with a new checkbox they had no reason to look for as the only clue. The switch is
+     * therefore a way to turn existing behaviour off, not a gate that has to be found to turn it on.
+     */
+    fun getDistributedInference(): Boolean = prefs().getBoolean(KEY_DISTRIBUTED_INFERENCE, true)
+
+    fun setDistributedInference(value: Boolean) =
+        prefs().edit().putBoolean(KEY_DISTRIBUTED_INFERENCE, value).apply()
+
+    /**
+     * Use other people's devices now and pay when the wallet has money.
+     *
+     * Checking this is what turns on forced mining, and that is not a side effect — it is the deal.
+     * Somebody's phone does the work, gets hot and loses battery on the promise of being paid, so the
+     * promise has to be backed by something. Mining is the only thing a device can do to generate the
+     * coin to pay with, so while a debt can exist, the miner runs. See `PayLaterPolicy`.
+     */
+    fun getPayLaterEnabled(): Boolean = prefs().getBoolean(KEY_PAY_LATER, false)
+
+    fun setPayLaterEnabled(value: Boolean) =
+        prefs().edit().putBoolean(KEY_PAY_LATER, value).apply()
+
+    // ── Mesh cloud ─────────────────────────────────────────────────────────
+
+    /** Whether the Cloud page may use the mesh for storage, compute and gaming. */
+    fun getCloudEnabled(): Boolean = prefs().getBoolean(KEY_CLOUD_ENABLED, false)
+
+    fun setCloudEnabled(value: Boolean) =
+        prefs().edit().putBoolean(KEY_CLOUD_ENABLED, value).apply()
+
+    /**
+     * How many peers each stored chunk is placed on.
+     *
+     * Three by default for the same reason every distributed store picks a small odd number: one copy
+     * on a phone that leaves the mesh is a lost file, and every extra copy is paid for.
+     */
+    fun getCloudReplicas(): Int = prefs().getInt(KEY_CLOUD_REPLICAS, 3).coerceIn(1, 8)
+
+    fun setCloudReplicas(value: Int) =
+        prefs().edit().putInt(KEY_CLOUD_REPLICAS, value.coerceIn(1, 8)).apply()
+
+    /** Whether this device stores other people's encrypted chunks for payment. */
+    fun getCloudSellStorage(): Boolean = prefs().getBoolean(KEY_CLOUD_SELL_STORAGE, false)
+
+    fun setCloudSellStorage(value: Boolean) =
+        prefs().edit().putBoolean(KEY_CLOUD_SELL_STORAGE, value).apply()
+
+    /** The ceiling, in megabytes, on what this device will store for others. */
+    fun getCloudStorageQuotaMb(): Int = prefs().getInt(KEY_CLOUD_STORAGE_QUOTA, 512)
+
+    fun setCloudStorageQuotaMb(value: Int) =
+        prefs().edit().putInt(KEY_CLOUD_STORAGE_QUOTA, value.coerceIn(0, 1_048_576)).apply()
 
     /** Where the Wine/box64/rootfs archive is fetched from. Empty until the user sets one. */
     fun getWindowsLayerUrl(): String = prefs().getString(KEY_WINDOWS_LAYER_URL, "").orEmpty()
@@ -2090,7 +2288,16 @@ object PrismSettings {
     const val KOKORO_VARIANT_FULL = "model"
 
     fun getKokoroVariant(): String =
-        prefs().getString(KEY_KOKORO_VARIANT, KOKORO_VARIANT_Q8F16) ?: KOKORO_VARIANT_Q8F16
+        // THE DEFAULT IS NOT THE SMALLEST ONE ANY MORE, AND THAT IS A BUG FIX.
+        //
+        // It used to be KOKORO_VARIANT_Q8F16 -- 86 MB, the obvious choice for a phone. That export
+        // is incomplete: it declares a SkipLayerNormalization node whose weight is not in the file,
+        // so the session opens, reports its inputs correctly, and then throws on the first sentence.
+        // Verified on the desktop ONNX Runtime 1.20.0; the same file is what Android downloads.
+        //
+        // model_quantized is 6 MB larger and works. A default that cannot speak is not a smaller
+        // default, it is a broken feature, so the six megabytes are not a trade at all.
+        prefs().getString(KEY_KOKORO_VARIANT, KOKORO_VARIANT_QUANTIZED) ?: KOKORO_VARIANT_QUANTIZED
 
     fun setKokoroVariant(value: String) =
         prefs().edit().putString(KEY_KOKORO_VARIANT, value).apply()
@@ -2307,10 +2514,14 @@ object PrismSettings {
     private const val KEY_WRITER_LEARNED = "writer_learned_words"
     private const val KEY_MINING_DISCOVERY = "mining_discovery_url"
     private const val KEY_MINING_THREADS = "mining_threads"
+    private const val KEY_INFERENCE_THREADS = "inference_threads"
+    private const val KEY_PAIRING_CODE_LENGTH = "pairing_code_length"
     private const val KEY_USE_CAKECHAT = "use_cakechat"
     private const val KEY_MINING_MODE = "mining_mode"
     private const val KEY_SOLO_NODE_URL = "mining_solo_node_url"
     private const val KEY_SOLO_NODE_AUTH = "mining_solo_node_auth"
+
+    private const val KEY_SOLO_NODE_BIN_DIR = "solo_node_binary_dir"
     private const val KEY_SELF_HOST_NODE = "mining_self_host_node"
     private const val KEY_MINED_SHARES = "mining_shares_by_coin"
     private const val KEY_EXPERIMENTAL_COMPILER = "mining_experimental_compiler"
@@ -2416,6 +2627,10 @@ object PrismSettings {
     private const val KEY_PRISM_VPN_USERNAME = "prism_vpn_username"
     private const val KEY_PRISM_VPN_PASSWORD  = "prism_vpn_password"
     private const val KEY_APP_WHITELIST       = "app_whitelist"
+    private const val KEY_BLOCKED_MESH_DEVICES = "blocked_mesh_devices"
+    private const val KEY_VM_QEMU_PATH = "vm_qemu_path"
+    private const val KEY_VM_IMAGE_PATH = "vm_image_path"
+    private const val KEY_VM_MEMORY_MB = "vm_memory_mb"
     private const val KEY_VPN_PROTOCOL_MODE   = "vpn_protocol_mode"
     private const val KEY_PRISM_SERVER_LIST   = "prism_server_list"
     private const val KEY_VPN_SERVER_ALWAYS_ON = "vpn_server_always_on"
@@ -2423,6 +2638,7 @@ object PrismSettings {
     private const val KEY_WG_SERVER_PRIVATE_KEY = "wg_server_private_key"
     private const val KEY_WG_SERVER_PUBLIC_KEY = "wg_server_public_key"
     private const val KEY_WG_SERVER_PORT         = "wg_server_port"
+    private const val KEY_WG_PEERS           = "wg_peers"
     private const val KEY_WG_ALLOWED_IPS        = "wg_allowed_ips"
     private const val KEY_MESH_BOOTSTRAP_ADDRESS = "mesh_bootstrap_address"
     private const val KEY_MESH_BOOTSTRAP_PORT    = "mesh_bootstrap_port"
@@ -2445,6 +2661,18 @@ object PrismSettings {
     private const val KEY_COMPUTE_AUTO           = "compute_auto"
     private const val KEY_COMPUTE_SORT           = "compute_sort"
     private const val KEY_COMPUTE_PEERS          = "compute_peers"
+    private const val KEY_DISTRIBUTED_TRAINING   = "distributed_training"
+    private const val KEY_DISTRIBUTED_INFERENCE  = "distributed_inference"
+    private const val KEY_PAY_LATER              = "compute_pay_later"
+    private const val KEY_IMAGE_ENGINE           = "image_engine_id"
+    private const val KEY_VISION_ENGINE          = "vision_engine_id"
+    private const val KEY_DICTATION_ENGINE       = "dictation_engine_id"
+    private const val KEY_WHISPER_MODEL          = "whisper_model_path"
+    private const val KEY_SMS_RELAY              = "sms_relay_enabled"
+    private const val KEY_CLOUD_ENABLED          = "cloud_enabled"
+    private const val KEY_CLOUD_REPLICAS         = "cloud_replicas"
+    private const val KEY_CLOUD_SELL_STORAGE     = "cloud_sell_storage"
+    private const val KEY_CLOUD_STORAGE_QUOTA    = "cloud_storage_quota_mb"
     private const val KEY_WINDOWS_MODE           = "windows_mode"
     private const val KEY_WINDOWS_LAYER_URL      = "windows_layer_url"
     private const val KEY_NETWORK_STORAGES       = "network_storages"
@@ -2506,6 +2734,23 @@ object PrismSettings {
         getWgServerPrivateKey() // Ensure generated
         return prefs().getString(KEY_WG_SERVER_PUBLIC_KEY, "") ?: ""
     }
+
+    /**
+     * WireGuard peers this device accepts, one record per entry: name, public key, address.
+     *
+     * TAB-SEPARATED RATHER THAN JSON. A WireGuard key is base64 -- letters, digits, plus, slash and
+     * equals -- and an address is digits and dots, so neither field can contain a tab. Three fields that
+     * somebody can read and repair in a text editor beat a parser here, and the alternative of a nested
+     * structure in a preference store means a JSON blob nobody can edit by hand when a key goes wrong.
+     *
+     * PUBLIC KEYS ONLY. A peer's private key is generated when it is invited, written into the file
+     * handed to that device, and never stored here -- see WireGuardInterface.invite.
+     */
+    fun getWgPeers(): List<String> =
+        (prefs().getStringSet(KEY_WG_PEERS, emptySet()) ?: emptySet()).toList().sorted()
+
+    fun setWgPeers(value: List<String>) =
+        prefs().edit().putStringSet(KEY_WG_PEERS, value.toSet()).apply()
 
     fun getWgServerPort(): Int =
         prefs().getInt(KEY_WG_SERVER_PORT, 51820)

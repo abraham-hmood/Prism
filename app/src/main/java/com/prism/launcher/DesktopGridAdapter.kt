@@ -106,7 +106,7 @@ class DesktopGridAdapter(
                 // A widget's own view is drawn by DesktopWidgetLayer, on top of the grid, because it
                 // spans several cells and a RecyclerView cell cannot. The cell underneath it stays
                 // blank and takes no clicks -- the widget above receives them.
-                is DesktopItem.Widget, is DesktopItem.Occupied -> {
+                is DesktopItem.Widget, is DesktopItem.PluginWidget, is DesktopItem.Occupied -> {
                     holder.binding.icon.isVisible = false
                     holder.binding.label.isVisible = false
                     holder.itemView.setOnClickListener(null)

@@ -126,8 +126,7 @@ class StremioRepositoriesActivity : PrismBaseActivity() {
             .setView(box)
             .setNegativeButton("Cancel", null)
             .setPositiveButton("Add") { _, _ ->
-                val error = StremioStore.addRepository(
-                    this, urlField.text.toString(), nameField.text.toString()
+                val error = StremioStore.addRepository(urlField.text.toString(), nameField.text.toString()
                 )
                 if (error != null) toast(error) else refresh()
             }
@@ -136,7 +135,7 @@ class StremioRepositoriesActivity : PrismBaseActivity() {
 
     private fun refresh() {
         list.removeAllViews()
-        val repositories = StremioStore.repositories(this)
+        val repositories = StremioStore.repositories()
 
         if (repositories.isEmpty()) {
             list.addView(TextView(this).apply {
@@ -175,7 +174,7 @@ class StremioRepositoriesActivity : PrismBaseActivity() {
                     .setMessage("Add-ons you already installed from it stay installed.")
                     .setNegativeButton("Cancel", null)
                     .setPositiveButton("Remove") { _, _ ->
-                        StremioStore.removeRepository(this, repository.url)
+                        StremioStore.removeRepository(repository.url)
                         refresh()
                     }
                     .show()

@@ -109,7 +109,7 @@ class ModelUploadActivity : PrismBaseActivity() {
             IosUi.sectionFooter(
                 this,
                 "Listings are checked against GitHub and Hugging Face every " +
-                    "${ModelListingScanner.intervalHours(this)} hours. A model found there is taken " +
+                    "${ModelListingScanner.intervalHours()} hours. A model found there is taken " +
                     "down, and because buyers' coins are held rather than sent, they simply keep them."
             )
         )
@@ -122,7 +122,7 @@ class ModelUploadActivity : PrismBaseActivity() {
     }
 
     private fun renderExisting(root: LinearLayout) {
-        val mine = ModelListingStore.all(this)
+        val mine = ModelListingStore.all()
         if (mine.isEmpty()) return
         root.addView(IosUi.sectionHeader(this, "YOU ARE SELLING"))
         val card = IosUi.card(this)
@@ -134,7 +134,7 @@ class ModelUploadActivity : PrismBaseActivity() {
                 val pad = IosUi.dp(this@ModelUploadActivity, 12f)
                 setPadding(pad, pad, pad, pad)
                 setOnClickListener {
-                    ModelListingStore.remove(this@ModelUploadActivity, listed.id)
+                    ModelListingStore.remove(listed.id)
                     Toast.makeText(
                         this@ModelUploadActivity,
                         "Withdrew ${listed.name}.",
@@ -184,7 +184,7 @@ class ModelUploadActivity : PrismBaseActivity() {
         status.text = "Copying $name into Prism's model store…"
 
         Thread({
-            val destination = P2pModelTransfer.destinationFor(applicationContext, name)
+            val destination = P2pModelTransfer.destinationFor(name)
             val copied = runCatching {
                 contentResolver.openInputStream(source)?.use { input ->
                     destination.outputStream().use { output -> input.copyTo(output, 1 shl 16) }
@@ -197,9 +197,7 @@ class ModelUploadActivity : PrismBaseActivity() {
                     status.text = "Could not read that file."
                     return@runOnUiThread
                 }
-                ModelListingStore.add(
-                    applicationContext,
-                    ModelListingStore.Listed(
+                ModelListingStore.add(ModelListingStore.Listed(
                         id = "${name}-${System.currentTimeMillis()}",
                         name = name,
                         kind = kindField.text.toString().trim().ifEmpty { "text" }.lowercase(),

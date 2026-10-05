@@ -1,3 +1,14 @@
+/*
+ * MediaPipe deprecated LlmInference, LlmInferenceSession and ProgressListener as a set, in favour of
+ * an on-device API that is not published for Android in the version Prism depends on. There is no
+ * replacement to migrate to: the classes still work, still ship in the AAR, and are how this library
+ * does local inference. Suppressed at file level with that written down rather than fifteen times.
+ *
+ * WHEN THIS CHANGES, it will not be by editing these lines -- it will be by choosing a different
+ * inference route entirely, which Prism already has in the GGUF bridge.
+ */
+@file:Suppress("DEPRECATION")
+
 package com.prism.launcher.messaging
 
 import android.app.ActivityManager

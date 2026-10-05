@@ -147,7 +147,7 @@ class ComputeMarketView(context: Context) : LinearLayout(context) {
         hostRow.setOnClickListener {
             val next = !PrismSettings.getComputeHostEnabled()
             PrismSettings.setComputeHostEnabled(next)
-            if (next) MeshComputeRegistry.announce(context) else MeshComputeRegistry.withdraw()
+            if (next) MeshComputeRegistry.announce() else MeshComputeRegistry.withdraw()
             refresh()
         }
         addView(hostRow, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply {
@@ -361,7 +361,7 @@ class ComputeMarketView(context: Context) : LinearLayout(context) {
     // ── The footer ─────────────────────────────────────────────────────────
 
     private fun renderSummary(chosen: Set<String>) {
-        val owed = ComputeDebtLedger.totalOwed(context)
+        val owed = ComputeDebtLedger.totalOwed()
         val lines = mutableListOf<String>()
 
         lines += when {

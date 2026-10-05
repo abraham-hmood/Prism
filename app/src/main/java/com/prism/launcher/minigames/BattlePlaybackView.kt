@@ -250,6 +250,7 @@ class BattlePlaybackView(
                 orders = snapshot,
                 seed = ticket.seed,
                 attackerSupportIds = ticket.attackerSupportIds,
+                attackerMilitaryBonus = ticket.attackerMilitaryBonus,
             )
             handler.post {
                 simulating = false

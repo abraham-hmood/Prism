@@ -29,8 +29,10 @@ import com.prism.launcher.LauncherActivity
 import com.prism.launcher.DesktopShortcutStore
 import com.prism.launcher.DesktopItem
 import com.prism.launcher.PrismSettings
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -57,6 +59,21 @@ sealed class FileEntry {
 }
 
 class FileExplorerPageView(context: Context) : FrameLayout(context) {
+
+    /**
+     * Work that belongs to this view while it is on screen.
+     *
+     * A VIEW HAS NO lifecycleScope, which is why this was GlobalScope. The listing is read off the main
+     * thread and applied back on it, so a coroutine still running after the view is gone would touch a
+     * detached hierarchy. Cancelled in onDetachedFromWindow, which is the view's equivalent of the
+     * Activity being destroyed.
+     */
+    private val viewScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+
+    override fun onDetachedFromWindow() {
+        super.onDetachedFromWindow()
+        viewScope.coroutineContext.cancelChildren()
+    }
 
     private var currentPath: ExplorerPath = ExplorerPath.Root
     private val adapter: FileExplorerAdapter
@@ -335,7 +352,7 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
                 // which is a real block for large directories (Downloads, DCIM, ...). Listed
                 // off-thread and applied back on Main, guarded against a stale result landing
                 // after the user has already navigated elsewhere while this was still running.
-                GlobalScope.launch(Dispatchers.Main) {
+                viewScope.launch {
                     val sorted = withContext(Dispatchers.IO) {
                         val files = dir.listFiles()?.toList() ?: emptyList()
                         files.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))

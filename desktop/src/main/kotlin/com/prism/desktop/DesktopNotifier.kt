@@ -46,6 +46,11 @@ class DesktopNotifier : Notifier {
     }
 
     override fun notify(channel: String, id: Int, title: String, body: String) {
+        // KEPT BEFORE IT IS SHOWN, and before the tray check, so the history is the same whether or not
+        // this machine has somewhere to draw a balloon. See NotificationCapture: on Windows and macOS
+        // Prism's own notifications are the only ones that can be captured at all.
+        NotificationCapture.recordOwn(channel, title, body)
+
         val icon = trayIcon
         if (icon == null) {
             // Still record it. A notification that cannot be shown is not a notification that

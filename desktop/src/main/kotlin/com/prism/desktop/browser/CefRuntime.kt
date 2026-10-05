@@ -106,7 +106,12 @@ object CefRuntime {
      * either -- which is stricter than Android's WebView incognito and is the correct reading of
      * what a private tab promises.
      */
-    fun newClient(): CefClient? = app.get()?.createClient()
+    fun newClient(): CefClient? = app.get()?.createClient()?.also { client ->
+        // PHASE 79's downloads. JCEF has a download handler, so the queue is Chromium's own rather
+        // than a second HTTP fetcher -- which would have to re-derive cookies, redirects and auth
+        // that the browser already negotiated for the page the link was on.
+        client.addDownloadHandler(DesktopDownloads)
+    }
 
     fun dispose() {
         app.getAndSet(null)?.dispose()

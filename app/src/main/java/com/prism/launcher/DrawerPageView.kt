@@ -19,13 +19,55 @@ import com.prism.launcher.notifications.NotificationHistory
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collectLatest
 
+/**
+ * The class name a trusted device's app carries in place of a real activity.
+ *
+ * It has to be something no real component could be, because the drawer stores a ComponentName and the
+ * tap handler decides from it whether Android can start the app or whether Prism has to fetch it first.
+ */
+private const val TRUSTED_APP_CLASS = "com.prism.launcher.trusted.OfferedApp"
+
 class DrawerPageView(
     context: Context,
     private val onLaunch: (ComponentName) -> Unit,
     private val allowDragToDesktop: () -> Boolean,
 ) : FrameLayout(context) {
 
-    private val adapter = DrawerAppsAdapter({ onLaunch(it) }, { allowDragToDesktop() })
+    private val adapter = DrawerAppsAdapter({ component -> launch(component) }, { allowDragToDesktop() })
+
+    /**
+     * Opens an app, whichever device it lives on.
+     *
+     * A trusted device's app is not installed here, so there is no activity to start: it has to be
+     * downloaded first and then virtualized. Intercepted at this one point rather than by teaching the
+     * rest of the launcher about a second kind of app, because from the drawer's point of view it IS an
+     * app -- it has a name, an icon and a tap.
+     */
+    private fun launch(component: android.content.ComponentName) {
+        if (component.className != TRUSTED_APP_CLASS) {
+            onLaunch(component)
+            return
+        }
+        val app = com.prism.launcher.trusted.TrustedApps.all()
+            .firstOrNull { it.pkg == component.packageName } ?: return
+        val lifecycleOwner = context as? LifecycleOwner ?: return
+
+        android.widget.Toast.makeText(
+            context,
+            "Getting " + app.label + " from " + app.deviceName + "…",
+            android.widget.Toast.LENGTH_SHORT,
+        ).show()
+
+        lifecycleOwner.lifecycleScope.launch {
+            // Hundreds of megabytes over the mesh, so off the main thread and with the result reported
+            // rather than assumed -- a download that failed and one that finished look identical from
+            // the drawer otherwise.
+            val result = withContext(Dispatchers.IO) {
+                com.prism.launcher.trusted.TrustedApps.open(app)
+            }
+            android.widget.Toast.makeText(context, result, android.widget.Toast.LENGTH_LONG).show()
+        }
+    }
     private var allApps: List<DrawerAppEntry> = emptyList()
     private var filterJob: Job? = null
     private var observeJob: Job? = null
@@ -216,12 +258,41 @@ class DrawerPageView(
         // shows up immediately, without needing to force-stop and relaunch the whole app.
         observeJob = lifecycleOwner.lifecycleScope.launch {
             AppDatabase.get().installedAppDao().observeAll().collectLatest { entities ->
-                allApps = withContext(Dispatchers.IO) { resolveDrawerEntries(entities) }
+                allApps = withContext(Dispatchers.IO) {
+                    resolveDrawerEntries(entities) + trustedEntries()
+                }
                 val grouped = groupDrawerApps(allApps)
                 adapter.submitList(grouped)
             }
         }
     }
+
+    /**
+     * Apps offered by trusted devices, as drawer entries.
+     *
+     * The component name is synthetic -- there is no such activity on this phone -- and
+     * [TRUSTED_APP_CLASS] is what marks it so a tap is routed to the download instead of to Android.
+     * Blocking: it reads icons from disk and may fetch ones that have not arrived yet, which is why the
+     * caller has it on the IO dispatcher.
+     */
+    private fun trustedEntries(): List<DrawerAppEntry> =
+        runCatching {
+            com.prism.launcher.trusted.TrustedApps.all().map { app ->
+                val icon = com.prism.launcher.trusted.TrustedApps.ensureIcon(app)?.let { file ->
+                    runCatching {
+                        android.graphics.drawable.BitmapDrawable(
+                            resources,
+                            android.graphics.BitmapFactory.decodeFile(file.absolutePath),
+                        )
+                    }.getOrNull()
+                }
+                DrawerAppEntry(
+                    component = android.content.ComponentName(app.pkg, TRUSTED_APP_CLASS),
+                    label = app.label,
+                    icon = icon,
+                )
+            }
+        }.getOrDefault(emptyList())
 
     override fun onDetachedFromWindow() {
         observeJob?.cancel()

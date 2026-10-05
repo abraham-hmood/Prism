@@ -169,6 +169,43 @@
             android:exported="false"
             android:theme="@style/Theme.PrismSettings" />
 
+        <!--
+            Relays an incoming text to this user's other devices (PHASE 39). Not exported to other apps
+            but it must be enabled for the system to deliver SMS_RECEIVED to it. The receiver itself
+            returns immediately unless the relay setting is on, so an install that never turns it on does
+            no work per message.
+        -->
+        <receiver
+            android:name=".messaging.SmsRelayReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.BROADCAST_SMS">
+            <intent-filter android:priority="500">
+                <action android:name="android.provider.Telephony.SMS_RECEIVED" />
+            </intent-filter>
+        </receiver>
+
+        <activity
+            android:name=".science.ProteinImportActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
+
+        <activity
+            android:name=".trusted.TrustedDevicesActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
+
+        <activity
+            android:name=".cloud.CloudFileActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
+
         <activity
             android:name=".DiagnosticsActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"

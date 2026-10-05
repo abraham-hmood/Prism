@@ -249,11 +249,11 @@ class WalletPageView(context: Context) : FrameLayout(context) {
         // Announcing here rather than at app start is the opt-in working as intended: a device that
         // has never opened this tab has never told the mesh anything about itself.
         if (com.prism.launcher.PrismSettings.getComputeHostEnabled()) {
-            com.prism.launcher.mesh.MeshComputeRegistry.announce(context)
-            com.prism.launcher.mesh.MeshInference.startHosting(context)
+            com.prism.launcher.mesh.MeshComputeRegistry.announce()
+            com.prism.launcher.mesh.MeshInference.startHosting()
         }
         // A good moment to clear anything owed: the balance may have moved since the last job.
-        Thread({ com.prism.launcher.mesh.ComputeDebtLedger.settleAll(context) }, "compute-settle").start()
+        Thread({ com.prism.launcher.mesh.ComputeDebtLedger.settleAll() }, "compute-settle").start()
     }
 
     // ── Setup ──────────────────────────────────────────────────────────────

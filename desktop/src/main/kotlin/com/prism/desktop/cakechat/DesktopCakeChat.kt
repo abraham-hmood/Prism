@@ -311,7 +311,7 @@ object DesktopCakeChat {
 
         onLine("No supported Python found. Downloading CPython $PYTHON_VERSION (about 50 MB)...")
         val downloaded = runCatching {
-            java.net.URL(url).openStream().use { input ->
+            com.prism.core.Urls.of(url).openStream().use { input ->
                 archive.outputStream().use { output -> input.copyTo(output, 1 shl 16) }
             }
         }
@@ -593,7 +593,7 @@ object DesktopCakeChat {
 
     private fun downloadRepo(onLine: (String) -> Unit): Boolean = runCatching {
         val zip = File(home(), "cakechat-master.zip")
-        java.net.URL(ARCHIVE_URL).openStream().use { input ->
+        com.prism.core.Urls.of(ARCHIVE_URL).openStream().use { input ->
             zip.outputStream().use { output -> input.copyTo(output, 64 * 1024) }
         }
         val target = repoDir()

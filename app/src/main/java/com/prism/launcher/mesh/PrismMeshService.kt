@@ -167,7 +167,7 @@ object PrismMeshService {
                     now - lastComputeAnnounce > COMPUTE_ANNOUNCE_INTERVAL_MS
                 ) {
                     lastComputeAnnounce = now
-                    runCatching { MeshComputeRegistry.announce(com.prism.launcher.PrismApp.instance) }
+                    runCatching { MeshComputeRegistry.announce() }
                 }
 
                 delay(if (activePeers.isEmpty()) 5000 else 15000)
@@ -194,7 +194,10 @@ object PrismMeshService {
     private fun sendDiscoveryBroadcast(port: Int) {
         val broadcasts = MeshUtils.getBroadcastAddresses()
         broadcasts.forEach { addr ->
-            sendPacket(addr.hostAddress, port, 0x0A.toByte(), "{\"port\":$port}")
+            // getHostAddress is nullable: an address with no literal form has none, and passing that
+            // through would have broadcast to the string "null".
+            val host = addr.hostAddress ?: return@forEach
+            sendPacket(host, port, 0x0A.toByte(), "{\"port\":$port}")
         }
     }
 
@@ -269,25 +272,22 @@ object PrismMeshService {
 
             // A buyer handing a model back. Off-thread: it scans the chain and signs.
             com.prism.launcher.ModelRefunds.OPCODE_REFUND_REQUEST -> {
-                val ctx = com.prism.launcher.PrismApp.instance
                 Thread({
-                    com.prism.launcher.ModelRefunds.onRefundRequest(ctx, payload)
+                    com.prism.launcher.ModelRefunds.onRefundRequest(payload)
                 }, "model-refund-request").start()
             }
 
             // The seller's verdict coming back. Off-thread: the buyer re-runs its own lookups
             // before paying, which is two blocking HTTP calls.
             com.prism.launcher.ModelListingScanner.OPCODE_SALE_APPROVED -> {
-                val ctx = com.prism.launcher.PrismApp.instance
                 Thread({
-                    com.prism.launcher.ModelListingScanner.onSaleApproved(ctx, payload)
+                    com.prism.launcher.ModelListingScanner.onSaleApproved(payload)
                 }, "model-sale-approved").start()
             }
 
             com.prism.launcher.ModelListingScanner.OPCODE_VERIFY_NOW -> {
-                val ctx = com.prism.launcher.PrismApp.instance
                 Thread({
-                    com.prism.launcher.ModelListingScanner.onVerifyRequest(ctx, payload, peerIp)
+                    com.prism.launcher.ModelListingScanner.onVerifyRequest(payload, peerIp)
                 }, "model-verify-request").start()
             }
             // The compute market. Capability gossip is cheap and frequent; the RPC handshake is
@@ -299,12 +299,67 @@ object PrismMeshService {
             // dispatch thread like every other opcode that does real work here.
             MeshComputeRegistry.OPCODE_RPC_REQUEST -> {
                 val ctx = com.prism.launcher.PrismApp.instance
-                Thread({ MeshInference.onRpcRequest(ctx, peerIp) }, "compute-rpc-request").start()
+                Thread({ MeshInference.onRpcRequest(peerIp) }, "compute-rpc-request").start()
             }
 
             MeshComputeRegistry.OPCODE_RPC_READY -> MeshComputeRegistry.ingestRpcReady(peerIp, payload)
 
             MeshComputeRegistry.OPCODE_DEBT_ANNOUNCE -> ComputeDebtLedger.ingestDebtAnnouncement(payload)
+
+            // Relayed texts (PHASE 39). A phone SENDS these; another phone receiving one stores it too,
+            // because a user with two handsets wants the relay both ways. Off the dispatch thread: it
+            // decrypts and writes a file, and this thread is the one every other peer's packets queue
+            // behind.
+            // Trusted devices (the mutual-consent pairing). Off the dispatch thread: onOffer and
+            // onShare decrypt and write a file, and this thread is the one every other peer's packets
+            // queue behind.
+            //
+            // THE TRANSPORT ABOVE IS DELIBERATELY UNCHANGED. PHASE 48 put a portable copy of it in
+            // :core (MeshCore) so a desktop can be a peer, and the temptation was to make this file
+            // delegate to it. It does not, because the wire protocol is the contract -- two
+            // implementations that both speak "PRISM" + opcode + payload on UDP 8081 interoperate
+            // whether or not they share code -- and refactoring the component every mesh feature depends
+            // on, without a device to test it against, would risk the working side to tidy the new one.
+            com.prism.launcher.trusted.TrustedDevices.OPCODE_TRUST_OFFER -> {
+                Thread({
+                    com.prism.launcher.trusted.TrustedDevices.onOffer(peerIp, payload)
+                }, "trust-offer").start()
+            }
+
+            com.prism.launcher.trusted.TrustedDevices.OPCODE_TRUST_REPLY -> {
+                Thread({
+                    com.prism.launcher.trusted.TrustedDevices.onReply(peerIp, payload)
+                }, "trust-reply").start()
+            }
+
+            com.prism.launcher.trusted.TrustedDevices.OPCODE_SHARE -> {
+                Thread({
+                    com.prism.launcher.trusted.TrustedDevices.onShare(peerIp, payload)
+                }, "trust-share").start()
+            }
+
+            // The wallet handoff, which is its own opcode because it is sealed with the pairing-code
+            // key rather than a wallet-derived one -- see TrustedDevices.OPCODE_TRUST_WALLET.
+            com.prism.launcher.trusted.TrustedDevices.OPCODE_TRUST_WALLET -> {
+                Thread({
+                    com.prism.launcher.trusted.TrustedDevices.onWallet(peerIp, payload)
+                }, "trust-wallet").start()
+            }
+
+            com.prism.launcher.messaging.SmsRelay.OPCODE_SMS -> {
+                val ctx = com.prism.launcher.PrismApp.instance
+                Thread({
+                    val sealed = com.prism.launcher.messaging.SmsRelay.fromPayloadString(payload)
+                    if (sealed != null) {
+                        val messages = com.prism.launcher.messaging.SmsRelay.open(sealed)
+                        if (messages != null) {
+                            com.prism.launcher.messaging.SmsRelay.store(
+                                java.io.File(ctx.filesDir, "relay"), messages,
+                            )
+                        }
+                    }
+                }, "sms-relay-ingest").start()
+            }
 
             // The Science page. Cosmic-ray hits are high-rate and must not block the
             // dispatch thread; the rest are rare enough to handle inline.
@@ -363,15 +418,25 @@ object PrismMeshService {
             com.prism.launcher.aether.AetherMeshSync.OPCODE_AETHER_ANNOUNCE -> handleAetherAnnounce(payload, peerIp)
             com.prism.launcher.social.NebulaMeshSync.OPCODE_NEBULA_ANNOUNCE -> handleNebulaAnnounce(payload, peerIp)
 
+            // Nebula posts and Lyke videos, both directions. The same three functions the desktop
+            // registers with MeshCore -- this build dispatches them itself, because two sockets on
+            // UDP 8081 in one process fight over the port.
+            com.prism.launcher.social.SocialMeshSync.OPCODE_ANNOUNCE ->
+                com.prism.launcher.social.SocialMeshSync.onAnnounce(peerIp, payload)
+
+            com.prism.launcher.social.SocialMeshSync.OPCODE_REQUEST ->
+                com.prism.launcher.social.SocialMeshSync.onRequest(peerIp, payload)
+
+            com.prism.launcher.social.SocialMeshSync.OPCODE_DELIVER ->
+                com.prism.launcher.social.SocialMeshSync.onDeliver(peerIp, payload)
+
             // PrismCoin blocks and transactions. The node itself decides whether this device
             // participates -- having the Wallet page on a desktop slot is the opt-in -- so a peer
             // that has not opted in simply drops these rather than relaying them.
             com.prism.launcher.wallet.psc.PrismCoinNode.OPCODE_BLOCK,
             com.prism.launcher.wallet.psc.PrismCoinNode.OPCODE_TX,
             com.prism.launcher.wallet.psc.PrismCoinNode.OPCODE_HEAD ->
-                com.prism.launcher.wallet.psc.PrismCoinNode.onMeshMessage(
-                    com.prism.launcher.PrismApp.instance, command, payload
-                )
+                com.prism.launcher.wallet.psc.PrismCoinNode.onMeshMessage(command, payload)
         }
     }
 

@@ -19,7 +19,7 @@ class SpatialFrame(val c: Int, val h: Int, val w: Int) {
     val plane = h * w
     val data = FloatArray(c * plane)
 
-    inline fun indexOf(ci: Int, y: Int, x: Int): Int = ci * plane + y * w + x
+    fun indexOf(ci: Int, y: Int, x: Int): Int = ci * plane + y * w + x
 
     operator fun get(ci: Int, y: Int, x: Int): Float = data[indexOf(ci, y, x)]
     operator fun set(ci: Int, y: Int, x: Int, v: Float) { data[indexOf(ci, y, x)] = v }

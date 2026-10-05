@@ -360,7 +360,59 @@ class ConversationActivity : AppCompatActivity() {
                 SAM_THREAD_ID -> loadAiMessages()
                 com.prism.launcher.nora.NoraChat.THREAD_ID -> loadNoraMessages()
                 com.prism.launcher.aether.AetherChat.THREAD_ID -> loadAetherMessages()
+                MessagingPageView.RELAYED_THREAD_ID -> loadRelayedMessages()
                 else -> loadSmsMessages()
+            }
+        }
+    }
+
+    /**
+     * A conversation that belongs to another device.
+     *
+     * Read from the relayed inbox rather than from this phone's SMS provider, because these texts were
+     * never on this phone's radio -- they arrived over the meshnet from a device the user trusts.
+     */
+    private suspend fun loadRelayedMessages() {
+        val relayed = com.prism.launcher.messaging.SmsRelay.threads(
+            com.prism.launcher.trusted.TrustedMessages.inboxRoot()
+        )[address].orEmpty()
+
+        val loaded = relayed.sortedBy { it.receivedAt }.map {
+            MessageInfo(it.body, isSent = it.outgoing, timestamp = it.receivedAt)
+        }
+        withContext(Dispatchers.Main) {
+            dbMessages = loaded
+            renderMessages()
+        }
+    }
+
+    /**
+     * Sends into a relayed conversation, through the device that owns it.
+     *
+     * This phone may not be the one with that line -- the conversation could have come from a second
+     * phone, or from a tablet with its own SIM. So the reply goes back to whichever device relayed it
+     * and that device puts it on its radio, which is the same path the desktop uses.
+     */
+    private fun sendRelayed(text: String) {
+        lifecycleScope.launch(Dispatchers.IO) {
+            val owner = com.prism.launcher.messaging.SmsRelay.threads(
+                com.prism.launcher.trusted.TrustedMessages.inboxRoot()
+            )[address].orEmpty().maxByOrNull { it.receivedAt }?.fromDevice.orEmpty()
+
+            val sent = if (owner.isBlank()) {
+                false
+            } else {
+                com.prism.launcher.trusted.TrustedMessages.sendThrough(owner, address, text)
+            }
+            loadRelayedMessages()
+            if (!sent) {
+                withContext(Dispatchers.Main) {
+                    android.widget.Toast.makeText(
+                        this@ConversationActivity,
+                        "Saved here, but the device that owns this conversation could not be reached.",
+                        android.widget.Toast.LENGTH_LONG,
+                    ).show()
+                }
             }
         }
     }
@@ -482,6 +534,7 @@ class ConversationActivity : AppCompatActivity() {
             SAM_THREAD_ID -> sendToSam(text, uri, type)
             com.prism.launcher.nora.NoraChat.THREAD_ID -> sendToNora(text)
             com.prism.launcher.aether.AetherChat.THREAD_ID -> sendToAether(text)
+            MessagingPageView.RELAYED_THREAD_ID -> sendRelayed(text)
             else -> sendSms(text, uri)
         }
     }

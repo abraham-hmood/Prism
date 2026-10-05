@@ -499,7 +499,7 @@ object AgenticBuiltinTools {
         if (url.isBlank()) return "Error: url is required."
         var conn: HttpURLConnection? = null
         return try {
-            conn = (URL(url).openConnection() as HttpURLConnection).apply {
+            conn = (com.prism.core.Urls.of(url).openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
                 connectTimeout = 15000
                 readTimeout = 15000

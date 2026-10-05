@@ -49,65 +49,86 @@ object WalletReceiveNotifier {
      *
      * @param note a message that came with the payment, where the chain supports one.
      */
+    /**
+     * Compares a coin's balance against the last one seen and notifies on an increase.
+     *
+     * THE RULES MOVED TO `WalletReceipts` IN :core (PHASE 88) so the desktop has them too -- the baseline
+     * comparison and the "a first sighting is not a receipt" rule were never Android-specific. This
+     * forwards; what stays here is the PRESENTATION, installed by [installPresenter], because Android can
+     * do things a tray balloon cannot.
+     */
     fun onBalanceObserved(
         context: Context,
         coin: CoinSpec,
         balance: BigInteger,
         note: String = "",
     ) {
-        val previous = PrismSettings.getLastSeenBalance(coin.symbol)
-        PrismSettings.setLastSeenBalance(coin.symbol, balance)
+        installPresenter(context)
+        com.prism.launcher.wallet.WalletReceipts.onBalanceObserved(coin, balance, note)
+    }
 
-        // A first sighting is not a receipt. Without this, adding a coin that already holds funds
-        // -- or reinstalling -- would announce the entire balance as though it had just arrived.
-        if (previous == null) return
-        if (balance <= previous) return
+    /**
+     * Points the shared receipt logic at an Android notification.
+     *
+     * WHAT WOULD HAVE BEEN LOST WITHOUT THIS: the tap target and the big-text style. `PrismPlatform.notifier`
+     * shows a title and a body, which is everything a desktop tray has; a payment notification on a phone
+     * that cannot be tapped to open the wallet, and that truncates a payment reference to one line, would
+     * be a real regression from moving the logic to :core. So the logic is shared and this is not.
+     *
+     * Idempotent, and installed from every entry point rather than once at startup: the node can announce a
+     * receipt before anything has touched the wallet UI.
+     */
+    fun installPresenter(context: Context) {
+        val app = context.applicationContext
+        com.prism.launcher.wallet.WalletReceipts.presenter = { coin, amountText, note ->
+            ensureChannel(app)
 
-        notifyReceived(context, coin, balance.subtract(previous), note)
+            val tap = PendingIntent.getActivity(
+                app, 0,
+                Intent(app, com.prism.launcher.LauncherActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+
+            val long = if (note.isBlank()) {
+                "$amountText arrived in your ${coin.name} wallet."
+            } else {
+                "$note\n\n$amountText arrived in your ${coin.name} wallet."
+            }
+
+            val notification = NotificationCompat.Builder(app, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                .setContentTitle("Received $amountText")
+                .setContentText(note.ifBlank { coin.name })
+                .setContentIntent(tap)
+                // The note can be longer than one line, and a payment reference truncated to
+                // "rent, M..." is worse than useless.
+                .setStyle(NotificationCompat.BigTextStyle().bigText(long))
+                .setAutoCancel(true)
+                .build()
+
+            runCatching {
+                (app.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+                    .notify(com.prism.launcher.wallet.WalletReceipts.idFor(coin.symbol), notification)
+            }.onFailure {
+                PrismLogger.logError(TAG, "Receipt notification suppressed for ${coin.symbol}", it)
+            }
+        }
     }
 
     /**
      * Announces a specific amount, for chains where the arrival is seen directly rather than
      * inferred. PrismCoin uses this, since it validates the transaction itself and has the note.
      */
+    /**
+     * Announces a specific amount, for chains where the arrival is seen directly rather than inferred.
+     * PrismCoin uses this, since it validates the transaction itself and has the note.
+     *
+     * Forwards to `WalletReceipts`; the presentation is what this file still owns.
+     */
     fun notifyReceived(context: Context, coin: CoinSpec, amount: BigInteger, note: String = "") {
-        if (amount.signum() <= 0) return
-        ensureChannel(context)
-
-        val formatted = "${coin.format(amount)} ${coin.symbol}"
-        val trimmedNote = note.trim()
-
-        val title = "Received $formatted"
-        val body = trimmedNote.ifBlank { coin.name }
-
-        val tap = PendingIntent.getActivity(
-            context, 0,
-            Intent(context, com.prism.launcher.LauncherActivity::class.java)
-                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-
-        val notification = NotificationCompat.Builder(context, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_download_done)
-            .setContentTitle(title)
-            .setContentText(body)
-            // The note can be longer than one line, and a payment reference truncated to "rent, M…"
-            // is worse than useless.
-            .setStyle(
-                NotificationCompat.BigTextStyle().bigText(
-                    if (trimmedNote.isBlank()) "$formatted arrived in your ${coin.name} wallet."
-                    else "$trimmedNote\n\n$formatted arrived in your ${coin.name} wallet."
-                )
-            )
-            .setAutoCancel(true)
-            .build()
-
-        runCatching {
-            (context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
-                .notify(idFor(coin.symbol), notification)
-        }.onFailure {
-            PrismLogger.logError(TAG, "Receipt notification suppressed for ${coin.symbol}", it)
-        }
+        installPresenter(context)
+        com.prism.launcher.wallet.WalletReceipts.notifyReceived(coin, amount, note)
     }
 
     /**

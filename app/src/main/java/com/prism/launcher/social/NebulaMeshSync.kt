@@ -58,8 +58,25 @@ object NebulaMeshSync {
      */
     const val NEBULA_HOST_DOMAIN = "nebulasocial.com"
 
-    /** Next free mesh opcode after 0x0C (model announce) and 0x0D (Aether announce). */
-    const val OPCODE_NEBULA_ANNOUNCE: Byte = 0x0E
+    /**
+     * The opcode Nebula announces on.
+     *
+     * MOVED FROM 0x0E TO 0x31 ON 2026-09-24. The comment that used to sit here read "next free mesh
+     * opcode after 0x0C (model announce) and 0x0D (Aether announce)", and it was wrong in both
+     * directions: 0x0D was not Aether's, it was `P2pModelListings`, and 0x0E was not free either --
+     * `P2pCoinOffers` had it. Counting upwards from a known opcode found the numbers the compute market
+     * had already taken, because the two features were added from opposite ends of the codebase.
+     *
+     * The consequence was silent. `PrismMeshService` dispatches coin offers before Nebula in the same
+     * `when (command)`, so every Nebula announcement was parsed as an offers payload and dropped, and
+     * the Nebula branch below it was unreachable. So there is no compatibility to preserve: this has
+     * never worked between two devices.
+     *
+     * A REGISTRY WOULD HAVE CAUGHT IT. `MeshCore.register` refuses a duplicate silently today by
+     * replacing the earlier handler; `registeredOpcodes()` is what a diagnostics page should show so a
+     * clash is visible rather than inferred from a feature that quietly does nothing.
+     */
+    const val OPCODE_NEBULA_ANNOUNCE: Byte = 0x31
 
     private const val STALE_MS = 10 * 60 * 1000L
 

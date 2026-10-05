@@ -74,5 +74,8 @@ class NeonGlowDrawable(
         corePaint.colorFilter = colorFilter
     }
 
+    // Deprecated on Drawable, and still abstract on it: a Drawable subclass has to implement this
+    // whether or not the framework asks for it any more.
+    @Suppress("OVERRIDE_DEPRECATION")
     override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
 }

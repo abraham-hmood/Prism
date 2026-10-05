@@ -153,9 +153,7 @@ object CoinConvertDialog {
         val open = P2pCoinOffers.matching(give = from, want = to).firstOrNull()
         val wanted = open?.let { value.multiply(it.rate()) } ?: value
 
-        P2pCoinOffers.post(
-            context,
-            P2pCoinOffers.Offer(
+        P2pCoinOffers.post(P2pCoinOffers.Offer(
                 peerIp = "",
                 id = "${from}-${to}-${System.currentTimeMillis()}",
                 fromSymbol = from.uppercase(),

@@ -106,7 +106,7 @@ object DatasetDiscoveryService {
             val searchUrl = "https://huggingface.co/api/datasets?search=$query&limit=15"
 
             try {
-                val response = URL(searchUrl).openConnection().getInputStream().bufferedReader().use { it.readText() }
+                val response = com.prism.core.Urls.of(searchUrl).openConnection().getInputStream().bufferedReader().use { it.readText() }
                 val repos = JSONArray(response)
                 for (i in 0 until repos.length()) {
                     val repoId = repos.getJSONObject(i).optString("id", "")
@@ -131,7 +131,7 @@ object DatasetDiscoveryService {
             val files = mutableListOf<DatasetFile>()
             try {
                 val treeUrl = "https://huggingface.co/api/datasets/$repoId/tree/main?recursive=true"
-                val response = URL(treeUrl).openConnection().getInputStream().bufferedReader().use { it.readText() }
+                val response = com.prism.core.Urls.of(treeUrl).openConnection().getInputStream().bufferedReader().use { it.readText() }
                 val tree = JSONArray(response)
                 for (i in 0 until tree.length()) {
                     val item = tree.getJSONObject(i)
@@ -167,7 +167,7 @@ object DatasetDiscoveryService {
             val searchUrl = "https://api.github.com/search/code?q=$q"
 
             try {
-                val conn = URL(searchUrl).openConnection() as HttpURLConnection
+                val conn = com.prism.core.Urls.of(searchUrl).openConnection() as HttpURLConnection
                 conn.setRequestProperty("Accept", "application/vnd.github.v3+json")
                 conn.setRequestProperty("User-Agent", "Prism-Launcher")
 
@@ -191,7 +191,7 @@ object DatasetDiscoveryService {
         }
 
         private fun getJson(url: String): JSONObject {
-            val conn = URL(url).openConnection() as HttpURLConnection
+            val conn = com.prism.core.Urls.of(url).openConnection() as HttpURLConnection
             conn.setRequestProperty("Accept", "application/vnd.github.v3+json")
             conn.setRequestProperty("User-Agent", "Prism-Launcher")
             return JSONObject(conn.inputStream.bufferedReader().use { it.readText() })

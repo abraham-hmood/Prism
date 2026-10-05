@@ -12,6 +12,7 @@ import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -257,6 +258,33 @@ private fun UnportedSlot(slot: SlotAssignment) {
                 "what is Android-only is the Keystore that encrypts the recovery phrase at rest, " +
                 "and the page UI. Desktop needs an equivalent WalletCipher before this can open a " +
                 "wallet safely."
+
+        // The six below were added to the Android build after this file was written, and each has
+        // a phase of its own from the 2026-09-23 audit. They are named individually rather than
+        // falling into "Unassigned", which would have told the user their page was empty when in
+        // fact the page exists and this platform has not caught up.
+        is SlotAssignment.Editor -> "Editor" to
+            "PHASE 93. The editor front-end is already a web app, so it hosts in JCEF; what is left " +
+                "is the Node runtime and the terminal, both of which are EASIER here than on " +
+                "Android because a desktop has a real shell and a real interpreter."
+        is SlotAssignment.Science -> "Science" to
+            "PHASE 96. The lab notebook is pure Kotlin and ports as-is. The instruments that read " +
+                "hardware -- camera, Wi-Fi scan, microphone -- need a per-platform implementation, " +
+                "and a desktop with no camera cannot do cosmic rays at all."
+        is SlotAssignment.Notifications -> "Notifications" to
+            "PHASE 110. The store and the page are portable. Capturing notifications is not: " +
+                "Windows needs a packaged app identity and Linux needs a D-Bus monitor."
+        is SlotAssignment.Language -> "Language" to
+            "PHASE 94. Nearly all of it is already in :core -- the scheduler, the syllabus, the " +
+                "lexicons and the validators are plain Kotlin. This is a UI port, plus text to " +
+                "speech (PHASE 100) before the spoken half works."
+        is SlotAssignment.Minigames -> "Minigames" to
+            "PHASE 95. The rules engine is in :core and tested there; the views are hand-drawn " +
+                "Canvas work that maps onto Compose closely. Mesh play waits on PHASE 48."
+        is SlotAssignment.Cloud -> "Cloud" to
+            "PHASE 98. The encryption and the file index are in :core and tested. It needs mesh " +
+                "gossip (PHASE 48) to find peers and a desktop WalletCipher (PHASE 81) for the " +
+                "seed every key derives from."
         else -> "Unassigned" to "Press ↓ to open the switcher, or Edit pages to assign something."
     }
 
@@ -462,6 +490,12 @@ private fun slotLabel(slot: SlotAssignment): String = when (slot) {
     is SlotAssignment.ModelStore -> "Model Store"
     is SlotAssignment.AgenticTools -> "Agentic Tools"
     is SlotAssignment.Wallet -> "Wallet"
+    is SlotAssignment.Editor -> "Editor"
+    is SlotAssignment.Science -> "Science"
+    is SlotAssignment.Notifications -> "Notifications"
+    is SlotAssignment.Language -> "Language"
+    is SlotAssignment.Minigames -> "Minigames"
+    is SlotAssignment.Cloud -> "Cloud"
     is SlotAssignment.Custom -> "Plugin"
 }
 
@@ -470,7 +504,7 @@ private fun slotIcon(slot: SlotAssignment): ImageVector = when (slot) {
     is SlotAssignment.Browser -> Icons.Filled.Public
     is SlotAssignment.DesktopGrid -> Icons.Filled.GridView
     is SlotAssignment.AppDrawer -> Icons.Filled.Apps
-    is SlotAssignment.Messaging -> Icons.Filled.Chat
+    is SlotAssignment.Messaging -> Icons.AutoMirrored.Filled.Chat
     is SlotAssignment.KineticHalo -> Icons.Filled.BlurOn
     is SlotAssignment.FileExplorer -> Icons.Filled.Folder
     is SlotAssignment.NebulaSocial -> Icons.Filled.Groups
@@ -479,5 +513,11 @@ private fun slotIcon(slot: SlotAssignment): ImageVector = when (slot) {
     is SlotAssignment.ModelStore -> Icons.Filled.Science
     is SlotAssignment.AgenticTools -> Icons.Filled.Build
     is SlotAssignment.Wallet -> Icons.Filled.AccountBalanceWallet
+    is SlotAssignment.Editor -> Icons.Filled.Code
+    is SlotAssignment.Science -> Icons.Filled.Biotech
+    is SlotAssignment.Notifications -> Icons.Filled.Notifications
+    is SlotAssignment.Language -> Icons.Filled.Translate
+    is SlotAssignment.Minigames -> Icons.Filled.SportsEsports
+    is SlotAssignment.Cloud -> Icons.Filled.CloudQueue
     is SlotAssignment.Custom -> Icons.Filled.Extension
 }

@@ -50,7 +50,7 @@ object WriterGifSource {
             "https://tenor.googleapis.com/v2/search?q=$term&key=$key&limit=$limit&media_filter=tinygif,gif$filter"
 
         return runCatching {
-            val connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+            val connection = (com.prism.core.Urls.of(endpoint).openConnection() as HttpURLConnection).apply {
                 connectTimeout = 8000
                 readTimeout = 12000
                 requestMethod = "GET"

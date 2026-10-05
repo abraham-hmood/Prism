@@ -70,7 +70,7 @@ class LanguagePageView(context: Context) : FrameLayout(context) {
             ImageView(context).apply {
                 setImageDrawable(
                     TutorPortrait(
-                        greeter.portrait.copy(gesture = TutorPortrait.Gesture.WAVE),
+                        greeter.portrait.copy(gesture = Gesture.WAVE),
                         circular = true,
                         withBackdrop = true,
                     )

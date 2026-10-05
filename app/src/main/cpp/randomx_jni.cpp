@@ -12,7 +12,6 @@
 // and the Kotlin side asks for a rebuild when it moves.
 
 #include <jni.h>
-#include <android/log.h>
 #include <cstring>
 #include <mutex>
 #include <new>
@@ -20,9 +19,20 @@
 #include "randomx.h"
 #include "virtual_memory.h"
 
+// LOGGING IS PER PLATFORM, AND THE UNGUARDED android/log.h WAS WHY THIS FILE COULD NOT BE BUILT FOR A HOST.
+// PHASE 89's answer is that a desktop builds RandomX with cmake like any other library rather than porting
+// Android's on-device compiler -- which needs this translation unit to compile on a host, and it did not.
+// gguf_bridge.cpp had the identical problem and the identical fix.
 #define LOG_TAG "PrismRandomX"
+#ifdef __ANDROID__
+#include <android/log.h>
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+#else
+#include <cstdio>
+#define LOGI(...) do { fprintf(stderr, "[INFO] " LOG_TAG ": "); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while (0)
+#define LOGW(...) do { fprintf(stderr, "[WARN] " LOG_TAG ": "); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while (0)
+#endif
 
 namespace {
 
@@ -65,7 +75,14 @@ randomx_flags desired_flags(bool allow_jit) {
     // large multipliers and neither is worth overriding.
     randomx_flags flags = randomx_get_flags();
     if (allow_jit) {
-        flags = static_cast<randomx_flags>(flags | RANDOMX_FLAG_JIT | RANDOMX_FLAG_SECURE);
+        flags = static_cast<randomx_flags>(flags | RANDOMX_FLAG_JIT);
+#ifdef __ANDROID__
+        // SECURE ONLY WHERE W^X IS ENFORCED. It makes RandomX mprotect the code buffer between writing and
+        // running rather than asking for write and execute at once, which on Android is the difference
+        // between working and being killed by the kernel. It also costs throughput, and a desktop kernel
+        // grants PAGE_EXECUTE_READWRITE without complaint -- so paying for it there buys nothing.
+        flags = static_cast<randomx_flags>(flags | RANDOMX_FLAG_SECURE);
+#endif
     } else {
         flags = static_cast<randomx_flags>(flags & ~RANDOMX_FLAG_JIT);
     }

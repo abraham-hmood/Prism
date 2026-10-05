@@ -28,7 +28,15 @@ import android.graphics.drawable.Drawable
  * ## How a face is built
  *
  * Everything is laid out in fractions of the shorter side, so the same [PortraitSpec] draws
- * identically in a 48dp list row and a 320dp hero. The order is strictly back-to-front —
+ * identically in a 48dp list row and a 320dp hero.
+ *
+ * ## PHASE 94: THE SPEC IS NOT IN HERE ANY MORE
+ *
+ * [PortraitSpec], [Hair] and [Gesture] were nested in this class, which meant `LanguageTutors` -- a
+ * roster, nothing but data -- could not compile outside Android. They live in `TutorFace.kt` in :core
+ * now and the desktop's Compose renderer draws from the same values, so a tutor looks the same on
+ * both. The colour arithmetic went with them for the same reason: two renderers deriving shades from
+ * the same base colour must derive the SAME shades. The order is strictly back-to-front —
  * backdrop, shoulders, neck, ears, head, hair back, features, hair front, accessories — because a
  * fringe has to sit over the forehead while the same hairstyle's volume sits behind the ears, and
  * that is only one style if it is drawn in two passes.
@@ -44,30 +52,6 @@ class TutorPortrait(
     /** Draws the backdrop. Off when the portrait sits on an already-tinted surface. */
     private val withBackdrop: Boolean = true,
 ) : Drawable() {
-
-    enum class Hair { LONG_WAVY, LONG_STRAIGHT, BOB, SHORT_CROP, CURLS, BUN, UNDERCUT, SHAGGY, PONYTAIL, FADE }
-
-    enum class Gesture { NONE, WAVE }
-
-    /**
-     * Everything that makes one tutor look like themselves.
-     *
-     * Plain values rather than a random seed: a seed makes faces that are different but
-     * uncontrollable, and "the Japanese tutor has ginger hair this build" is not a bug anyone can
-     * fix. Naming each choice means the roster is art-directed and stable across versions.
-     */
-    data class PortraitSpec(
-        val skin: Int,
-        val hairColor: Int,
-        val hair: Hair,
-        val clothing: Int,
-        val backdrop: Int,
-        val glasses: Boolean = false,
-        val earrings: Boolean = false,
-        val eyesClosed: Boolean = false,
-        val freckles: Boolean = false,
-        val gesture: Gesture = Gesture.NONE,
-    )
 
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -436,21 +420,15 @@ class TutorPortrait(
 
     companion object {
 
-        fun lighten(color: Int, amount: Float): Int = blend(color, Color.WHITE, amount)
+        // DELEGATED RATHER THAN DELETED. These names have about twenty call sites across the
+        // setup flow, the learning path and the lesson screen, and the arithmetic they perform has
+        // to match the desktop renderer's exactly -- two platforms deriving "a bit lighter than the
+        // hair colour" differently would show as two different tutors. So the implementation is
+        // shared and the names are kept where the callers already look for them.
+        fun lighten(color: Int, amount: Float): Int = TutorPalette.lighten(color, amount)
 
-        fun darken(color: Int, amount: Float): Int = blend(color, Color.BLACK, amount)
+        fun darken(color: Int, amount: Float): Int = TutorPalette.darken(color, amount)
 
-        fun withAlpha(color: Int, alpha: Int): Int =
-            Color.argb(alpha, Color.red(color), Color.green(color), Color.blue(color))
-
-        private fun blend(a: Int, b: Int, t: Float): Int {
-            val k = t.coerceIn(0f, 1f)
-            return Color.argb(
-                Color.alpha(a),
-                (Color.red(a) + (Color.red(b) - Color.red(a)) * k).toInt(),
-                (Color.green(a) + (Color.green(b) - Color.green(a)) * k).toInt(),
-                (Color.blue(a) + (Color.blue(b) - Color.blue(a)) * k).toInt(),
-            )
-        }
+        fun withAlpha(color: Int, alpha: Int): Int = TutorPalette.withAlpha(color, alpha)
     }
 }

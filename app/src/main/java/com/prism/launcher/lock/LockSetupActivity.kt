@@ -218,7 +218,7 @@ class LockSetupActivity : PrismBaseActivity() {
 
         firstEntry = null
         if (duress) {
-            val error = LockStore.setDuress(this, value)
+            val error = LockStore.setDuress(value)
             if (error != null) {
                 toast(error)
                 stepEnterCredential(duress = true)
@@ -226,7 +226,7 @@ class LockSetupActivity : PrismBaseActivity() {
             }
             finishSetup()
         } else {
-            LockStore.configure(this, mechanism!!, value)
+            LockStore.configure(mechanism!!, value)
             stepEnterCredential(duress = true)
         }
     }
@@ -235,7 +235,7 @@ class LockSetupActivity : PrismBaseActivity() {
         PrismSettings.setLockScreenEnabled(true)
         LockGate.install(this)
         toast(
-            if (LockStore.hasDuress(this)) "Lock screen on, with an emergency code set"
+            if (LockStore.hasDuress()) "Lock screen on, with an emergency code set"
             else "Lock screen on"
         )
         finish()
