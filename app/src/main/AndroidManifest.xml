@@ -578,6 +578,12 @@
             android:theme="@style/Theme.PrismSettings" />
 
         <activity
+            android:name=".speech.VoiceCloningActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:theme="@style/Theme.PrismSettings" />
+
+        <activity
             android:name=".language.LanguageSetupActivity"
             android:exported="false"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"

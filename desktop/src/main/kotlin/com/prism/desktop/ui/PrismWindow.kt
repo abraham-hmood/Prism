@@ -179,6 +179,8 @@ private fun PageBody(
         PageId.CHARACTERS -> CharactersPage()
         PageId.STREMIO -> StremioPage()
         PageId.SPEECH -> SpeechPage()
+        PageId.KOKORO -> KokoroSettingsPage(onNavigate)
+        PageId.VOICE_CLONING -> VoiceCloningPage(onNavigate)
         PageId.LANGUAGE -> LanguagePage()
         PageId.GAMES -> MinigamesPage()
         PageId.EDITOR -> EditorPage()
@@ -248,6 +250,9 @@ enum class PageId(
     CHARACTERS("Characters", Icons.Filled.Face),
     STREMIO("Stremio", Icons.Filled.Movie),
     SPEECH("Speech", Icons.Filled.RecordVoiceOver),
+    // Kokoro's whole screen and the cloning studio it opens, the way the phone keeps them.
+    KOKORO("Kokoro speech", Icons.Filled.Speaker),
+    VOICE_CLONING("Clone a voice", Icons.Filled.Mic),
     LANGUAGE("Language", Icons.Filled.Translate),
     GAMES("Games", Icons.Filled.SportsEsports),
     EDITOR("Editor", Icons.Filled.Code),

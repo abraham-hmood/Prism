@@ -23,6 +23,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -40,6 +41,7 @@ import androidx.compose.ui.window.Dialog
 import com.prism.launcher.PrismSettings
 import com.prism.launcher.vpn.PrismServerClient
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -79,6 +81,24 @@ fun PrismServersDialog(onDismiss: () -> Unit) {
     var outcomeOk by remember { mutableStateOf(false) }
     var menuFor by remember { mutableStateOf<String?>(null) }
     var confirmDelete by remember { mutableStateOf<PrismSettings.PrismServer?>(null) }
+    var nearbyNodes by remember { mutableStateOf(emptyList<com.prism.core.MeshTransport.Node>()) }
+    var scanningNearby by remember { mutableStateOf(true) }
+    var nearbyScanGeneration by remember { mutableStateOf(0) }
+
+    LaunchedEffect(nearbyScanGeneration) {
+        scanningNearby = true
+        com.prism.core.MeshTransport.discover()
+        repeat(8) {
+            delay(700)
+            val saved = PrismSettings.getPrismServers()
+            nearbyNodes = com.prism.core.MeshTransport.nodes().filter { node ->
+                node.serverPort != null && saved.none {
+                    it.address == node.address && it.port == node.serverPort
+                }
+            }
+        }
+        scanningNearby = false
+    }
 
     fun reload() {
         servers = PrismSettings.getPrismServers()
@@ -91,7 +111,11 @@ fun PrismServersDialog(onDismiss: () -> Unit) {
             modifier = Modifier.widthIn(max = 560.dp),
         ) {
             Column(Modifier.padding(20.dp)) {
-                Text("Prism meshnet servers", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Prism meshnet servers", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                    Spacer(Modifier.weight(1f))
+                    Button(onClick = { adding = true }) { Text("+ Add Prism Server", fontSize = 12.sp) }
+                }
                 Spacer(Modifier.height(4.dp))
                 Text(
                     "Click one to connect and make it active. Right-click for edit and delete.",
@@ -209,6 +233,69 @@ fun PrismServersDialog(onDismiss: () -> Unit) {
                     }
                 }
 
+                Spacer(Modifier.height(14.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Nearby Prism servers", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    Spacer(Modifier.weight(1f))
+                    OutlinedButton(onClick = {
+                        scanningNearby = true
+                        nearbyScanGeneration++
+                    }) { Text("Scan again", fontSize = 12.sp) }
+                }
+                if (nearbyNodes.isEmpty()) {
+                    Text(
+                        if (scanningNearby) "Searching this Wi-Fi network..." else "No new Prism servers found.",
+                        fontSize = 12.sp,
+                        color = colors.faint,
+                        modifier = Modifier.padding(top = 5.dp),
+                    )
+                } else {
+                    Column(Modifier.heightIn(max = 150.dp).verticalScroll(rememberScrollState())) {
+                        nearbyNodes.forEach { node ->
+                            Row(
+                                Modifier.fillMaxWidth().clickableRow {
+                                    if (node.serverProtocol == "wireguard") {
+                                        outcome = "Found a WireGuard server at " + node.address + ":" + node.serverPort +
+                                            ". Invite this device from that server to create its client profile."
+                                        outcomeOk = true
+                                        return@clickableRow
+                                    }
+                                    val port = node.serverPort ?: return@clickableRow
+                                    val server = PrismSettings.PrismServer(
+                                        name = node.name,
+                                        address = node.address,
+                                        port = port,
+                                        username = "",
+                                        password = "",
+                                    )
+                                    PrismServerClient.save(server)
+                                    reload()
+                                    nearbyNodes = nearbyNodes - node
+                                    outcome = "Added " + server.name + ". Test or click it to connect."
+                                    outcomeOk = true
+                                }.padding(vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(node.name, fontSize = 13.sp)
+                                    Text(
+                                        node.address + ":" + node.serverPort + " · " +
+                                            (node.serverProtocol?.uppercase() ?: "PRISM"),
+                                        fontSize = 11.sp,
+                                        color = colors.faint,
+                                    )
+                                }
+                                Text(
+                                    if (node.serverProtocol == "wireguard") "WG" else "Add",
+                                    fontSize = 12.sp,
+                                    color = colors.accent,
+                                )
+                            }
+                            Hairline()
+                        }
+                    }
+                }
+
                 if (outcome.isNotBlank()) {
                     Spacer(Modifier.height(12.dp))
                     Surface(
@@ -227,7 +314,6 @@ fun PrismServersDialog(onDismiss: () -> Unit) {
 
                 Spacer(Modifier.height(16.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Button(onClick = { adding = true }) { Text("Add a server") }
                     Spacer(Modifier.weight(1f))
                     OutlinedButton(onClick = onDismiss) { Text("Close", fontSize = 13.sp) }
                 }

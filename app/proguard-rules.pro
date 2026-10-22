@@ -90,6 +90,24 @@
 -keep class com.wireguard.android.** { *; }
 -dontwarn com.wireguard.**
 
+# ── Classes Android never ships ─────────────────────────────────────────────
+#
+# Referenced only from paths that do not run on a device (JVM host diagnostics behind a
+# runtime host check, AutoValue's compile-time processor shading, slf4j's optional binding
+# lookup, which tolerates a missing binding at runtime). Debug builds never notice because
+# D8 does not check; R8 correctly reports that the classes cannot exist, so tell it the
+# absence is deliberate rather than let the release build fail.
+-dontwarn java.lang.management.ManagementFactory
+-dontwarn java.lang.management.OperatingSystemMXBean
+-dontwarn javax.lang.model.SourceVersion
+-dontwarn javax.lang.model.element.Element
+-dontwarn javax.lang.model.element.ElementKind
+-dontwarn javax.lang.model.element.Modifier
+-dontwarn javax.lang.model.type.TypeMirror
+-dontwarn javax.lang.model.type.TypeVisitor
+-dontwarn javax.lang.model.util.SimpleTypeVisitor8
+-dontwarn org.slf4j.impl.StaticLoggerBinder
+
 # ── Keep line numbers in stack traces ───────────────────────────────────────
 #
 # Prism's own diagnostics page shows stack traces to the user, and an obfuscated one is unreadable

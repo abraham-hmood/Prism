@@ -1,5 +1,6 @@
 package com.prism.launcher.speech
 
+import android.content.Intent
 import android.os.Bundle
 import android.view.Gravity
 import android.view.View
@@ -29,6 +30,7 @@ class KokoroSettingsActivity : PrismBaseActivity() {
 
     private lateinit var statusLine: TextView
     private lateinit var voiceRow: TextView
+    private lateinit var cloneRow: TextView
     private lateinit var modelRow: TextView
     private lateinit var speedRow: TextView
 
@@ -101,6 +103,12 @@ class KokoroSettingsActivity : PrismBaseActivity() {
             KokoroVoicePicker.show(this, PrismSettings.VOICE_SPEAKER_SAM) { refresh() }
         }
         card.addView(voiceRow)
+        card.addView(IosUi.hairline(this))
+
+        cloneRow = navRow("Clone a voice", "Record or upload a sample") {
+            startActivity(Intent(this, VoiceCloningActivity::class.java))
+        }
+        card.addView(cloneRow)
         card.addView(IosUi.hairline(this))
 
         speedRow = navRow("Speed", "") { pickSpeed() }
@@ -243,6 +251,7 @@ class KokoroSettingsActivity : PrismBaseActivity() {
         }
 
         setRowDetail(voiceRow, "Voice", KokoroVoicePicker.summaryFor(this, PrismSettings.VOICE_SPEAKER_SAM))
+        setRowDetail(cloneRow, "Clone a voice", "Opens the cloning studio")
         setRowDetail(speedRow, "Speed", "${PrismSettings.getKokoroSpeed()}×")
         setRowDetail(
             modelRow,

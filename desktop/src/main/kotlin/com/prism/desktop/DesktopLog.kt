@@ -2,9 +2,13 @@ package com.prism.desktop
 
 import com.prism.core.PrismLog
 import com.prism.core.PrismPlatform
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import java.io.File
+import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Desktop diagnostics: everything to a file, only problems to the console.
@@ -20,7 +24,24 @@ import java.time.format.DateTimeFormatter
  */
 class DesktopLog(private val quiet: Boolean = true) : PrismLog {
 
-    private val stamp = DateTimeFormatter.ofPattern("HH:mm:ss.SSS")
+    enum class Level { INFO, WARN, ERROR, SUCCESS, DEBUG }
+
+    data class Entry(
+        val id: Long,
+        val timestamp: String,
+        val level: Level,
+        val tag: String,
+        val message: String,
+    )
+
+    private val stamp = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")
+    private val ids = AtomicLong()
+    private val history = ArrayList<Entry>()
+    private var historyLoaded = false
+    private var loadedFileLength = -1L
+    private var loadedFileModified = -1L
+    private val mutableUpdates = MutableSharedFlow<Entry>(extraBufferCapacity = 512)
+    val updates = mutableUpdates.asSharedFlow()
 
     private val file: File by lazy {
         File(PrismPlatform.host.dataDir(), "logs").apply { mkdirs() }
@@ -28,13 +49,21 @@ class DesktopLog(private val quiet: Boolean = true) : PrismLog {
     }
 
     private fun write(level: String, tag: String, message: String, throwable: Throwable? = null) {
-        val line = "${LocalDateTime.now().format(stamp)} $level $tag: $message"
-        synchronized(this) {
-            runCatching {
-                file.appendText(line + "\n")
-                throwable?.let { file.appendText(it.stackTraceToString() + "\n") }
+        val timestamp = LocalDateTime.now().format(stamp)
+        val detail = message + (throwable?.let { "\n" + it.stackTraceToString() } ?: "")
+        val line = "[$timestamp] [$level] [$tag] $message"
+        val entry = synchronized(this) {
+            loadHistoryLocked()
+            Entry(ids.incrementAndGet(), timestamp, parseLevel(level), tag, detail).also { created ->
+                history += created
+                runCatching {
+                    file.appendText(line + (throwable?.let { "\n" + it.stackTraceToString() } ?: "") + "\n")
+                    loadedFileLength = file.length()
+                    loadedFileModified = file.lastModified()
+                }
             }
         }
+        mutableUpdates.tryEmit(entry)
         // WARN and above always surface. Below that, only when the user asked for noise.
         if (!quiet || level == "WARN" || level == "ERROR") {
             System.err.println(line)
@@ -53,4 +82,81 @@ class DesktopLog(private val quiet: Boolean = true) : PrismLog {
     override fun flushBlocking() = System.err.flush()
 
     fun path(): File = file
+
+    /** Every persisted and current-process entry, oldest first. */
+    @Synchronized
+    fun entries(): List<Entry> {
+        loadHistoryLocked()
+        return history.toList()
+    }
+
+    @Synchronized
+    fun clear() {
+        history.clear()
+        historyLoaded = true
+        runCatching { file.writeText("") }
+    }
+
+    private fun loadHistoryLocked() {
+        val currentLength = runCatching { file.length() }.getOrDefault(-1L)
+        val currentModified = runCatching { file.lastModified() }.getOrDefault(-1L)
+        if (historyLoaded && currentLength == loadedFileLength && currentModified == loadedFileModified) return
+        historyLoaded = true
+        history.clear()
+        ids.set(0L)
+        if (!file.isFile) return
+        var lastIndex = -1
+        runCatching {
+            file.forEachLine { line ->
+                val entry = parseLine(line)
+                if (entry != null) {
+                    history += entry.copy(id = ids.incrementAndGet())
+                    lastIndex = history.lastIndex
+                } else if (lastIndex >= 0) {
+                    history[lastIndex] = history[lastIndex].copy(
+                        message = history[lastIndex].message + "\n" + line,
+                    )
+                }
+            }
+        }.onFailure {
+            history.clear()
+            System.err.println("Could not read Prism log: " + it.message)
+        }
+        loadedFileLength = runCatching { file.length() }.getOrDefault(-1L)
+        loadedFileModified = runCatching { file.lastModified() }.getOrDefault(-1L)
+    }
+
+    private fun parseLine(line: String): Entry? {
+        val modern = MODERN_LINE.matchEntire(line)
+        if (modern != null) {
+            return Entry(
+                0,
+                modern.groupValues[1],
+                parseLevel(modern.groupValues[2]),
+                modern.groupValues[3],
+                modern.groupValues[4],
+            )
+        }
+        val legacy = LEGACY_LINE.matchEntire(line) ?: return null
+        return Entry(
+            0,
+            LocalDate.now().toString() + " " + legacy.groupValues[1],
+            parseLevel(legacy.groupValues[2]),
+            legacy.groupValues[3],
+            legacy.groupValues[4],
+        )
+    }
+
+    private fun parseLevel(value: String): Level = when (value.uppercase()) {
+        "WARN", "WARNING" -> Level.WARN
+        "ERROR", "FAIL" -> Level.ERROR
+        "OK", "SUCCESS" -> Level.SUCCESS
+        "DEBUG" -> Level.DEBUG
+        else -> Level.INFO
+    }
+
+    private companion object {
+        val MODERN_LINE = Regex("^\\[(.+)] \\[(INFO|WARN|ERROR|OK|SUCCESS|DEBUG)] \\[(.*?)] (.*)$")
+        val LEGACY_LINE = Regex("^(\\d{2}:\\d{2}:\\d{2}\\.\\d{3}) (INFO|WARN|ERROR|OK|SUCCESS|DEBUG) (.*?): (.*)$")
+    }
 }
