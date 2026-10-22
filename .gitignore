@@ -9,6 +9,8 @@ captures/
 *.apk
 *.ap_
 *.aab
+**.log
+**/**.log
 /prism-os/scripts/qemu-android-build/
 
 # Scratch output dir used for CLI verification builds when the IDE holds app/build locks
