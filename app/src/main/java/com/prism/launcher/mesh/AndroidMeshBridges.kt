@@ -67,10 +67,6 @@ object AndroidMeshBridges {
             },
             // The same helper the service itself uses; there is no per-service address.
             localIp = { com.prism.core.MeshUtils.getLocalMeshIp() },
-            nodes = { PrismMeshService.nodes() },
-            discover = { PrismMeshService.discover() },
-            kickNode = { PrismMeshService.kickNode(it) },
-            banNode = { PrismMeshService.banNode(it) },
         )
     }
 

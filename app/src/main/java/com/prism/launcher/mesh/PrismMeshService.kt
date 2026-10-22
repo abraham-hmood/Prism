@@ -2,8 +2,6 @@ package com.prism.launcher.mesh
 
 import android.util.Log
 import com.prism.core.MeshUtils
-import com.prism.core.MeshTransport
-import com.prism.core.PrismNodeWire
 import com.prism.launcher.PrismApp
 import com.prism.launcher.PrismLogger
 import com.prism.launcher.PrismSettings
@@ -37,7 +35,6 @@ object PrismMeshService {
 
     // List of active peers (IP -> PeerInfo)
     private val activePeers = ConcurrentHashMap<String, PeerInfo>()
-    private val kickedUntil = ConcurrentHashMap<String, Long>()
     
     // Tracking RTT for "Best Connection" selection
     private val pendingRequests = ConcurrentHashMap<String, Long>()
@@ -45,13 +42,7 @@ object PrismMeshService {
     data class PeerInfo(
         var lastSeen: Long,
         var port: Int = DEFAULT_MESH_PORT,
-        var latency: Long = 9999L,
-        var nodeId: String = "",
-        var name: String = "",
-        var serverPort: Int? = null,
-        var serverProtocol: String? = null,
-        var serverPublicKey: String? = null,
-        var wireGuardPort: Int? = null,
+        var latency: Long = 9999L
     )
 
     /**
@@ -83,8 +74,8 @@ object PrismMeshService {
         else -> "disabled in settings"
     }
 
-    fun start(forceForDiscovery: Boolean = false) {
-        if (!PrismSettings.getMeshEnabled() && !forceForDiscovery) {
+    fun start() {
+        if (!PrismSettings.getMeshEnabled()) {
             Log.d(TAG, "Mesh disabled in settings; not starting the listener/gossip loops.")
             return
         }
@@ -184,56 +175,6 @@ object PrismMeshService {
         }
     }
 
-    /** Starts an on-demand Wi-Fi scan; a temporary listener is stopped when the scan window ends. */
-    fun discover() {
-        val temporary = listenerJob?.isActive != true && !PrismSettings.getMeshEnabled()
-        if (listenerJob?.isActive != true) start(forceForDiscovery = true)
-        val port = try { PrismSettings.getMeshBootstrapPort().toInt() } catch (_: Exception) {
-            DEFAULT_MESH_PORT
-        }
-        sendDiscoveryBroadcast(port)
-        if (temporary) {
-            Thread({
-                try { Thread.sleep(8_000L) } catch (_: InterruptedException) { return@Thread }
-                if (!PrismSettings.getMeshEnabled()) stop()
-            }, "prism-mesh-discovery-window").apply { isDaemon = true }.start()
-        }
-    }
-
-    fun nodes(): List<MeshTransport.Node> = activePeers.map { (ip, info) ->
-        MeshTransport.Node(
-            id = info.nodeId,
-            name = info.name.ifBlank { ip },
-            address = ip,
-            meshPort = info.port,
-            lastSeen = info.lastSeen,
-            latency = info.latency,
-            serverPort = info.serverPort,
-            serverProtocol = info.serverProtocol,
-            serverPublicKey = info.serverPublicKey,
-            wireGuardPort = info.wireGuardPort,
-        )
-    }.sortedBy { it.name.lowercase() }
-
-    fun kickNode(nodeId: String): Boolean = evictNode(nodeId, permanent = false)
-
-    fun banNode(nodeId: String): Boolean {
-        if (nodeId.isBlank()) return false
-        PrismSettings.setBannedPrismNodeIds(PrismSettings.getBannedPrismNodeIds() + nodeId)
-        evictNode(nodeId, permanent = true)
-        return true
-    }
-
-    private fun evictNode(nodeId: String, permanent: Boolean): Boolean {
-        if (nodeId.isBlank()) return false
-        val entry = activePeers.entries.firstOrNull { it.value.nodeId == nodeId } ?: return false
-        if (!permanent) {
-            kickedUntil[nodeId] = System.currentTimeMillis() + 5 * 60 * 1000L
-        }
-        activePeers.remove(entry.key, entry.value)
-        return true
-    }
-
     /** When this device last put its capacity on the market. */
     private var lastComputeAnnounce = 0L
     private val COMPUTE_ANNOUNCE_INTERVAL_MS = 5 * 60 * 1000L
@@ -256,7 +197,7 @@ object PrismMeshService {
             // getHostAddress is nullable: an address with no literal form has none, and passing that
             // through would have broadcast to the string "null".
             val host = addr.hostAddress ?: return@forEach
-            sendPacket(host, port, 0x0A.toByte(), localAnnouncement(port))
+            sendPacket(host, port, 0x0A.toByte(), "{\"port\":$port}")
         }
     }
 
@@ -275,12 +216,6 @@ object PrismMeshService {
         val now = System.currentTimeMillis()
         val command = data[5]
         val payload = String(data, 6, data.size - 6)
-
-        val announcement = PrismNodeWire.parse(payload)
-        val knownNodeId = announcement?.nodeId ?: activePeers[peerIp]?.nodeId.orEmpty()
-        if (kickedUntil[knownNodeId]?.let { it > System.currentTimeMillis() } == true) return
-        kickedUntil.remove(knownNodeId)
-        if (knownNodeId in PrismSettings.getBannedPrismNodeIds()) return
 
         // RTT Tracking: Map incoming response commands to their requests
         val responseTo = when (command) {
@@ -304,15 +239,6 @@ object PrismMeshService {
         }
         info.lastSeen = now
         info.port = packet.port
-        announcement?.let {
-            info.nodeId = it.nodeId
-            info.name = it.name
-            info.serverPort = it.serverPort
-            info.serverProtocol = it.serverProtocol
-            info.serverPublicKey = it.serverPublicKey
-            info.wireGuardPort = it.wireGuardPort
-            info.port = it.meshPort
-        }
         
         if (isNew) {
             PrismLogger.logInfo(TAG, "Peer discovered: $peerIp")
@@ -538,7 +464,7 @@ object PrismMeshService {
 
     private fun handleHeartbeat(peerIp: String, port: Int) {
         val myPort = try { PrismSettings.getMeshBootstrapPort().toInt() } catch(e: Exception) { DEFAULT_MESH_PORT }
-        sendPacket(peerIp, port, 0x0B.toByte(), localAnnouncement(myPort))
+        sendPacket(peerIp, port, 0x0B.toByte(), "{\"port\":$myPort}")
     }
     
     private fun handleHeartbeatResp(peerIp: String, payload: String) {
@@ -556,28 +482,9 @@ object PrismMeshService {
             val peerPort = json.optInt("port", DEFAULT_MESH_PORT)
             activePeers[peerIp]?.port = peerPort
             val myPort = try { PrismSettings.getMeshBootstrapPort().toInt() } catch(e: Exception) { DEFAULT_MESH_PORT }
-            sendPacket(peerIp, peerPort, 0x0B.toByte(), localAnnouncement(myPort))
+            sendPacket(peerIp, peerPort, 0x0B.toByte(), "{\"port\":$myPort}")
             requestSync(peerIp)
         } catch (e: Exception) {}
-    }
-
-    private fun localAnnouncement(meshPort: Int): String {
-        val advertisesProxy = PrismSettings.getVpnTunnelingEnabled() &&
-            PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM &&
-            PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_SERVER &&
-            runCatching { PrismApp.instance.tunnelEngine.isPrismServerRunning() }.getOrDefault(false) &&
-            (PrismSettings.getVpnProtocolMode() == PrismSettings.VPN_PROTOCOL_AUTO ||
-                PrismSettings.getVpnProtocolMode() == PrismSettings.VPN_PROTOCOL_PROXY)
-        val serverPort = if (advertisesProxy) {
-            PrismSettings.getPrismVpnPort().toIntOrNull()
-        } else {
-            null
-        }
-        return PrismNodeWire.announcement(
-            meshPort = meshPort,
-            serverPort = serverPort,
-            serverProtocol = if (serverPort == null) null else "proxy",
-        )
     }
 
     private fun handlePeerListReq(peerIp: String, port: Int) {

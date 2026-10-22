@@ -1,12 +1,12 @@
 package com.prism.launcher.vpn
 
 import com.prism.core.PrismPlatform
-import com.prism.core.ProxyBasicAuth
 import com.prism.launcher.PrismSettings
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.util.Base64
 
 /**
  * Connecting to a Prism meshnet server, and finding out whether it worked.
@@ -69,8 +69,9 @@ object PrismServerClient {
                     append("CONNECT 127.0.0.1:1 HTTP/1.1\r\n")
                     append("Host: 127.0.0.1:1\r\n")
                     if (server.username.isNotBlank() || server.password.isNotBlank()) {
-                        append(ProxyBasicAuth.authorizationHeader(server.username, server.password))
-                            .append("\r\n")
+                        val token = Base64.getEncoder()
+                            .encodeToString((server.username + ":" + server.password).toByteArray())
+                        append("Proxy-Authorization: Basic ").append(token).append("\r\n")
                     }
                     append("Connection: close\r\n\r\n")
                 }

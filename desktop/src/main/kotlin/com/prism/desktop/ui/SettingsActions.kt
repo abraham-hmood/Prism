@@ -41,7 +41,7 @@ object SettingsActions {
     var navigate: ((PageId) -> Unit)? = null
 
     /** Dialogs a settings row can ask the page to show. */
-    enum class Dialog { PRISM_SERVERS, PRISM_NODES, SPEECH_MODEL }
+    enum class Dialog { PRISM_SERVERS }
 
     /** Installed by the settings page, which is what can host a dialog. */
     var openDialog: ((Dialog) -> Unit)? = null
@@ -101,39 +101,6 @@ object SettingsActions {
         Target.VIEW_LOCAL_ADDRESS -> com.prism.core.MeshUtils.getLocalMeshIp()
             .ifBlank { "This device has no mesh address; the mesh is not running." }
 
-        Target.MANAGE_PRISM_NODES -> {
-            if (!PrismSettings.getVpnTunnelingEnabled() ||
-                PrismSettings.getVpnMode() != PrismSettings.VPN_MODE_PRISM ||
-                PrismSettings.getPrismVpnRole() != PrismSettings.PRISM_ROLE_SERVER
-            ) {
-                "Manage Prism nodes is available when this device is a server."
-            } else {
-                openDialog?.invoke(Dialog.PRISM_NODES)
-                ""
-            }
-        }
-
-        Target.START_VPN_SERVER -> {
-            PrismSettings.setPrismVpnRole(PrismSettings.PRISM_ROLE_SERVER)
-            PrismSettings.setVpnServerAlwaysOn(true)
-            val bootstrap = com.prism.desktop.net.DesktopTunnelBootstrap.ensureReadyForTunnel(
-                elevatedArgs = listOf("vpn", "serve", "up"),
-                exitAfterElevation = false,
-            )
-            if (bootstrap.shouldRestart || bootstrap.message != "Ready.") {
-                bootstrap.message
-            } else {
-                val result = com.prism.desktop.net.WireGuardInterface.upAndConnectToSelf()
-                if (result.ok) "The VPN server is running." else result.message
-            }
-        }
-
-        Target.STOP_VPN_SERVER -> {
-            PrismSettings.setVpnServerAlwaysOn(false)
-            val result = com.prism.desktop.net.WireGuardInterface.down()
-            if (result.ok) "The VPN server is stopped." else result.message
-        }
-
         // OFF THE UI THREAD AND REPORTED LATER, because scanning a subnet is suspending and takes
         // seconds. Doing it inline with runBlocking would freeze the window mid-scan, which on a
         // settings page reads as Prism having crashed.
@@ -189,25 +156,9 @@ object SettingsActions {
             "ISO set to " + file.name + "."
         }
 
-        Target.OPEN_SPEECH_MODEL -> {
-            // THE PHONE'S FLOW, NOT A BARE FILE PICKER. Picking a speech model is described, not
-            // typed: the dialog shows what is in use, walks the model-type question and asks
-            // before a chosen model gives its place back to Kokoro -- the same beats the Android
-            // settings screen hits for this setting.
-            openDialog?.invoke(Dialog.SPEECH_MODEL)
-            ""
-        }
-
-        Target.OPEN_KOKORO -> {
-            // THE PHONE GREYS THIS ROW OUT while an imported speech model is doing the talking --
-            // every knob on the Kokoro screen belongs to Kokoro and none mean anything otherwise.
-            // A desktop row cannot be greyed mid-catalog, so it explains instead of opening.
-            if (PrismSettings.isLocalAudioModelImported()) {
-                "Kokoro's settings are unavailable while a model you imported does the talking — " +
-                    "remove it (Speech model, below) to go back."
-            } else {
-                go(PageId.KOKORO, "Opened the Kokoro-82M Voice & Speech screen.")
-            }
+        Target.OPEN_SPEECH_MODEL -> chooseFile("Choose a speech model") { file ->
+            PrismSettings.setLocalAudioModelPath(file.absolutePath)
+            "Speech model set to " + file.name + "."
         }
 
         Target.AUTO_CAPTION_FOLDER ->

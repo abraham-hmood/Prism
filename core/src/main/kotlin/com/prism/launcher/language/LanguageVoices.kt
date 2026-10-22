@@ -154,18 +154,6 @@ object LanguageVoices {
         targetVoice(nativeCode, tutor)
 
     /**
-     * Which Kokoro voice to use when previewing a tutor during setup.
-     *
-     * If Kokoro has no voices for the tutor's own language, [userVoiceId] is used — usually the
-     * voice the learner already picked for Sam. When Kokoro does cover that language, a voice is
-     * chosen to match the tutor's gender (and accent rules in [targetVoice]).
-     */
-    fun tutorPreviewVoice(tutor: LanguageTutors.Tutor, userVoiceId: String): String {
-        if (kokoroFor(tutor.heritage) == null) return userVoiceId
-        return targetVoice(tutor.heritage, tutor) ?: userVoiceId
-    }
-
-    /**
      * The locale the tutor's own line should be spoken in.
      *
      * The learner's language, but in the tutor's regional variety when the two are compatible —

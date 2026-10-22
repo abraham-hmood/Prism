@@ -383,55 +383,6 @@ class SettingsActivity : PrismBaseActivity() {
         }
     }
 
-    private fun stopPrismVpnTunnel(keepServerAlwaysOn: Boolean = false) {
-        if (!keepServerAlwaysOn) PrismSettings.setVpnServerAlwaysOn(false)
-        runCatching { (application as PrismApp).tunnelEngine.stop() }
-        com.prism.launcher.browser.PrivateDnsVpnService.stop(this)
-        refresh()
-    }
-
-    private fun vpnServerActionRow(): android.view.View {
-        val serverRole = PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_SERVER
-        val serverRunning = serverRole &&
-            runCatching { (application as PrismApp).tunnelEngine.isPrismServerRunning() }.getOrDefault(false)
-
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = android.view.Gravity.CENTER_VERTICAL
-            setPadding(24, 12, 24, 12)
-        }
-
-        val startButton = android.widget.Button(this).apply {
-            text = if (serverRunning) "Restart VPN server" else "Start VPN server"
-            isEnabled = PrismSettings.getVpnTunnelingEnabled() &&
-                PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM && serverRole
-            setOnClickListener {
-                PrismSettings.setPrismVpnRole(PrismSettings.PRISM_ROLE_SERVER)
-                PrismSettings.setVpnServerAlwaysOn(true)
-                if (serverRunning) {
-                    stopPrismVpnTunnel(keepServerAlwaysOn = true)
-                    binding.root.postDelayed({
-                        if (!isFinishing) startPrismVpnTunnel()
-                    }, 500L)
-                } else {
-                    startPrismVpnTunnel()
-                }
-            }
-        }
-
-        val stopButton = android.widget.Button(this).apply {
-            text = "Stop VPN server"
-            isEnabled = serverRunning
-            alpha = if (serverRunning) 1f else 0.4f
-            setOnClickListener {
-                if (serverRunning) stopPrismVpnTunnel()
-            }
-        }
-
-        row.addView(startButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        row.addView(stopButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        return row
-    }
 
     private fun refresh() {
         if (::adapter.isInitialized) adapter.setItems(displayItems())
@@ -1076,6 +1027,12 @@ class SettingsActivity : PrismBaseActivity() {
                 { enabled ->
                     PrismSettings.setVpnServerAlwaysOn(enabled)
                     if (enabled) {
+                        // Switching this on now BRINGS THE SERVER UP, rather than only recording a
+                        // preference and hoping something else starts the service later. Turning on
+                        // a thing called "Persistent VPN Server" and finding no server running is
+                        // the wrong outcome, and it was the previous one whenever the service was
+                        // not already alive: start() was called, but nothing put the device into
+                        // the server role or established the tunnel.
                         PrismSettings.setPrismVpnRole(PrismSettings.PRISM_ROLE_SERVER)
                         startPrismVpnTunnel()
                     }
@@ -1084,7 +1041,6 @@ class SettingsActivity : PrismBaseActivity() {
                 },
                 isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM
             ),
-            SettingItem.Custom(vpnServerActionRow()),
             SettingItem.Picker(
                 "Prism VPN Role",
                 "Serve as a node or connect as a client",
@@ -1147,14 +1103,6 @@ class SettingsActivity : PrismBaseActivity() {
                 PrismSettings.getPrismVpnUsername(),
                 { PrismSettings.setPrismVpnUsername(it) },
                 isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM && PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_SERVER
-            ),
-            SettingItem.Nav(
-                "Manage Prism nodes",
-                "Connected nodes on this Prism server",
-                { showPrismNodesDialog() },
-                isEnabled = PrismSettings.getVpnTunnelingEnabled() &&
-                    PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM &&
-                    PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_SERVER
             ),
             SettingItem.Nav(
                 "Manage Prism Servers",
@@ -2714,163 +2662,12 @@ class SettingsActivity : PrismBaseActivity() {
         }
     }
 
-    private fun showPrismNodesDialog() {
-        if (!PrismSettings.getVpnTunnelingEnabled() ||
-            PrismSettings.getVpnMode() != PrismSettings.VPN_MODE_PRISM ||
-            PrismSettings.getPrismVpnRole() != PrismSettings.PRISM_ROLE_SERVER
-        ) return
-
-        val nodes = mutableListOf<com.prism.core.MeshTransport.Node>()
-        val adapter = object : android.widget.BaseAdapter() {
-            override fun getCount(): Int = nodes.size
-            override fun getItem(position: Int) = nodes[position]
-            override fun getItemId(position: Int): Long = position.toLong()
-            override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
-                val node = nodes[position]
-                val row = convertView ?: LayoutInflater.from(this@SettingsActivity)
-                    .inflate(android.R.layout.simple_list_item_2, parent, false)
-                row.findViewById<TextView>(android.R.id.text1).apply {
-                    text = node.name
-                    setTextColor(androidx.core.content.ContextCompat.getColor(this@SettingsActivity, R.color.prism_text_primary))
-                }
-                row.findViewById<TextView>(android.R.id.text2).apply {
-                    text = node.address + (node.serverPort?.let { ":$it" } ?: "") + " · " + node.latency + " ms"
-                    setTextColor(androidx.core.content.ContextCompat.getColor(this@SettingsActivity, R.color.prism_text_muted))
-                }
-                return row
-            }
-        }
-        val list = android.widget.ListView(this).apply {
-            this.adapter = adapter
-            setOnItemLongClickListener { _, _, position, _ ->
-                showPrismNodeActions(nodes[position]) {
-                    nodes.clear()
-                    nodes.addAll(com.prism.core.MeshTransport.nodes())
-                    adapter.notifyDataSetChanged()
-                }
-                true
-            }
-        }
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(32, 16, 32, 8)
-            addView(list, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                (560 * resources.displayMetrics.density).toInt(),
-            ))
-        }
-        val dialog = PrismDialogFactory.show(
-            this,
-            "Prism nodes",
-            "Nodes recently connected to this Prism mesh server. Long-press a node for actions.",
-            customView = content,
-        )
-        val handler = android.os.Handler(android.os.Looper.getMainLooper())
-        lateinit var refreshNodes: Runnable
-        var scanRounds = 8
-        refreshNodes = Runnable {
-            nodes.clear()
-            nodes.addAll(com.prism.core.MeshTransport.nodes())
-            adapter.notifyDataSetChanged()
-            if (scanRounds-- > 0 && dialog.isShowing) handler.postDelayed(refreshNodes, 700L)
-        }
-        dialog.setOnDismissListener { handler.removeCallbacks(refreshNodes) }
-        com.prism.core.MeshTransport.discover()
-        handler.post(refreshNodes)
-    }
-
-    private fun showPrismNodeActions(
-        node: com.prism.core.MeshTransport.Node,
-        refresh: () -> Unit,
-    ) {
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = android.view.Gravity.CENTER
-            setPadding(24, 20, 24, 20)
-        }
-        lateinit var actionDialog: AlertDialog
-
-        fun iconAction(description: String, icon: Int, tint: Int, action: () -> Boolean) {
-            val button = android.widget.ImageButton(this).apply {
-                contentDescription = description
-                setImageResource(icon)
-                setColorFilter(tint)
-                setBackgroundColor(android.graphics.Color.TRANSPARENT)
-                isEnabled = node.id.isNotBlank()
-                alpha = if (isEnabled) 1f else 0.35f
-                setOnClickListener {
-                    val succeeded = action()
-                    actionDialog.dismiss()
-                    refresh()
-                    Toast.makeText(
-                        this@SettingsActivity,
-                        when {
-                            !succeeded -> "Could not apply the node action."
-                            description == "Kick node" -> "Node disconnected."
-                            else -> "Node disconnected and permanently banned."
-                        },
-                        Toast.LENGTH_SHORT,
-                    ).show()
-                }
-            }
-            val size = (56 * resources.displayMetrics.density).toInt()
-            content.addView(button, LinearLayout.LayoutParams(size, size))
-        }
-
-        iconAction(
-            "Kick node",
-            android.R.drawable.ic_menu_close_clear_cancel,
-            android.graphics.Color.rgb(255, 205, 55),
-        ) {
-            com.prism.core.MeshTransport.kickNode(node.id)
-        }
-        iconAction(
-            "Ban node permanently",
-            android.R.drawable.ic_delete,
-            android.graphics.Color.rgb(220, 55, 60),
-        ) {
-            com.prism.core.MeshTransport.banNode(node.id)
-        }
-
-        actionDialog = PrismDialogFactory.show(
-            this,
-            node.name,
-            "Kick disconnects this node. Ban also blocks its Prism app identity from rejoining this server.",
-            positiveText = null,
-            negativeText = "Cancel",
-            customView = content,
-        )
-        actionDialog.window?.let { window ->
-            window.setGravity(android.view.Gravity.BOTTOM)
-            window.setLayout(
-                android.view.WindowManager.LayoutParams.MATCH_PARENT,
-                android.view.WindowManager.LayoutParams.WRAP_CONTENT,
-            )
-        }
-    }
-
     private fun showServerFleetManager() {
         val servers = PrismSettings.getPrismServers()
-        val nearby = mutableListOf<com.prism.core.MeshTransport.Node>()
-        val handler = android.os.Handler(android.os.Looper.getMainLooper())
-        lateinit var refreshNearby: Runnable
-        var scanRounds = 8
         val container = android.widget.LinearLayout(this).apply {
             orientation = android.widget.LinearLayout.VERTICAL
             setPadding(40, 40, 40, 40)
         }
-        lateinit var fleetDialog: AlertDialog
-
-        val addBtn = android.widget.Button(this).apply {
-            text = "+ ADD PRISM SERVER"
-            setBackgroundColor(android.graphics.Color.TRANSPARENT)
-            setTextColor(PrismSettings.getGlowColor())
-            setOnClickListener {
-                fleetDialog.dismiss()
-                showServerEditor(null)
-            }
-        }
-        container.addView(addBtn)
 
         val list = android.widget.ListView(this).apply {
             adapter = object : android.widget.BaseAdapter() {
@@ -2893,12 +2690,17 @@ class SettingsActivity : PrismBaseActivity() {
                         s.isActive = true
                         PrismSettings.setPrismServers(servers)
                         this@SettingsActivity.refresh()
-                        fleetDialog.dismiss()
                         showServerFleetManager() // Refresh
                     }
                     
                     view.setOnLongClickListener {
-                        showServerActions(s, fleetDialog)
+                        PrismDialogFactory.show(this@SettingsActivity, "Delete Server?", "Remove ${s.name} from your fleet?", onPositive = {
+                            val newList = servers.toMutableList()
+                            newList.removeAt(idx)
+                            PrismSettings.setPrismServers(newList)
+                            this@SettingsActivity.refresh()
+                            showServerFleetManager()
+                        })
                         true
                     }
                     return view
@@ -2906,313 +2708,54 @@ class SettingsActivity : PrismBaseActivity() {
             }
         }
         
-        container.addView(list, android.widget.LinearLayout.LayoutParams(
-            android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
-            (360 * resources.displayMetrics.density).toInt(),
-        ))
-
-        val nearbyTitle = TextView(this).apply {
-            text = "NEARBY PRISM SERVERS"
-            textSize = 12f
-            setTextColor(PrismSettings.getGlowColor())
-            setPadding(4, 16, 4, 4)
-        }
-        container.addView(nearbyTitle)
-        val nearbyList = android.widget.ListView(this).apply {
-            adapter = object : android.widget.BaseAdapter() {
-                override fun getCount(): Int = nearby.size
-                override fun getItem(position: Int) = nearby[position]
-                override fun getItemId(position: Int): Long = position.toLong()
-                override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
-                    val node = nearby[position]
-                    val view = convertView ?: LayoutInflater.from(this@SettingsActivity)
-                        .inflate(android.R.layout.simple_list_item_2, parent, false)
-                    view.findViewById<TextView>(android.R.id.text1).text = node.name
-                    val protocol = node.serverProtocol?.uppercase() ?: "PRISM"
-                    view.findViewById<TextView>(android.R.id.text2).text =
-                        "${node.address}:${node.serverPort} · $protocol" +
-                            if (node.serverProtocol == "wireguard") " · peer invite required" else " · Tap to add"
-                    return view
-                }
-            }
-            setOnItemClickListener { _, _, position, _ ->
-                val node = nearby[position]
-                if (node.serverProtocol == "wireguard") {
-                    Toast.makeText(
-                        this@SettingsActivity,
-                        "WireGuard server found. Import a peer config from that server to connect.",
-                        Toast.LENGTH_LONG,
-                    ).show()
-                    return@setOnItemClickListener
-                }
-                val updated = PrismSettings.getPrismServers().toMutableList()
-                if (updated.none { it.address == node.address && it.port == node.serverPort }) {
-                    updated += PrismSettings.PrismServer(
-                        name = node.name,
-                        address = node.address,
-                        port = node.serverPort ?: return@setOnItemClickListener,
-                        username = "",
-                        password = "",
-                    )
-                    PrismSettings.setPrismServers(updated)
-                    refresh()
-                }
-                fleetDialog.dismiss()
-                showServerFleetManager()
-            }
-        }
-        container.addView(nearbyList, android.widget.LinearLayout.LayoutParams(
-            android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
-            (180 * resources.displayMetrics.density).toInt(),
-        ))
-        val scanButton = android.widget.Button(this).apply {
-            text = "Scan Wi-Fi again"
-            setOnClickListener {
-                com.prism.core.MeshTransport.discover()
-                scanRounds = 8
-                handler.removeCallbacks(refreshNearby)
-                handler.post(refreshNearby)
-            }
-        }
-        container.addView(scanButton)
+        container.addView(list, android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.MATCH_PARENT, 800))
         
-        fleetDialog = PrismDialogFactory.show(
-            this,
-            "Prism Server Fleet",
-            "Select an active server or long-press for server actions.",
-            customView = container,
-        )
-        refreshNearby = Runnable {
-            val saved = PrismSettings.getPrismServers()
-            nearby.clear()
-            nearby.addAll(
-                com.prism.core.MeshTransport.nodes().filter { node ->
-                    node.serverPort != null && saved.none {
-                        it.address == node.address && it.port == node.serverPort
-                    }
-                },
-            )
-            (nearbyList.adapter as android.widget.BaseAdapter).notifyDataSetChanged()
-            if (scanRounds-- > 0 && fleetDialog.isShowing) handler.postDelayed(refreshNearby, 700L)
+        val addBtn = android.widget.Button(this).apply {
+            text = "+ ADD PRISM SERVER"
+            setBackgroundColor(android.graphics.Color.TRANSPARENT)
+            setTextColor(PrismSettings.getGlowColor())
+            setOnClickListener { showAddServerDialog() }
         }
-        fleetDialog.setOnDismissListener { handler.removeCallbacks(refreshNearby) }
-        com.prism.core.MeshTransport.discover()
-        handler.post(refreshNearby)
+        container.addView(addBtn)
+
+        PrismDialogFactory.show(this, "Prism Server Fleet", "Select active server or long-press to delete.", customView = container)
     }
 
     private fun showAddServerDialog() {
-        showServerEditor(null)
-    }
-
-    private fun showServerActions(server: PrismSettings.PrismServer, fleetDialog: AlertDialog) {
-        val actions = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(0, 0, 0, 0)
-        }
-        lateinit var actionDialog: AlertDialog
-
-        fun addAction(label: String, color: Int, action: () -> Unit) {
-            val button = android.widget.Button(this).apply {
-                text = label
-                textSize = 17f
-                setTextColor(color)
-                setBackgroundColor(android.graphics.Color.TRANSPARENT)
-                minHeight = (52 * resources.displayMetrics.density).toInt()
-                setOnClickListener {
-                    actionDialog.dismiss()
-                    action()
-                }
-            }
-            actions.addView(button, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-            ))
-            val divider = View(this).apply {
-                setBackgroundColor(android.graphics.Color.LTGRAY)
-                alpha = 0.35f
-            }
-            actions.addView(divider, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                (resources.displayMetrics.density).toInt().coerceAtLeast(1),
-            ))
-        }
-
-        addAction("Edit", PrismSettings.getGlowColor()) {
-            fleetDialog.dismiss()
-            showServerEditor(server)
-        }
-        addAction("Test connection", PrismSettings.getGlowColor()) {
-            testServerInPopup(server)
-        }
-        addAction("Delete", android.graphics.Color.rgb(220, 65, 70)) {
-            com.prism.launcher.vpn.PrismServerClient.delete(server.id)
-            refresh()
-            fleetDialog.dismiss()
-            showServerFleetManager()
-        }
-
-        actionDialog = PrismDialogFactory.show(
-            this,
-            server.name.ifBlank { "Prism server" },
-            "",
-            positiveText = null,
-            negativeText = "Cancel",
-            customView = actions,
-        )
-        actionDialog.window?.let { window ->
-            window.setGravity(android.view.Gravity.BOTTOM)
-            window.setLayout(
-                android.view.WindowManager.LayoutParams.MATCH_PARENT,
-                android.view.WindowManager.LayoutParams.WRAP_CONTENT,
-            )
-        }
-    }
-
-    private fun showServerEditor(existing: PrismSettings.PrismServer?) {
         val layout = android.widget.LinearLayout(this).apply {
             orientation = android.widget.LinearLayout.VERTICAL
             setPadding(40, 20, 40, 20)
         }
-
-        val nameInput = EditText(this).apply {
-            hint = "Server Name (e.g. Home Lab)"
-            setText(existing?.name.orEmpty())
-        }
-        val ipInput = EditText(this).apply {
-            hint = "Target IP/Hostname"
-            setText(existing?.address.orEmpty())
-        }
-        val portInput = EditText(this).apply {
-            hint = "Port (Default 8888)"
-            inputType = InputType.TYPE_CLASS_NUMBER
-            setText(existing?.port?.toString().orEmpty())
-        }
-        val userInput = EditText(this).apply {
-            hint = "Username"
-            setText(existing?.username.orEmpty())
-        }
-        val passInput = EditText(this).apply {
-            hint = "Password"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-            setText(existing?.password.orEmpty())
-        }
-        val testResult = TextView(this).apply {
-            visibility = View.GONE
-            textSize = 14f
-            val pad = (8 * resources.displayMetrics.density).toInt()
-            setPadding(0, pad, 0, pad)
-        }
+        
+        val nameInput = EditText(this).apply { hint = "Server Name (e.g. Home Lab)" }
+        val ipInput = EditText(this).apply { hint = "Target IP/Hostname" }
+        val portInput = EditText(this).apply { hint = "Port (Default 8888)"; inputType = android.text.InputType.TYPE_CLASS_NUMBER }
+        val userInput = EditText(this).apply { hint = "Username" }
+        val passInput = EditText(this).apply { hint = "Password"; inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD }
         
         layout.addView(nameInput)
         layout.addView(ipInput)
         layout.addView(portInput)
         layout.addView(userInput)
         layout.addView(passInput)
-        layout.addView(testResult)
 
-        val dialog = AlertDialog.Builder(this, R.style.Theme_PrismSettings)
-            .setTitle(if (existing == null) "Add Prism Server" else "Edit Prism Server")
-            .setMessage("Enter your server credentials below.")
-            .setView(layout)
-            .setNegativeButton("Cancel", null)
-            .setNeutralButton("Test", null)
-            .setPositiveButton("OK", null)
-            .create()
-
-        dialog.setOnDismissListener {
-            if (!isFinishing) showServerFleetManager()
-        }
-        dialog.setOnShowListener {
-            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
-                val candidate = serverFromFields(
-                    existing, nameInput, ipInput, portInput, userInput, passInput,
-                )
-                testResult.visibility = View.VISIBLE
-                testResult.setTextColor(android.graphics.Color.DKGRAY)
-                testResult.text = "Testing connection..."
-                testServer(candidate) { result ->
-                    if (!dialog.isShowing) return@testServer
-                    val connected = result is com.prism.launcher.vpn.PrismServerClient.Result.Connected
-                    testResult.setTextColor(
-                        if (connected) android.graphics.Color.rgb(46, 150, 82)
-                        else android.graphics.Color.rgb(210, 55, 60),
-                    )
-                    testResult.text = result.message
-                }
-            }
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                val name = nameInput.text.toString().trim()
-                val address = ipInput.text.toString().trim()
-                if (name.isEmpty() || address.isEmpty()) {
-                    Toast.makeText(this, "Enter a server name and address.", Toast.LENGTH_SHORT).show()
-                    return@setOnClickListener
-                }
-                com.prism.launcher.vpn.PrismServerClient.save(
-                    serverFromFields(existing, nameInput, ipInput, portInput, userInput, passInput),
-                )
+        PrismDialogFactory.show(this, "Add Prism Server", "Enter your server credentials below.", onPositive = {
+            val name = nameInput.text.toString().trim()
+            val ip = ipInput.text.toString().trim()
+            if (name.isNotEmpty() && ip.isNotEmpty()) {
+                val servers = PrismSettings.getPrismServers().toMutableList()
+                servers.add(PrismSettings.PrismServer(
+                    name = name,
+                    address = ip,
+                    port = portInput.text.toString().toIntOrNull() ?: 8888,
+                    username = userInput.text.toString(),
+                    password = passInput.text.toString()
+                ))
+                PrismSettings.setPrismServers(servers)
                 refresh()
-                dialog.dismiss()
+                showServerFleetManager()
             }
-        }
-        dialog.show()
-    }
-
-    private fun serverFromFields(
-        existing: PrismSettings.PrismServer?,
-        name: EditText,
-        address: EditText,
-        port: EditText,
-        username: EditText,
-        password: EditText,
-    ) = PrismSettings.PrismServer(
-        id = existing?.id ?: java.util.UUID.randomUUID().toString(),
-        name = name.text.toString().trim(),
-        address = address.text.toString().trim(),
-        port = port.text.toString().toIntOrNull() ?: 8888,
-        username = username.text.toString(),
-        password = password.text.toString(),
-        isActive = existing?.isActive ?: false,
-    )
-
-    private fun testServerInPopup(server: PrismSettings.PrismServer) {
-        val progress = AlertDialog.Builder(this, R.style.Theme_PrismSettings)
-            .setTitle("Testing connection")
-            .setView(android.widget.ProgressBar(this).apply {
-                isIndeterminate = true
-                val pad = (24 * resources.displayMetrics.density).toInt()
-                setPadding(pad, pad, pad, pad)
-            })
-            .setCancelable(false)
-            .show()
-        testServer(server) { result ->
-            progress.dismiss()
-            if (isFinishing) return@testServer
-            val connected = result is com.prism.launcher.vpn.PrismServerClient.Result.Connected
-            val message = TextView(this).apply {
-                text = result.message
-                textSize = 16f
-                setTextColor(
-                    if (connected) android.graphics.Color.rgb(46, 150, 82)
-                    else android.graphics.Color.rgb(210, 55, 60),
-                )
-            }
-            PrismDialogFactory.show(
-                this,
-                if (connected) "Connection successful" else "Connection failed",
-                "",
-                customView = message,
-            )
-        }
-    }
-
-    private fun testServer(
-        server: PrismSettings.PrismServer,
-        onResult: (com.prism.launcher.vpn.PrismServerClient.Result) -> Unit,
-    ) {
-        Thread({
-            val result = com.prism.launcher.vpn.PrismServerClient.probe(server)
-            runOnUiThread { onResult(result) }
-        }, "prism-server-probe").apply { isDaemon = true }.start()
+        }, customView = layout)
     }
 
     /**

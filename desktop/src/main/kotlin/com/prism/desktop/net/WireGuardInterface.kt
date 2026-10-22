@@ -3,8 +3,6 @@ package com.prism.desktop.net
 import com.prism.core.PrismPlatform
 import com.prism.launcher.PrismSettings
 import java.io.File
-import java.net.InetSocketAddress
-import java.net.Socket
 import java.util.concurrent.TimeUnit
 
 /**
@@ -47,13 +45,8 @@ object WireGuardInterface {
 
     /** The subnet handed out to peers, matching the mesh subnet the tunnel already routes. */
     private const val SERVER_ADDRESS = "10.8.0.1/24"
-    private const val SELF_CLIENT_NAME = "Prism local self-client"
-    private const val SELF_CLIENT_INTERFACE = "prism-client"
-    private const val SELF_CLIENT_ALLOWED_IPS = "10.8.0.1/32, 10.8.0.254/32"
 
     data class Peer(val name: String, val publicKey: String, val address: String)
-
-    data class ConnectedPeer(val peer: Peer, val latestHandshakeEpochSeconds: Long)
 
     data class Result(val ok: Boolean, val message: String)
 
@@ -61,8 +54,6 @@ object WireGuardInterface {
     fun directory(): File = File(PrismPlatform.host.dataDir(), "wireguard").apply { mkdirs() }
 
     fun configFile(): File = File(directory(), INTERFACE + ".conf")
-
-    private fun selfClientConfigFile(): File = File(directory(), SELF_CLIENT_INTERFACE + ".conf")
 
     // ── Peers ──────────────────────────────────────────────────────────────
 
@@ -79,62 +70,13 @@ object WireGuardInterface {
             if (parts.size != 3) null else Peer(parts[0], parts[1], parts[2])
         }
 
-    /** Configured server peers with a recent real WireGuard handshake. */
-    fun connectedPeers(): List<ConnectedPeer> {
-        val inspector = wgExecutable() ?: return emptyList()
-        val output = run(listOf(inspector, "show", INTERFACE, "latest-handshakes")) ?: return emptyList()
-        val cutoff = System.currentTimeMillis() / 1000L - 180L
-        val handshakes = output.lineSequence().mapNotNull { line ->
-            val fields = line.trim().split(Regex("\\s+"))
-            val epoch = fields.getOrNull(1)?.toLongOrNull() ?: return@mapNotNull null
-            if (epoch <= cutoff) return@mapNotNull null
-            fields[0] to epoch
-        }.toMap()
-        return peers().mapNotNull { peer ->
-            handshakes[peer.publicKey]?.let { ConnectedPeer(peer, it) }
-        }.filterNot { it.peer.name == SELF_CLIENT_NAME }
-            .sortedByDescending { it.latestHandshakeEpochSeconds }
-    }
-
-    fun kickPeer(publicKey: String): Result = removePeer(publicKey, permanent = false)
-
-    fun banPeer(publicKey: String): Result {
-        if (publicKey.isBlank()) return failed("Peer public key is empty.")
-        PrismSettings.setBannedWgPeerPublicKeys(PrismSettings.getBannedWgPeerPublicKeys() + publicKey)
-        return removePeer(publicKey, permanent = true)
-    }
-
-    private fun removePeer(publicKey: String, permanent: Boolean): Result {
-        val peer = peers().firstOrNull { it.publicKey == publicKey }
-            ?: return if (permanent) Result(true, "Peer public key is permanently banned.")
-            else Result(false, "Peer is no longer configured.")
-        val wg = wgExecutable() ?: return failed("Could not find the WireGuard wg command.")
-        val output = run(listOf(wg, "set", INTERFACE, "peer", publicKey, "remove"))
-            ?: return failed("Could not remove the peer from the live WireGuard interface.")
-        if (output.startsWith("ERROR:", true) || refused(output)) {
-            return failed("Could not remove ${peer.name} from the live interface: " + output.trim())
-        }
-        forget(publicKey)
-        val result = if (permanent) {
-            "${peer.name} was disconnected and its public key banned."
-        } else {
-            "${peer.name} was disconnected."
-        }
-        PrismPlatform.log.warn(TAG, result)
-        return Result(true, result)
-    }
-
     /**
      * Creates a configuration for a new peer and remembers its public key.
      *
      * @return the config text to hand to that device, which contains ITS private key and nothing of
      *   this machine's except the public key it needs to recognise the server.
      */
-    fun invite(
-        name: String,
-        endpointHost: String,
-        allowedIps: String = PrismSettings.getWgAllowedIps().ifBlank { "0.0.0.0/0" },
-    ): Pair<String, Peer> {
+    fun invite(name: String, endpointHost: String): Pair<String, Peer> {
         val pair = com.prism.core.JdkWireGuardKeys.generate()
         val address = nextAddress()
         val peer = Peer(name.ifBlank { "peer" }.replace("\t", " "), pair.second, address)
@@ -154,7 +96,7 @@ object WireGuardInterface {
             appendLine("[Peer]")
             appendLine("PublicKey = " + PrismSettings.getWgServerPublicKey())
             appendLine("Endpoint = " + endpointHost + ":" + PrismSettings.getWgServerPort())
-            appendLine("AllowedIPs = " + allowedIps)
+            appendLine("AllowedIPs = " + PrismSettings.getWgAllowedIps().ifBlank { "0.0.0.0/0" })
             appendLine("PersistentKeepalive = 25")
         }
         return config to peer
@@ -224,44 +166,6 @@ object WireGuardInterface {
     var running = false
         private set
 
-    /** Checks the OS interface instead of trusting this process's cached flag. */
-    fun isRunning(): Boolean = isInterfaceRunning(INTERFACE)
-
-    fun isPrismServerRunning(): Boolean =
-        isRunning() && DesktopPrismProxyServer.isRunning()
-
-    private fun isInterfaceRunning(interfaceName: String): Boolean {
-        val windows = System.getProperty("os.name").orEmpty().lowercase().contains("win")
-        val inspector = if (windows) {
-            val wireguard = VpnStack.wireGuardExecutable()?.let(::File)
-            listOfNotNull(
-                wireguard?.parentFile?.let { File(it, "wg.exe").takeIf(File::isFile)?.absolutePath },
-                "wg.exe".takeIf { which(it) != null },
-                "wg".takeIf { which(it) != null },
-            ).firstOrNull()
-        } else {
-            "wg".takeIf { which(it) != null }
-        } ?: return false
-
-        return runCatching {
-            val process = ProcessBuilder(inspector, "show", interfaceName)
-                .redirectErrorStream(true)
-                .start()
-            val output = process.inputStream.bufferedReader().use { it.readText() }
-            process.waitFor(5, TimeUnit.SECONDS) && process.exitValue() == 0 &&
-                output.lineSequence().any { it.trim().startsWith("interface:", ignoreCase = true) }
-        }.getOrDefault(false)
-    }
-
-    private fun wgExecutable(): String? {
-        val windows = System.getProperty("os.name").orEmpty().lowercase().contains("win")
-        if (!windows) return which("wg")
-        val wireguard = VpnStack.wireGuardExecutable()?.let(::File)
-        return wireguard?.parentFile?.let { File(it, "wg.exe").takeIf(File::isFile)?.absolutePath }
-            ?: which("wg.exe")
-            ?: which("wg")
-    }
-
     /**
      * Brings the interface up.
      *
@@ -272,23 +176,28 @@ object WireGuardInterface {
     fun up(): Result {
         val report = VpnStack.wireGuard()
         if (!report.canConnect) {
-            return failed(report.detail)
+            return Result(false, report.detail)
         }
-        val file = runCatching { writeConfig() }.getOrElse {
-            return failed("Could not write the WireGuard server config: " + (it.message ?: it::class.java.simpleName))
+        if (peers().isEmpty()) {
+            // Refused rather than started. An interface with no peers listens and drops every handshake,
+            // which presents as "connected here, broken there" -- the least debuggable outcome.
+            return Result(false, "No peers yet. Invite a device first, so its key is in the config.")
         }
-        val command = upCommand(file) ?: return failed(report.detail)
-        val output = run(command) ?: return failed("Could not run " + command.first() + ".")
+
+        val file = writeConfig()
+        val command = upCommand(file) ?: return Result(false, report.detail)
+        val output = run(command) ?: return Result(false, "Could not run " + command.first() + ".")
 
         if (refused(output)) {
-            return failed(
+            return Result(
+                false,
                 command.first() + " was refused: bringing an interface up needs root or " +
                     "administrator rights. On Windows, start Prism as administrator; on Linux, run it " +
                     "with sudo or give it CAP_NET_ADMIN.",
             )
         }
         if (output.contains("error", true) || output.contains("Cannot find", true)) {
-            return failed(command.first() + " failed: " + output.trim().lines().firstOrNull())
+            return Result(false, command.first() + " failed: " + output.trim().lines().firstOrNull())
         }
 
         running = true
@@ -304,89 +213,9 @@ object WireGuardInterface {
         )
     }
 
-    fun upAndConnectToSelf(): Result {
-        if (isRunning() || isInterfaceRunning(SELF_CLIENT_INTERFACE)) {
-            val stopped = down()
-            if (!stopped.ok) return stopped
-        }
-
-        val proxyResult = DesktopPrismProxyServer.start()
-        if (!proxyResult.ok) return failed(proxyResult.message)
-
-        val localClientFile = selfClientConfigFile()
-        if (!localClientFile.isFile || peers().none { it.name == SELF_CLIENT_NAME }) {
-            if (localClientFile.exists()) localClientFile.delete()
-            peers().firstOrNull { it.name == SELF_CLIENT_NAME }?.let { forget(it.publicKey) }
-            val (config, _) = invite(
-                SELF_CLIENT_NAME,
-                "127.0.0.1",
-                SELF_CLIENT_ALLOWED_IPS,
-            )
-            val selfConfig = config.lineSequence()
-                .filterNot { it.startsWith("DNS = ") }
-                .joinToString(System.lineSeparator(), postfix = System.lineSeparator())
-            runCatching {
-                localClientFile.writeText(selfConfig)
-                localClientFile.setReadable(false, false)
-                localClientFile.setReadable(true, true)
-                localClientFile.setWritable(false, false)
-                localClientFile.setWritable(true, true)
-            }.onFailure {
-                DesktopPrismProxyServer.stop()
-                return failed("Could not save the local WireGuard client config: " + (it.message ?: it::class.java.simpleName))
-            }
-        }
-
-        val serverResult = up()
-        if (!serverResult.ok) {
-            DesktopPrismProxyServer.stop()
-            return serverResult
-        }
-
-        val command = clientUpCommand() ?: return failedAndStopProxy("Could not locate the local WireGuard client startup command.")
-        val output = run(command) ?: return failedAndStopProxy("Could not run " + command.first() + " for the local client.")
-        if (output.startsWith("ERROR:", true) || refused(output) ||
-            (output.contains("error", true) && !output.contains("already exists", true))
-        ) {
-            return failedAndStopProxy("The server is running, but its local client failed to connect: " + output.trim())
-        }
-        if (!awaitInterfaceRunning(SELF_CLIENT_INTERFACE)) {
-            return failedAndStopProxy("The server is running, but the local WireGuard client interface did not become active.")
-        }
-        sendHandshakeProbe()
-        if (!awaitHandshake(SELF_CLIENT_INTERFACE)) {
-            return failed("The server and local client interfaces are up, but this PC did not complete a WireGuard handshake with its own server.")
-        }
-
-        val message = serverResult.message + " This PC is connected to its own VPN server on $SELF_CLIENT_ALLOWED_IPS."
-        PrismPlatform.log.success(TAG, message)
-        return Result(true, message)
-    }
-
     fun down(): Result {
-        val proxyResult = DesktopPrismProxyServer.stop()
-        if (!proxyResult.ok) return failed(proxyResult.message)
-        val selfClientFile = selfClientConfigFile()
-        if (selfClientFile.isFile && isInterfaceRunning(SELF_CLIENT_INTERFACE)) {
-            val clientDown = clientDownCommand(selfClientFile)
-                ?: return failed("Could not locate the local WireGuard client shutdown command.")
-            val clientOutput = run(clientDown)
-                ?: return failed("Could not run " + clientDown.first() + " to stop the local client.")
-            if (clientOutput.startsWith("ERROR:", true) || refused(clientOutput)) {
-                return failed("Could not stop this PC's local WireGuard client: " + clientOutput.trim())
-            }
-        }
-        val command = downCommand() ?: return failed("Could not locate the WireGuard shutdown command.")
-        val output = run(command) ?: return failed("Could not run " + command.first() + " to stop the interface.")
-        if (output.startsWith("ERROR:", ignoreCase = true)) {
-            return failed("Could not stop the WireGuard interface: " + output.trim())
-        }
-        if (output.contains("access is denied", true) || output.contains("permission denied", true) ||
-            output.contains("operation not permitted", true) || output.contains("must be run as root", true)
-        ) return failed("Could not stop the WireGuard interface: " + output.trim())
+        val output = downCommand()?.let { run(it) }
         running = false
-        if (isRunning()) return failed("The WireGuard command returned, but interface $INTERFACE is still running.")
-        PrismPlatform.log.info(TAG, "The $INTERFACE interface is down.")
         return Result(true, "The interface is down." + (if (output.isNullOrBlank()) "" else " " + output.trim()))
     }
 
@@ -419,77 +248,6 @@ object WireGuardInterface {
             return listOf(tool, "/uninstalltunnelservice", INTERFACE)
         }
         return listOf("wg-quick", "down", configFile().absolutePath)
-    }
-
-    private fun clientUpCommand(): List<String>? {
-        val file = selfClientConfigFile()
-        val windows = System.getProperty("os.name").orEmpty().lowercase().contains("win")
-        if (windows) {
-            val tool = VpnStack.wireGuardExecutable() ?: return null
-            return listOf(tool, "/installtunnelservice", file.absolutePath)
-        }
-        return listOf("wg-quick", "up", file.absolutePath)
-    }
-
-    private fun clientDownCommand(file: File): List<String>? {
-        val windows = System.getProperty("os.name").orEmpty().lowercase().contains("win")
-        if (windows) {
-            val tool = VpnStack.wireGuardExecutable() ?: return null
-            return listOf(tool, "/uninstalltunnelservice", SELF_CLIENT_INTERFACE)
-        }
-        return listOf("wg-quick", "down", file.absolutePath)
-    }
-
-    private fun awaitInterfaceRunning(interfaceName: String): Boolean {
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
-        while (System.nanoTime() < deadline) {
-            if (isInterfaceRunning(interfaceName)) return true
-            try {
-                TimeUnit.MILLISECONDS.sleep(200)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-                return false
-            }
-        }
-        return isInterfaceRunning(interfaceName)
-    }
-
-    private fun awaitHandshake(interfaceName: String): Boolean {
-        val windows = System.getProperty("os.name").orEmpty().lowercase().contains("win")
-        val inspector = if (windows) {
-            val wireguard = VpnStack.wireGuardExecutable()?.let(::File)
-            listOfNotNull(
-                wireguard?.parentFile?.let { File(it, "wg.exe").takeIf(File::isFile)?.absolutePath },
-                "wg.exe".takeIf { which(it) != null },
-                "wg".takeIf { which(it) != null },
-            ).firstOrNull()
-        } else {
-            "wg".takeIf { which(it) != null }
-        } ?: return false
-
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
-        while (System.nanoTime() < deadline) {
-            val output = run(listOf(inspector, "show", interfaceName, "latest-handshakes"))
-            if (output != null && output.lineSequence().any { line ->
-                    line.trim().split(Regex("\\s+")).lastOrNull()?.toLongOrNull()?.let { it > 0L } == true
-                }
-            ) return true
-            try {
-                TimeUnit.MILLISECONDS.sleep(250)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-                return false
-            }
-        }
-        return false
-    }
-
-    private fun sendHandshakeProbe() {
-        runCatching {
-            Socket().use { socket ->
-                socket.connect(InetSocketAddress("10.8.0.254", 9), 1_000)
-            }
-        }
     }
 
     /**
@@ -526,20 +284,9 @@ object WireGuardInterface {
 
     private fun run(command: List<String>): String? = runCatching {
         val process = ProcessBuilder(command).redirectErrorStream(true).start()
-        val output = java.util.concurrent.CompletableFuture.supplyAsync {
-            process.inputStream.bufferedReader().use { it.readText() }
-        }
-        if (!process.waitFor(30, TimeUnit.SECONDS)) {
-            process.destroyForcibly()
-            return@runCatching "ERROR: command timed out after 30 seconds"
-        }
-        output.get(2, TimeUnit.SECONDS)
-    }.getOrNull()
-
-    private fun which(name: String): String? = runCatching {
-        val path = System.getenv("PATH").orEmpty()
-        path.split(File.pathSeparatorChar).map { File(it, name) }
-            .firstOrNull { it.isFile }?.absolutePath
+        val output = process.inputStream.bufferedReader().readText()
+        process.waitFor(30, TimeUnit.SECONDS)
+        output
     }.getOrNull()
 
     private fun refused(output: String): Boolean =
@@ -548,14 +295,4 @@ object WireGuardInterface {
             output.contains("permission denied", true) ||
             output.contains("operation not permitted", true) ||
             output.contains("requires elevation", true)
-
-    private fun failed(message: String): Result {
-        PrismPlatform.log.error(TAG, message)
-        return Result(false, message)
-    }
-
-    private fun failedAndStopProxy(message: String): Result {
-        DesktopPrismProxyServer.stop()
-        return failed(message)
-    }
 }

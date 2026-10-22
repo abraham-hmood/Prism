@@ -8,7 +8,7 @@ plugins {
 android {
     namespace = "com.prism.launcher"
     compileSdk = 35
-    ndkVersion = "26.1.10909125"
+    ndkVersion = "27.0.12077973"
 
     defaultConfig {
         applicationId = "com.prism.launcher"

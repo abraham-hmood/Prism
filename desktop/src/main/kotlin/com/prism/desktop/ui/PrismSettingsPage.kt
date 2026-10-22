@@ -15,7 +15,6 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -29,7 +28,6 @@ import androidx.compose.ui.unit.sp
 import com.prism.launcher.PrismSettings
 import com.prism.launcher.SettingsCatalog
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -90,12 +88,6 @@ fun PrismSettingsPage(mobileMode: Boolean, onMobileModeChange: (Boolean) -> Unit
         SettingsActions.Dialog.PRISM_SERVERS -> PrismServersDialog(onDismiss = {
             dialog = null
             // The active server may have changed, and a row shows which one it is.
-            revision++
-        })
-        SettingsActions.Dialog.PRISM_NODES -> PrismNodesDialog(onDismiss = { dialog = null })
-        SettingsActions.Dialog.SPEECH_MODEL -> SpeechModelDialog(onDismiss = {
-            dialog = null
-            // A model may have been set or removed, and the row's summary says which.
             revision++
         })
         null -> Unit
@@ -328,133 +320,12 @@ private fun SettingRow(item: SettingsCatalog.Item, onChanged: () -> Unit) {
         }
 
         is SettingsCatalog.Action -> {
-            when {
-                item.target == SettingsCatalog.Target.MANAGE_PRISM_NODES -> {
-                    val serverRole = PrismSettings.getVpnTunnelingEnabled() &&
-                        PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM &&
-                        PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_SERVER
-                    OutlinedButton(
-                        enabled = serverRole,
-                        onClick = { SettingsActions.perform(item.target) },
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
-                    ) { Text(item.title, fontSize = 13.sp) }
-                }
-
-                item.target == SettingsCatalog.Target.START_VPN_SERVER -> {
-                    val serverRole = PrismSettings.getVpnTunnelingEnabled() &&
-                        PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM &&
-                        PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_SERVER
-                    val scope = rememberCoroutineScope()
-                    var serverRunning by remember { mutableStateOf(false) }
-                    var serverBusy by remember { mutableStateOf(false) }
-                    var serverMessage by remember { mutableStateOf("") }
-
-                    LaunchedEffect(serverRole) {
-                        serverRunning = false
-                        while (serverRole) {
-                            serverRunning = withContext(Dispatchers.IO) {
-                                com.prism.desktop.net.WireGuardInterface.isRunning()
-                            }
-                            delay(1000L)
-                        }
-                    }
-
-                    Row(
-                        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Button(
-                            enabled = serverRole && !serverBusy,
-                            onClick = {
-                                serverBusy = true
-                                serverMessage = "Starting Prism server..."
-                                scope.launch {
-                                    try {
-                                        serverMessage = withContext(Dispatchers.IO) {
-                                            PrismSettings.setPrismVpnRole(PrismSettings.PRISM_ROLE_SERVER)
-                                            PrismSettings.setVpnServerAlwaysOn(true)
-                                            val bootstrap = com.prism.desktop.net.DesktopTunnelBootstrap.ensureReadyForTunnel(
-                                                elevatedArgs = listOf("vpn", "serve", "up"),
-                                                exitAfterElevation = false,
-                                            )
-                                            if (bootstrap.shouldRestart || bootstrap.message != "Ready.") {
-                                                val message = bootstrap.message
-                                                if (bootstrap.shouldRestart) {
-                                                    com.prism.core.PrismPlatform.log.info("PrismWireGuard", message)
-                                                } else {
-                                                    com.prism.core.PrismPlatform.log.error("PrismWireGuard", message)
-                                                }
-                                                return@withContext message
-                                            }
-                                            val result = com.prism.desktop.net.WireGuardInterface.upAndConnectToSelf()
-                                            if (result.ok) com.prism.core.PrismPlatform.log.success("PrismWireGuard", result.message)
-                                            else com.prism.core.PrismPlatform.log.error("PrismWireGuard", result.message)
-                                            if (result.ok) com.prism.core.MeshCore.discover()
-                                            result.message
-                                        }
-                                    } catch (failure: Throwable) {
-                                        val message = "Prism server startup failed: " + (failure.message ?: failure::class.java.simpleName)
-                                        com.prism.core.PrismPlatform.log.error("PrismWireGuard", message, failure)
-                                        serverMessage = message
-                                    } finally {
-                                        serverBusy = false
-                                    }
-                                }
-                            },
-                            modifier = Modifier.weight(1f),
-                        ) { Text(if (serverRunning) "Restart VPN server" else "Start VPN server", fontSize = 13.sp) }
-
-                        Spacer(Modifier.width(8.dp))
-
-                        OutlinedButton(
-                            enabled = serverRole && serverRunning && !serverBusy,
-                            onClick = {
-                                serverBusy = true
-                                serverMessage = "Stopping Prism server..."
-                                scope.launch {
-                                    try {
-                                        serverMessage = withContext(Dispatchers.IO) {
-                                            PrismSettings.setVpnServerAlwaysOn(false)
-                                            val result = com.prism.desktop.net.WireGuardInterface.down()
-                                            if (result.ok) com.prism.core.PrismPlatform.log.info("PrismWireGuard", result.message)
-                                            else com.prism.core.PrismPlatform.log.error("PrismWireGuard", result.message)
-                                            result.message
-                                        }
-                                    } catch (failure: Throwable) {
-                                        val message = "Prism server shutdown failed: " + (failure.message ?: failure::class.java.simpleName)
-                                        com.prism.core.PrismPlatform.log.error("PrismWireGuard", message, failure)
-                                        serverMessage = message
-                                    } finally {
-                                        serverBusy = false
-                                    }
-                                }
-                            },
-                            modifier = Modifier.weight(1f),
-                        ) { Text("Stop VPN server", fontSize = 13.sp) }
-                    }
-                    if (serverMessage.isNotBlank()) {
-                        Text(
-                            serverMessage,
-                            fontSize = 12.sp,
-                            color = if (serverMessage.startsWith("Could not") || serverMessage.contains("failed", true) || serverMessage.contains("refused", true)) {
-                                Color(0xFFFF7777)
-                            } else {
-                                LocalPrismColors.current.faint
-                            },
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
-                        )
-                    }
-                }
-
-                else -> {
-                    var outcome by remember(item.title) { mutableStateOf("") }
-                    NavRow(
-                        title = item.title,
-                        detail = outcome.ifBlank { detail },
-                        onClick = { outcome = SettingsActions.perform(item.target) },
-                    )
-                }
-            }
+            var outcome by remember(item.title) { mutableStateOf("") }
+            NavRow(
+                title = item.title,
+                detail = outcome.ifBlank { detail },
+                onClick = { outcome = SettingsActions.perform(item.target) },
+            )
         }
 
         is SettingsCatalog.Info -> InfoRow(item.title, runCatching { item.value() }.getOrDefault(""))

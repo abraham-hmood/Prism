@@ -119,12 +119,6 @@ fun TunnelPage() {
                     onClick = {
                         busy = true
                         scope.launch {
-                            val bootstrap = withContext(Dispatchers.IO) { com.prism.desktop.net.DesktopTunnelBootstrap.ensureReadyForTunnel() }
-                            if (bootstrap.shouldRestart) {
-                                message = bootstrap.message
-                                busy = false
-                                return@launch
-                            }
                             val result = withContext(Dispatchers.IO) { TunnelRuntime.start() }
                             message = result.message
                             busy = false

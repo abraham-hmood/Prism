@@ -344,23 +344,6 @@ fun main(args: Array<String>) {
     com.prism.launcher.messaging.ModelRegistry.watchDownloads()
     com.prism.launcher.messaging.ModelRegistry.reconcile()
 
-    com.prism.core.MeshCore.serverEndpoint = {
-        val isConfiguredServer = com.prism.launcher.PrismSettings.getVpnTunnelingEnabled() &&
-            com.prism.launcher.PrismSettings.getVpnMode() == com.prism.launcher.PrismSettings.VPN_MODE_PRISM &&
-            com.prism.launcher.PrismSettings.getPrismVpnRole() == com.prism.launcher.PrismSettings.PRISM_ROLE_SERVER
-        if (isConfiguredServer && com.prism.desktop.net.WireGuardInterface.isPrismServerRunning()) {
-            com.prism.desktop.net.DesktopPrismProxyServer.port()?.let { proxyPort ->
-                com.prism.core.PrismNodeWire.ServerEndpoint(
-                    port = proxyPort,
-                    protocol = "proxy",
-                    publicKey = com.prism.launcher.PrismSettings.getWgServerPublicKey(),
-                    wireGuardPort = com.prism.launcher.PrismSettings.getWgServerPort(),
-                )
-            }
-        } else {
-            null
-        }
-    }
     com.prism.core.MeshCore.start()
     com.prism.core.MeshConnect.startServer()
 
@@ -2013,15 +1996,9 @@ private fun vpn(args: List<String>) {
             rule("WireGuard server")
             when (args.getOrNull(1)) {
                 "up" -> {
-                    val result = com.prism.desktop.net.WireGuardInterface.upAndConnectToSelf()
+                    val result = com.prism.desktop.net.WireGuardInterface.up()
                     row("result", if (result.ok) "up" else "not up")
                     println()
-                    println("  " + result.message)
-                }
-
-                "restart" -> {
-                    val result = com.prism.desktop.net.WireGuardInterface.upAndConnectToSelf()
-                    row("result", if (result.ok) "restarted" else "restart failed")
                     println("  " + result.message)
                 }
 

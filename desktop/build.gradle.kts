@@ -85,9 +85,6 @@ dependencies {
     // feature existing here and not.
     implementation("org.jcodec:jcodec:0.2.5")
     implementation("org.jcodec:jcodec-javase:0.2.5")
-
-    // The speech engines' tests: the parity harness runs the real engine classes on the JVM.
-    testImplementation(kotlin("test"))
 }
 
 // THE SAME PYTHON BOTH PLATFORMS RUN. prism_cakechat.py and prism_corpus.py live in the Android
@@ -131,18 +128,11 @@ compose.desktop {
             // NativePayload finds the libraries in a build that has no build/nativeLibs.
             appResourcesRootDir.set(layout.buildDirectory.dir("appResources"))
 
-            // MSI for Windows, deb for Debian-family, rpm for the rest, plus a standalone .exe
-            // and AppImage for explicit desktop packaging workflows. jpackage bundles a trimmed
-            // JRE, so the result installs without the user having a JDK.
-            targetFormats(
-                TargetFormat.Msi,
-                TargetFormat.Exe,
-                TargetFormat.Deb,
-                TargetFormat.Rpm,
-                TargetFormat.AppImage,
-            )
+            // MSI for Windows, deb for Debian-family, rpm for the rest. jpackage bundles a
+            // trimmed JRE, so the result installs without the user having a JDK.
+            targetFormats(TargetFormat.Msi, TargetFormat.Deb, TargetFormat.Rpm)
             packageName = "Prism"
-            packageVersion = "1.0.1"
+            packageVersion = "1.0.0"
             description = "Prism"
             vendor = "Prism"
 
@@ -154,10 +144,8 @@ compose.desktop {
             windows {
                 menuGroup = "Prism"
                 perUserInstall = true
-                // Keep this upgrade identity stable: the EXE is a WiX maintenance installer, so an
-                // existing per-user install can be repaired/reinstalled or removed, and newer builds
-                // upgrade it instead of installing a second copy. Windows also registers its standard
-                // Uninstall entry for Settings > Apps.
+                // Stable UUID: changing it makes an upgrade install alongside the old copy
+                // rather than replacing it.
                 upgradeUuid = "6E9C2A41-7B3D-4F58-9A26-1D4E8C7B5A03"
             }
             linux {
@@ -168,18 +156,6 @@ compose.desktop {
     }
 }
 
-// Explicit aliases for the desktop packaging flows users are most likely to trigger from Gradle.
-tasks.register("packageWindowsExe") {
-    group = "distribution"
-    description = "Builds the Windows .exe desktop distribution."
-    dependsOn("packageExe")
-}
-
-tasks.register("packageUbuntuAppImage") {
-    group = "distribution"
-    description = "Builds the Ubuntu AppImage desktop distribution."
-    dependsOn("packageAppImage")
-}
 
 // ── Native kernels ───────────────────────────────────────────────────────────────────────────
 //

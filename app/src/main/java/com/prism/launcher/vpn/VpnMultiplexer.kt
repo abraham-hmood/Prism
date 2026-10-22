@@ -27,7 +27,7 @@ class VpnMultiplexer(
         Dispatchers.IO + SupervisorJob() +
             com.prism.launcher.PrismLogger.coroutineHandler("VpnMultiplexer")
     )
-    private val channels = java.util.concurrent.CopyOnWriteArrayList<DatagramChannel>()
+    private val channels = mutableListOf<DatagramChannel>()
     
     // Pass full credentials to engines
     private val ikeEngine = IkeEngine(psk, user, pass)
@@ -132,10 +132,6 @@ class VpnMultiplexer(
             try { c.close() } catch (e: Exception) {}
         }
         channels.clear()
-    }
-
-    fun isRunning(): Boolean = channels.any { channel ->
-        channel.isOpen && runCatching { channel.socket().isBound }.getOrDefault(false)
     }
 
     enum class VpnProtocol {

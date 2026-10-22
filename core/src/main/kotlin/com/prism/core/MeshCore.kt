@@ -1,7 +1,6 @@
 package com.prism.core
 
 import com.prism.core.json.JSONObject
-import com.prism.launcher.PrismSettings
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -68,15 +67,9 @@ object MeshCore {
         @Volatile var latency: Long = 9999L,
         /** What the peer calls itself, when it has said. Empty until a feature tells us. */
         @Volatile var name: String = "",
-        @Volatile var nodeId: String = "",
-        @Volatile var serverPort: Int? = null,
-        @Volatile var serverProtocol: String? = null,
-        @Volatile var serverPublicKey: String? = null,
-        @Volatile var wireGuardPort: Int? = null,
     )
 
     private val activePeers = ConcurrentHashMap<String, PeerInfo>()
-    private val kickedUntil = ConcurrentHashMap<String, Long>()
 
     /** Sent-at times for the opcodes that get a reply, so latency is measured and not guessed. */
     private val pendingRequests = ConcurrentHashMap<String, Long>()
@@ -155,10 +148,6 @@ object MeshCore {
     @Volatile
     var bootstrapNodes: () -> List<String> = { emptyList() }
 
-    /** A platform's active Prism server endpoint, if it is actually listening. */
-    @Volatile
-    var serverEndpoint: () -> PrismNodeWire.ServerEndpoint? = { null }
-
     /** The port to bind. A hook so a platform can read it from its own settings. */
     @Volatile
     var portProvider: () -> Int = { DEFAULT_PORT }
@@ -168,44 +157,6 @@ object MeshCore {
     fun isOnMesh(): Boolean = running && socket?.isClosed == false
 
     fun activePeerIps(): List<String> = activePeers.keys.toList()
-
-    fun nodes(): List<MeshTransport.Node> = activePeers.map { (ip, info) ->
-        MeshTransport.Node(
-            id = info.nodeId,
-            name = info.name.ifBlank { ip },
-            address = ip,
-            meshPort = info.port,
-            lastSeen = info.lastSeen,
-            latency = info.latency,
-            serverPort = info.serverPort,
-            serverProtocol = info.serverProtocol,
-            serverPublicKey = info.serverPublicKey,
-            wireGuardPort = info.wireGuardPort,
-        )
-    }.sortedBy { it.name.lowercase() }
-
-    fun discover() {
-        if (running) sendDiscoveryBroadcast(boundPort)
-    }
-
-    fun kickNode(nodeId: String): Boolean = evictNode(nodeId, permanent = false)
-
-    fun banNode(nodeId: String): Boolean {
-        if (nodeId.isBlank()) return false
-        PrismSettings.setBannedPrismNodeIds(PrismSettings.getBannedPrismNodeIds() + nodeId)
-        evictNode(nodeId, permanent = true)
-        return true
-    }
-
-    private fun evictNode(nodeId: String, permanent: Boolean): Boolean {
-        if (nodeId.isBlank()) return false
-        val entry = activePeers.entries.firstOrNull { it.value.nodeId == nodeId } ?: return false
-        if (!permanent) {
-            kickedUntil[nodeId] = System.currentTimeMillis() + KICK_COOLDOWN_MS
-        }
-        activePeers.remove(entry.key, entry.value)
-        return true
-    }
 
     fun peers(): Map<String, PeerInfo> = activePeers.toMap()
 
@@ -314,12 +265,8 @@ object MeshCore {
             val parts = node.split(":")
             val ip = parts.firstOrNull()?.trim().orEmpty()
             if (ip.isNotEmpty()) {
-                sendPacket(
-                    ip,
-                    parts.getOrNull(1)?.trim()?.toIntOrNull() ?: DEFAULT_PORT,
-                    OP_DISCOVERY_REQ,
-                    localAnnouncement(),
-                )
+                sendPacket(ip, parts.getOrNull(1)?.trim()?.toIntOrNull() ?: DEFAULT_PORT,
+                    OP_DISCOVERY_REQ, """{"port":$boundPort}""")
             }
         }
 
@@ -343,9 +290,8 @@ object MeshCore {
             }
             val target = activePeers.keys.randomOrNull() ?: continue
             val info = activePeers[target] ?: continue
-            val identity = localAnnouncement()
-            sendPacket(target, info.port, OP_HEARTBEAT, identity)
-            sendPacket(target, info.port, OP_PEER_LIST_REQ, identity)
+            sendPacket(target, info.port, OP_HEARTBEAT, "{}")
+            sendPacket(target, info.port, OP_PEER_LIST_REQ, "{}")
 
             runCatching { Thread.sleep(GOSSIP_INTERVAL_MS) }.onFailure { return }
         }
@@ -357,7 +303,7 @@ object MeshCore {
         // send path and one place latency is recorded.
         MeshUtils.getBroadcastAddresses().forEach { address ->
             val host = address.hostAddress ?: return@forEach
-            sendPacket(host, port, OP_DISCOVERY_REQ, localAnnouncement())
+            sendPacket(host, port, OP_DISCOVERY_REQ, """{"port":$port}""")
         }
     }
 
@@ -375,26 +321,12 @@ object MeshCore {
 
         val command = data[5]
         val payload = String(data, 6, data.size - 6)
-        val announcement = PrismNodeWire.parse(payload)
-        val knownNodeId = announcement?.nodeId ?: activePeers[peerIp]?.nodeId.orEmpty()
-        if (kickedUntil[knownNodeId]?.let { it > System.currentTimeMillis() } == true) return
-        kickedUntil.remove(knownNodeId)
-        if (knownNodeId in PrismSettings.getBannedPrismNodeIds()) return
         val now = System.currentTimeMillis()
 
         val isNew = !activePeers.containsKey(peerIp)
         val info = activePeers.getOrPut(peerIp) { PeerInfo(now, packet.port) }
         info.lastSeen = now
         info.port = packet.port
-        announcement?.let {
-            info.nodeId = it.nodeId
-            info.name = it.name
-            info.serverPort = it.serverPort
-            info.serverProtocol = it.serverProtocol
-            info.serverPublicKey = it.serverPublicKey
-            info.wireGuardPort = it.wireGuardPort
-            info.port = it.meshPort
-        }
         if (isNew) PrismPlatform.log.info(TAG, "Peer discovered: $peerIp")
 
         // Latency, from the request this is answering.
@@ -411,9 +343,7 @@ object MeshCore {
         }
 
         when (command) {
-            OP_HEARTBEAT -> sendPacket(
-                peerIp, info.port, OP_HEARTBEAT_RESP, localAnnouncement(),
-            )
+            OP_HEARTBEAT -> sendPacket(peerIp, info.port, OP_HEARTBEAT_RESP, """{"port":$boundPort}""")
 
             OP_HEARTBEAT_RESP -> runCatching {
                 info.port = JSONObject(payload).optInt("port", DEFAULT_PORT)
@@ -422,9 +352,7 @@ object MeshCore {
             OP_DISCOVERY_REQ -> runCatching {
                 val peerPort = JSONObject(payload).optInt("port", DEFAULT_PORT)
                 info.port = peerPort
-                sendPacket(
-                    peerIp, peerPort, OP_HEARTBEAT_RESP, localAnnouncement(),
-                )
+                sendPacket(peerIp, peerPort, OP_HEARTBEAT_RESP, """{"port":$boundPort}""")
                 requestDnsSync(peerIp)
             }
 
@@ -538,21 +466,6 @@ object MeshCore {
         }
     }
 
-    private fun localAnnouncement(): String {
-        val endpoint = runCatching { serverEndpoint() }.getOrNull()
-        return if (endpoint != null) {
-            PrismNodeWire.announcement(
-                meshPort = boundPort,
-                serverPort = endpoint.port,
-                serverProtocol = endpoint.protocol,
-                serverPublicKey = endpoint.publicKey,
-                wireGuardPort = endpoint.wireGuardPort,
-            )
-        } else {
-            PrismNodeWire.announcement(boundPort)
-        }
-    }
-
     /**
      * Strips the IPv4-mapped IPv6 prefix.
      *
@@ -589,7 +502,6 @@ object MeshCore {
     }
 
     private const val GOSSIP_INTERVAL_MS = 15_000L
-    private const val KICK_COOLDOWN_MS = 5 * 60 * 1000L
 
     /** Short enough that a newly discovered peer has a real latency figure almost immediately. */
     private const val FIRST_GOSSIP_DELAY_MS = 1_200L

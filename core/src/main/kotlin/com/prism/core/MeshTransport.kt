@@ -36,19 +36,6 @@ package com.prism.core
  */
 object MeshTransport {
 
-    data class Node(
-        val id: String,
-        val name: String,
-        val address: String,
-        val meshPort: Int,
-        val lastSeen: Long,
-        val latency: Long,
-        val serverPort: Int?,
-        val serverProtocol: String?,
-        val serverPublicKey: String?,
-        val wireGuardPort: Int?,
-    )
-
     /**
      * Whether this device is on the mesh at all.
      *
@@ -62,18 +49,6 @@ object MeshTransport {
 
     /** The peers, by IP. */
     var peers: () -> List<String> = { MeshCore.activePeerIps() }
-
-    /** Live mesh nodes with the identity metadata they have announced. */
-    var nodes: () -> List<Node> = { MeshCore.nodes() }
-
-    /** Broadcasts a fresh local-network discovery request. */
-    var discover: () -> Unit = { MeshCore.discover() }
-
-    /** Evicts a live peer without persisting a deny rule. */
-    var kickNode: (String) -> Boolean = { MeshCore.kickNode(it) }
-
-    /** Persists a ban for the peer's Prism app identity and evicts it. */
-    var banNode: (String) -> Boolean = { MeshCore.banNode(it) }
 
     /** Sends to one peer. */
     var sendToPeer: (peerIp: String, opcode: Byte, payload: String) -> Unit =
@@ -108,10 +83,6 @@ object MeshTransport {
         sendToPeer: (String, Byte, String) -> Unit,
         broadcast: (Byte, String, String?) -> Unit,
         localIp: () -> String = { MeshUtils.getLocalMeshIp() },
-        nodes: () -> List<Node> = { emptyList() },
-        discover: () -> Unit = {},
-        kickNode: (String) -> Boolean = { false },
-        banNode: (String) -> Boolean = { false },
     ) {
         this.isOnMesh = isOnMesh
         this.peerCount = peerCount
@@ -119,10 +90,6 @@ object MeshTransport {
         this.sendToPeer = sendToPeer
         this.broadcast = broadcast
         this.localIp = localIp
-        this.nodes = nodes
-        this.discover = discover
-        this.kickNode = kickNode
-        this.banNode = banNode
         PrismPlatform.log.info(TAG, "The mesh transport is installed by the host platform.")
     }
 

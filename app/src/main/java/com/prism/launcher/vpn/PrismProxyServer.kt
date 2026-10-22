@@ -14,7 +14,6 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import com.prism.launcher.PrismApp
 import com.prism.core.MeshUtils
-import com.prism.core.ProxyBasicAuth
 import com.prism.launcher.PrismLogger
 
 class PrismProxyServer(
@@ -28,17 +27,18 @@ class PrismProxyServer(
     )
     private val startMutex = Mutex()
     
-    private var authUsername: String? = null
-    private var authPassword: String? = null
+    private var authHeaderExpected: String? = null
 
     fun setCredentials(username: String, pass: String) {
         if (pass.isEmpty() && username.isEmpty()) {
-            authUsername = null
-            authPassword = null
+            authHeaderExpected = null
             return
         }
-        authUsername = username
-        authPassword = pass
+        val encoded = android.util.Base64.encodeToString(
+            "${username}:${pass}".toByteArray(),
+            android.util.Base64.NO_WRAP
+        )
+        authHeaderExpected = "Proxy-Authorization: Basic $encoded"
     }
 
     fun start() {
@@ -108,27 +108,6 @@ class PrismProxyServer(
                 }
             }
         }
-    }
-
-    fun isRunning(): Boolean = serverChannel?.let { channel ->
-        channel.isOpen && runCatching { channel.socket().isBound }.getOrDefault(false)
-    } ?: false
-
-    fun listeningPort(): Int? = serverChannel?.takeIf { it.isOpen }
-        ?.let { runCatching { it.socket().localPort }.getOrNull() }
-
-    fun awaitListening(timeoutMs: Long = 5_000L): Boolean {
-        val deadline = System.nanoTime() + timeoutMs * 1_000_000L
-        while (System.nanoTime() < deadline) {
-            if (isRunning()) return true
-            try {
-                Thread.sleep(50L)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-                return false
-            }
-        }
-        return isRunning()
     }
 
     fun stop() {
@@ -237,13 +216,8 @@ class PrismProxyServer(
             val header = if (firstLine.contains(" HTTP/")) firstLine else firstLine + "\n" + readHeader(input)
 
             if (isProxyMode) {
-                val requiredUsername = authUsername
-                val requiredPassword = authPassword
-                if (requiredUsername != null && requiredPassword != null) {
-                    val localSelfConnection = clientSocket.inetAddress?.isLoopbackAddress == true
-                    if (!localSelfConnection &&
-                        !ProxyBasicAuth.isAuthorized(header, requiredUsername, requiredPassword)
-                    ) {
+                if (authHeaderExpected != null) {
+                    if (!header.contains(authHeaderExpected!!)) {
                         output.write("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Prism\"\r\n\r\n".toByteArray())
                         output.flush()
                         clientSocket.close()
@@ -254,12 +228,6 @@ class PrismProxyServer(
                 if (header.startsWith("CONNECT")) {
                     val parts = header.split(" ")
                     if (parts.size >= 2) {
-                        if (parts[1] == "127.0.0.1:1") {
-                            output.write("HTTP/1.1 200 Connection Established\r\nConnection: close\r\n\r\n".toByteArray())
-                            output.flush()
-                            clientSocket.close()
-                            return@withContext
-                        }
                         val hostPort = parts[1].split(":")
                         if (hostPort.size == 2) {
                             connectToTarget(hostPort[0], hostPort[1].toIntOrNull() ?: 443, clientSocket, input, output)

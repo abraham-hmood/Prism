@@ -53,7 +53,6 @@ import com.prism.launcher.language.LessonRunner
 import com.prism.launcher.language.LessonSpec
 import com.prism.launcher.language.PictureBank
 import com.prism.launcher.language.PlannedLesson
-import com.prism.launcher.PrismSettings
 import com.prism.launcher.speech.PrismSpeaker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -435,10 +434,9 @@ private fun TutorGridStep(step: LanguageSetupFlow.TutorGrid, onDone: () -> Unit)
                     // sixteen of them is lost if they are chosen from pictures alone.
                     previewing = tutor.id
                     PrismSpeaker.stop()
-                    val userVoice = PrismSettings.getKokoroVoice(PrismSettings.VOICE_SPEAKER_SAM)
                     PrismSpeaker.speakAs(
                         text = "Hello. I am " + tutor.name + ". I will be your tutor.",
-                        voiceId = LanguageVoices.tutorPreviewVoice(tutor, userVoice),
+                        voiceId = tutor.voice,
                     ) { previewing = "" }
                 },
             ) {

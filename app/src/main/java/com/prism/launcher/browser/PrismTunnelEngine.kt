@@ -309,12 +309,6 @@ class PrismTunnelEngine(private val context: Context) {
             PrismSettings.getPrismServers().isNotEmpty()
     }
 
-    /** True only while a Prism server listener or VPN server socket is actually bound. */
-    fun isPrismServerRunning(): Boolean =
-        (PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM &&
-            PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_SERVER) &&
-            (proxyServer?.isRunning() == true || vpnMultiplexer?.isRunning() == true)
-
     fun routeOutboundPacket(packet: ByteArray): ByteArray? {
         if (!routingActive) return null
         
@@ -371,27 +365,9 @@ class PrismTunnelEngine(private val context: Context) {
         startHostingServer()
 
         if (protoMode == PrismSettings.VPN_PROTOCOL_AUTO || protoMode == PrismSettings.VPN_PROTOCOL_PROXY) {
-            val localServer = PrismProxyServer(port, "PrismVPN", isProxyMode = true)
-            proxyServer = localServer
-            localServer.setCredentials(user, pass)
-            localServer.start()
-            Thread({
-                if (localServer.awaitListening() && routingActive && proxyServer === localServer) {
-                    val boundPort = localServer.listeningPort()
-                    if (boundPort != null) {
-                        PrismProxyClient.connectToLocalServer(context, boundPort)
-                        com.prism.launcher.PrismLogger.logSuccess(
-                            "PrismTunnel",
-                            "This device's local browser proxy is connected to its own Prism server at 127.0.0.1:$boundPort.",
-                        )
-                        return@Thread
-                    }
-                }
-                com.prism.launcher.PrismLogger.logError(
-                    "PrismTunnel",
-                    "Could not connect this device to its own Prism proxy server: the local listener did not become ready.",
-                )
-            }, "prism-local-server-client").apply { isDaemon = true; start() }
+            proxyServer = PrismProxyServer(port, "PrismVPN", isProxyMode = true)
+            proxyServer?.setCredentials(user, pass)
+            proxyServer?.start()
         }
 
         if (protoMode != PrismSettings.VPN_PROTOCOL_PROXY) {

@@ -152,10 +152,10 @@ object SettingsCatalog {
     enum class Target {
         ADD_SEED, VIEW_SEEDS, VIEW_DISCOVERED_SEEDS, REBUILD_INDEX, DIAGNOSE_SEARCH,
         OPEN_BLOCKLIST, CLEAR_HISTORY, VIEW_CACHED_SITES,
-        VIEW_LOCAL_ADDRESS, START_VPN_SERVER, STOP_VPN_SERVER, MANAGE_PRISM_NODES, MANAGE_PRISM_SERVERS,
-        EXTERNAL_VPN_PROFILE, APP_WHITELIST, COPY_WIREGUARD_CONFIG, OPEN_TRUSTED_DEVICES,
+        VIEW_LOCAL_ADDRESS, MANAGE_PRISM_SERVERS, EXTERNAL_VPN_PROFILE, APP_WHITELIST,
+        COPY_WIREGUARD_CONFIG, OPEN_TRUSTED_DEVICES,
         OPEN_ACCESS_POINT, MANAGE_DNS_RECORDS, MANAGE_WEB_HOSTING, OPEN_DIAGNOSTICS,
-        OPEN_MODELS, OPEN_CLOUD_MODELS, RESCAN_OLLAMA, OPEN_LOCAL_MODEL, OPEN_SPEECH_MODEL, OPEN_KOKORO,
+        OPEN_MODELS, OPEN_CLOUD_MODELS, RESCAN_OLLAMA, OPEN_LOCAL_MODEL, OPEN_SPEECH_MODEL,
         OPEN_IMAGE_MODELS, OPEN_NORA, OPEN_AETHER, OPEN_CAKECHAT, AUTO_CAPTION_FOLDER,
         OPEN_PRISM_SWAP, OPEN_DATASETS, OPEN_WALLET, OPEN_MINING, OPEN_WRITER, WRITER_DICTIONARY,
         SELECT_CUSTOM_FONT, SUMMARY_STATUS, SELECT_ISO, OPEN_TOUR, OPEN_LOCK_SCREEN,
@@ -359,18 +359,6 @@ object SettingsCatalog {
                 set = { PrismSettings.setVpnServerAlwaysOn(it) },
                 relevant = prismVpn,
             ),
-            Action(
-                "Start VPN server",
-                "Starts the Prism VPN server, or restarts it if it is already running",
-                Target.START_VPN_SERVER,
-                relevant = prismVpn,
-            ),
-            Action(
-                "Stop VPN server",
-                "Stops the Prism VPN server",
-                Target.STOP_VPN_SERVER,
-                relevant = prismVpn,
-            ),
             Choice(
                 "Prism VPN role", "Serve the tunnel, or connect to somebody who does",
                 labels = listOf("Client", "Server"),
@@ -410,10 +398,6 @@ object SettingsCatalog {
                 set = { PrismSettings.setPrismVpnPassword(it) },
                 secret = true,
                 relevant = prismServer,
-            ),
-            Action(
-                "Manage Prism nodes", "Connected nodes on this Prism server",
-                Target.MANAGE_PRISM_NODES,
             ),
             Action(
                 "Manage Prism servers", "Addresses this device connects to",
@@ -570,10 +554,11 @@ object SettingsCatalog {
     private fun speech() = Section(
         "Speech",
         listOf(
-            // The phone's Kokoro row, labels and order. Greyed out on the phone while an imported
-            // speech model is doing the talking; the desktop says why instead, because a catalog
-            // action answers with a sentence rather than a disabled click.
-            Action("Kokoro-82M Voice & Speech", "Voice, cloning, speed, the model", Target.OPEN_KOKORO),
+            Text(
+                "Kokoro voice model", "The path to the speech model",
+                get = { PrismSettings.getLocalAudioModelPath() },
+                set = { PrismSettings.setLocalAudioModelPath(it) },
+            ),
             Action("Speech model", "Download or choose one", Target.OPEN_SPEECH_MODEL),
         ),
     )
