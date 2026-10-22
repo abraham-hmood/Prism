@@ -48,6 +48,7 @@ import com.prism.launcher.speech.ClonedVoices
 import com.prism.launcher.speech.CloneEngine
 import com.prism.launcher.speech.CloneEngines
 import com.prism.launcher.speech.CustomCloneEngines
+import com.prism.launcher.speech.KokoroMeshShare
 import com.prism.launcher.speech.KokoroVoices
 import com.prism.launcher.speech.VoiceCloner
 import java.io.File
@@ -87,6 +88,25 @@ fun VoiceCloningPage(onNavigate: (PageId) -> Unit = {}) {
     var customLanguage by remember { mutableStateOf<String?>(null) }
     var gender by remember { mutableStateOf(KokoroVoices.Gender.FEMALE) }
     var saveStage by remember { mutableStateOf("") }
+
+    /**
+     * Which machine on the mesh should run the encoder, or null for this one.
+     *
+     * Deliberately not persisted: a desktop that has been switched off since yesterday must not
+     * be silently selected the next time a voice is saved.
+     */
+    var meshClonePeer by remember { mutableStateOf<String?>(null) }
+    var meshTick by remember { mutableStateOf(0) }
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        while (true) {
+            kotlinx.coroutines.delay(2_500)
+            meshTick++
+        }
+    }
+    val meshClonePeers = remember(meshTick) { KokoroMeshShare.withVoiceCloner() }
+    // Resolve rather than mutate during composition: a selection whose machine has left the mesh
+    // simply stops resolving, and Save falls back to this device.
+    val activeMeshClonePeer = meshClonePeers.firstOrNull { it.peerIp == meshClonePeer }
 
     val recorder = remember { DesktopVoiceRecorder() }
 
@@ -173,22 +193,41 @@ fun VoiceCloningPage(onNavigate: (PageId) -> Unit = {}) {
 
     fun commitSave(name: String) {
         val profile = pendingProfile ?: return
+        // Captured now: the user pressed Save on the machine that was selected at that moment.
+        val remote = activeMeshClonePeer
         working = true
         Thread({
             try {
-                ClonedVoices.save(
-                    displayName = name,
-                    language = language,
-                    customLanguage = customLanguage,
-                    gender = gender,
-                    region = profile.region,
-                    sampleRate = VoiceCloner.WORK_RATE,
-                    pitchHz = profile.pitchHz,
-                ) { line -> saveStage = line }
+                if (remote != null) {
+                    // Analysis already happened here; only the encoder is the desktop's.
+                    val artifacts = KokoroMeshShare.prepareCloneOn(remote.peerIp, profile.region)
+                        ?: throw IllegalStateException(
+                            "${remote.deviceName} did not answer. Save on this computer instead.",
+                        )
+                    ClonedVoices.importPrepared(
+                        displayName = name,
+                        language = language,
+                        customLanguage = customLanguage,
+                        gender = gender,
+                        region = profile.region,
+                        pitchHz = profile.pitchHz,
+                        artifacts = artifacts,
+                    ) { line -> saveStage = line }
+                } else {
+                    ClonedVoices.save(
+                        displayName = name,
+                        language = language,
+                        customLanguage = customLanguage,
+                        gender = gender,
+                        region = profile.region,
+                        sampleRate = VoiceCloner.WORK_RATE,
+                        pitchHz = profile.pitchHz,
+                    ) { line -> saveStage = line }
+                }
                 pendingProfile = null
                 sheet = SaveSheet.HIDDEN
                 working = false
-                say("Saved as $name")
+                say("Saved as $name" + if (remote != null) " (prepared on ${remote.deviceName})" else "")
                 onNavigate(PageId.KOKORO)
             } catch (error: Throwable) {
                 working = false
@@ -270,6 +309,42 @@ fun VoiceCloningPage(onNavigate: (PageId) -> Unit = {}) {
                         )
                         Spacer(Modifier.height(8.dp))
                     }
+
+                    // ── The mesh ─────────────────────────────────────────────
+                    //
+                    // Rendered only when a machine is actually offering an encoder. The whole
+                    // block disappears on a box that has never joined a meshnet.
+                    if (meshClonePeers.isNotEmpty()) {
+                        Spacer(Modifier.height(10.dp))
+                        SectionHeader("CLONE ON YOUR MESHNET")
+                        Card {
+                            if (activeMeshClonePeer != null) {
+                                NavRow("This device", "Run the encoder here instead") {
+                                    meshClonePeer = null
+                                    say("Cloning on this computer")
+                                }
+                                Hairline()
+                            }
+                            meshClonePeers.forEachIndexed { index, peer ->
+                                if (index > 0) Hairline()
+                                val chosen = peer.peerIp == activeMeshClonePeer?.peerIp
+                                NavRow(
+                                    if (chosen) "✓ ${peer.deviceName}" else peer.deviceName,
+                                    if (chosen) "IN USE · this machine will prepare the clone"
+                                    else "Tap to run the encoder on ${peer.deviceName}",
+                                ) {
+                                    meshClonePeer = peer.peerIp
+                                    say("Cloning will run on ${peer.deviceName}")
+                                }
+                            }
+                        }
+                        SectionFooter(
+                            "Recording and analysis still happen here; only the model work goes " +
+                                "to the machine you pick, and the finished clone is stored on " +
+                                "this device.",
+                        )
+                    }
+
                     Text(
                         "＋ Use a model on this computer…",
                         fontSize = 14.sp,

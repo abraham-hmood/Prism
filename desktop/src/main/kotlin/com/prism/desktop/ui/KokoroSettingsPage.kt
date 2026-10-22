@@ -29,10 +29,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import com.prism.core.MeshTransport
 import com.prism.core.PrismPlatform
 import com.prism.launcher.PrismSettings
 import com.prism.launcher.speech.ClonedVoices
 import com.prism.launcher.speech.KokoroInstall
+import com.prism.launcher.speech.KokoroMeshShare
 import com.prism.launcher.speech.KokoroVoices
 import com.prism.launcher.speech.PrismSpeaker
 
@@ -59,6 +61,28 @@ fun KokoroSettingsPage(onNavigate: (PageId) -> Unit = {}) {
     var note by remember { mutableStateOf("") }
     var panel by remember { mutableStateOf<KokoroPanel?>(null) }
 
+    // Mesh peers are read on a timer rather than only when something is clicked: another machine
+    // joining or leaving is not a local action, and a list that only refreshed on navigation
+    // would show a desktop that has been switched off for an hour.
+    var meshTick by remember { mutableStateOf(0) }
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        while (true) {
+            kotlinx.coroutines.delay(2_500)
+            meshTick++
+        }
+    }
+    val meshPeers = remember(meshTick) { KokoroMeshShare.withKokoro() }
+    val meshServing = remember(meshTick) { KokoroMeshShare.servingSummary() }
+    val meshSelected = remember(meshTick, revision) { PrismSettings.getMeshSpeechPeer() }
+
+    // The sharing switch. Its stored value is read once and then owned by the switch itself; the
+    // mesh state is re-read on the same timer as the peer list so the switch becomes usable (or
+    // greyed out) within a couple of seconds of the mesh coming up or going away.
+    var sharingEnabled by remember { mutableStateOf(PrismSettings.getMeshSpeechSharingEnabled()) }
+    val onMesh = remember(meshTick) {
+        runCatching { MeshTransport.isOnMesh() }.getOrDefault(false)
+    }
+
     fun say(message: String, ok: Boolean = true) {
         noteOk = ok
         note = message
@@ -83,6 +107,7 @@ fun KokoroSettingsPage(onNavigate: (PageId) -> Unit = {}) {
                 append(KokoroInstall.installedVoices().size)
                 append(" voice(s)")
             }
+            KokoroMeshShare.servingSummary()?.let { append("\n").append(it) }
         }
     }
     val voiceDetail = remember(revision) {
@@ -134,6 +159,96 @@ fun KokoroSettingsPage(onNavigate: (PageId) -> Unit = {}) {
                     "like itself on a call.",
             )
             Spacer(Modifier.height(18.dp))
+
+            // ── Sharing ──────────────────────────────────────────────────
+            //
+            // ALWAYS VISIBLE, sometimes disabled. A switch that vanished when the mesh was off
+            // would leave "why can't I share?" unanswerable; a disabled switch with the reason
+            // beside it is the honest version. It is checked by default because a sharing feature
+            // that starts off is one nobody turns on.
+            SectionHeader("MESH SHARING")
+            Card {
+                ToggleRow(
+                    "Share models with the mesh",
+                    if (onMesh) {
+                        "Other Prism devices on this meshnet can use this computer's Kokoro " +
+                            "speech and voice-cloning models"
+                    } else {
+                        "Join or serve a meshnet to change this"
+                    },
+                    checked = sharingEnabled,
+                    enabled = onMesh,
+                    onChange = { checked ->
+                        sharingEnabled = checked
+                        // Writes the preference, opens or closes the port, and tells peers now
+                        // rather than waiting for the next announce timer.
+                        KokoroMeshShare.setSharingEnabled(checked)
+                        meshTick++
+                        revision++
+                        say(
+                            if (checked) "Sharing speech models on the mesh"
+                            else "No longer sharing speech models",
+                        )
+                    },
+                )
+            }
+            SectionFooter(
+                "On by default. While it is on, this machine answers other devices on port " +
+                    "47812; turning it off closes that port immediately and withdraws this " +
+                    "machine from everyone's list.",
+            )
+            Spacer(Modifier.height(18.dp))
+
+            // ── The mesh ─────────────────────────────────────────────────
+            //
+            // Only rendered when there is something to say: a machine on this meshnet offering
+            // Kokoro, or this machine sharing its own. A section that was always present would be
+            // permanent clutter on every device that has never joined a mesh.
+            if (meshPeers.isNotEmpty() || meshServing != null) {
+                SectionHeader("KOKORO ON YOUR MESHNET")
+                Card {
+                    if (meshServing != null) {
+                        Text(
+                            meshServing,
+                            fontSize = 12.sp,
+                            color = colors.faint,
+                            lineHeight = 17.sp,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                        )
+                        if (meshPeers.isNotEmpty()) Hairline()
+                    }
+                    if (meshSelected.isNotBlank()) {
+                        NavRow("This device", "Use the Kokoro installed here") {
+                            PrismSettings.setMeshSpeechPeer("")
+                            PrismSpeaker.invalidate()
+                            revision++
+                            say("Speaking with this machine's Kokoro")
+                        }
+                        if (meshPeers.isNotEmpty()) Hairline()
+                    }
+                    meshPeers.forEachIndexed { index, peer ->
+                        if (index > 0) Hairline()
+                        val chosen = peer.peerIp == meshSelected
+                        val detail = if (chosen) {
+                            "IN USE · ${peer.kokoroVoiceCount} voice(s) there"
+                        } else {
+                            "${peer.kokoroVoiceCount} voice(s) · tap to speak through this machine"
+                        }
+                        NavRow(if (chosen) "✓ ${peer.deviceName}" else peer.deviceName, detail) {
+                            PrismSettings.setMeshSpeechPeer(peer.peerIp)
+                            PrismSpeaker.invalidate()
+                            revision++
+                            say("Speaking through ${peer.deviceName}")
+                        }
+                    }
+                }
+                SectionFooter(
+                    "Choosing a machine sends the text to it and plays what comes back. Nothing " +
+                        "is copied here, and the choice falls back to this machine's own Kokoro " +
+                        "the moment that machine leaves the mesh.",
+                )
+                Spacer(Modifier.height(18.dp))
+            }
 
             // ── Model ─────────────────────────────────────────────────────
             SectionHeader("MODEL")

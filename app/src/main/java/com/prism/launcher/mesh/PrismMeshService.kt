@@ -179,6 +179,12 @@ object PrismMeshService {
                     runCatching { MeshComputeRegistry.announce() }
                 }
 
+                // Speech capabilities (Kokoro and the voice-cloning encoders). Called on every
+                // gossip round and throttled inside KokoroMeshShare to once a minute, because
+                // this loop runs every 5-15 seconds. A device that has neither model says
+                // nothing, and one that has either starts its HTTP listener on the first round.
+                runCatching { com.prism.launcher.speech.KokoroMeshShare.announce() }
+
                 delay(if (activePeers.isEmpty()) 5000 else 15000)
             }
         }
@@ -248,6 +254,10 @@ object PrismMeshService {
         socket = null
         activePeers.clear()
         pendingRequests.clear()
+        // The speech HTTP port is part of what the mesh exposes. Leaving it listening after the
+        // mesh is switched off would keep offering this machine's models over the plain LAN,
+        // which is not what "leave the mesh" means.
+        runCatching { com.prism.launcher.speech.SpeechMeshServer.stop() }
     }
 
     private fun sendDiscoveryBroadcast(port: Int) {
@@ -491,6 +501,12 @@ object PrismMeshService {
 
             com.prism.launcher.aether.AetherMeshSync.OPCODE_AETHER_ANNOUNCE -> handleAetherAnnounce(payload, peerIp)
             com.prism.launcher.social.NebulaMeshSync.OPCODE_NEBULA_ANNOUNCE -> handleNebulaAnnounce(payload, peerIp)
+
+            // A desktop or phone offering its Kokoro / voice-cloning models. The announcement is
+            // the only speech traffic on this socket; the models themselves are reached over the
+            // HTTP listener SpeechMeshServer runs on the port in that announcement.
+            com.prism.launcher.speech.KokoroMeshShare.OPCODE_KOKORO_ANNOUNCE ->
+                com.prism.launcher.speech.KokoroMeshShare.ingestFromPeer(peerIp, payload)
 
             // Nebula posts and Lyke videos, both directions. The same three functions the desktop
             // registers with MeshCore -- this build dispatches them itself, because two sockets on

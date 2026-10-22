@@ -82,13 +82,35 @@ object PrismSpeaker {
     /**
      * Describes what will speak, for settings screens that need to say so before anything is spoken.
      */
-    fun describeEngine(): String = when {
-        PrismSettings.isLocalAudioModelImported() -> {
-            val path = PrismSettings.getLocalAudioModelPath()
-            File(path).name.ifEmpty { "an imported model" }
+    fun describeEngine(): String {
+        // Read once: the peer table can expire an entry between two calls, and `!!` on a second
+        // lookup would turn a settings label into an NPE.
+        val peer = meshPeer()
+        return when {
+            PrismSettings.isLocalAudioModelImported() -> {
+                val path = PrismSettings.getLocalAudioModelPath()
+                File(path).name.ifEmpty { "an imported model" }
+            }
+            // The mesh choice wins over the local download because it was made explicitly. It
+            // stops counting the moment the peer goes quiet -- see [engineFor] -- and this says
+            // so rather than naming a machine that is no longer there.
+            peer != null -> "Kokoro on ${peer.deviceName}"
+            KokoroInstall.isModelInstalled() -> "Kokoro-82M"
+            else -> "Kokoro-82M (not downloaded yet — the system voice is standing in)"
         }
-        KokoroInstall.isModelInstalled() -> "Kokoro-82M"
-        else -> "Kokoro-82M (not downloaded yet — the system voice is standing in)"
+    }
+
+    /**
+     * The chosen mesh peer, if the user chose one and it is still announcing.
+     *
+     * A stale choice is deliberately ignored rather than reported as an error on every reply:
+     * a desktop that was switched off should cost this device's own voice, not a failure to
+     * speak at all.
+     */
+    private fun meshPeer(): KokoroMeshShare.SpeechPeer? {
+        val chosen = PrismSettings.getMeshSpeechPeer()
+        if (chosen.isBlank()) return null
+        return KokoroMeshShare.peer(chosen)
     }
 
     /**
@@ -214,9 +236,12 @@ object PrismSpeaker {
      */
     @Synchronized
     private fun engineFor(): TtsEngine? {
+        val peer = meshPeer()
         val key = when {
             PrismSettings.isLocalAudioModelImported() ->
                 "imported:${PrismSettings.getLocalAudioModelPath()}"
+            peer != null ->
+                "mesh:${peer.peerIp}"
             KokoroInstall.isModelInstalled() ->
                 "kokoro:${PrismSettings.getKokoroVariant()}"
             else -> "system"
@@ -238,6 +263,10 @@ object PrismSpeaker {
                 ImportedAudioEngine.openOrNull(PrismSettings.getLocalAudioModelPath())
                     ?: systemEngine()
             }
+            key.startsWith("mesh:") ->
+                // Explicitly chosen, and still announcing. The peer does the synthesis; this
+                // device only decodes the WAV and plays it.
+                peer?.let { MeshSpeechEngine(it) }
             key.startsWith("kokoro:") ->
                 // The whole point. Falls back only if opening it fails, which is a real possibility
                 // -- a half-finished download, a device ONNX Runtime will not start on -- and going

@@ -151,9 +151,17 @@ object MeshMarket {
             true
         }
 
+        // Speech (Kokoro + voice cloning). One opcode: the announcement only. The audio itself is
+        // fetched over the HTTP listener SpeechMeshServer runs, because synthesis is a request
+        // with a large answer, not gossip.
+        MeshCore.register(com.prism.launcher.speech.KokoroMeshShare.OPCODE_KOKORO_ANNOUNCE) { peerIp, payload ->
+            com.prism.launcher.speech.KokoroMeshShare.ingestFromPeer(peerIp, payload)
+            true
+        }
+
         PrismPlatform.log.info(
             TAG,
-            "The mesh market is on the wire: listings, coin offers, compute capability, RPC and debts.",
+            "The mesh market is on the wire: listings, coin offers, compute capability, RPC, debts and speech.",
         )
         return true
     }
@@ -170,6 +178,10 @@ object MeshMarket {
         if (!com.prism.core.MeshTransport.isOnMesh()) return
         runCatching { MeshComputeRegistry.announce() }
             .onFailure { PrismPlatform.log.warn(TAG, "Could not announce compute capacity: " + it.message) }
+        // Speech is part of the same capability gossip. It starts its HTTP listener on the first
+        // call that finds a model installed, then throttles itself to a minute.
+        runCatching { com.prism.launcher.speech.KokoroMeshShare.announce() }
+            .onFailure { PrismPlatform.log.warn(TAG, "Could not announce speech: " + it.message) }
     }
 
     /** What is on the wire and what the market can see, for a diagnostics page. */
@@ -181,6 +193,8 @@ object MeshMarket {
         append(P2pModelListings.getAll().size)
         append(" model listing(s), ")
         append(P2pCoinOffers.getAll().size)
-        append(" coin offer(s)")
+        append(" coin offer(s), ")
+        append(com.prism.launcher.speech.KokoroMeshShare.all().size)
+        append(" speech peer(s)")
     }
 }

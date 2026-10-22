@@ -51,6 +51,13 @@ class PrismApp : Application(), ComponentCallbacks2 {
             com.prism.launcher.speech.SystemTtsEngine(this)
         }
 
+        // What this phone calls itself when another machine lists it as a Kokoro or voice-cloning
+        // provider. `Build.MODEL` is better than the hostname here because an Android hostname is
+        // frequently "localhost" -- a mesh list of four "localhost"s tells nobody anything.
+        com.prism.launcher.speech.KokoroMeshShare.localDeviceName = {
+            android.os.Build.MODEL?.takeIf { it.isNotBlank() } ?: "Android device"
+        }
+
         // Whether a Node extension can be given a real runtime (PHASE 93). A hook because the two
         // platforms get Node completely differently -- an Ubuntu rootfs under PRoot here, the
         // system binary on a desktop -- and ExtensionStore only needs the yes-or-no.

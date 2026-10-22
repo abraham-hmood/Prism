@@ -34,6 +34,16 @@ object CloneEngines {
 
     fun active(): CloneEngine = byId(PrismSettings.getVoiceCloneEngine()) ?: OPENVOICE
 
+    /**
+     * Whether any engine at all can run here right now.
+     *
+     * The mesh announcement asks this, not "is the ACTIVE engine installed": a desktop sharing a
+     * phone's clone work needs one working encoder, and refusing to advertise because the user's
+     * preferred engine happens to be a different, un-downloaded one would hide a machine that can
+     * genuinely help.
+     */
+    fun hasAnyInstalled(): Boolean = all().any { runCatching { it.isInstalled() }.getOrDefault(false) }
+
     fun setActive(engine: CloneEngine) = PrismSettings.setVoiceCloneEngine(engine.id)
 
     /** Drops every cached ONNX session -- after any model (re)download, or a folder changes. */

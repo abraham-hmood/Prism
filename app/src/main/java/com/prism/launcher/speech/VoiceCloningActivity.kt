@@ -47,6 +47,26 @@ class VoiceCloningActivity : PrismBaseActivity() {
 
     private val engineRows = ArrayList<EngineRow>()
 
+    /**
+     * Machines on this meshnet that are offering a clone encoder.
+     *
+     * Null means "prepare the clone here", which is what every install did before this feature
+     * and stays the default. The peers are not persisted: a selected desktop that has gone away
+     * must not leave the screen silently trying to reach it forever.
+     */
+    private var selectedClonePeer: String? = null
+    private lateinit var meshHeader: TextView
+    private lateinit var meshCard: LinearLayout
+    private lateinit var meshFooter: TextView
+
+    private val meshHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val meshPoll = object : Runnable {
+        override fun run() {
+            refreshCloneMeshSection()
+            meshHandler.postDelayed(this, 2500)
+        }
+    }
+
     private class EngineRow(
         val engine: CloneEngine,
         val badge: TextView,
@@ -130,6 +150,8 @@ class VoiceCloningActivity : PrismBaseActivity() {
         ))
         buildEngineCards(column)
 
+        buildCloneMeshSection(column)
+
         progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             isIndeterminate = true
             visibility = View.GONE
@@ -159,6 +181,123 @@ class VoiceCloningActivity : PrismBaseActivity() {
     override fun onDestroy() {
         stopRecording()
         super.onDestroy()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshCloneMeshSection()
+        meshHandler.removeCallbacks(meshPoll)
+        meshHandler.post(meshPoll)
+    }
+
+    override fun onPause() {
+        meshHandler.removeCallbacks(meshPoll)
+        super.onPause()
+    }
+
+    // -- Mesh ----------------------------------------------------------------
+
+    /**
+     * Machines on this meshnet offering a voice-cloning encoder.
+     *
+     * HIDDEN UNLESS SOMEBODY IS OFFERING ONE, for the same reason the Kokoro screen's section is:
+     * a device that has never joined a mesh should not carry an empty panel about one.
+     */
+    private fun buildCloneMeshSection(column: LinearLayout) {
+        meshHeader = IosUi.sectionHeader(this, "CLONE ON YOUR MESHNET")
+        column.addView(meshHeader)
+
+        meshCard = IosUi.card(this)
+        column.addView(meshCard)
+
+        meshFooter = IosUi.sectionFooter(
+            this,
+            "A machine that has joined this meshnet can run the encoder for you. Recording and " +
+                "analysis still happen here; only the model work goes to the machine you pick, " +
+                "and the finished clone is stored on this device.",
+        )
+        column.addView(meshFooter)
+        column.addView(spacer())
+    }
+
+    private fun refreshCloneMeshSection() {
+        if (!::meshCard.isInitialized) return
+
+        val peers = com.prism.launcher.speech.KokoroMeshShare.withVoiceCloner()
+        // A peer that left the mesh cannot prepare anything; dropping the selection here is what
+        // keeps the Save button from pointing at a machine that is no longer there.
+        if (selectedClonePeer != null && peers.none { it.peerIp == selectedClonePeer }) {
+            selectedClonePeer = null
+        }
+
+        val visible = peers.isNotEmpty()
+        val visibility = if (visible) View.VISIBLE else View.GONE
+        meshHeader.visibility = visibility
+        meshCard.visibility = visibility
+        meshFooter.visibility = visibility
+        if (!visible) return
+
+        meshCard.removeAllViews()
+
+        if (selectedClonePeer != null) {
+            meshCard.addView(cloneMeshRow(
+                title = "This device",
+                detail = "Run the encoder here instead",
+                checked = false,
+            ) {
+                selectedClonePeer = null
+                Toast.makeText(this, "Cloning on this device", Toast.LENGTH_SHORT).show()
+                refreshCloneMeshSection()
+            })
+            meshCard.addView(IosUi.hairline(this))
+        }
+
+        peers.forEachIndexed { index, peer ->
+            if (index > 0) meshCard.addView(IosUi.hairline(this))
+            val chosen = peer.peerIp == selectedClonePeer
+            val detail = if (chosen) {
+                "IN USE · this machine will prepare the clone"
+            } else {
+                "Tap to run the encoder on ${peer.deviceName}"
+            }
+            meshCard.addView(cloneMeshRow(peer.deviceName, detail, chosen) {
+                selectedClonePeer = peer.peerIp
+                Toast.makeText(
+                    this, "Cloning will run on ${peer.deviceName}", Toast.LENGTH_SHORT,
+                ).show()
+                refreshCloneMeshSection()
+            })
+        }
+    }
+
+    private fun cloneMeshRow(
+        title: String,
+        detail: String,
+        checked: Boolean,
+        onClick: () -> Unit,
+    ): TextView = TextView(this).apply {
+        textSize = 16f
+        setTextColor(if (checked) IosUi.accent(this@VoiceCloningActivity) else IosUi.label(this@VoiceCloningActivity))
+        val h = IosUi.dp(this@VoiceCloningActivity, 16f)
+        val v = IosUi.dp(this@VoiceCloningActivity, 14f)
+        setPadding(h, v, h, v)
+        isClickable = true
+        setOnClickListener { onClick() }
+        val head = if (checked) "✓ $title" else title
+        val spannable = android.text.SpannableStringBuilder(head)
+        spannable.append("\n").append(detail)
+        val detailStart = head.length + 1
+        spannable.setSpan(
+            android.text.style.ForegroundColorSpan(IosUi.secondaryLabel(this@VoiceCloningActivity)),
+            detailStart, spannable.length,
+            android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+        )
+        spannable.setSpan(
+            android.text.style.RelativeSizeSpan(0.82f),
+            detailStart, spannable.length,
+            android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+        )
+        text = spannable
     }
 
     /** One card per engine: name + status + a Download or Use action (or an "In use" badge). */
@@ -772,17 +911,47 @@ class VoiceCloningActivity : PrismBaseActivity() {
             saveBtn.text = "Saving…"
 
             Thread({
+                // Captured before the thread starts: the screen may repaint and clear a stale
+                // selection while the save is in flight, and the voice should be prepared on the
+                // machine the user saw when they pressed Save.
+                val remotePeer = selectedClonePeer
                 val saveResult = runCatching {
-                    ClonedVoices.save(
-                        displayName = name,
-                        language = language,
-                        customLanguage = customLanguage,
-                        gender = gender,
-                        region = profile.region,
-                        sampleRate = VoiceCloner.WORK_RATE,
-                        pitchHz = profile.pitchHz,
-                        onStage = { stage -> runOnUiThread { saveBtn.text = stage } },
-                    )
+                    if (remotePeer != null) {
+                        val peer = com.prism.launcher.speech.KokoroMeshShare.peer(remotePeer)
+                            ?: throw IllegalStateException(
+                                "That machine is no longer on the mesh. Save here instead.",
+                            )
+                        runOnUiThread { saveBtn.text = "Preparing on ${peer.deviceName}…" }
+                        // Only the model work is remote. The recording is already cleaned and
+                        // levelled by VoiceCloner.profile, so this is the same input the local
+                        // path would have handed its engine.
+                        val artifacts = com.prism.launcher.speech.KokoroMeshShare
+                            .prepareCloneOn(peer.peerIp, profile.region)
+                            ?: throw IllegalStateException(
+                                "${peer.deviceName} did not answer. Try saving on this device.",
+                            )
+                        ClonedVoices.importPrepared(
+                            displayName = name,
+                            language = language,
+                            customLanguage = customLanguage,
+                            gender = gender,
+                            region = profile.region,
+                            pitchHz = profile.pitchHz,
+                            artifacts = artifacts,
+                            onStage = { stage -> runOnUiThread { saveBtn.text = stage } },
+                        )
+                    } else {
+                        ClonedVoices.save(
+                            displayName = name,
+                            language = language,
+                            customLanguage = customLanguage,
+                            gender = gender,
+                            region = profile.region,
+                            sampleRate = VoiceCloner.WORK_RATE,
+                            pitchHz = profile.pitchHz,
+                            onStage = { stage -> runOnUiThread { saveBtn.text = stage } },
+                        )
+                    }
                 }
                 runOnUiThread {
                     if (saveResult.isSuccess) {

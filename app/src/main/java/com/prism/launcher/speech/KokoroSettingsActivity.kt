@@ -34,6 +34,24 @@ class KokoroSettingsActivity : PrismBaseActivity() {
     private lateinit var modelRow: TextView
     private lateinit var speedRow: TextView
 
+    /**
+     * The mesh section. Its three parts are kept as fields because the whole block is hidden when
+     * no machine is offering Kokoro -- the requirement is that it appears only on a meshnet where
+     * somebody is, not that it sits there permanently saying "nobody".
+     */
+    private lateinit var meshHeader: TextView
+    private lateinit var meshCard: LinearLayout
+    private lateinit var meshFooter: TextView
+
+    /** Repaints the peer list while the screen is visible; peers appear and leave on their own. */
+    private val meshHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val meshPoll = object : Runnable {
+        override fun run() {
+            refreshMeshSection()
+            meshHandler.postDelayed(this, 2500)
+        }
+    }
+
     /** Set while a download is running, so the row says so and cannot be started twice. */
     @Volatile
     private var downloading = false
@@ -60,13 +78,22 @@ class KokoroSettingsActivity : PrismBaseActivity() {
 
         buildStatusSection()
         buildVoiceSection()
+        buildMeshSection()
         buildModelSection()
         refresh()
+    }
+
+    override fun onPause() {
+        meshHandler.removeCallbacks(meshPoll)
+        super.onPause()
     }
 
     override fun onResume() {
         super.onResume()
         refresh()
+        refreshMeshSection()
+        meshHandler.removeCallbacks(meshPoll)
+        meshHandler.post(meshPoll)
     }
 
     // -- Status ---------------------------------------------------------------
@@ -130,6 +157,139 @@ class KokoroSettingsActivity : PrismBaseActivity() {
             )
         )
         content.addView(spacer())
+    }
+
+    // -- Mesh ----------------------------------------------------------------
+
+    /**
+     * Machines on this meshnet that are offering their Kokoro.
+     *
+     * HIDDEN UNTIL THERE IS SOMETHING TO SHOW. A section that is always present but usually says
+     * "no machines" is clutter on every device that has never joined a mesh, and the feature only
+     * exists on a meshnet that is actually sharing. The whole block -- header, card and footer --
+     * is visibility-switched together so it cannot leave a stray heading behind.
+     */
+    private fun buildMeshSection() {
+        meshHeader = IosUi.sectionHeader(this, "KOKORO ON YOUR MESHNET")
+        content.addView(meshHeader)
+
+        meshCard = IosUi.card(this)
+        content.addView(meshCard)
+
+        meshFooter = IosUi.sectionFooter(
+            this,
+            "A desktop (or another phone) that has joined this meshnet can speak for this " +
+                "device. Choosing one sends the text to it and plays what comes back — nothing " +
+                "about the voice is copied here, and the choice falls back to this machine's " +
+                "own Kokoro the moment that machine leaves the mesh.",
+        )
+        content.addView(meshFooter)
+        content.addView(spacer())
+    }
+
+    /**
+     * Rebuilds the peer list and hides the section when there is nothing in it.
+     *
+     * Rebuilt rather than diffed: the list is a handful of rows and every one of them can change
+     * (a peer renames itself, gains a voice, goes stale), so a diff would be more code with more
+     * ways to show a stale label.
+     */
+    private fun refreshMeshSection() {
+        if (!::meshCard.isInitialized) return
+
+        val peers = com.prism.launcher.speech.KokoroMeshShare.withKokoro()
+        val serving = com.prism.launcher.speech.KokoroMeshShare.servingSummary()
+        val selected = PrismSettings.getMeshSpeechPeer()
+        val visible = peers.isNotEmpty() || serving != null
+
+        val visibility = if (visible) View.VISIBLE else View.GONE
+        meshHeader.visibility = visibility
+        meshCard.visibility = visibility
+        meshFooter.visibility = visibility
+        if (!visible) return
+
+        meshCard.removeAllViews()
+
+        // One divider before each row after the first, wherever the first row came from. Tracking
+        // it rather than testing each row's index keeps the serving status, the "this device" row
+        // and the peer rows from producing a double line at their seams.
+        var dividerPending = false
+
+        if (serving != null) {
+            val status = TextView(this).apply {
+                text = serving
+                textSize = 13f
+                setTextColor(IosUi.secondaryLabel(this@KokoroSettingsActivity))
+                val h = IosUi.dp(this@KokoroSettingsActivity, 16f)
+                val v = IosUi.dp(this@KokoroSettingsActivity, 12f)
+                setPadding(h, v, h, v)
+            }
+            meshCard.addView(status)
+            dividerPending = true
+        }
+
+        // The local option is only offered once a remote one has been chosen, so the list does
+        // not start with a redundant "this device" row on every install.
+        if (selected.isNotBlank()) {
+            if (dividerPending) meshCard.addView(IosUi.hairline(this))
+            meshCard.addView(meshRow(
+                title = "This device",
+                detail = "Use the Kokoro installed here instead",
+                checked = false,
+            ) {
+                PrismSettings.setMeshSpeechPeer("")
+                PrismSpeaker.invalidate()
+                Toast.makeText(this, "Speaking with this device's Kokoro", Toast.LENGTH_SHORT).show()
+                refresh()
+                refreshMeshSection()
+            })
+            dividerPending = true
+        }
+
+        peers.forEach { peer ->
+            if (dividerPending) meshCard.addView(IosUi.hairline(this))
+            val voices = if (peer.kokoroVoiceCount > 0) {
+                "${peer.kokoroVoiceCount} voice(s) downloaded there"
+            } else {
+                "no voices downloaded there yet"
+            }
+            val detail = if (peer.peerIp == selected) {
+                "IN USE · $voices"
+            } else {
+                "$voices · tap to speak through this machine"
+            }
+            meshCard.addView(meshRow(peer.deviceName, detail, peer.peerIp == selected) {
+                PrismSettings.setMeshSpeechPeer(peer.peerIp)
+                PrismSpeaker.invalidate()
+                Toast.makeText(
+                    this, "Speaking through ${peer.deviceName}", Toast.LENGTH_SHORT,
+                ).show()
+                refresh()
+                refreshMeshSection()
+            })
+            dividerPending = true
+        }
+    }
+
+    /** One peer row: name, a secondary line, and a tick when it is the chosen machine. */
+    private fun meshRow(
+        title: String,
+        detail: String,
+        checked: Boolean,
+        onClick: () -> Unit,
+    ): TextView = TextView(this).apply {
+        textSize = 16f
+        setTextColor(if (checked) IosUi.accent(this@KokoroSettingsActivity) else IosUi.label(this@KokoroSettingsActivity))
+        val h = IosUi.dp(this@KokoroSettingsActivity, 16f)
+        val v = IosUi.dp(this@KokoroSettingsActivity, 14f)
+        setPadding(h, v, h, v)
+        isClickable = true
+        setOnClickListener { onClick() }
+        setRowDetail(
+            this,
+            if (checked) "✓ $title" else title,
+            detail,
+        )
     }
 
     private fun pickSpeed() {
@@ -247,6 +407,9 @@ class KokoroSettingsActivity : PrismBaseActivity() {
                 append(" MB, ")
                 append(KokoroInstall.installedVoices().size)
                 append(" voice(s)")
+            }
+            com.prism.launcher.speech.KokoroMeshShare.servingSummary()?.let {
+                append("\n").append(it)
             }
         }
 

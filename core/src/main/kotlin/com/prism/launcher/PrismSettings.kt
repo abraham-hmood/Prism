@@ -2336,6 +2336,35 @@ object PrismSettings {
         prefs().edit().putString(KEY_VOICE_CLONE_ENGINE, value).apply()
 
     /**
+     * A machine on the mesh whose Kokoro this device should speak through, by mesh IP.
+     *
+     * Empty means "speak locally", which is the default and remains right for every device that
+     * has its own model. Choosing a peer is an explicit act on the Kokoro screen; it is honoured
+     * only while that peer is still announcing, so an unplugged desktop falls back to this
+     * machine's own voice rather than turning every reply into a network timeout.
+     */
+    fun getMeshSpeechPeer(): String =
+        prefs().getString(KEY_MESH_SPEECH_PEER, "") ?: ""
+
+    fun setMeshSpeechPeer(value: String) =
+        prefs().edit().putString(KEY_MESH_SPEECH_PEER, value).apply()
+
+    /**
+     * Whether this device offers its Kokoro and voice-cloning models to the mesh.
+     *
+     * ON BY DEFAULT, deliberately. The desktop switch that controls it is checked when the user
+     * first opens the page, and the feature is only useful if a machine that has the models is
+     * already serving them -- a sharing feature that starts off is a sharing feature nobody turns
+     * on. It is still an explicit preference, so a user who does not want the port open can turn
+     * it off and stay off.
+     */
+    fun getMeshSpeechSharingEnabled(): Boolean =
+        prefs().getBoolean(KEY_MESH_SPEECH_SHARING, true)
+
+    fun setMeshSpeechSharingEnabled(value: Boolean) =
+        prefs().edit().putBoolean(KEY_MESH_SPEECH_SHARING, value).apply()
+
+    /**
      * Folders of user-supplied ONNX voice-conversion models, remembered as absolute paths.
      * Each folder is one extra engine, registered by pointing Prism at it from the desktop's
      * cloning studio; the files stay the user's, and nothing is moved or copied into Prism.
@@ -2631,6 +2660,8 @@ object PrismSettings {
     private const val KEY_KOKORO_SPEED         = "kokoro_speed"
     private const val KEY_KOKORO_VARIANT       = "kokoro_variant"
     private const val KEY_VOICE_CLONE_ENGINE   = "voice_clone_engine"
+    private const val KEY_MESH_SPEECH_PEER     = "mesh_speech_peer"
+    private const val KEY_MESH_SPEECH_SHARING  = "mesh_speech_sharing"
     private const val KEY_CUSTOM_CLONE_ENGINE_FOLDERS = "custom_clone_engine_folders"
     private const val KEY_SPEAK_REPLIES_ALOUD  = "speak_replies_aloud"
     private const val KEY_KV_CACHE_QUANT       = "kv_cache_quant"

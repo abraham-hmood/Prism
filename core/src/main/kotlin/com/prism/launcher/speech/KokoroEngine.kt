@@ -207,6 +207,35 @@ class KokoroEngine private constructor(
     }
 
     /**
+     * Renders [text] to audio without playing it.
+     *
+     * This is [speak] with the last step removed: every chunk the speaking path would have queued
+     * to the audio sink is concatenated instead, at one rate. It exists for [SpeechMeshServer],
+     * which has to hand bytes to another machine rather than make a noise locally -- and the
+     * synthesis itself (phonemes, style row, ONNX, clone conversion) is identical, because a
+     * second rendering path would be a second set of bugs in the one part of this feature that
+     * already works.
+     *
+     * Returns null when the model fails, which the server turns into a 500 with a generic
+     * message: the caller is a remote peer and the detailed ONNX explanation belongs in this
+     * machine's diagnostics, not in another device's Toast.
+     */
+    fun synthesizeToPcm(text: String, voiceId: String?, speed: Float): SpeechMeshWire.Clip? {
+        val voice = voiceId?.ifBlank { null } ?: com.prism.launcher.PrismSettings.KOKORO_DEFAULT_VOICE
+        return runCatching {
+            val chunks = chunkText(text)
+            if (chunks.isEmpty()) return SpeechMeshWire.Clip(FloatArray(0), SAMPLE_RATE)
+            val clips = chunks.map { chunk ->
+                val rendered = render(chunk, voice, speed)
+                SpeechMeshWire.Clip(rendered.samples, rendered.sampleRate)
+            }
+            SpeechMeshWire.join(clips)
+        }.onFailure {
+            PrismPlatform.log.warn(TAG, "Remote synthesis failed: " + explain(it))
+        }.getOrNull()
+    }
+
+    /**
      * Turns an ONNX Runtime failure into something a user can act on.
      *
      * ONE CASE IS SINGLED OUT and it is worth the special case. A broken quantisation reports a

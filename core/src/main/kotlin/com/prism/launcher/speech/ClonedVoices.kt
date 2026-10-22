@@ -260,6 +260,65 @@ object ClonedVoices {
         return id
     }
 
+    /**
+     * Stores a clone whose per-engine artifacts were prepared on ANOTHER machine.
+     *
+     * This is the receiving half of [KokoroMeshShare.prepareCloneOn]. The analysis (trim,
+     * levelling, pitch) already happened locally; what a weak device could not do is run the
+     * ONNX encoder, so a desktop ran [CloneEngine.prepare] for it and sent back the files.
+     * Everything else -- the id, the registry entry, the base voice -- belongs to the machine
+     * that will actually speak, which is here.
+     *
+     * [artifacts] maps a filename suffix to its bytes: `tone`, `knnfeat`, and any engine-specific
+     * cache. The recording itself is not among them, because the caller already holds [region]
+     * and [writeRef] stores it. A suffix that is not a plain filename is refused rather than
+     * written, so a hostile or confused peer cannot choose a path.
+     */
+    fun importPrepared(
+        displayName: String,
+        language: KokoroVoices.Language?,
+        customLanguage: String?,
+        gender: KokoroVoices.Gender,
+        region: FloatArray,
+        pitchHz: Float,
+        artifacts: Map<String, ByteArray>,
+        onStage: (String) -> Unit = {},
+    ): String {
+        val name = displayName.trim()
+        require(name.isNotEmpty()) { "Give this voice a name" }
+        if (region.isEmpty()) throw IllegalStateException("There is no audio to store")
+
+        val base = baseVoiceFor(language, gender)
+            ?: throw IllegalStateException("No published voice is available to build on")
+
+        // The words are spoken by this machine's Kokoro through [base], so that tensor has to be
+        // here even when the conversion model is not. Half a megabyte, and the alternative is a
+        // saved voice that cannot say anything.
+        if (!KokoroInstall.isVoiceInstalled(base.id)) {
+            onStage("Fetching ${base.displayName}…")
+            KokoroInstall.downloadVoice(base.id)?.let {
+                throw IllegalStateException("Could not fetch ${base.displayName}: $it")
+            }
+        }
+
+        val id = ID_PREFIX + UUID.randomUUID().toString().replace("-", "").take(12)
+        writeRef(id, region)
+        artifacts.forEach { (suffix, bytes) ->
+            if (!safeSuffix(suffix) || suffix == "ref") return@forEach
+            File(KokoroInstall.voicesDir(), "$id.$suffix").writeBytes(bytes)
+        }
+        writeRegistry(all() + Entry(id, name, language, customLanguage, gender, base.id, pitchHz))
+        PrismPlatform.log.info(
+            TAG, "Imported cloned voice $id ($name) prepared on a mesh peer, on ${base.id}",
+        )
+        return id
+    }
+
+    /** A suffix that cannot escape the voices directory or overwrite the recording. */
+    private fun safeSuffix(suffix: String): Boolean =
+        suffix.isNotEmpty() && suffix.length <= 24 &&
+            suffix.all { it.isLetterOrDigit() || it == '_' || it == '-' }
+
     fun remove(id: String) {
         if (!isCloned(id)) return
         // Every per-voice artifact any engine has written: tone, reference, feature caches, and
