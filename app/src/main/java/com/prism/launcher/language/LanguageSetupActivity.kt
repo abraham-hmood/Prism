@@ -561,7 +561,12 @@ class LanguageSetupActivity : PrismBaseActivity() {
                     syncButton()
                     // Hearing them is the entire basis for the choice, so selecting plays a line.
                     PrismSpeaker.stop()
-                    PrismSpeaker.preview(tutor.voice)
+                    val userVoice = com.prism.launcher.PrismSettings.getKokoroVoice(
+                        com.prism.launcher.PrismSettings.VOICE_SPEAKER_SAM,
+                    )
+                    PrismSpeaker.preview(
+                        com.prism.launcher.language.LanguageVoices.tutorPreviewVoice(tutor, userVoice),
+                    )
                 }
                 cards[tutor.id] = card
                 row.addView(card, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {

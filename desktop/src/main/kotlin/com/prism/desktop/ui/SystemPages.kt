@@ -37,7 +37,9 @@ import com.prism.desktop.DesktopLog
 import com.prism.launcher.AppSync
 import com.prism.launcher.DesktopItem
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.withContext
 import java.io.File
 
@@ -361,52 +363,67 @@ private fun OfferedAppTile(app: TrustedApps.Offered, busy: Boolean, onClick: () 
 fun DiagnosticsPage() {
     val scope = rememberCoroutineScope()
     val colors = LocalPrismColors.current
-    val logFile = remember { (PrismPlatform.log as? DesktopLog)?.path() }
+    val logger = remember { PrismPlatform.log as? DesktopLog }
 
     var panels by remember { mutableStateOf<List<DesktopDiagnostics.Panel>>(emptyList()) }
-    var content by remember { mutableStateOf("") }
-    var showLog by remember { mutableStateOf(false) }
+    var entries by remember { mutableStateOf<List<DesktopLog.Entry>>(emptyList()) }
+    var expandedDays by remember { mutableStateOf(setOf<String>()) }
+    var showChecks by remember { mutableStateOf(false) }
     var copied by remember { mutableStateOf("") }
 
-    suspend fun reload() {
-        // Off the UI thread: the checks read the filesystem, probe the CPU and enumerate network
-        // interfaces, and a settings page that stalls while it does is indistinguishable from a hang.
+    suspend fun reloadChecks() {
         panels = withContext(Dispatchers.IO) {
             runCatching { DesktopDiagnostics.run() }.getOrDefault(emptyList())
         }
-        content = withContext(Dispatchers.IO) {
-            val f = logFile
-            when {
-                f == null -> "No file-backed log is installed."
-                !f.exists() -> "No log written yet."
-                // Bounded read: a long-running install's log can reach megabytes, and rendering
-                // all of it would stall the frame for no benefit.
-                else -> runCatching { f.readLines().takeLast(600).joinToString("\n") }
-                    .getOrElse { "Could not read the log: " + it.message }
+    }
+
+    LaunchedEffect(logger) {
+        if (logger != null) {
+            launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+                logger.updates.collect { entry ->
+                    if (entries.none { it.id == entry.id }) {
+                        entries = (entries + entry).sortedBy { it.id }
+                    }
+                }
+            }
+            entries = withContext(Dispatchers.IO) { logger.entries() }
+            while (true) {
+                delay(1000L)
+                val latest = withContext(Dispatchers.IO) { logger.entries() }
+                if (latest.size != entries.size || latest.lastOrNull() != entries.lastOrNull()) {
+                    entries = latest
+                }
             }
         }
     }
+    LaunchedEffect(Unit) { reloadChecks() }
 
-    LaunchedEffect(Unit) { reload() }
-
-    PageScaffold("Diagnostics", "Every subsystem, and the machine underneath it") {
+    PageScaffold("Diagnostics", "Every Prism log entry, grouped by day") {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Button(onClick = { scope.launch { reload() } }) { Text("Refresh") }
+            Button(onClick = {
+                scope.launch {
+                    entries = withContext(Dispatchers.IO) { logger?.entries().orEmpty() }
+                    reloadChecks()
+                }
+            }) { Text("Refresh") }
             Spacer(Modifier.width(10.dp))
             OutlinedButton(onClick = {
-                // The whole report, because what somebody attaches to a bug report should not depend on
-                // which panels they happened to have scrolled to.
                 runCatching {
                     java.awt.Toolkit.getDefaultToolkit().systemClipboard.setContents(
-                        java.awt.datatransfer.StringSelection(DesktopDiagnostics.report()), null,
+                        java.awt.datatransfer.StringSelection(
+                            entries.joinToString("\n") { entry ->
+                                "[${entry.timestamp}] [${entry.level}] [${entry.tag}] ${entry.message}"
+                            } + "\n\n" + DesktopDiagnostics.report(),
+                        ), null,
                     )
-                    copied = "The full report is on the clipboard."
+                    copied = "The logs and system report are on the clipboard."
                 }.onFailure { copied = "Could not copy it: " + it.message }
             }) { Text("Copy report", fontSize = 13.sp) }
-            Spacer(Modifier.width(10.dp))
-            OutlinedButton(onClick = { showLog = !showLog }) {
-                Text(if (showLog) "Hide the log" else "Show the log", fontSize = 13.sp)
-            }
+            Spacer(Modifier.width(8.dp))
+            OutlinedButton(onClick = {
+                logger?.clear()
+                entries = emptyList()
+            }) { Text("Clear logs", fontSize = 13.sp) }
             Spacer(Modifier.weight(1f))
             val failures = panels.sumOf { panel -> panel.checks.count { it.status == Status.FAIL } }
             val warnings = panels.sumOf { panel -> panel.checks.count { it.status == Status.WARN } }
@@ -430,35 +447,102 @@ fun DiagnosticsPage() {
         Spacer(Modifier.height(12.dp))
 
         Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
-            panels.forEach { panel ->
-                SectionHeader(panel.title.lowercase())
-                Card {
-                    panel.checks.forEachIndexed { index, check ->
-                        if (index > 0) Hairline()
-                        CheckRow(check)
+            if (entries.isEmpty()) {
+                Text("No Prism log entries yet.", fontSize = 13.sp, color = colors.faint)
+            } else {
+                entries.groupBy { it.timestamp.take(10) }
+                    .toSortedMap(compareByDescending { it })
+                    .forEach { (day, dayEntries) ->
+                        val expanded = day in expandedDays
+                        Surface(
+                            color = Color(0xFF1B1B21),
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                        ) {
+                            Column {
+                                Row(
+                                    Modifier.fillMaxWidth().clickableRow {
+                                        expandedDays = if (expanded) expandedDays - day else expandedDays + day
+                                    }.padding(horizontal = 16.dp, vertical = 12.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text(
+                                            runCatching {
+                                                java.time.LocalDate.parse(day).getDayOfWeek().getDisplayName(
+                                                    java.time.format.TextStyle.FULL,
+                                                    java.util.Locale.getDefault(),
+                                                )
+                                            }.getOrDefault(day),
+                                            fontSize = 14.sp,
+                                        )
+                                        Text(
+                                            day + "  ·  " + dayEntries.size +
+                                                (if (dayEntries.size == 1) " entry" else " entries") +
+                                                "  ·  last at " + dayEntries.last().timestamp.substringAfter(' '),
+                                            fontSize = 11.sp,
+                                            color = colors.faint,
+                                        )
+                                    }
+                                    Text(if (expanded) "−" else "+", fontSize = 16.sp, color = colors.faint)
+                                }
+                                if (expanded) {
+                                    dayEntries.forEachIndexed { index, entry ->
+                                        if (index > 0) Hairline()
+                                        Row(
+                                            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 9.dp),
+                                            verticalAlignment = Alignment.Top,
+                                        ) {
+                                            Text(
+                                                entry.timestamp.substringAfter(' '),
+                                                fontSize = 11.sp,
+                                                color = colors.faint,
+                                            )
+                                            Spacer(Modifier.width(8.dp))
+                                            Text(
+                                                entry.level.name,
+                                                fontSize = 11.sp,
+                                                color = when (entry.level) {
+                                                    DesktopLog.Level.ERROR -> Color(0xFFFF6B6B)
+                                                    DesktopLog.Level.WARN -> Color(0xFFFFB454)
+                                                    DesktopLog.Level.SUCCESS -> Color(0xFF67D58A)
+                                                    DesktopLog.Level.INFO -> colors.accent
+                                                    DesktopLog.Level.DEBUG -> colors.faint
+                                                },
+                                            )
+                                            Spacer(Modifier.width(8.dp))
+                                            Column(Modifier.weight(1f)) {
+                                                Text(entry.tag, fontSize = 11.sp, color = colors.muted)
+                                                Text(entry.message, fontSize = 13.sp, lineHeight = 18.sp)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+            }
+
+            Spacer(Modifier.height(12.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("System checks", fontSize = 14.sp)
+                Spacer(Modifier.weight(1f))
+                OutlinedButton(onClick = {
+                    showChecks = !showChecks
+                    if (showChecks) scope.launch { reloadChecks() }
+                }) { Text(if (showChecks) "Hide" else "Show", fontSize = 12.sp) }
+            }
+            if (showChecks) {
+                panels.forEach { panel ->
+                    SectionHeader(panel.title.lowercase())
+                    Card {
+                        panel.checks.forEachIndexed { index, check ->
+                            if (index > 0) Hairline()
+                            CheckRow(check)
+                        }
                     }
                 }
             }
-
-            if (showLog) {
-                SectionHeader("log")
-                Box(
-                    Modifier.fillMaxWidth()
-                        .background(Color(0xFF101014), RoundedCornerShape(10.dp)).padding(12.dp)
-                ) {
-                    Text(
-                        content, fontSize = 11.sp, fontFamily = FontFamily.Monospace,
-                        color = Color(0xFF9A9AA6), lineHeight = 15.sp,
-                    )
-                }
-                SectionFooter(logFile?.absolutePath ?: "no log file")
-                Spacer(Modifier.height(10.dp))
-                OutlinedButton(onClick = {
-                    logFile?.let { runCatching { it.writeText("") } }
-                    scope.launch { reload() }
-                }) { Text("Clear the log", fontSize = 13.sp) }
-            }
-
             Spacer(Modifier.height(24.dp))
         }
     }

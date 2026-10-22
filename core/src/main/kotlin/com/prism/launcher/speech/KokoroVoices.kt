@@ -22,10 +22,12 @@ object KokoroVoices {
     enum class Gender { FEMALE, MALE }
 
     /**
-     * The languages Kokoro ships voices for.
+     * The languages a clone can name.
      *
-     * [code] is the id prefix letter. [pack] is the language pack its phonemiser needs, which is
-     * not always the same thing: American and British English are two voice sets over one language.
+     * [code] is the id prefix letter for the nine Kokoro ships voices for; the rest carry no
+     * published voice at all, which matters only for cloning -- a clone built on one of them
+     * speaks through an American English voice and is re-voiced to the recording, so the words
+     * still come out. [pack] is the locale the system engine would use for the same language.
      */
     enum class Language(val code: Char, val display: String, val pack: String) {
         AMERICAN_ENGLISH('a', "American English", "en-us"),
@@ -36,7 +38,21 @@ object KokoroVoices {
         ITALIAN('i', "Italian", "it"),
         BRAZILIAN_PORTUGUESE('p', "Brazilian Portuguese", "pt-br"),
         JAPANESE('j', "Japanese", "ja"),
-        MANDARIN('z', "Mandarin Chinese", "zh");
+        MANDARIN('z', "Mandarin Chinese", "zh"),
+        // Below: languages with no published Kokoro voice. Chosen for the clone dialog, where a
+        // name is all that is needed -- the base voice falls back to American English.
+        ARABIC('r', "Arabic", "ar"),
+        KOREAN('k', "Korean", "ko"),
+        GERMAN('g', "German", "de"),
+        RUSSIAN('u', "Russian", "ru"),
+        TURKISH('t', "Turkish", "tr"),
+        DUTCH('d', "Dutch", "nl"),
+        POLISH('l', "Polish", "pl"),
+        SWEDISH('s', "Swedish", "sv"),
+        INDONESIAN('n', "Indonesian", "id"),
+        VIETNAMESE('v', "Vietnamese", "vi"),
+        THAI('w', "Thai", "th"),
+        GREEK('y', "Greek", "el");
 
         companion object {
             fun of(code: Char): Language? = entries.firstOrNull { it.code == code }

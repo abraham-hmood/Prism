@@ -6,6 +6,13 @@ import androidx.webkit.ProxyController
 import com.prism.launcher.PrismSettings
 
 object PrismProxyClient {
+    fun connectToLocalServer(context: Context, port: Int) {
+        val builder = ProxyConfig.Builder()
+            .addProxyRule("http://127.0.0.1:$port")
+            .addDirect()
+        ProxyController.getInstance().setProxyOverride(builder.build(), { it.run() }, {})
+    }
+
     fun start(context: Context) {
         val servers = PrismSettings.getPrismServers()
         if (servers.isEmpty()) return

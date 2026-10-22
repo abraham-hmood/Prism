@@ -1454,6 +1454,26 @@ object PrismSettings {
         return id
     }
 
+    /** Stable identity for this Prism installation, advertised to other mesh peers. */
+    fun getPrismNodeId(): String {
+        val stored = prefs().getString(KEY_PRISM_NODE_ID, "") ?: ""
+        if (stored.isNotBlank()) return stored
+        val created = java.util.UUID.randomUUID().toString()
+        prefs().edit().putString(KEY_PRISM_NODE_ID, created).apply()
+        return created
+    }
+
+    /** Name shown to server operators; this is not used as an authentication credential. */
+    fun getPrismNodeName(): String =
+        PrismPlatform.host.deviceName().ifBlank { "Prism node" }
+
+    /** Persistent denylist for app identities banned by this mesh server. */
+    fun getBannedPrismNodeIds(): Set<String> =
+        (prefs().getStringSet(KEY_BANNED_PRISM_NODE_IDS, emptySet()) ?: emptySet()).toSet()
+
+    fun setBannedPrismNodeIds(value: Set<String>) =
+        prefs().edit().putStringSet(KEY_BANNED_PRISM_NODE_IDS, value.toSet()).apply()
+
     fun getActiveServer(): PrismServer? {
         return getPrismServers().find { it.isActive }
     }
@@ -2303,6 +2323,32 @@ object PrismSettings {
         prefs().edit().putString(KEY_KOKORO_VARIANT, value).apply()
 
     /**
+     * Which voice-conversion engine re-voices Kokoro toward a cloned voice.
+     *
+     * Every engine speaks every clone that has its reference recording on disk, so this is a
+     * live choice -- switch it and the same clone is re-rendered through the other model. The
+     * default stays the engine that came first and has the smallest download.
+     */
+    fun getVoiceCloneEngine(): String =
+        prefs().getString(KEY_VOICE_CLONE_ENGINE, "openvoice") ?: "openvoice"
+
+    fun setVoiceCloneEngine(value: String) =
+        prefs().edit().putString(KEY_VOICE_CLONE_ENGINE, value).apply()
+
+    /**
+     * Folders of user-supplied ONNX voice-conversion models, remembered as absolute paths.
+     * Each folder is one extra engine, registered by pointing Prism at it from the desktop's
+     * cloning studio; the files stay the user's, and nothing is moved or copied into Prism.
+     */
+    fun getCustomCloneEngineFolders(): List<String> =
+        prefs().getString(KEY_CUSTOM_CLONE_ENGINE_FOLDERS, "")?.split('\n')?.filter {
+            it.isNotBlank()
+        } ?: emptyList()
+
+    fun setCustomCloneEngineFolders(value: List<String>) =
+        prefs().edit().putString(KEY_CUSTOM_CLONE_ENGINE_FOLDERS, value.distinct().joinToString("\n")).apply()
+
+    /**
      * Speak replies aloud outside call mode too.
      *
      * Off by default: a reply read out loud in a room is a different thing from one that arrives
@@ -2584,6 +2630,8 @@ object PrismSettings {
     private const val KEY_KOKORO_VOICE_PREFIX  = "kokoro_voice_"
     private const val KEY_KOKORO_SPEED         = "kokoro_speed"
     private const val KEY_KOKORO_VARIANT       = "kokoro_variant"
+    private const val KEY_VOICE_CLONE_ENGINE   = "voice_clone_engine"
+    private const val KEY_CUSTOM_CLONE_ENGINE_FOLDERS = "custom_clone_engine_folders"
     private const val KEY_SPEAK_REPLIES_ALOUD  = "speak_replies_aloud"
     private const val KEY_KV_CACHE_QUANT       = "kv_cache_quant"
     private const val KEY_AI_BACKEND           = "ai_backend_mode"
@@ -2635,10 +2683,13 @@ object PrismSettings {
     private const val KEY_PRISM_SERVER_LIST   = "prism_server_list"
     private const val KEY_VPN_SERVER_ALWAYS_ON = "vpn_server_always_on"
     private const val KEY_P2P_SELF_ID         = "p2p_self_id"
+    private const val KEY_PRISM_NODE_ID       = "prism_node_id"
+    private const val KEY_BANNED_PRISM_NODE_IDS = "banned_prism_node_ids"
     private const val KEY_WG_SERVER_PRIVATE_KEY = "wg_server_private_key"
     private const val KEY_WG_SERVER_PUBLIC_KEY = "wg_server_public_key"
     private const val KEY_WG_SERVER_PORT         = "wg_server_port"
     private const val KEY_WG_PEERS           = "wg_peers"
+    private const val KEY_BANNED_WG_PEER_PUBLIC_KEYS = "banned_wg_peer_public_keys"
     private const val KEY_WG_ALLOWED_IPS        = "wg_allowed_ips"
     private const val KEY_MESH_BOOTSTRAP_ADDRESS = "mesh_bootstrap_address"
     private const val KEY_MESH_BOOTSTRAP_PORT    = "mesh_bootstrap_port"
@@ -2751,6 +2802,12 @@ object PrismSettings {
 
     fun setWgPeers(value: List<String>) =
         prefs().edit().putStringSet(KEY_WG_PEERS, value.toSet()).apply()
+
+    fun getBannedWgPeerPublicKeys(): Set<String> =
+        (prefs().getStringSet(KEY_BANNED_WG_PEER_PUBLIC_KEYS, emptySet()) ?: emptySet()).toSet()
+
+    fun setBannedWgPeerPublicKeys(value: Set<String>) =
+        prefs().edit().putStringSet(KEY_BANNED_WG_PEER_PUBLIC_KEYS, value.toSet()).apply()
 
     fun getWgServerPort(): Int =
         prefs().getInt(KEY_WG_SERVER_PORT, 51820)

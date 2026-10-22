@@ -80,19 +80,130 @@ class KokoroEngine private constructor(
         val mine = ++generation
 
         Thread({
-            val result = runCatching { synthesize(text, voice, speed) }
-            if (mine != generation) return@Thread
+            // Progressive speech: chunks are rendered while the previous one is still being
+            // heard, so the delay between passing text and the first sound is one chunk's
+            // synthesis rather than the whole utterance's. Was previously the SINGLE biggest
+            // complaint about latency -- a paragraph was synthesised end to end, then played.
+            val events = java.util.concurrent.LinkedBlockingQueue<Any?>(4)
+            val producerErr = arrayOf<Throwable?>(null)
 
-            val audio = result.getOrNull()
-            if (audio == null) {
-                val reason = result.exceptionOrNull()
-                PrismPlatform.log.error(TAG, "Kokoro could not speak", reason)
-                PrismPlatform.main.post { onDone(explain(reason)) }
-                return@Thread
-            }
+            Thread({
+                try {
+                    for (chunk in chunkText(text)) {
+                        if (mine != generation) return@Thread
+                        val rendered = runCatching { render(chunk, voice, speed) }
+                            .getOrElse { producerErr[0] = it; events.put(DONE); return@Thread }
+                        if (mine != generation) return@Thread
+                        events.put(rendered ?: continue)
+                    }
+                } finally {
+                    try { events.put(DONE) } catch (_: InterruptedException) {}
+                }
+            }, "kokoro-render").apply { isDaemon = true; start() }
 
-            play(audio, mine, onDone)
+            Thread({
+                var failure: Throwable? = null
+                var playbackProblem: String? = null
+                try {
+                    while (true) {
+                        val event = events.take()
+                        when (event) {
+                            DONE -> break
+                            is Rendered -> {
+                                if (mine != generation) return@Thread
+                                val problem = PrismPlatform.audio.play(
+                                    samples = event.samples,
+                                    sampleRate = event.sampleRate,
+                                    cancelled = { mine != generation },
+                                )
+                                if (mine != generation) return@Thread
+                                if (problem != null) {
+                                    PrismPlatform.log.warn(
+                                        TAG, "Kokoro produced audio but it did not play: " + problem,
+                                    )
+                                    playbackProblem = problem
+                                    break
+                                }
+                            }
+                        }
+                    }
+                } catch (_: InterruptedException) {
+                }
+
+                val reason = when {
+                    playbackProblem != null -> playbackProblem
+                    producerErr[0] != null -> explain(producerErr[0])
+                    else -> null
+                }
+                if (mine != generation) return@Thread
+                if (reason != null) PrismPlatform.main.post { onDone(reason) } else {
+                    PrismPlatform.main.post { onDone(null) }
+                }
+            }, "kokoro-play").apply { isDaemon = true; start() }
         }, "kokoro-speak").apply { isDaemon = true; start() }
+    }
+
+    /** A sentence, and the rate it must be played at -- 22.05 kHz when it has been re-voiced. */
+    private data class Rendered(val samples: FloatArray, val sampleRate: Int)
+
+    /** Wake marker: the renderer is done, whatever it produced. */
+    private val DONE = Any()
+
+    /**
+     * Synthesises [text], re-voicing it when [voiceId] is a cloned voice.
+     *
+     * Order matters and is the same for every engine: Kokoro speaks through the published voice,
+     * [VoicePitch.match] moves that audio's pitch onto the speaker's measured pitch (only for
+     * engines that carry source pitch through), and the active [CloneEngine] re-voices the result.
+     * A clone with only a style tensor is the old kind: it has no reference recording, so it is
+     * spoken through OpenVoice -- the only engine that ever saw it -- and refusing would break
+     * every voice saved before reference recordings existed.
+     */
+    private fun render(text: String, voiceId: String, speed: Float): Rendered {
+        val clone = ClonedVoices.find(voiceId)
+        // A new clone speaks through its base voice; a legacy one has its own tensor on disk.
+        val styleVoice = clone?.baseVoiceId ?: voiceId
+
+        // A ReferenceSpeechEngine (Pocket TTS) speaks the text itself, directly in the clone's
+        // recorded voice; Kokoro is bypassed entirely, so its phrasing and pitch contours do not
+        // overwrite those of the recorded speaker. A legacy tensor-only clone has no reference,
+        // and falls through to being spoken through OpenVoice below.
+        if (clone != null) {
+            val direct = ClonedVoices.refFor(clone.id)?.let {
+                val active = CloneEngines.active()
+                if (active is CloneEngine.ReferenceSpeechEngine) active to it else null
+            }
+            if (direct != null) {
+                val (engine, reference) = direct
+                val spoken = engine.speakReference(text, clone.id, reference)
+                return Rendered(spoken.samples, spoken.sampleRate)
+            }
+        }
+
+        val synthesised = synthesize(text, styleVoice, speed)
+        if (clone == null) return Rendered(synthesised, SAMPLE_RATE)
+
+        val reference = ClonedVoices.refFor(clone.id)
+        val engine = if (reference == null) {
+            if (CloneEngines.active().id != OpenVoiceEngine.id) {
+                PrismPlatform.log.info(
+                    TAG,
+                    "Voice ${clone.id} has no reference recording -- speaking it through " +
+                        "${OpenVoiceEngine.label} rather than ${CloneEngines.active().label}",
+                )
+            }
+            OpenVoiceEngine
+        } else {
+            CloneEngines.active()
+        }
+
+        var source = synthesised
+        if (engine.preservesPitch && clone.pitchHz > 0f) {
+            source = VoicePitch.match(source, SAMPLE_RATE, clone.pitchHz)
+        }
+
+        val converted = engine.convert(clone.id, source, SAMPLE_RATE, reference)
+        return Rendered(converted.samples, converted.sampleRate)
     }
 
     /**
@@ -111,6 +222,12 @@ class KokoroEngine private constructor(
                 "contain, so it loads and then fails when run. Choose a different precision in " +
                 "Speech; the quantised (92 MB) and full-precision exports are known good. " +
                 "Original error: " + message.take(160)
+        }
+        if (message.contains("conversion models")) {
+            val engine = CloneEngines.active()
+            return "This is a cloned voice, and the ${engine.label} engine's models are not " +
+                "downloaded. Open voice cloning and download them once (${engine.totalSizeLabel()}); " +
+                "every clone works after that. Original error: " + message.take(160)
         }
         return message
     }
@@ -220,35 +337,75 @@ class KokoroEngine private constructor(
     // -- Playback -------------------------------------------------------------
 
     /**
-     * Hands the waveform to the platform's sink and waits for it to be HEARD.
+     * Splits [text] into synthesis-sized pieces.
      *
-     * The sink blocks until playback has actually finished -- see [com.prism.core.AudioSink], where
-     * that is part of the contract rather than an implementation detail. It matters here because
-     * call mode starts listening off [onDone]: returning when the samples were queued rather than
-     * when they were played makes Prism transcribe its own voice.
-     *
-     * [generation] is what a `stop()` or a newer sentence increments, and it is passed down as the
-     * cancellation predicate so an interruption is noticed mid-buffer rather than after it.
+     * Sentences are nearly always the right unit -- but a pathological paragraph-long sentence has
+     * to give, so an oversized one is broken at commas and then at words. The limit is countable in
+     * characters: roughly 250 characters of English is ~130 phoneme tokens and ~10 seconds heard,
+     * which is what one chunk's synthesis costs the listener in waiting time if they are quick to
+     * stop. Keeping to ~10s keeps first-sound fast for long text; short utterances pass whole.
      */
-    private fun play(audio: FloatArray, mine: Int, onDone: (String?) -> Unit) {
-        if (mine != generation) return
+    private fun chunkText(text: String): List<String> {
+        val sentences = text.split(Regex("(?<=([.!?;…。！？]|\\n))"))
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+        if (sentences.isEmpty()) return listOf(text.trim()).filter { it.isNotEmpty() }
 
-        val problem = PrismPlatform.audio.play(
-            samples = audio,
-            sampleRate = SAMPLE_RATE,
-            cancelled = { mine != generation },
-        )
-
-        // A cancelled sentence is not a failure and must not report one: the caller's state machine
-        // would treat it as "speech failed" and say something about it, when what happened is that
-        // the user pressed stop.
-        if (mine != generation) return
-
-        if (problem != null) {
-            PrismPlatform.log.warn(TAG, "Kokoro produced audio but it did not play: " + problem)
+        val chunks = ArrayList<String>()
+        var piece = StringBuilder()
+        fun flush() {
+            if (piece.isNotEmpty()) chunks.add(piece.toString().trim())
+            piece = StringBuilder()
         }
-        PrismPlatform.main.post { onDone(problem) }
+        for (sentence in sentences) {
+            if (sentence.length > CHAR_LIMIT) {
+                flush()
+                for (part in splitLongSentence(sentence)) chunks.add(part)
+            } else if (piece.length + sentence.length + 1 > CHAR_LIMIT) {
+                flush()
+                piece.append(sentence); piece.append(' ')
+            } else {
+                piece.append(sentence); piece.append(' ')
+            }
+        }
+        flush()
+        return chunks.ifEmpty { listOf(text.trim()) }.filter { it.isNotEmpty() }
     }
+
+    /** Breaks sentences far beyond the character limit at commas, then at words. */
+    private fun splitLongSentence(sentence: String): List<String> {
+        val out = ArrayList<String>()
+        val pieces = sentence.split(Regex("(?<=[,;、，：])"))
+        var piece = StringBuilder()
+        fun flush() {
+            if (piece.isNotEmpty()) out.add(piece.toString().trim())
+            piece = StringBuilder()
+        }
+        for (p in pieces) {
+            if (p.length > 2 * CHAR_LIMIT) {
+                flush()
+                // Falling all the way to word boundaries: some prose has no punctuation at all.
+                val words = p.split(Regex("(?<= )"))
+                for (word in words) {
+                    if (piece.length + word.length + 1 > CHAR_LIMIT) {
+                        flush()
+                    }
+                    piece.append(word)
+                }
+                flush()
+            } else if (piece.length + p.length > CHAR_LIMIT) {
+                flush()
+                piece.append(p)
+            } else {
+                piece.append(p)
+            }
+        }
+        flush()
+        return out.filter { it.isNotEmpty() }
+    }
+
+    /** ~250 characters keeps one chunk under ~10 seconds of audio. */
+    private val CHAR_LIMIT = 250
 
     override fun stop() {
         generation++
