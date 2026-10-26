@@ -18,7 +18,8 @@ import android.graphics.Typeface
  * normalization, not this.
  */
 object AetherTextRenderer {
-    private const val SIZE = 128
+    /** Retina edge, shared with Nora's text samples so both brains read identical glyphs. */
+    const val SIZE = 128
 
     /**
      * Renders a line onto a canvas WIDER than the fovea, for

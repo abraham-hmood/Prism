@@ -25,7 +25,41 @@ object PrismMirrorManager {
     private val _syncProgress = MutableStateFlow<Map<String, Int>>(emptyMap())
     val syncProgress: StateFlow<Map<String, Int>> = _syncProgress
 
+    /**
+     * Domains currently being mirrored.
+     *
+     * Auto-mirror runs on every navigation event, so without this the same site was crawled
+     * repeatedly while the first crawl was still running. A set is enough: the work is
+     * idempotent, and a second concurrent crawl would only compete for the same files.
+     */
+    private val inFlight = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * Clears anything a killed mirror left behind.
+     *
+     * Downloads go into a `<domain>.partial` directory and are only renamed into place once every
+     * file has been verified, so an interruption leaves a staging directory rather than a site
+     * that looks half-served. The previous copy is renamed to `.old` during that swap; a crash in
+     * the middle of it leaves both, and the complete prior copy is the one that must survive.
+     * Called at startup, when nothing can be in flight.
+     */
+    fun cleanupInterrupted() {
+        if (inFlight.isNotEmpty()) return
+        val root = PrismSettings.getMirrorsDir()
+        root.listFiles().orEmpty()
+            .filter { it.isDirectory && (it.name.endsWith(".partial") || it.name.endsWith(".old")) }
+            .forEach { stale ->
+                runCatching { stale.deleteRecursively() }
+                    .onSuccess { Log.i(TAG, "Removed an interrupted mirror staging folder: ${stale.name}") }
+            }
+    }
+
     fun mirrorSite(context: Context, engine: PrismTunnelEngine, domain: String) {
+        val key = domain.lowercase()
+        if (!inFlight.add(key)) {
+            Log.d(TAG, "Mirror already in progress for $key")
+            return
+        }
         scope.launch {
             try {
                 updateProgress(domain, 0)
@@ -33,15 +67,24 @@ object PrismMirrorManager {
                 // 1. Fetch Manifest using internal .remote hint to bypass local mirrors
                 val manifestUrl = "https://$domain.remote/manifest.json"
                 val response = engine.fetchMeshContent(manifestUrl) ?: throw Exception("Host unreachable (Remote)")
-                if (!response.isSuccessful) throw Exception("Failed to fetch manifest: ${response.code}")
-                
-                val manifestJson = com.prism.core.json.JSONObject(response.body?.string() ?: "{}")
+                val manifestJson = response.use {
+                    if (!it.isSuccessful) throw Exception("Failed to fetch manifest: ${it.code}")
+                    com.prism.core.json.JSONObject(it.body?.string() ?: "{}")
+                }
                 val files = manifestJson.getJSONArray("files")
                 val total = files.length()
                 
                 val mirrorsDir = PrismSettings.getMirrorsDir()
                 val siteDir = java.io.File(mirrorsDir, domain)
-                if (!siteDir.exists()) siteDir.mkdirs()
+                // STAGED, NOT IN PLACE. Downloading over a live mirror would serve a site with
+                // holes in it for as long as the crawl takes, and a crawl that dies halfway would
+                // leave those holes permanently. Everything is fetched into `.partial` and only
+                // becomes the real directory after the last hash matches.
+                val staging = java.io.File(mirrorsDir, "$domain.partial")
+                val previous = java.io.File(mirrorsDir, "$domain.old")
+                staging.deleteRecursively()
+                previous.deleteRecursively()
+                staging.mkdirs()
 
                 // 2. Download Files
                 for (i in 0 until total) {
@@ -49,20 +92,39 @@ object PrismMirrorManager {
                     val relPath = fileObj.getString("path")
                     val expectedHash = fileObj.getString("hash")
                     
-                    downloadAndVerify(context, engine, domain, relPath, expectedHash, siteDir)
+                    downloadAndVerify(context, engine, domain, relPath, expectedHash, staging)
                     
                     val percent = ((i + 1) * 100) / total
                     updateProgress(domain, percent)
                 }
 
-                // 3. Register Mirror
+                // 3. Swap the verified copy into place. The previous mirror is kept as `.old`
+                // for the duration of the rename so a failure to move the new one does not leave
+                // the user with neither.
+                if (siteDir.exists()) {
+                    if (!siteDir.renameTo(previous)) {
+                        throw Exception("Could not move the old mirror aside for $domain")
+                    }
+                }
+                if (!staging.renameTo(siteDir)) {
+                    if (previous.exists()) previous.renameTo(siteDir)
+                    throw Exception("Could not put the new mirror in place for $domain")
+                }
+                previous.deleteRecursively()
+
+                // 4. Register Mirror
                 finalizeMirror(context, domain, siteDir.absolutePath)
                 updateProgress(domain, 100)
                 Log.i(TAG, "Successfully mirrored $domain")
 
             } catch (e: Exception) {
+                // The staging copy is never the served one, so discarding it costs only the bytes
+                // of this attempt; a previous complete mirror is untouched.
+                runCatching { java.io.File(PrismSettings.getMirrorsDir(), "$domain.partial").deleteRecursively() }
                 Log.e(TAG, "Mirroring failed for $domain", e)
                 updateProgress(domain, -1) // Error state
+            } finally {
+                inFlight.remove(key)
             }
         }
     }
@@ -78,17 +140,29 @@ object PrismMirrorManager {
         // Use .remote hint for files to ensure we sync from external peers
         val url = "https://$domain.remote/$path"
         val response = engine.fetchMeshContent(url) ?: throw Exception("Failed to download $path (Remote)")
-        if (!response.isSuccessful) throw Exception("Error $path: ${response.code}")
 
-        val targetFile = java.io.File(targetDir, path)
+        // A peer controls both `path` and the manifest, so this must not be able to escape the
+        // mirrors directory. Canonical comparison handles `..`, absolute paths and symlinks.
+        val relative = path.replace('\\', '/').trimStart('/')
+        if (relative.isBlank() || relative.split('/').any { it == ".." || it.isEmpty() }) {
+            throw Exception("Refusing unsafe mirror path: $path")
+        }
+        val root = targetDir.canonicalFile
+        val targetFile = java.io.File(root, relative).canonicalFile
+        if (!targetFile.toPath().startsWith(root.toPath())) {
+            throw Exception("Refusing mirror path outside $domain: $path")
+        }
         targetFile.parentFile?.mkdirs()
 
-        response.body?.byteStream()?.use { input ->
-            java.io.FileOutputStream(targetFile).use { output ->
-                val buffer = ByteArray(8192)
-                var read: Int
-                while (input.read(buffer).also { read = it } != -1) {
-                    output.write(buffer, 0, read)
+        response.use { body ->
+            if (!body.isSuccessful) throw Exception("Error $path: ${body.code}")
+            body.body?.byteStream()?.use { input ->
+                java.io.FileOutputStream(targetFile).use { output ->
+                    val buffer = ByteArray(8192)
+                    var read: Int
+                    while (input.read(buffer).also { read = it } != -1) {
+                        output.write(buffer, 0, read)
+                    }
                 }
             }
         }

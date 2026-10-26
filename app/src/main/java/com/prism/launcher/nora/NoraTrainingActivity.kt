@@ -125,7 +125,10 @@ class NoraTrainingActivity : PrismBaseActivity() {
             IosUi.sectionFooter(
                 ctx,
                 "Drop images into ${NoraConfig.datasetDir().absolutePath} and name each file " +
-                    "after what it shows — “a red apple on a table.png” teaches exactly that."
+                    "after what it shows — “a red apple on a table.png” teaches exactly that. " +
+                    "Put .txt or .parquet files there too: each line is drawn and looked at. " +
+                    "Held-out files go in validation/ and testing/ (or are named validation-… and " +
+                    "test-…), and every file in each split is used."
             )
         )
         return box
@@ -387,8 +390,11 @@ class NoraTrainingActivity : PrismBaseActivity() {
     // ── Behaviour ───────────────────────────────────────────────────────────
 
     private fun refreshStatus() {
-        val n = NoraStudio.datasetSize(this)
-        datasetValue.text = "$n image${if (n == 1) "" else "s"}"
+        val summary = NoraStudio.datasetSummary()
+        datasetValue.text = "${summary.totalFiles} file${if (summary.totalFiles == 1) "" else "s"}" +
+            if (summary.validationFiles + summary.testFiles > 0)
+                " · ${summary.validationFiles} val · ${summary.testFiles} test"
+            else ""
         statusValue.text = if (NoraStudio.isTrained(this)) {
             "${NoraPersistence.sizeBytes() / 1024} KB on disk"
         } else {
@@ -428,11 +434,12 @@ class NoraTrainingActivity : PrismBaseActivity() {
                     NoraTrainingState.progress.collect { p ->
                         if (p == null) return@collect
                         progress.progress = NoraTrainingState.percent
-                        progressCaption.text = if (p.phase == "sleep") {
-                            "Epoch ${p.epoch} · consolidating"
-                        } else {
-                            "Epoch ${p.epoch} of ${p.totalEpochs} · " +
-                                "image ${p.sample} of ${p.totalSamples}"
+                        progressCaption.text = when (p.phase) {
+                            "sleep" -> "Epoch ${p.epoch} · consolidating"
+                            "validation", "test" ->
+                                "Epoch ${p.epoch} · ${p.caption}"
+                            else -> "Epoch ${p.epoch} of ${p.totalEpochs} · " +
+                                "sample ${p.sample} of ${p.totalSamples}"
                         }
                     }
                 }
@@ -494,7 +501,7 @@ class NoraTrainingActivity : PrismBaseActivity() {
         if (batteryPromptShown) return
         batteryPromptShown = true
 
-        androidx.appcompat.app.AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Let Nora train overnight?")
             .setMessage(
                 "Android throttles long-running work when the screen is off. Exempting Prism " +
@@ -552,7 +559,7 @@ class NoraTrainingActivity : PrismBaseActivity() {
             android.os.Environment.isExternalStorageManager()
 
     private fun requestStorageAccess() {
-        androidx.appcompat.app.AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Storage access needed")
             .setMessage(
                 "Nora reads her dataset from ${NoraConfig.datasetDir().absolutePath} and " +
@@ -578,7 +585,7 @@ class NoraTrainingActivity : PrismBaseActivity() {
     }
 
     private fun confirmForget() {
-        androidx.appcompat.app.AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Erase Nora's connectome?")
             .setMessage(
                 "This deletes every weight, every episode, and her whole vocabulary. " +

@@ -76,7 +76,18 @@ class PrismProxyServer(
                             port = MeshUtils.findAvailablePort()
                         }
                         
-                        channel.socket().bind(InetSocketAddress("0.0.0.0", port))
+                        // AN OPEN PROXY MUST NOT LISTEN ON EVERY INTERFACE. This server is
+                        // reachable from the LAN by design when it is the mesh hosting listener;
+                        // the proxy mode without credentials is different, and binding it to
+                        // 0.0.0.0 let any device on the network relay through this phone.
+                        val bindAddress = if (isProxyMode && authUsername == null) "127.0.0.1" else "0.0.0.0"
+                        channel.socket().bind(InetSocketAddress(bindAddress, port))
+                        if (isProxyMode && authUsername == null) {
+                            com.prism.launcher.PrismLogger.logWarning(
+                                serverName,
+                                "No proxy credentials configured; listening on loopback only",
+                            )
+                        }
                         serverChannel = channel
                         
                         val roleName = if (isProxyMode) "VPN Proxy Engine" else "Mesh Hosting Listener"
@@ -154,7 +165,9 @@ class PrismProxyServer(
 
                 val parts = firstLine.split(" ")
                 if (parts.size >= 2) {
-                    val domain = parts[1].trim()
+                    // `.remote` asks for a peer copy rather than this device's mirror. The peer
+                    // still serves the real site name, so the suffix is removed before dispatch.
+                    val domain = parts[1].trim().removeSuffix(".remote")
                     output.write("PRISM_ACK\n".toByteArray())
                     output.flush()
 
@@ -234,7 +247,11 @@ class PrismProxyServer(
             // Prism's own WebView and mesh peers -- an ordinary browser or app on this device, which
             // knows nothing about the handshake, got a socket that read its request and closed. The
             // dispatch below needs nothing but a Host header, which every HTTP client sends.
-            val header = if (firstLine.contains(" HTTP/")) firstLine else firstLine + "\n" + readHeader(input)
+            // THE HEADERS HAVE TO BE READ FOR BOTH BRANCHES. The old code only read them when
+            // the request line itself contained "Host:", which it never does -- so every plain
+            // HTTP request to the hosting listener fell through to close(). That is why the
+            // Host: branch was unreachable and only PRISM_CONNECT worked.
+            val header = firstLine + "\n" + readHeader(input)
 
             if (isProxyMode) {
                 val requiredUsername = authUsername
@@ -266,29 +283,27 @@ class PrismProxyServer(
                             return@withContext
                         }
                     }
+                } else if (!header.contains(" HTTP/")) {
+                    output.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n".toByteArray())
+                    output.flush()
+                    clientSocket.close()
+                    return@withContext
+                } else {
+                    // A plain absolute-URI proxy request. Forward it instead of dropping it, which
+                    // is what used to happen to every non-CONNECT request.
+                    forwardPlainProxy(header, clientSocket, input, output)
+                    return@withContext
                 }
             }
 
-            if (header.contains("Host:", ignoreCase = true)) {
-                // Any HTTP client: Prism's WebView, another browser, or an app on this device.
-                val fullHeader = header + "\n" + readHeader(input)
-                val hostLine = fullHeader.lines().find { it.startsWith("Host:", ignoreCase = true) }
-                val domain = hostLine?.substringAfter(":")?.trim()?.substringBefore(":") ?: ""
-                if (domain.isNotEmpty()) {
-                    // fullHeader is handed on: this branch has ALREADY read the request line
-                    // and headers off the socket in order to find the Host: it dispatches on,
-                    // so a host that tries to read them again finds an empty stream.
-                    if (domain.equals(com.prism.launcher.aether.AetherMeshSync.AETHER_HOST_DOMAIN, ignoreCase = true)) {
-                        com.prism.launcher.aether.AetherConnectomeHost.serve(PrismApp.instance, clientSocket, fullHeader)
-                    } else if (domain.equals(com.prism.launcher.social.NebulaMeshSync.NEBULA_HOST_DOMAIN, ignoreCase = true)) {
-                        com.prism.launcher.social.NebulaSocialHost.serve(PrismApp.instance, clientSocket, fullHeader)
-                    } else if (domain.equals(com.prism.launcher.PrismSettings.PRISM_SEARCH_DOMAIN, ignoreCase = true)) {
-                        com.prism.launcher.search.PrismSearchHost.serve(PrismApp.instance, clientSocket, fullHeader)
-                    } else {
-                        PrismWebHost.serve(PrismApp.instance, clientSocket, domain, preReadHeader = fullHeader)
-                    }
-                    return@withContext
-                }
+            val hostLine = header.lines().find { it.startsWith("Host:", ignoreCase = true) }
+            val domain = hostLine?.substringAfter(":")?.trim()?.substringBefore(":") ?: ""
+            if (domain.isNotEmpty()) {
+                // header is handed on: this branch has ALREADY read the request line and
+                // headers off the socket in order to find the Host: it dispatches on, so a host
+                // that tries to read them again finds an empty stream.
+                serveLocalOrClose(domain, clientSocket, header)
+                return@withContext
             }
 
             clientSocket.close()
@@ -315,6 +330,109 @@ class PrismProxyServer(
             if (head.length > 16 * 1024) break     // a head this large is not one we serve
         }
         return head.toString().takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * Forwards an absolute-URI HTTP request (the form a browser sends to a plain proxy).
+     *
+     * CONNECT has always worked; this is the other half. The head has already been read from the
+     * client, so it is written to the target explicitly and only the bodies are relayed.
+     */
+    private suspend fun forwardPlainProxy(
+        head: String,
+        clientSocket: Socket,
+        clientIn: InputStream,
+        clientOut: OutputStream,
+    ) = withContext(Dispatchers.IO) {
+        var targetSocket: Socket? = null
+        try {
+            val requestLine = head.lineSequence().firstOrNull().orEmpty()
+            val parts = requestLine.split(" ").filter { it.isNotBlank() }
+            if (parts.size < 3 || !parts[1].startsWith("http://", ignoreCase = true)) {
+                clientOut.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n".toByteArray())
+                clientOut.flush()
+                return@withContext
+            }
+
+            val uri = java.net.URI(parts[1])
+            val host = uri.host ?: return@withContext
+            val path = (uri.rawPath?.ifBlank { "/" } ?: "/") +
+                (uri.rawQuery?.let { "?$it" } ?: "")
+            // The proxy credential is for THIS hop. Forwarding it to the origin would hand the
+            // user's Prism credentials to every site they visit through the proxy.
+            val cleanedHead = head.lines()
+                .filterNot { it.startsWith("Proxy-Authorization:", ignoreCase = true) }
+                .joinToString("\r\n")
+                .let { if (it.endsWith("\r\n\r\n")) it else it.trimEnd('\r', '\n') + "\r\n\r\n" }
+            val originHead = cleanedHead.replaceFirst(requestLine, "${parts[0]} $path ${parts[2]}")
+
+            if (isLocalPrismHost(host)) {
+                serveLocalOrClose(host, clientSocket, originHead)
+                return@withContext
+            }
+
+            // A mesh name resolves through the ledger, not the system resolver, and mesh sites
+            // are served on 8080 regardless of the port the browser wrote in the URL.
+            val meshIp = P2pDnsManager.resolve(host, onlyP2p = true)
+            val connectHost = meshIp ?: host
+            val targetPort = if (meshIp != null) 8080 else if (uri.port > 0) uri.port else 80
+
+            targetSocket = if (meshIp != null) {
+                com.prism.launcher.vpn.PrismSocket().apply { setHostHint(host) }
+            } else {
+                Socket().apply {
+                    com.prism.launcher.browser.PrivateDnsVpnService.protectSocket(this)
+                }
+            }
+            targetSocket.connect(InetSocketAddress(connectHost, targetPort), 10_000)
+            targetSocket.getOutputStream().write(originHead.toByteArray())
+            targetSocket.getOutputStream().flush()
+
+            val targetIn = targetSocket.getInputStream()
+            val targetOut = targetSocket.getOutputStream()
+            val a = launch { relay(clientIn, targetOut) }
+            val b = launch { relay(targetIn, clientOut) }
+            joinAll(a, b)
+        } catch (e: Exception) {
+            PrismLogger.logError(serverName, "Plain proxy forward failed", e)
+            runCatching {
+                clientOut.write("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n".toByteArray())
+                clientOut.flush()
+            }
+        } finally {
+            runCatching { targetSocket?.close() }
+            runCatching { clientSocket.close() }
+        }
+    }
+
+    /** True for names this device can answer itself rather than forwarding to the internet. */
+    private fun isLocalPrismHost(host: String): Boolean {
+        val clean = host.lowercase().removeSuffix(".remote")
+        if (clean == "localhost" || clean == "127.0.0.1" || clean == "::1") return true
+        if (clean == com.prism.launcher.PrismSettings.PRISM_SEARCH_DOMAIN) return true
+        if (clean == com.prism.launcher.aether.AetherMeshSync.AETHER_HOST_DOMAIN) return true
+        if (clean == com.prism.launcher.social.NebulaMeshSync.NEBULA_HOST_DOMAIN) return true
+        // A `.p2p` name is not automatically local: it may be another peer's site. Only answer
+        // here when this device actually hosts the name or holds a cached copy.
+        if (com.prism.launcher.PrismSettings.getP2pHostedSites()
+                .any { it.domain.equals(clean, ignoreCase = true) }
+        ) return true
+        val cacheHost = com.prism.launcher.browser.PrismWebCache.hostForMeshDomain(clean) ?: clean
+        return runCatching { com.prism.launcher.browser.PrismWebCache.dirFor(cacheHost).isDirectory }
+            .getOrDefault(false)
+    }
+
+    private suspend fun serveLocalOrClose(domain: String, clientSocket: Socket, head: String) {
+        val clean = domain.removeSuffix(".remote")
+        if (clean.equals(com.prism.launcher.aether.AetherMeshSync.AETHER_HOST_DOMAIN, ignoreCase = true)) {
+            com.prism.launcher.aether.AetherConnectomeHost.serve(PrismApp.instance, clientSocket, head)
+        } else if (clean.equals(com.prism.launcher.social.NebulaMeshSync.NEBULA_HOST_DOMAIN, ignoreCase = true)) {
+            com.prism.launcher.social.NebulaSocialHost.serve(PrismApp.instance, clientSocket, head)
+        } else if (clean.equals(com.prism.launcher.PrismSettings.PRISM_SEARCH_DOMAIN, ignoreCase = true)) {
+            com.prism.launcher.search.PrismSearchHost.serve(PrismApp.instance, clientSocket, head)
+        } else {
+            PrismWebHost.serve(PrismApp.instance, clientSocket, clean, preReadHeader = head)
+        }
     }
 
     private suspend fun connectToTarget(host: String, targetPort: Int, clientSocket: Socket, clientIn: InputStream, clientOut: OutputStream) = withContext(Dispatchers.IO) {
@@ -347,7 +465,13 @@ class PrismProxyServer(
                 return@withContext
             }
             // ----------------------
-            targetSocket = if (isP2p) com.prism.launcher.vpn.PrismSocket() else Socket()
+            targetSocket = if (isP2p) {
+                com.prism.launcher.vpn.PrismSocket()
+            } else {
+                // Bypass our own TUN, or the proxy's outbound connection is captured by the VPN
+                // and loops straight back into this listener.
+                Socket().also { com.prism.launcher.browser.PrivateDnsVpnService.protectSocket(it) }
+            }
 
             // Connect with timeout - if PrismSocket, this triggers the handshake automatically
             targetSocket.connect(InetSocketAddress(targetHost, finalPort), 10000)

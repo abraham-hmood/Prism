@@ -4,46 +4,30 @@ import java.net.Inet4Address
 import java.net.NetworkInterface
 
 /**
- * Whether a device is actually ON the meshnet, as opposed to merely on the same Wi-Fi.
+ * Whether a device is on the Prism meshnet, as opposed to merely on the same Wi-Fi.
  *
- * ## The distinction this exists to make, and why it was missing
+ * ## What went wrong before
  *
- * Prism's mesh transport finds peers by UDP broadcast on the local network. That is the right way to
- * BOOTSTRAP -- it is how two devices discover each other with no server and no configuration -- but it
- * means "a peer Prism can see" and "a peer on the meshnet" were the same set, and several things that
- * should have required the second were satisfied by the first.
+ * Membership used to require a 10.8.0.x address on both ends. That is the subnet the WireGuard tunnel
+ * uses, and it is a real overlay when that tunnel is the transport -- but it is not what Prism's mesh
+ * actually is. A phone serving the mesh is discovered and reached at its LAN address; its own VPN
+ * interface is 10.7.0.2/30, and a desktop client that joined the phone has no 10.8.0.x address at all.
+ * Both devices were therefore told they were "not on a meshnet" while they were sitting on a working
+ * one, and the trusted-device picker listed nobody.
  *
- * Trusted-device pairing was one of them, and it is the one that matters. Pairing hands over text
- * messages, browsing history, clipboards and, with the wallet kind, a recovery phrase. Any laptop on a
- * café network could appear in the picker and send an offer. The pairing code is what stopped that offer
- * from succeeding, and a six-character code is a reasonable second line of defence -- it should never
- * have been the first.
+ * ## The rule
  *
- * ## What counts as the overlay
+ * A device is on the meshnet when its mesh transport is running, or when it holds an address inside
+ * [SUBNET]. A peer is on the meshnet when it is one of the peers that transport can currently reach,
+ * or when it is at an overlay address.
  *
- * ONE RULE: an address inside [SUBNET]. Not a guess and not a new convention -- it is the subnet the rest
- * of Prism already treats as the mesh:
+ * That is deliberately the same question the rest of Prism answers with [MeshTransport.isOnMesh]. The
+ * mesh is unauthenticated and this is a feature for a LAN the user controls -- the README says so, and
+ * pairing still requires the short code shown on the other device before anything is shared. The old
+ * rule did not add authentication; it only made the feature unable to see the devices it was for.
  *
- *  - `WireGuardInterface` gives itself 10.8.0.1/24 and hands peers 10.8.0.2 upwards.
- *  - [TunnelRouter] routes exactly that /24 into the adapter and nothing else.
- *  - Android's `PrismTunnelEngine.routeOutboundPacket` matches 10.8.0.x to decide what goes to the mesh.
- *
- * So the overlay already had a definition in three places. This is the fourth, and the one the security
- * decisions read.
- *
- * ## Why not "is the tunnel up"
- *
- * Because a tunnel being up says nothing about who is on the other side of it, and because both devices
- * have to be on the SAME overlay for pairing to mean anything. An address in the mesh subnet is evidence
- * about the peer; a flag on this device is evidence about this device. Pairing needs the former.
- *
- * ## The honest cost
- *
- * PAIRING NOW REQUIRES A TUNNEL, where before it worked on bare Wi-Fi. That is the point of the change
- * and it is a real loss of convenience: two phones on a home network can no longer pair without one of
- * them serving the mesh. [explain] exists so the UI can say exactly that rather than showing an empty
- * list, because "no devices found" for a user who can see the other device in the room is the worst
- * possible way to communicate a policy.
+ * The WireGuard subnet remains a sufficient condition because a device on that overlay is reachable
+ * even before a heartbeat has been exchanged.
  */
 object MeshMembership {
 
@@ -59,6 +43,9 @@ object MeshMembership {
      */
     var addressesOverride: (() -> List<String>)? = null
 
+    /** Whether the mesh transport is live. Cheap: both platforms answer from a field. */
+    fun isMeshRunning(): Boolean = runCatching { MeshTransport.isOnMesh() }.getOrDefault(false)
+
     /** Every IPv4 address this device holds, from every interface that is up. */
     private fun localAddresses(): List<String> {
         addressesOverride?.let { return runCatching { it() }.getOrDefault(emptyList()) }
@@ -72,7 +59,7 @@ object MeshMembership {
         }.getOrDefault(emptyList())
     }
 
-    /** Whether an address is inside the overlay. */
+    /** Whether an address is inside the WireGuard overlay. */
     fun isOverlayAddress(ip: String): Boolean {
         val parts = ip.trim().split(".")
         if (parts.size != 4) return false
@@ -85,36 +72,49 @@ object MeshMembership {
         return a == SUBNET.first && b == SUBNET.second && c == SUBNET.third
     }
 
-    /** This device's overlay address, or null when it is not on the overlay. */
+    /** This device's overlay address, or null when it holds none. */
     fun overlayAddress(): String? = localAddresses().firstOrNull { isOverlayAddress(it) }
 
-    /** Whether this device is on the overlay at all. */
-    fun isOnOverlay(): Boolean = overlayAddress() != null
+    /** Whether this device is on the meshnet at all. */
+    fun isOnMeshnet(): Boolean = isMeshRunning() || overlayAddress() != null
+
+    /**
+     * Whether [peerIp] is a device the user could pair with.
+     *
+     * The peer must be on this meshnet and be reachable through it: either a live mesh peer, or an
+     * address inside the overlay. A device that merely shares the Wi-Fi but runs no Prism mesh is
+     * neither, which is the distinction that matters.
+     */
+    fun isMeshPeer(peerIp: String): Boolean {
+        if (!isOnMeshnet()) return false
+        if (isOverlayAddress(peerIp)) return true
+        val live = runCatching { MeshTransport.peers() }.getOrDefault(emptyList())
+        return live.any { it == peerIp }
+    }
 
     /**
      * Whether pairing with [peerIp] is allowed.
      *
-     * BOTH ENDS MUST BE ON THE OVERLAY. Checking only the peer would let a device that is not itself on
-     * the mesh accept an offer from one that is, which is the same hole from the other side.
+     * BOTH ENDS MUST BE ON THE MESHNET. The heartbeat gate in [isMeshPeer] is what makes the peer's
+     * side true; a peer that is not answering is not reachable to send an offer to.
      */
-    fun mayPairWith(peerIp: String): Boolean = isOnOverlay() && isOverlayAddress(peerIp)
+    fun mayPairWith(peerIp: String): Boolean = isOnMeshnet() && isMeshPeer(peerIp)
 
     /**
      * Why pairing is unavailable, in a sentence a user can act on, or empty when it is available.
      *
-     * Separate from [mayPairWith] because a boolean cannot distinguish "you are not on the mesh" from
-     * "that device is not", and those have completely different fixes.
+     * Separate from [mayPairWith] because a boolean cannot distinguish "you are not on the meshnet"
+     * from "that device is not", and those have completely different fixes.
      */
     fun explain(peerIp: String? = null): String {
-        if (!isOnOverlay()) {
+        if (!isOnMeshnet()) {
             return "This device is not on the Prism meshnet. Pairing carries messages, history, " +
-                "clipboards and possibly a wallet phrase, so it is only offered over the mesh -- not " +
-                "to whatever else happens to be on this Wi-Fi. Connect to a Prism server, or serve the " +
-                "mesh from this device, and the picker will fill."
+                "clipboards and possibly a wallet phrase, so it is only offered over the mesh. Turn " +
+                "the mesh on, or start the VPN server, and the picker will fill."
         }
-        if (peerIp != null && !isOverlayAddress(peerIp)) {
-            return peerIp + " is on this network but not on the meshnet, so it cannot be paired with. " +
-                "It has to join the mesh first."
+        if (peerIp != null && !isMeshPeer(peerIp)) {
+            return peerIp + " is on this network but is not on your meshnet, so it cannot be paired " +
+                "with. It has to run Prism with the mesh enabled on the same network."
         }
         return ""
     }
@@ -122,13 +122,22 @@ object MeshMembership {
     /** One line for a diagnostics page. */
     fun describe(): String {
         val address = overlayAddress()
-        return if (address == null) {
-            "not on the overlay (" + localAddresses().joinToString(", ").ifBlank { "no addresses" } + ")"
-        } else {
-            "on the overlay as " + address
+        return when {
+            address != null && isMeshRunning() -> "on the meshnet; overlay address " + address
+            address != null -> "on the overlay as " + address + "; mesh transport not running"
+            isMeshRunning() -> "on the meshnet at " +
+                runCatching { MeshTransport.localIp() }.getOrDefault("an unknown address")
+            else -> "not on the meshnet (" +
+                localAddresses().joinToString(", ").ifBlank { "no addresses" } + ")"
         }
     }
 
-    /** Filters a discovered peer list down to those actually on the overlay. */
-    fun overlayPeers(peers: Collection<String>): List<String> = peers.filter { isOverlayAddress(it) }
+    /**
+     * Filters a discovered peer list down to the devices on this meshnet.
+     *
+     * Empty when this device is not on a meshnet: a device whose transport is off has no business
+     * offering a pairing, and the picker says why rather than showing an unexplained empty list.
+     */
+    fun meshPeers(discovered: Collection<String>): List<String> =
+        discovered.filter { isMeshPeer(it) }.distinct()
 }

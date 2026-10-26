@@ -1,6 +1,8 @@
 package com.prism.launcher.nora
 
 import com.prism.core.PrismImage
+import com.prism.launcher.aether.AetherParquet
+import com.prism.launcher.training.DatasetSplits
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
@@ -33,7 +35,16 @@ import kotlin.random.Random
  * standards of a GPU training run and fast by the standards of "impossible", which is what
  * training a diffusion model on this hardware would be.
  */
-class NoraTrainer(private val brain: NoraBrain) {
+class NoraTrainer(
+    private val brain: NoraBrain,
+    /**
+     * Draws a line of text as an image for the retina, or null when the host has no font
+     * renderer (`:core` must not depend on Android Canvas or AWT). Injected by `:app` and
+     * `:desktop` with the SAME renderer Aether reads with, so the two brains learn the same
+     * letter shapes. Text items are skipped with a log line when this is null.
+     */
+    private val textRenderer: ((String) -> PrismImage)? = null,
+) {
 
     data class Progress(
         val epoch: Int,
@@ -46,27 +57,135 @@ class NoraTrainer(private val brain: NoraBrain) {
         val phase: String
     )
 
-    data class DatasetItem(val file: File, val caption: String)
+    /**
+     * One training sample.
+     *
+     * An image's caption is its filename. A TEXT item (from `.txt` or `.parquet`) carries the
+     * line in [text] and is drawn by the injected renderer at training time rather than being
+     * read as a picture from [file]; that is how a vision brain can learn written language at
+     * all. `file` stays non-null so every log line and error still names its source.
+     */
+    data class DatasetItem(val file: File, val caption: String, val text: String? = null)
+
+    /**
+     * File counts for a status line. Cheap: no file is opened.
+     *
+     * `loadDataset()` now expands text into items, which is fine off the main thread but
+     * not for a screen that just wants "how much data is there".
+     */
+    data class Summary(
+        val trainFiles: Int,
+        val validationFiles: Int,
+        val testFiles: Int,
+        val images: Int,
+        val textFiles: Int,
+        val parquetFiles: Int,
+    ) {
+        val totalFiles: Int get() = trainFiles + validationFiles + testFiles
+    }
 
     companion object {
         private val IMAGE_EXTENSIONS = setOf("png", "jpg", "jpeg", "webp", "bmp")
+        private val TEXT_EXTENSIONS = setOf("txt")
+        private val PARQUET_EXTENSIONS = setOf("parquet")
+        private val DATASET_EXTENSIONS = IMAGE_EXTENSIONS + TEXT_EXTENSIONS + PARQUET_EXTENSIONS
 
-        /** Reads the dataset directory. Filename (minus extension) is the caption. */
-        fun loadDataset(): List<DatasetItem> {
-            val dir = NoraConfig.datasetDir()
-            val files = dir.listFiles() ?: return emptyList()
-            return files
-                .filter { it.isFile && it.extension.lowercase() in IMAGE_EXTENSIONS }
-                .sortedBy { it.name }
-                .map {
-                    DatasetItem(
-                        it,
-                        it.nameWithoutExtension
-                            .replace('_', ' ')
-                            .replace('-', ' ')
-                            .trim()
+        /** Words per drawn text sample. Short lines stay legible at the 128px retina edge. */
+        const val TEXT_WORDS_PER_ITEM = 8
+
+        /** All three splits; see [DatasetSplits] for how files are classified. */
+        fun scanDataset(): DatasetSplits.Files =
+            DatasetSplits.scan(NoraConfig.datasetDir(), DATASET_EXTENSIONS)
+
+        fun summarize(): Summary {
+            val splits = scanDataset()
+            fun kind(entries: List<DatasetSplits.Entry>, ext: Set<String>) =
+                entries.count { it.file.extension.lowercase() in ext }
+            return Summary(
+                trainFiles = splits.train.size,
+                validationFiles = splits.validation.size,
+                testFiles = splits.test.size,
+                images = kind(splits.all, IMAGE_EXTENSIONS),
+                textFiles = kind(splits.all, TEXT_EXTENSIONS),
+                parquetFiles = kind(splits.all, PARQUET_EXTENSIONS),
+            )
+        }
+
+        /** The TRAIN split. Held-out files are excluded so they stay held out. */
+        fun loadDataset(): List<DatasetItem> = loadItems(scanDataset().train)
+
+        /** Images, `.txt` and `.parquet` files in already-classified entries. */
+        fun loadItems(entries: List<DatasetSplits.Entry>): List<DatasetItem> {
+            val items = mutableListOf<DatasetItem>()
+            for (entry in entries) {
+                val file = entry.file
+                when (file.extension.lowercase()) {
+                    in IMAGE_EXTENSIONS -> items += DatasetItem(
+                        file,
+                        file.nameWithoutExtension.replace('_', ' ').replace('-', ' ').trim(),
                     )
+                    in TEXT_EXTENSIONS -> items += loadTextFile(file)
+                    in PARQUET_EXTENSIONS -> items += loadParquet(file, entry.relativePath)
                 }
+            }
+            return items
+        }
+
+        private fun loadTextFile(file: File): List<DatasetItem> {
+            val text = try { file.readText(Charsets.UTF_8) } catch (e: Exception) { return emptyList() }
+            return textItems(text, file)
+        }
+
+        /**
+         * A parquet file as training samples.
+         *
+         * Chat-shaped files use their TURNS, not the raw `<|user|>` markup -- drawing the tags
+         * would teach letter shapes that occur in the template rather than in language. A
+         * plain prose parquet has no turns, so its string column falls back to the same
+         * line/word chunking a `.txt` gets. This is the same reader Aether uses for parquet,
+         * including its honest refusal of codecs it cannot decompress.
+         */
+        private fun loadParquet(file: File, label: String): List<DatasetItem> {
+            val conversations = try {
+                AetherParquet.conversations(file, label)
+            } catch (e: Exception) {
+                NoraLog.warn(NoraLog.Area.TRAIN, "Parquet: could not read ${file.name}: ${e.message}")
+                emptyList()
+            }
+
+            val items = mutableListOf<DatasetItem>()
+            if (conversations.isNotEmpty()) {
+                for (conversation in conversations) {
+                    for (turn in conversation.turns) {
+                        items += textItems(turn.text, file)
+                    }
+                }
+                if (items.isNotEmpty()) return items
+            }
+
+            return try {
+                AetherParquet.strings(file).flatMap { textItems(it, file) }
+            } catch (e: Exception) {
+                NoraLog.warn(NoraLog.Area.TRAIN, "Parquet: no usable text in ${file.name}: ${e.message}")
+                emptyList()
+            }
+        }
+
+        /** Lines, split into short word groups. Blank lines and mark-up-only lines are dropped. */
+        private fun textItems(blob: String, file: File): List<DatasetItem> {
+            val out = mutableListOf<DatasetItem>()
+            for (line in blob.lines()) {
+                val words = line.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+                if (words.isEmpty() || words.none { w -> w.any { it.isLetter() } }) continue
+                var start = 0
+                while (start < words.size) {
+                    val end = minOf(start + TEXT_WORDS_PER_ITEM, words.size)
+                    val caption = words.subList(start, end).joinToString(" ")
+                    out += DatasetItem(file, caption, caption)
+                    start = end
+                }
+            }
+            return out
         }
     }
 
@@ -84,27 +203,47 @@ class NoraTrainer(private val brain: NoraBrain) {
      *        self-test runs this way so that measuring a geometry cannot overwrite the brain the
      *        user actually uses -- checkpointing a throwaway run over a real connectome would be
      *        a spectacularly annoying way to lose an overnight session.
-     * @param datasetOverride images to train on instead of the user's dataset directory.
+     * @param datasetOverride samples to train on instead of the user's dataset directory.
      */
     suspend fun train(
         epochs: Int,
         focus: String? = null,
         sandbox: Boolean = false,
         datasetOverride: List<DatasetItem>? = null,
+        /** Epochs between held-out validation passes -- same meaning as Aether's argument. */
+        validationIntervalEpochs: Int = 1,
         onProgress: (Progress) -> Unit
     ): String = withContext(Dispatchers.Default) {
-        val dataset = datasetOverride ?: loadDataset()
+        val splitFiles = scanDataset()
+        val dataset = datasetOverride ?: loadItems(splitFiles.train)
+        // An explicit override is a self-contained set (the geometry self-test's synthetic
+        // samples); pulling the user's held-out files into that run would only slow it down.
+        val validationDataset = if (datasetOverride != null) emptyList() else loadItems(splitFiles.validation)
+        val testDataset = if (datasetOverride != null) emptyList() else loadItems(splitFiles.test)
+        if (dataset.any { it.text != null } && textRenderer == null) {
+            NoraLog.warn(
+                NoraLog.Area.TRAIN,
+                "Text samples are present but no text renderer was supplied -- they will be skipped.",
+            )
+        }
+        if (validationDataset.isNotEmpty()) {
+            NoraLog.info(NoraLog.Area.TRAIN, "[Validation] ${validationDataset.size} held-out sample(s) from ${splitFiles.validation.size} file(s).")
+        }
+        if (testDataset.isNotEmpty()) {
+            NoraLog.info(NoraLog.Area.TRAIN, "[Testing] ${testDataset.size} held-out sample(s) from ${splitFiles.test.size} file(s) -- evaluated once at the end.")
+        }
         NoraLog.info(
             NoraLog.Area.TRAIN,
-            "Training start — $epochs epochs, ${dataset.size} images" +
+            "Training start — $epochs epochs, ${dataset.size} samples" +
                 (focus?.let { ", focus \"$it\"" } ?: "") +
                 (if (sandbox) ", SANDBOX" else "") + ". " + NoraLog.describeGeometry()
         )
         if (dataset.isEmpty()) {
-            NoraLog.warn(NoraLog.Area.TRAIN, "No images found — nothing to train on")
-            return@withContext "No images found in ${NoraConfig.datasetDir().absolutePath}.\n\n" +
+            NoraLog.warn(NoraLog.Area.TRAIN, "No training samples found — nothing to train on")
+            return@withContext "No training samples found in ${NoraConfig.datasetDir().absolutePath}.\n\n" +
                 "Drop images in there and name each file after what it shows -- " +
-                "\"a red apple on a table.png\" teaches exactly that."
+                "\"a red apple on a table.png\" teaches exactly that -- or add .txt/.parquet " +
+                "files, whose lines she reads as drawn text."
         }
 
         if (!sandbox) {
@@ -124,9 +263,18 @@ class NoraTrainer(private val brain: NoraBrain) {
         val rng = Random(System.currentTimeMillis())
         val javaRng = java.util.Random()
         val denoising = NoraConfig.denoisingEnabled
-        var lastError = 0f
+        var lastValidationError: Float? = null
+        var lastTestError: Float? = null
+        // NaN MEANS "NO MEASUREMENT YET", not zero. Zero is a perfectly good prediction error
+        // and is also what an untouched accumulator reads as, which is why the old divergence
+        // guard (`!lastError.isFinite()`) could never fire: it compared a freshly-initialised
+        // finite value against a test for non-finite. A session where every image failed to
+        // decode therefore ran to completion, reported 0 presentations, and saved anyway.
+        var lastError = Float.NaN
+        var measured = 0
         var trained = 0
         var unbound = 0
+        var skipped = 0
 
         for (epoch in 0 until epochs) {
             // ── WAKE ────────────────────────────────────────────────────────
@@ -134,7 +282,19 @@ class NoraTrainer(private val brain: NoraBrain) {
             for ((n, idx) in order.withIndex()) {
                 coroutineContext.ensureActive()
                 val item = dataset[idx]
-                val bitmap = decodeScaled(item.file) ?: continue
+                val bitmap = bitmapFor(item)
+                if (bitmap == null) {
+                    skipped++
+                    if (skipped <= 3) {
+                        NoraLog.warn(
+                            NoraLog.Area.TRAIN,
+                            if (item.text != null)
+                                "Skipped ${item.file.name}: the text renderer produced no image"
+                            else "Skipped ${item.file.name}: it is not an image this device can decode",
+                        )
+                    }
+                    continue
+                }
 
                 val focused = focus != null && item.caption.contains(focus, ignoreCase = true)
                 // Focused items get a dopamine boost, which raises the learning rate AND makes
@@ -167,6 +327,7 @@ class NoraTrainer(private val brain: NoraBrain) {
                         unbound++
                     }
                     lastError = brain.lastErrorRms
+                    measured++
                     trained++
                 } catch (e: OutOfMemoryError) {
                     NoraLog.fatal(
@@ -183,8 +344,9 @@ class NoraTrainer(private val brain: NoraBrain) {
                 // Abort on divergence rather than spending an hour writing NaN to disk. The
                 // error readout going NaN used to be the only symptom, and it was easy to
                 // mistake for a display quirk while every weight in the connectome rotted.
-                if (!NoraHealth.healthy || !lastError.isFinite()) {
-                    if (lastError.isFinite().not()) {
+                val errorIsBad = measured > 0 && !lastError.isFinite()
+                if (!NoraHealth.healthy || errorIsBad) {
+                    if (errorIsBad) {
                         NoraHealth.report("prediction error became non-finite")
                     }
                     NoraLog.error(
@@ -208,6 +370,22 @@ class NoraTrainer(private val brain: NoraBrain) {
                 sleepPhase(rng)
             }
 
+            // ── HELD-OUT VALIDATION ─────────────────────────────────────────
+            // Real measurement, not a training signal: the forward pass runs with the expert
+            // router's learning disabled and nothing calls learn()/bindCaption().
+            if (validationDataset.isNotEmpty() && epoch % validationIntervalEpochs.coerceAtLeast(1) == 0) {
+                val (avgError, count) = evaluateHeldOut(validationDataset)
+                if (avgError != null) {
+                    lastValidationError = avgError
+                    onProgress(
+                        Progress(
+                            epoch + 1, epochs, count, count,
+                            "validation avg err %.4f".format(avgError), avgError, "validation",
+                        )
+                    )
+                }
+            }
+
             NoraLog.info(
                 NoraLog.Area.TRAIN,
                 "Epoch ${epoch + 1}/$epochs complete — err(rms) %.4f, ".format(lastError) +
@@ -217,18 +395,84 @@ class NoraTrainer(private val brain: NoraBrain) {
                         brain.surfacePathwayStrength(), brain.contrastPathwayStrength()
                     )
             )
-            if (!sandbox) {
+            // SAVING IS A CLAIM THAT SOMETHING WAS LEARNED. If every presentation was unbound,
+            // the connectome is byte-for-byte the one that was loaded, so checkpointing it and
+            // calling markTrained() tells /status "trained" about a brain that learned nothing.
+            if (!sandbox && trained > 0 && unbound < trained) {
                 NoraPersistence.save(brain)
                 if (NoraHealth.healthy) NoraPersistence.markTrained()
             }
         }
 
+        // ── FINAL TEST ─────────────────────────────────────────────────────
+        // Once, after every training decision has been made. Never fed back into learning.
+        if (testDataset.isNotEmpty()) {
+            val (avgError, count) = evaluateHeldOut(testDataset)
+            if (avgError != null) {
+                lastTestError = avgError
+                onProgress(
+                    Progress(
+                        epochs, epochs, count, count,
+                        "final test avg err %.4f".format(avgError), avgError, "test",
+                    )
+                )
+            }
+        }
+
+        if (trained == 0) {
+            NoraLog.error(
+                NoraLog.Area.TRAIN,
+                "Training produced no usable presentations ($skipped image(s) skipped)",
+            )
+            return@withContext buildString {
+                append("Training did NOT run: none of the ${dataset.size} image(s) could be ")
+                append("decoded and presented.\n\n")
+                append("Nothing was saved and Nora was not marked as trained.\n")
+                if (skipped > 0) {
+                    append("$skipped file(s) were skipped as unreadable; check that they are ")
+                    append("real PNG/JPEG images rather than renamed files.\n")
+                }
+            }
+        }
+
+        val learnedNothing = unbound == trained
+        if (learnedNothing) {
+            NoraLog.error(
+                NoraLog.Area.TRAIN,
+                "All $trained presentations ran but none produced an IT pattern",
+            )
+        }
+
         buildString {
-            append("Training complete.\n\n")
-            append("$trained presentations over $epochs epochs on ${dataset.size} images.\n")
+            if (learnedNothing) {
+                append("Training ran but taught nothing.\n\n")
+            } else {
+                append("Training complete.\n\n")
+            }
+            append("$trained presentations over $epochs epochs on ${dataset.size} training sample(s).")
+            if (skipped > 0) append(" $skipped sample(s) skipped as unreadable.")
+            if (validationDataset.isNotEmpty()) {
+                append("\nHeld-out validation: ${validationDataset.size} sample(s) from ${splitFiles.validation.size} file(s)")
+                if (lastValidationError != null) append(", final avg err %.4f".format(lastValidationError))
+                append(".")
+            }
+            if (testDataset.isNotEmpty()) {
+                append("\nHeld-out test: ${testDataset.size} sample(s) from ${splitFiles.test.size} file(s)")
+                if (lastTestError != null) append(", avg err %.4f".format(lastTestError))
+                append(".")
+            }
+            append("\n")
             append("Vocabulary: ${brain.semanticHub.knownWords()} words.\n")
             append("Episodes stored: ${brain.hippocampus.episodeCount()}.\n")
-            append("Final prediction error (rms): %.4f\n".format(lastError))
+            if (measured > 0) {
+                append("Final prediction error (rms): %.4f\n".format(lastError))
+            } else {
+                append("Final prediction error (rms): not measured\n")
+            }
+            if (learnedNothing) {
+                append("\nEvery presentation failed to produce an IT pattern, so the connectome ")
+                append("did not change. This was not saved as a trained brain.\n")
+            }
             if (sandbox) {
                 append("Sandbox run — nothing was saved.")
             } else {
@@ -279,6 +523,54 @@ class NoraTrainer(private val brain: NoraBrain) {
         // Synaptic downscaling closes the sleep cycle (Tononi & Cirelli 2014).
         brain.sleepCycle()
         brain.neuromod.setDopamine(1f)
+    }
+
+    /**
+     * The image a sample presents to the retina: the file itself for an image, a drawing of
+     * the line for a text sample.
+     */
+    private fun bitmapFor(item: DatasetItem): PrismImage? {
+        val text = item.text
+        if (text != null) {
+            val renderer = textRenderer ?: return null
+            return try {
+                renderer(text)
+            } catch (e: Exception) {
+                NoraLog.error(NoraLog.Area.TRAIN, "Could not draw text from ${item.file.name}", e)
+                null
+            }
+        }
+        return decodeScaled(item.file)
+    }
+
+    /**
+     * A forward-only pass over held-out samples.
+     *
+     * NOTHING HERE MAY LEARN. `perceive(learning = false)` stops the expert router from moving
+     * its prototypes, and neither `learn()` nor `bindCaption()` is called, so the connectome
+     * that walks out of this function is byte-for-byte the one that walked in. That is what
+     * makes the number a generalisation measurement rather than another training step.
+     */
+    private suspend fun evaluateHeldOut(items: List<DatasetItem>): Pair<Float?, Int> {
+        var total = 0.0
+        var count = 0
+        for (item in items) {
+            coroutineContext.ensureActive()
+            val bitmap = bitmapFor(item) ?: continue
+            try {
+                brain.evaluateHeldOut(bitmap)
+                val error = brain.lastErrorRms
+                if (error.isFinite()) {
+                    total += error
+                    count++
+                }
+            } catch (e: OutOfMemoryError) {
+                throw e
+            } catch (e: Exception) {
+                NoraLog.error(NoraLog.Area.TRAIN, "Held-out sample failed: ${item.file.name}", e)
+            }
+        }
+        return if (count > 0) Pair((total / count).toFloat(), count) else Pair(null, 0)
     }
 
     /**

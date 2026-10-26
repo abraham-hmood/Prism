@@ -81,7 +81,7 @@ class StremioInstallActivity : PrismBaseActivity() {
             setTextColor(IosUi.secondaryLabel(this@StremioInstallActivity))
         })
 
-        androidx.appcompat.app.AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Install ${addon.name}?")
             .setView(body)
             .setCancelable(false)

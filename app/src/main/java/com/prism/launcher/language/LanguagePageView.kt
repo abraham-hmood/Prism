@@ -342,7 +342,7 @@ class LanguagePageView(context: Context) : FrameLayout(context) {
         val available = LanguageCatalog.LEARNABLE.filterNot { it.code in already }
 
         if (available.isEmpty()) {
-            androidx.appcompat.app.AlertDialog.Builder(context)
+            com.prism.launcher.theme.PrismDialogs.Builder(context)
                 .setTitle("Every language")
                 .setMessage("You are already learning all of them, which is quite a lot of languages.")
                 .setPositiveButton("Close", null)
@@ -351,7 +351,7 @@ class LanguagePageView(context: Context) : FrameLayout(context) {
         }
 
         val labels = available.map { "${it.flag}  ${it.english}" }.toTypedArray()
-        androidx.appcompat.app.AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("Add a language")
             .setItems(labels) { _, which ->
                 val chosen = available[which]
@@ -367,7 +367,7 @@ class LanguagePageView(context: Context) : FrameLayout(context) {
 
     private fun showXpDetail() {
         val xp = LanguageStats.xp()
-        androidx.appcompat.app.AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("$xp XP · ${LanguageStats.rank(xp)}")
             .setMessage(
                 "XP comes from finishing lessons — more for a harder level, more for covering more " +
@@ -582,7 +582,7 @@ class LanguagePageView(context: Context) : FrameLayout(context) {
         val mastery = model.masteryByConcept(now)
 
         if (mastery.isEmpty()) {
-            androidx.appcompat.app.AlertDialog.Builder(context)
+            com.prism.launcher.theme.PrismDialogs.Builder(context)
                 .setTitle("Your words")
                 .setMessage("Nothing yet. Finish a lesson and the words you meet will collect here.")
                 .setPositiveButton("Close", null)
@@ -605,7 +605,7 @@ class LanguagePageView(context: Context) : FrameLayout(context) {
             }
 
         val held = mastery.values.count { it >= LearnerModel.KNOWN_MASTERY }
-        androidx.appcompat.app.AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("Your words · $held held of ${mastery.size} met")
             .setMessage(lines.joinToString("\n"))
             .setPositiveButton("Close", null)
@@ -616,7 +616,7 @@ class LanguagePageView(context: Context) : FrameLayout(context) {
         val done = level.lessons.count { LanguagePlanStore.isComplete(it.id) }
         val hours = level.estimatedMinutes / 60
 
-        androidx.appcompat.app.AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("${level.level.code} · ${level.level.title}")
             .setMessage(
                 buildString {
@@ -656,7 +656,7 @@ class LanguagePageView(context: Context) : FrameLayout(context) {
             append("what they are.")
         }
 
-        androidx.appcompat.app.AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("Your plan")
             .setMessage(body)
             .setPositiveButton("Close", null)

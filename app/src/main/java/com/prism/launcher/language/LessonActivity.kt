@@ -593,7 +593,7 @@ class LessonActivity : PrismBaseActivity() {
 
     private fun showHint() {
         val hint = lastHint ?: return
-        android.app.AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("You could say")
             .setMessage(hint)
             .setPositiveButton("Got it", null)
@@ -736,7 +736,7 @@ class LessonActivity : PrismBaseActivity() {
             if (streak > 0) appendLine("Streak: $streak ${if (streak == 1) "day" else "days"}.")
         }.trim()
 
-        android.app.AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Lesson complete")
             .setMessage(body)
             .setCancelable(false)
@@ -752,7 +752,7 @@ class LessonActivity : PrismBaseActivity() {
             finish()
             return
         }
-        android.app.AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Leave the lesson?")
             .setMessage("It will not count as done, and what you covered here will not be scheduled.")
             .setPositiveButton("Leave") { _, _ -> finish() }

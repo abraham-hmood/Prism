@@ -66,6 +66,7 @@ class PrismLockActivity : FragmentActivity() {
 
     private var attempts = 0
     private var medicalExpanded = false
+    private var unlocked = false
 
     private val ticker = object : Runnable {
         override fun run() {
@@ -91,7 +92,11 @@ class PrismLockActivity : FragmentActivity() {
         }
 
         root = FrameLayout(this)
-        root.setBackgroundColor(Color.BLACK)
+        // THE LOCK SCREEN WEARS THE THEME TOO. It used to be black and white regardless, which
+        // meant the one screen a user sees before every unlock was the one screen their theme never
+        // reached. The wallpaper and scrim stay -- a photograph is what a lock screen is for -- but
+        // the fallback, the clock and every control come from the active theme's palette.
+        root.setBackgroundColor(themePalette().background.toInt())
         setContentView(root)
 
         addWallpaper()
@@ -104,7 +109,17 @@ class PrismLockActivity : FragmentActivity() {
 
     override fun onResume() {
         super.onResume()
+        // Tells LockGate the launch actually landed. Without this, a blocked launch is
+        // indistinguishable from a visible lock and the retry never fires.
+        LockGate.markShown()
         root.post(ticker)
+    }
+
+    override fun onDestroy() {
+        // If the activity goes away without an unlock (the user pressed Home, the system killed
+        // it, an overlay took over), clear the flag so the next resume can show the lock again.
+        if (!unlocked) LockGate.markDismissed()
+        super.onDestroy()
     }
 
     override fun onPause() {
@@ -186,22 +201,49 @@ class PrismLockActivity : FragmentActivity() {
         if (drawable != null) {
             image.setImageDrawable(drawable)
         } else {
+            val palette = themePalette()
             image.setImageDrawable(GradientDrawable(
                 GradientDrawable.Orientation.TOP_BOTTOM,
-                intArrayOf(0xFF1C1C2E.toInt(), 0xFF000000.toInt())
+                intArrayOf(palette.surface.toInt(), palette.background.toInt())
             ))
         }
     }
 
+    /**
+     * The active theme's palette for this screen.
+     *
+     * Resolved per call rather than cached: a lock screen is recreated on every wake, and the theme
+     * can change between two of them.
+     */
+    private fun themePalette() = com.prism.launcher.theme.PrismThemes.modeFor(isDarkTheme()).palette
+
+    private fun isDarkTheme(): Boolean =
+        (resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+            android.content.res.Configuration.UI_MODE_NIGHT_YES
+
+    /** A palette colour with its alpha replaced, for scrims and glass. */
+    private fun withAlpha(color: Long, alpha: Int): Int =
+        (alpha shl 24) or (color.toInt() and 0x00FFFFFF)
+
     private fun android.graphics.Bitmap.toDrawable(resources: android.content.res.Resources): Drawable =
         android.graphics.drawable.BitmapDrawable(resources, this)
 
-    /** A scrim, so white text stays readable over a bright photograph. */
+    /**
+     * A scrim, so the clock stays readable over a bright photograph.
+     *
+     * Tinted with the theme's background rather than pure black, so a light theme's lock screen
+     * reads as light instead of as a dark screen with dark text on it.
+     */
     private fun addScrim() {
+        val scrimColor = themePalette().background
         root.addView(View(this).apply {
             background = GradientDrawable(
                 GradientDrawable.Orientation.TOP_BOTTOM,
-                intArrayOf(0x99000000.toInt(), 0x44000000.toInt(), 0xCC000000.toInt())
+                intArrayOf(
+                    withAlpha(scrimColor, 0x99),
+                    withAlpha(scrimColor, 0x44),
+                    withAlpha(scrimColor, 0xCC),
+                )
             )
         }, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT
@@ -219,7 +261,7 @@ class PrismLockActivity : FragmentActivity() {
 
         clock = TextView(this).apply {
             textSize = 62f
-            setTextColor(Color.WHITE)
+            setTextColor(themePalette().text.toInt())
             gravity = Gravity.CENTER_HORIZONTAL
         }
         column.addView(clock, LinearLayout.LayoutParams(
@@ -228,7 +270,7 @@ class PrismLockActivity : FragmentActivity() {
 
         dateLine = TextView(this).apply {
             textSize = 15f
-            setTextColor(0xCCFFFFFF.toInt())
+            setTextColor(themePalette().muted.toInt())
             gravity = Gravity.CENTER_HORIZONTAL
         }
         column.addView(dateLine, LinearLayout.LayoutParams(
@@ -241,7 +283,7 @@ class PrismLockActivity : FragmentActivity() {
 
         hintLine = TextView(this).apply {
             textSize = 14f
-            setTextColor(0xCCFFFFFF.toInt())
+            setTextColor(themePalette().muted.toInt())
             gravity = Gravity.CENTER
             text = when (LockStore.mechanism()) {
                 LockStore.Mechanism.PIN -> "Enter your PIN"
@@ -287,17 +329,18 @@ class PrismLockActivity : FragmentActivity() {
     }
 
     private fun buildPassword() {
+        val palette = themePalette()
         val field = EditText(this).apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             textSize = 17f
             gravity = Gravity.CENTER
-            setTextColor(Color.WHITE)
-            setHintTextColor(0x88FFFFFF.toInt())
+            setTextColor(palette.text.toInt())
+            setHintTextColor(palette.muted.toInt())
             hint = "Password"
             background = GradientDrawable().apply {
-                setColor(0x55000000)
+                setColor(withAlpha(palette.card, 0xAA))
                 cornerRadius = IosUi.dp(this@PrismLockActivity, 12f).toFloat()
-                setStroke(1, 0x44FFFFFF)
+                setStroke(1, palette.divider.toInt())
             }
             val pad = IosUi.dp(this@PrismLockActivity, 14f)
             setPadding(pad, pad, pad, pad)
@@ -322,7 +365,7 @@ class PrismLockActivity : FragmentActivity() {
         pinDots = TextView(this).apply {
             textSize = 28f
             gravity = Gravity.CENTER
-            setTextColor(Color.WHITE)
+            setTextColor(themePalette().text.toInt())
             letterSpacing = 0.4f
         }
         entryArea.addView(pinDots, LinearLayout.LayoutParams(
@@ -348,11 +391,12 @@ class PrismLockActivity : FragmentActivity() {
         text = key
         textSize = if (key == "⌫") 22f else 26f
         gravity = Gravity.CENTER
-        setTextColor(Color.WHITE)
+        val palette = themePalette()
+        setTextColor(palette.text.toInt())
         if (key.isNotBlank()) {
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
-                setColor(0x33FFFFFF)
+                setColor(withAlpha(palette.text, 0x2E))
             }
             setOnClickListener { onKey(key) }
         }
@@ -419,6 +463,7 @@ class PrismLockActivity : FragmentActivity() {
      * appearance.
      */
     private fun unlock(duress: Boolean) {
+        unlocked = true
         if (duress) DuressResponder.trigger(this) else DuressResponder.standDown(this)
         LockGate.markUnlocked()
         // THE TWO CALLS GO ON OPPOSITE SIDES OF finish(), which is not a style choice.

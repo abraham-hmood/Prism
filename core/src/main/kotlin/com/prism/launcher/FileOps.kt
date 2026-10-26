@@ -68,6 +68,13 @@ object FileOps {
                 skipped.add("${source.name}: cannot paste a folder into itself")
                 continue
             }
+            // Cutting a file into the folder it already lives in is a no-op, not a rename to
+            // "name (2)" -- which is what the copy-and-disambiguate path below would otherwise
+            // do, silently changing a name the user never asked to change.
+            if (cb.mode == Mode.CUT && sameFile(source.parentFile, target)) {
+                skipped.add("${source.name}: already in this folder")
+                continue
+            }
             val destination = uniqueName(target, source.name)
             try {
                 if (cb.mode == Mode.CUT) {
@@ -94,8 +101,18 @@ object FileOps {
             }
         }
 
-        if (cb.mode == Mode.CUT) clipboard = null
+        // Cleared only when the cut actually landed somewhere. A refused move leaves the source
+        // where it was, so dropping the clipboard too would make the user cut it again.
+        if (cb.mode == Mode.CUT && pasted.isNotEmpty()) clipboard = null
         return PasteResult(pasted, skipped)
+    }
+
+    /** Whether two paths name the same location, tolerating a canonicalisation failure. */
+    private fun sameFile(a: File?, b: File): Boolean {
+        if (a == null) return false
+        val left = runCatching { a.canonicalFile }.getOrDefault(a.absoluteFile)
+        val right = runCatching { b.canonicalFile }.getOrDefault(b.absoluteFile)
+        return left == right
     }
 
     /** True when [candidate] is [ancestor] or lives underneath it. */

@@ -158,9 +158,9 @@ class DomainAdapter(
         holder.binding.removeDomainBtn.setOnClickListener { onRemove(domain) }
         
         if (isCustom) {
-            holder.binding.domainText.setTextColor(androidx.core.content.ContextCompat.getColor(holder.binding.domainText.context, R.color.prism_text_primary))
+            holder.binding.domainText.setTextColor(com.prism.launcher.nora.IosUi.label(holder.binding.domainText.context))
         } else {
-            holder.binding.domainText.setTextColor(androidx.core.content.ContextCompat.getColor(holder.binding.domainText.context, R.color.prism_text_muted))
+            holder.binding.domainText.setTextColor(com.prism.launcher.nora.IosUi.secondaryLabel(holder.binding.domainText.context))
         }
     }
 

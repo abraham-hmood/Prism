@@ -13,6 +13,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
@@ -46,6 +47,27 @@ class ContactDetailActivity : FragmentActivity() {
     private val contactName by lazy { intent.getStringExtra(EXTRA_NAME).orEmpty() }
     private val contactNumber by lazy { intent.getStringExtra(EXTRA_NUMBER).orEmpty() }
     private val contactId by lazy { intent.getStringExtra(EXTRA_ID).orEmpty() }
+
+    /** The name this contact knows the user by. Required before they can be added. */
+    private var knownAsField: EditText? = null
+
+    /** True while an add is waiting for the SMS/location permission dialog. */
+    private var awaitingPermissions = false
+
+    /**
+     * Asked for at the moment the contact is added, not at first launch.
+     *
+     * BOTH the alert and its location need runtime grants. Prism used to declare them in the
+     * manifest and never ask, so every duress alert went out as "No location was available" -- the
+     * permission was present in the APK and absent on the device.
+     */
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        if (!awaitingPermissions) return@registerForActivityResult
+        awaitingPermissions = false
+        addEmergencyNow()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -89,7 +111,33 @@ class ContactDetailActivity : FragmentActivity() {
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = IosUi.dp(this@ContactDetailActivity, 14f) })
 
-        val already = EmergencyContacts.isEmergency(contactNumber)
+        val existing = EmergencyContacts.all().firstOrNull {
+            it.number.filter(Char::isDigit).takeLast(9) == contactNumber.filter(Char::isDigit).takeLast(9)
+        }
+        val already = existing != null
+
+        // THE NAME FIELD IS PART OF SETTING UP A CONTACT, NOT A SECOND STEP. The alert cannot be
+        // useful without it, so it is asked for here and refused when blank.
+        if (!already || existing?.knownAs.isNullOrBlank()) {
+            knownAsField = EditText(this).apply {
+                hint = "Your name they know (required)"
+                inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_WORDS
+                setText(existing?.knownAs.orEmpty())
+                setSingleLine(true)
+                setTextColor(IosUi.label(this@ContactDetailActivity))
+                setHintTextColor(IosUi.tertiaryLabel(this@ContactDetailActivity))
+            }
+            content.addView(knownAsField, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = IosUi.dp(this@ContactDetailActivity, 16f) })
+            content.addView(TextView(this).apply {
+                text = "The emergency alert uses this name so the person knows who needs help. " +
+                    "It is sent together with your current location."
+                textSize = 12f
+                setTextColor(IosUi.secondaryLabel(this@ContactDetailActivity))
+                setPadding(0, IosUi.dp(this@ContactDetailActivity, 6f), 0, 0)
+            })
+        }
 
         content.addView(
             if (already) {
@@ -181,7 +229,7 @@ class ContactDetailActivity : FragmentActivity() {
             setPadding(pad, pad, pad, pad)
         }
 
-        androidx.appcompat.app.AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Confirm it is you")
             .setMessage("Enter your emergency code. Nothing is sent — this only confirms who you are.")
             .setView(field)
@@ -200,7 +248,7 @@ class ContactDetailActivity : FragmentActivity() {
 
     private fun askForDuressPattern(action: () -> Unit) {
         val view = PatternView(this)
-        val dialog = androidx.appcompat.app.AlertDialog.Builder(this)
+        val dialog = com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Draw your emergency pattern")
             .setView(view)
             .setNegativeButton("Cancel", null)
@@ -222,17 +270,52 @@ class ContactDetailActivity : FragmentActivity() {
     // ── The change ─────────────────────────────────────────────────────────
 
     private fun addEmergency() {
-        EmergencyContacts.add(contactName, contactNumber)
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.SEND_SMS)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            toast(
-                "$contactName added. Prism cannot send SMS yet, so grant that permission or the " +
-                    "alert will have no way out."
-            )
-        } else {
-            toast("$contactName is now an emergency contact")
+        val knownAs = knownAsField?.text?.toString()?.trim().orEmpty()
+        if (knownAs.isBlank()) {
+            toast("Enter the name this person knows you by — the alert uses it.")
+            knownAsField?.requestFocus()
+            return
         }
+        if (contactNumber.isBlank()) {
+            toast("This contact has no phone number, so an alert has nowhere to go.")
+            return
+        }
+
+        val missing = EMERGENCY_PERMISSIONS.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isNotEmpty()) {
+            awaitingPermissions = true
+            permissionLauncher.launch(missing.toTypedArray())
+            return
+        }
+        addEmergencyNow()
+    }
+
+    private fun addEmergencyNow() {
+        val knownAs = knownAsField?.text?.toString()?.trim().orEmpty()
+        if (knownAs.isBlank()) {
+            toast("Enter the name this person knows you by — the alert uses it.")
+            return
+        }
+        val added = EmergencyContacts.add(contactName, contactNumber, knownAs)
+        if (!added) {
+            toast("Could not add this contact. Check the number and the name.")
+            return
+        }
+
+        val noSms = ContextCompat.checkSelfPermission(this, Manifest.permission.SEND_SMS) !=
+            PackageManager.PERMISSION_GRANTED
+        val noLocation = EMERGENCY_LOCATION_PERMISSIONS.none {
+            ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
+        }
+        toast(
+            when {
+                noSms -> "$contactName added, but SMS permission was refused — the alert has no way out."
+                noLocation -> "$contactName added, but location permission was refused — the alert will not say where."
+                else -> "$contactName is now an emergency contact. They will know you as $knownAs."
+            }
+        )
         render()
     }
 
@@ -269,5 +352,18 @@ class ContactDetailActivity : FragmentActivity() {
         const val EXTRA_ID = "contact_id"
         const val EXTRA_NAME = "contact_name"
         const val EXTRA_NUMBER = "contact_number"
+
+        /**
+         * What the alert needs to actually arrive and say where.
+         *
+         * The manifest declared these from the beginning; nothing ever asked for them at runtime,
+         * which is why every duress message said "No location was available". Requested here, at
+         * the one moment adding a contact can justify a permission dialog.
+         */
+        val EMERGENCY_LOCATION_PERMISSIONS = arrayOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION,
+        )
+        val EMERGENCY_PERMISSIONS = EMERGENCY_LOCATION_PERMISSIONS + Manifest.permission.SEND_SMS
     }
 }

@@ -75,12 +75,21 @@ object AetherChat {
             lower == "/help" || lower == "help" -> return Reply(helpText())
 
             lower == "/status" -> {
-                val trained = AetherStudio.isTrained(ctx)
+                // FILE CHECK, NOT A BRAIN BUILD. The main process must never construct a
+                // connectome just to answer "are you trained" -- see AetherStudio.isTrained's
+                // own warning; on a phone that is hundreds of megabytes and an OOM crash.
+                val trained = AetherStudio.hasTrainedWeights()
+                val summary = AetherStudio.datasetSummary()
                 return Reply(
                     buildString {
                         append(if (trained) "Connectome loaded.\n" else "No connectome yet -- untrained.\n")
                         append(AetherStudio.status())
-                        append("\n\nDataset: ${AetherStudio.datasetSize()} sample(s) (images + text chunks) in ${AetherConfig.datasetDir().absolutePath}")
+                        append("\n\nDataset: ${summary.totalFiles} file(s) — ")
+                        append("${summary.images} image, ${summary.textFiles} text, ${summary.parquetFiles} parquet")
+                        append(" · ${summary.trainFiles} training")
+                        if (summary.validationFiles > 0) append(", ${summary.validationFiles} validation")
+                        if (summary.testFiles > 0) append(", ${summary.testFiles} test")
+                        append("\nin ${AetherConfig.datasetDir().absolutePath}")
                         append("\nbiotrain: ${if (PrismSettings.getAetherBiotrainEnabled()) "on" else "off"} · ")
                         append("biogen: ${if (PrismSettings.getAetherBiogenEnabled()) "on" else "off"}")
                     }

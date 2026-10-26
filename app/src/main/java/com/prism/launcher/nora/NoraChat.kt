@@ -164,12 +164,17 @@ object NoraChat {
 
             lower == "/status" -> {
                 val trained = NoraStudio.isTrained(ctx)
-                val dataset = NoraStudio.datasetSize(ctx)
+                val summary = NoraStudio.datasetSummary()
                 return Reply(
                     buildString {
                         append(if (trained) "Connectome loaded.\n" else "No connectome yet -- untrained.\n")
                         append(NoraStudio.status(ctx))
-                        append("\n\nDataset: $dataset images in ${NoraConfig.datasetDir().absolutePath}")
+                        append("\n\nDataset: ${summary.totalFiles} file(s) — ")
+                        append("${summary.images} image, ${summary.textFiles} text, ${summary.parquetFiles} parquet")
+                        append(" · ${summary.trainFiles} training")
+                        if (summary.validationFiles > 0) append(", ${summary.validationFiles} validation")
+                        if (summary.testFiles > 0) append(", ${summary.testFiles} test")
+                        append("\nin ${NoraConfig.datasetDir().absolutePath}")
                         append("\nFeedback: ${NoraFeedback.summary()}")
                     }
                 )

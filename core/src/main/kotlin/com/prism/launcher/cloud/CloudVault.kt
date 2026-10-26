@@ -89,6 +89,30 @@ object CloudVault {
          * the user has been made to write down.
          */
         MESSAGING("messaging"),
+
+        /**
+         * Trusted-device locations and find requests. See
+         * [com.prism.launcher.trusted.TrustedLocations].
+         *
+         * A SEPARATE KEY ON PURPOSE. Location is more sensitive than a clipboard entry, and a
+         * purpose label is the only thing that keeps a misrouted or replayed packet from being
+         * opened by the wrong subsystem. Rotating it (by deriving a different label) would also
+         * invalidate every cached position without touching any other share.
+         */
+        LOCATION("location"),
+
+        /** Mesh call audio and meshnet voicemail. See `com.prism.launcher.calls`. */
+        CALLS("calls"),
+
+        /**
+         * Compressed photo and video backups. See `com.prism.launcher.photos.PhotoBackup`.
+         *
+         * A SEPARATE KEY FROM STORAGE, although both are "the mesh holds my files". A photo backup
+         * is placed on the user's OWN trusted devices and is not a market transaction; the storage
+         * key seals chunks that strangers hold and that are paid for. Giving them one key would mean
+         * a peer renting space could open the camera roll.
+         */
+        PHOTOS("photos"),
     }
 
     // ── Derivation ─────────────────────────────────────────────────────────

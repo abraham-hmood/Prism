@@ -62,7 +62,7 @@ object PrismDialogFactory {
             root.addView(container)
         }
 
-        val builder = AlertDialog.Builder(context, R.style.Theme_PrismSettings)
+        val builder = com.prism.launcher.theme.PrismDialogs.Builder(context, R.style.Theme_PrismSettings)
             .setTitle(title)
             .setView(root)
 
@@ -75,6 +75,9 @@ object PrismDialogFactory {
 
         val dialog = builder.create()
         dialog.show()
+        // A dialog owns its own window, so the screen's tree walk cannot reach the card it floats
+        // on. Apply the theme after it is attached, when that window exists.
+        com.prism.launcher.theme.ThemeSkin.apply(dialog)
         return dialog
     }
 
@@ -84,6 +87,7 @@ object PrismDialogFactory {
     }
 
     private fun resolveAttr(context: Context, attr: Int): Int {
+        com.prism.launcher.theme.ThemeSkin.resolveAttr(context, attr)?.let { return it }
         val typedValue = android.util.TypedValue()
         context.theme.resolveAttribute(attr, typedValue, true)
         return typedValue.data

@@ -86,7 +86,7 @@ class CloneEnginesTest {
         assertTrue(FreeVcEngine.MODEL.file.endsWith("_int8q.onnx"), "must be the QDQ export")
         assertFalse(FreeVcEngine.MODEL.file.contains("_q8"), "would be purged as a stale export")
         assertEquals(
-            "https://github.com/ibrahim-hmood/Prism/releases/download/voice-engines-v1/freevc_vc_int8q.onnx",
+            "https://github.com/abraham-hmood/Prism/releases/download/voice-engines-v1/freevc_vc_int8q.onnx",
             FreeVcEngine.MODEL.url,
         )
     }
@@ -97,7 +97,7 @@ class CloneEnginesTest {
             assertTrue(model.file.endsWith("_int8q.onnx"), "${model.file} must be the QDQ export")
             assertFalse(model.file.contains("_q8"), "${model.file} would be purged as a stale export")
             assertTrue(
-                model.url.startsWith("https://github.com/ibrahim-hmood/Prism/releases/download/voice-engines-v1/"),
+                model.url.startsWith("https://github.com/abraham-hmood/Prism/releases/download/voice-engines-v1/"),
                 "${model.url} must come from the published release",
             )
             assertTrue(model.url.endsWith("/${model.file}"), "${model.url} must serve ${model.file}")
@@ -143,7 +143,7 @@ class CloneEnginesTest {
         )
         for (model in PocketTtsEngine.models) {
             assertEquals(
-                "https://github.com/ibrahim-hmood/Prism/releases/download/voice-engines-v1/${model.file}",
+                "https://github.com/abraham-hmood/Prism/releases/download/voice-engines-v1/${model.file}",
                 model.url,
             )
         }
@@ -153,7 +153,7 @@ class CloneEnginesTest {
     fun seedVcFilesAreThePublishedGraphs() {
         for (model in SeedVcEngine.models) {
             assertTrue(
-                model.url.startsWith("https://github.com/ibrahim-hmood/Prism/releases/download/voice-engines-v1/"),
+                model.url.startsWith("https://github.com/abraham-hmood/Prism/releases/download/voice-engines-v1/"),
                 "${model.url} must come from the published release",
             )
             assertTrue(model.url.endsWith("/${model.file}"), "${model.url} must serve ${model.file}")
@@ -163,6 +163,31 @@ class CloneEnginesTest {
         // constants; quantizing them costs accuracy for no meaningful size).
         assertEquals(5, SeedVcEngine.models.count { it.file.endsWith("_int8q.onnx") })
         assertEquals("mel_w.onnx", SeedVcEngine.MEL.file)
+    }
+
+    @Test
+    fun everyDownloadCarriesAPinnedDigest() {
+        // The digest is what makes a download verifiable: without one, a truncated transfer or a
+        // swapped asset is only discovered when ONNX Runtime fails at speak time.
+        val hex = Regex("^[0-9a-f]{64}$")
+        val all = CloneEngines.ALL.flatMap { it.models }
+        assertTrue(all.isNotEmpty())
+        for (model in all) {
+            assertTrue(hex.matches(model.sha256), "${model.file} has a malformed sha256: ${model.sha256}")
+        }
+        assertEquals(all.size, all.map { it.sha256 }.toSet().size, "two files share a digest")
+    }
+
+    @Test
+    fun theDigestFunctionMatchesThePublishedShaOfKnownBytes() {
+        // Proves the verifier itself, independently of any multi-hundred-megabyte download:
+        // SHA-256("abc") is the canonical NIST vector.
+        val file = File(tempDir, "abc.bin")
+        file.writeText("abc")
+        assertEquals(
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            VoiceCloningModels.digest(file),
+        )
     }
 
     @Test

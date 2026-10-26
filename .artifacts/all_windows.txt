@@ -1,0 +1,265 @@
+
+Copilot Quick View           pid=29072 vis=False rect=658,477,1262,603 
+ChatGPT is using your computer. Esc to cancel pid=26160 vis=False rect=0,0,1920,1080 
+Battery Meter                pid=12464 vis=False rect=0,0,14,14 
+Prism                        pid=38536 vis=True rect=48,48,1328,888 
+Custom cloud agentic AI … - Leon - Visual Studio Code pid=8116 vis=True rect=-32000,-32000,-31840,-31972 
+Freebuff Desktop             pid=9592 vis=True rect=-8,-8,1928,1088 
+D3DFocusWindow               pid=38536 vis=False rect=0,0,1,1 
+theAwtToolkitWindow          pid=38536 vis=False rect=-1,-1,135,38 
+PopupHost                    pid=14288 vis=False rect=1214,366,1625,725 
+Command Prompt               pid=14288 vis=True rect=-7,0,967,1087 
+notebookbbf98e3c82 and 11 more pages - Personal - Microsoft? Edge pid=36156 vis=True rect=-32000,-32000,-31840,-31972 
+model - File Explorer        pid=12464 vis=True rect=0,176,1918,1080 
+shedeed-v1.zip - File Explorer pid=12464 vis=True rect=-32000,-32000,-31840,-31972 
+DesktopWindowXamlSource      pid=12464 vis=False rect=0,0,1,1 
+100% complete                pid=12464 vis=False rect=240,266,703,560 
+DesktopWindowXamlSource      pid=12464 vis=False rect=0,0,1,1 
+Home - File Explorer         pid=12464 vis=False rect=0,176,1918,1080 
+Command Prompt - adb  shell  pid=14288 vis=True rect=-32000,-32000,-31840,-31972 
+Adobe Acrobat Updater        pid=35696 vis=False rect=704,354,1215,726 
+MiPool (F:) - File Explorer  pid=12464 vis=True rect=-32000,-32000,-31840,-31972 
+ADB Power Notification Window pid=26748 vis=False rect=0,0,0,0 
+ChatGPT                      pid=7232 vis=False rect=320,130,1600,950 
+.NET-BroadcastEventWindow.1903e4b.0 pid=29072 vis=False rect=0,0,0,0 
+Copilot                      pid=38288 vis=False rect=270,280,1650,1070 
+GDI+ Window (Explorer.EXE)   pid=12464 vis=False rect=0,0,1,1 
+MS_WebcheckMonitor           pid=12464 vis=False rect=104,104,1544,893 
+Task Manager                 pid=17988 vis=True rect=104,104,884,694 
+GDI+ Window (OneDrive.exe)   pid=29612 vis=False rect=0,0,1,1 
+Microsoft OneDrive Sync Service pid=21828 vis=False rect=26,26,226,226 
+OneDrive - Personal          pid=29612 vis=False rect=0,0,136,39 
+Task Host Window             pid=3508 vis=False rect=0,0,136,39 
+Add meshnet model sharing and README audit — DeepSeek Harness pid=15992 vis=False rect=312,130,1608,958 
+Setup - Microsoft Visual Studio Code (User) pid=25752 vis=False rect=654,304,1266,775 
+InnoSetupLdrWindow           pid=27440 vis=False rect=0,0,136,39 
+Gemini Launcher              pid=28440 vis=False rect=0,0,136,39 
+DDE Server Window            pid=14288 vis=False rect=0,0,0,0 
+Settings                     pid=28320 vis=True rect=0,8,1920,1088 
+Settings                     pid=27768 vis=True rect=-8,-8,1928,1088 
+C:\Users\bremo\AppData\Local\Programs\Ollama\ollama.exe pid=2836 vis=False rect=78,78,1071,597 
+Cloudflare WARP              pid=18468 vis=False rect=1558,570,1908,1020 
+Hidden Window                pid=18468 vis=False rect=208,208,1648,997 
+DDE Server Window            pid=18468 vis=False rect=0,0,0,0 
+MediaContextNotificationWindow pid=18468 vis=False rect=0,0,0,0 
+GDI+ Window (Cloudflare WARP.exe) pid=18468 vis=False rect=0,0,1,1 
+.NET-BroadcastEventWindow.358a177.0 pid=18468 vis=False rect=0,0,0,0 
+SystemResourceNotifyWindow   pid=18468 vis=False rect=0,0,0,0 
+OpenVPN Messages             pid=6404 vis=False rect=1362,46,1865,479 
+OpenVPN                      pid=6404 vis=False rect=104,104,334,304 
+DDE Server Window            pid=24244 vis=False rect=0,0,0,0 
+GOG Galaxy Notifications Renderer pid=20204 vis=False rect=1370,0,1920,1080 
+MrLinkWatcherWindow          pid=16592 vis=False rect=0,0,1544,893 
+GDI+ Window (WhatsApp.Root.exe) pid=3892 vis=False rect=0,0,1,1 
+H.NotifyIcon_3e741664-3ba4-4b6f-9d4b-c9e509ff79d8 pid=3892 vis=False rect=0,0,136,39 
+WhatsApp                     pid=3892 vis=False rect=208,208,1648,997 
+.NET-BroadcastEventWindow.3b95145.0 pid=3892 vis=False rect=0,0,0,0 
+CopyDataMessageManager       pid=20204 vis=False rect=156,156,292,195 
+__wglDummyWindowFodder       pid=20204 vis=False rect=52,52,1492,841 
+NVOGLDC invisible            pid=20204 vis=False rect=26,26,1466,815 
+CopyDataMessageManager       pid=20552 vis=False rect=182,182,318,221 
+__wglDummyWindowFodder       pid=20552 vis=False rect=52,52,1492,841 
+NVOGLDC invisible            pid=20552 vis=False rect=26,26,1466,815 
+Honeygain                    pid=5488 vis=False rect=208,208,744,868 
+Honeygain                    pid=5488 vis=False rect=182,182,726,842 
+Honeygain                    pid=5488 vis=False rect=693,289,1228,791 
+Honeygain                    pid=5488 vis=False rect=552,180,1368,900 
+SystemResourceNotifyWindow   pid=5488 vis=False rect=0,0,0,0 
+MediaContextNotificationWindow pid=5488 vis=False rect=0,0,0,0 
+Signal                       pid=10904 vis=False rect=560,235,1360,845 
+RealtekAudioBackgroundProcessClass pid=19700 vis=False rect=0,0,0,0 
+SecurityHealthSystray        pid=20228 vis=False rect=0,0,0,0 
+.NET-BroadcastEventWindow.bf7771.0 pid=7116 vis=False rect=0,0,0,0 
+{5AEA657D-F3F5-4BD8-BFE9-A4B537FA24C3} pid=15728 vis=False rect=0,0,136,128 
+CallBackWindowThread         pid=15728 vis=False rect=130,130,1570,919 
+BroadcastListenerWindow      pid=12644 vis=False rect=0,0,136,39 
+BroadcastListenerWindow      pid=12644 vis=False rect=0,0,136,39 
+BroadcastListenerWindow      pid=12644 vis=False rect=0,0,136,39 
+BroadcastListenerWindow      pid=12644 vis=False rect=0,0,136,39 
+BroadcastListenerWindow      pid=12644 vis=False rect=0,0,136,39 
+.NET-BroadcastEventWindow.3d893c.0 pid=12352 vis=False rect=0,0,0,0 
+NVIDIA GeForce Overlay DT    pid=15728 vis=False rect=0,0,1920,1080 
+NVIDIA GeForce Overlay       pid=15728 vis=True rect=0,0,1920,1080 
+NvSvc                        pid=4724 vis=False rect=78,78,1518,867 
+UxdService                   pid=11292 vis=False rect=52,52,1492,841 
+UxdService                   pid=4724 vis=False rect=26,26,1466,815 
+{1274D398-C3C8-422E-87DD-2FAFFD5A7F2F} pid=15704 vis=False rect=0,0,136,128 
+{2A335767-FC94-417F-ABC4-B4122ADBEE60} pid=12436 vis=False rect=0,0,136,128 
+BroadcastListenerWindow      pid=12644 vis=False rect=0,0,136,39 
+BroadcastListenerWindow      pid=12644 vis=False rect=0,0,136,39 
+BroadcastListenerWindow      pid=12644 vis=False rect=0,0,136,39 
+Windows Terminal             pid=14288 vis=False rect=0,0,136,39 
+NvContainerWindowClass00003164 pid=12644 vis=False rect=0,0,0,0 
+CrossDeviceResumeWindow      pid=11044 vis=False rect=78,78,1518,867 
+NvContainerWindowClass00003094 pid=12436 vis=False rect=0,0,0,0 
+NvContainerWindowClass00002C1C pid=11292 vis=False rect=0,0,0,0 
+DesktopWindowXamlSource      pid=10536 vis=False rect=0,0,1,1 
+Windows Push Notifications Platform pid=9872 vis=False rect=0,0,0,0 
+Task Host Window             pid=10144 vis=False rect=0,0,136,39 
+Sunshine Session Monitor Window pid=9168 vis=False rect=78,78,1518,867 
+NvContainerWindowClass00001274 pid=4724 vis=False rect=0,0,0,0 
+DWM Notification Window      pid=1960 vis=False rect=0,1052,160,1080 
+GOG GALAXY                   pid=20552 vis=False rect=90,140,1830,940 
+WhatsApp                     pid=22888 vis=False rect=216,209,1640,989 
+Windows Input Experience     pid=33000 vis=True rect=0,0,1920,1080 
+MiracastConnectionWindow     pid=12464 vis=False rect=0,0,136,39 
+Cloudflare WARP              pid=18468 vis=True rect=-32000,-32000,-31840,-31972 
+Program Manager              pid=12464 vis=True rect=0,0,1920,1080 
+Default IME                  pid=12464 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=12464 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=12464 vis=False rect=0,0,0,0 
+Default IME                  pid=12464 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=29072 vis=False rect=0,0,0,0 
+Default IME                  pid=29072 vis=False rect=0,0,0,0 
+Default IME                  pid=12464 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=38536 vis=False rect=0,0,0,0 
+Default IME                  pid=38536 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=8116 vis=False rect=0,0,0,0 
+Default IME                  pid=8116 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=9592 vis=False rect=0,0,0,0 
+Default IME                  pid=9592 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=14288 vis=False rect=0,0,0,0 
+Default IME                  pid=14288 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=36156 vis=False rect=0,0,0,0 
+Default IME                  pid=36156 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=12464 vis=False rect=0,0,0,0 
+Default IME                  pid=12464 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=12464 vis=False rect=0,0,0,0 
+Default IME                  pid=12464 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=12464 vis=False rect=0,0,0,0 
+Default IME                  pid=12464 vis=False rect=0,0,0,0 
+Default IME                  pid=12464 vis=False rect=0,0,0,0 
+Default IME                  pid=35696 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=35696 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=12464 vis=False rect=0,0,0,0 
+Default IME                  pid=12464 vis=False rect=0,0,0,0 
+Default IME                  pid=25752 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=25752 vis=False rect=0,0,0,0 
+CiceroUIWndFrame             pid=18468 vis=False rect=200,200,400,400 
+Default IME                  pid=26160 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=12464 vis=False rect=0,0,0,0 
+Default IME                  pid=12464 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=29324 vis=False rect=0,0,0,0 
+Default IME                  pid=29324 vis=False rect=0,0,0,0 
+Default IME                  pid=26748 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=7232 vis=False rect=0,0,0,0 
+Default IME                  pid=7232 vis=False rect=0,0,0,0 
+Default IME                  pid=29072 vis=False rect=0,0,0,0 
+Default IME                  pid=38280 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=38288 vis=False rect=0,0,0,0 
+Default IME                  pid=38288 vis=False rect=0,0,0,0 
+Default IME                  pid=10300 vis=False rect=0,0,0,0 
+Default IME                  pid=19252 vis=False rect=0,0,0,0 
+Default IME                  pid=12464 vis=False rect=0,0,0,0 
+Default IME                  pid=9492 vis=False rect=0,0,0,0 
+Default IME                  pid=12472 vis=False rect=0,0,0,0 
+Default IME                  pid=16564 vis=False rect=0,0,0,0 
+Default IME                  pid=12464 vis=False rect=0,0,0,0 
+Default IME                  pid=12464 vis=False rect=0,0,0,0 
+Default IME                  pid=18572 vis=False rect=0,0,0,0 
+Default IME                  pid=18572 vis=False rect=0,0,0,0 
+Default IME                  pid=12464 vis=False rect=0,0,0,0 
+Default IME                  pid=12464 vis=False rect=0,0,0,0 
+Default IME                  pid=12464 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=17988 vis=False rect=0,0,0,0 
+Default IME                  pid=17988 vis=False rect=0,0,0,0 
+Default IME                  pid=17988 vis=False rect=0,0,0,0 
+Default IME                  pid=18572 vis=False rect=0,0,0,0 
+Default IME                  pid=18572 vis=False rect=0,0,0,0 
+Default IME                  pid=29612 vis=False rect=0,0,0,0 
+Default IME                  pid=21828 vis=False rect=0,0,0,0 
+Default IME                  pid=21828 vis=False rect=0,0,0,0 
+Default IME                  pid=29612 vis=False rect=0,0,0,0 
+Default IME                  pid=29612 vis=False rect=0,0,0,0 
+Default IME                  pid=29612 vis=False rect=0,0,0,0 
+Default IME                  pid=29612 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=15992 vis=False rect=0,0,0,0 
+Default IME                  pid=15992 vis=False rect=0,0,0,0 
+Default IME                  pid=9592 vis=False rect=0,0,0,0 
+Default IME                  pid=21984 vis=False rect=0,0,0,0 
+Default IME                  pid=27440 vis=False rect=0,0,0,0 
+Default IME                  pid=8116 vis=False rect=0,0,0,0 
+Default IME                  pid=28184 vis=False rect=0,0,0,0 
+Default IME                  pid=31576 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=24844 vis=False rect=0,0,0,0 
+Default IME                  pid=24844 vis=False rect=0,0,0,0 
+Default IME                  pid=22592 vis=False rect=0,0,0,0 
+Default IME                  pid=13884 vis=False rect=0,0,0,0 
+Default IME                  pid=9248 vis=False rect=0,0,0,0 
+Default IME                  pid=28440 vis=False rect=0,0,0,0 
+Default IME                  pid=28320 vis=False rect=0,0,0,0 
+Default IME                  pid=28320 vis=False rect=0,0,0,0 
+Default IME                  pid=28320 vis=False rect=0,0,0,0 
+Default IME                  pid=27768 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=27768 vis=False rect=0,0,0,0 
+Default IME                  pid=15596 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=18468 vis=False rect=0,0,0,0 
+Default IME                  pid=18468 vis=False rect=0,0,0,0 
+CiceroUIWndFrame             pid=18468 vis=False rect=0,0,0,0 
+Default IME                  pid=18468 vis=False rect=0,0,0,0 
+Default IME                  pid=18468 vis=False rect=0,0,0,0 
+Default IME                  pid=16744 vis=False rect=0,0,0,0 
+Default IME                  pid=5396 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=6404 vis=False rect=0,0,0,0 
+Default IME                  pid=6404 vis=False rect=0,0,0,0 
+Default IME                  pid=24100 vis=False rect=0,0,0,0 
+Default IME                  pid=24524 vis=False rect=0,0,0,0 
+Default IME                  pid=24552 vis=False rect=0,0,0,0 
+Default IME                  pid=24244 vis=False rect=0,0,0,0 
+Default IME                  pid=3892 vis=False rect=0,0,0,0 
+Default IME                  pid=16592 vis=False rect=0,0,0,0 
+Default IME                  pid=13692 vis=False rect=0,0,0,0 
+Default IME                  pid=10692 vis=False rect=0,0,0,0 
+Default IME                  pid=3892 vis=False rect=0,0,0,0 
+Default IME                  pid=22888 vis=False rect=0,0,0,0 
+Default IME                  pid=21764 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=3892 vis=False rect=0,0,0,0 
+Default IME                  pid=16796 vis=False rect=0,0,0,0 
+Default IME                  pid=3892 vis=False rect=0,0,0,0 
+Default IME                  pid=20204 vis=False rect=0,0,0,0 
+Default IME                  pid=20204 vis=False rect=0,0,0,0 
+Default IME                  pid=20204 vis=False rect=0,0,0,0 
+Default IME                  pid=20552 vis=False rect=0,0,0,0 
+Default IME                  pid=20552 vis=False rect=0,0,0,0 
+Default IME                  pid=20552 vis=False rect=0,0,0,0 
+Default IME                  pid=5488 vis=False rect=0,0,0,0 
+Default IME                  pid=1956 vis=False rect=0,0,0,0 
+Default IME                  pid=10904 vis=False rect=0,0,0,0 
+Default IME                  pid=19700 vis=False rect=0,0,0,0 
+Default IME                  pid=20228 vis=False rect=0,0,0,0 
+Default IME                  pid=7116 vis=False rect=0,0,0,0 
+Default IME                  pid=18572 vis=False rect=0,0,0,0 
+Default IME                  pid=18572 vis=False rect=0,0,0,0 
+Default IME                  pid=15728 vis=False rect=0,0,0,0 
+Default IME                  pid=15728 vis=False rect=0,0,0,0 
+Default IME                  pid=12644 vis=False rect=0,0,0,0 
+Default IME                  pid=12644 vis=False rect=0,0,0,0 
+Default IME                  pid=12644 vis=False rect=0,0,0,0 
+Default IME                  pid=12644 vis=False rect=0,0,0,0 
+Default IME                  pid=12644 vis=False rect=0,0,0,0 
+Default IME                  pid=12352 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=15728 vis=False rect=0,0,0,0 
+Default IME                  pid=15728 vis=False rect=0,0,0,0 
+Default IME                  pid=7568 vis=False rect=0,0,0,0 
+Default IME                  pid=16728 vis=False rect=0,0,0,0 
+Default IME                  pid=11292 vis=False rect=0,0,0,0 
+Default IME                  pid=7568 vis=False rect=0,0,0,0 
+Default IME                  pid=15704 vis=False rect=0,0,0,0 
+Default IME                  pid=12436 vis=False rect=0,0,0,0 
+Default IME                  pid=12644 vis=False rect=0,0,0,0 
+Default IME                  pid=12644 vis=False rect=0,0,0,0 
+Default IME                  pid=12644 vis=False rect=0,0,0,0 
+Default IME                  pid=9168 vis=False rect=0,0,0,0 
+Default IME                  pid=12644 vis=False rect=0,0,0,0 
+Default IME                  pid=11044 vis=False rect=0,0,0,0 
+Default IME                  pid=12436 vis=False rect=0,0,0,0 
+Default IME                  pid=11292 vis=False rect=0,0,0,0 
+Default IME                  pid=7568 vis=False rect=0,0,0,0 
+Default IME                  pid=9872 vis=False rect=0,0,0,0 
+Default IME                  pid=9168 vis=False rect=0,0,0,0 
+Default IME                  pid=7832 vis=False rect=0,0,0,0 
+Default IME                  pid=7568 vis=False rect=0,0,0,0 
+MSCTFIME UI                  pid=12464 vis=False rect=0,0,0,0 
+Default IME                  pid=12464 vis=False rect=0,0,0,0 
+Default IME                  pid=33000 vis=False rect=0,0,0,0 
+Default IME                  pid=13884 vis=False rect=0,0,0,0 

@@ -80,8 +80,16 @@ class PrismSocket : Socket() {
             // Protect the socket so it bypasses the VPN tunnel to reach the physical network.
             // IMPORTANT: Never protect a local loopback connection (127.0.0.1), as it 
             // will cause the OS to refuse the connection (ECONNREFUSED).
-            if (!isLocal) {
-                PrivateDnsVpnService.protectSocket(this)
+            if (!isLocal && PrivateDnsVpnService.isServiceRunning()) {
+                if (!PrivateDnsVpnService.protectSocket(this)) {
+                    // Failing here does not mean the socket cannot connect; it means it will be
+                    // captured by the VPN and loop back to this app. Say so instead of failing
+                    // later with a timeout that looks like an unreachable peer.
+                    PrismLogger.logWarning(
+                        "PrismSocket",
+                        "Could not protect the mesh socket to $originalHost; it may loop through the VPN",
+                    )
+                }
             }
             
             // Use InetAddress directly to avoid re-resolving

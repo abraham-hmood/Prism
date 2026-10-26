@@ -22,7 +22,22 @@ object AetherConfig {
     fun datasetDir(): File = File(rootDir(), "dataset").also { it.mkdirs() }
     fun weightsDir(): File = File(rootDir(), "connectome").also { it.mkdirs() }
     fun outputDir(): File = File(rootDir(), "output").also { it.mkdirs() }
-    fun chatFile(): File = File(rootDir(), "conversation.json")
+    /**
+     * Aether's transcript, in app-private storage for the same reason as Nora's -- see
+     * `NoraConfig.chatFile`. The old Documents copy is migrated once when it exists.
+     */
+    fun chatFile(): File {
+        val target = File(File(PrismPlatform.host.dataDir(), "Aether"), "conversation.json")
+        val legacy = File(rootDir(), "conversation.json")
+        if (!target.exists() && legacy.isFile) {
+            runCatching {
+                target.parentFile?.mkdirs()
+                legacy.copyTo(target, overwrite = false)
+            }
+        }
+        target.parentFile?.mkdirs()
+        return target
+    }
 
     /**
      * Each geometry keeps its own weight file, so resizing parks the previous size's trained

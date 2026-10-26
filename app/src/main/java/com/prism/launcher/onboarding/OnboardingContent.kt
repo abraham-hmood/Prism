@@ -30,7 +30,15 @@ object OnboardingContent {
          * to hunt. Empty when the feature is the page itself.
          */
         val whereToFind: String = "",
-    )
+        /**
+         * Set for the two screens that are not just text: the page-picker introduction and the
+         * swipe capture. The overlay switches its whole body for these instead of rendering a
+         * paragraph, which is why it is a property of the step rather than a separate screen.
+         */
+        val special: Special = Special.NONE,
+    ) {
+        enum class Special { NONE, PAGE_PICKER, SWIPE_TRIGGER, WALLET_SETUP, MESSAGING_BRIDGES }
+    }
 
     data class Section(
         val name: String,
@@ -39,12 +47,67 @@ object OnboardingContent {
 
     val SECTIONS: List<Section> = listOf(
 
+        // ── First: the page picker, and the gesture that opens it ────────────
+        //
+        // THESE TWO SCREENS COME BEFORE THE WELCOME SECTION, because the page picker is the one
+        // thing a new user has to understand to reach anything else. The second screen is
+        // interactive and the tour will not let the user skip past it until they have defined a
+        // swipe -- see OnboardingOverlay's skip rule.
+        Section("Your pages", listOf(
+            Step(
+                "Everything is a page, and this is how you choose them",
+                "Prism's home screen is a row of pages. The page picker replaces the page you are " +
+                    "on with any other: browser, app grid, drawer, messaging, models, wallet, " +
+                    "editor, science, or a plugin page from an installed app.\n\n" +
+                    "You open it with a swipe. The built-in one is a hard vertical flick on a " +
+                    "page that cannot scroll any further, which is easy to miss -- so the next " +
+                    "screen lets you choose your own.\n\n" +
+                    "You can change it later in Settings > Other > Page picker swipe.",
+                "▦",
+                "A swipe on the home screen",
+                Step.Special.PAGE_PICKER,
+            ),
+            Step(
+                "Choose the swipe that opens it",
+                "Do your swipe three times. Prism records the direction and how far you travel, " +
+                    "then uses that gesture from now on.\n\n" +
+                    "The count restarts if the direction changes, so the three swipes have to " +
+                    "agree. Horizontal swipes are edge-only, because a horizontal swipe in the " +
+                    "middle of the screen already changes pages.",
+                "⇅",
+                "Settings > Other > Page picker swipe",
+                Step.Special.SWIPE_TRIGGER,
+            ),
+        )),
+
+        // ── Third: the wallet, which everything else is derived from ───────
+        //
+        // FORCED, like the two above it. Every encrypted mesh feature -- clipboard sharing
+        // between this user's devices, the identity a P2P site is published under, the cloud
+        // vault, the text relay -- takes its key from the recovery phrase. A user who skipped
+        // this would find that sharing silently does nothing, and the fix is buried in another
+        // page. Creating one here is the moment it is least surprising.
+        Section("Your wallet", listOf(
+            Step(
+                "Set up the wallet everything is encrypted with",
+                "Prism derives its mesh keys from your wallet's recovery phrase. Clipboard sharing " +
+                    "between your own devices is encrypted with it, and so is the identity a P2P " +
+                    "site is published under. Without a wallet those features have no key and " +
+                    "nothing can be shared.\n\n" +
+                    "Create a wallet below, or restore the one you already use on another device. " +
+                    "Devices can read each other's shares only when they hold the SAME phrase.",
+                "◈",
+                "Settings → Trusted devices, and the Wallet page",
+                Step.Special.WALLET_SETUP,
+            ),
+        )),
+
         // ── Getting oriented ────────────────────────────────────────────────
         Section("Welcome", listOf(
             Step(
                 "Prism is a launcher made of pages",
-                "Your home screen is a row of pages you choose. Swipe between them. Long-press an " +
-                    "empty spot on any page to swap it for a different one, or to add another.\n\n" +
+                "Your home screen is a row of pages you choose. Swipe between them, and open the " +
+                    "page picker with the gesture you chose to swap the current page or add another.\n\n" +
                     "Most of what follows is a page you can add. None of it is on by default, " +
                     "because a launcher that switched on twenty subsystems at first boot would be " +
                     "unusable and would flatten your battery.",
@@ -54,9 +117,10 @@ object OnboardingContent {
                 "The pages you can choose from",
                 "Browser · App grid · App drawer · Messaging · Kinetic Halo · File Explorer · " +
                     "Nebula Social · Virtualization · Models · Model Store · Agentic Tools · " +
-                    "Wallet · Editor · Science — plus any plugin page an installed app provides.",
+                    "Wallet · Editor · Science · Notifications · Meshvoice · Maps — plus any plugin " +
+                    "page an installed app provides.",
                 "▦",
-                "Long-press an empty area of a page",
+                "The page picker — see the first screen for your gesture",
             ),
             Step(
                 "Settings is grouped, and searchable",
@@ -416,6 +480,18 @@ object OnboardingContent {
                     "and a search bar built in.",
                 "⌨",
                 "Settings > Other > Prism Writer",
+            ),
+            Step(
+                "Connect WhatsApp, Messenger and Signal",
+                "None of the three allows another app to send as you, so Prism does the part a " +
+                    "launcher can honestly do: it puts them in Messages, opens them from here, and " +
+                    "adds their notifications to your message history.\n\n" +
+                    "Switch on the apps you use below. Notification access is a separate system " +
+                    "permission; without it the apps still open from Prism but their messages do " +
+                    "not appear in your history. This is also in Settings > Intelligence & Messaging.",
+                "✉",
+                "Settings > Intelligence & Messaging > Messaging apps",
+                Step.Special.MESSAGING_BRIDGES,
             ),
             Step(
                 "Messaging and contacts",

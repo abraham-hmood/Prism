@@ -1,0 +1,5 @@
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<map>
+    <boolean name="notifications_page_added_v1" value="true" />
+    <string name="page_assignments_v2">maps;desktop_grid;app_drawer;file_explorer;mouse</string>
+</map>

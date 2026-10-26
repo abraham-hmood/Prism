@@ -78,6 +78,7 @@ class KokoroSettingsActivity : PrismBaseActivity() {
 
         buildStatusSection()
         buildVoiceSection()
+        buildSharingSection()
         buildMeshSection()
         buildModelSection()
         refresh()
@@ -154,6 +155,58 @@ class KokoroSettingsActivity : PrismBaseActivity() {
                 this,
                 "Nora's and Aether's voices are set on their own screens, so each of them sounds " +
                     "like itself on a call.",
+            )
+        )
+        content.addView(spacer())
+    }
+
+    // -- Sharing -------------------------------------------------------------
+
+    /**
+     * The opt-out, on the phone as well as the desktop.
+     *
+     * Announcing used to be unconditional on Android: any phone with Kokoro and a mesh was in
+     * everybody's list, serving a port, with no way to stop it short of leaving the mesh. The
+     * preference existed but only the desktop wrote it. It is the same preference and the same
+     * switch semantics here, because a phone is a device people carry onto networks they do not
+     * own and "this machine is a speech server now" must be a choice.
+     */
+    private fun buildSharingSection() {
+        content.addView(IosUi.sectionHeader(this, "MESH SHARING"))
+        val card = IosUi.card(this)
+        val onMesh = PrismSettings.getMeshEnabled()
+        card.addView(
+            toggleRow(
+                "Share models with the mesh",
+                if (onMesh) {
+                    "Other Prism devices on this meshnet can use this phone's Kokoro and " +
+                        "voice-cloning models"
+                } else {
+                    "Join or serve a meshnet to change this"
+                },
+                PrismSettings.getMeshSpeechSharingEnabled(),
+                enabled = onMesh,
+            ) { checked ->
+                // Writes the preference first, then opens or closes the port and tells peers
+                // immediately -- waiting for the gossip timer would leave the port answering for
+                // up to a minute after the switch said it was off.
+                KokoroMeshShare.setSharingEnabled(checked)
+                Toast.makeText(
+                    this,
+                    if (checked) "Sharing speech models on the mesh"
+                    else "No longer sharing speech models",
+                    Toast.LENGTH_SHORT,
+                ).show()
+                refreshMeshSection()
+            }
+        )
+        content.addView(card)
+        content.addView(
+            IosUi.sectionFooter(
+                this,
+                "On by default. While it is on, this phone answers other devices on port " +
+                    "47812; turning it off closes that port immediately and withdraws this " +
+                    "machine from everyone's list.",
             )
         )
         content.addView(spacer())
@@ -297,7 +350,7 @@ class KokoroSettingsActivity : PrismBaseActivity() {
         val labels = options.map { "${it}×" }.toTypedArray()
         val current = options.indexOfFirst { kotlin.math.abs(it - PrismSettings.getKokoroSpeed()) < 0.01f }
 
-        androidx.appcompat.app.AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Speed")
             .setSingleChoiceItems(labels, current) { dialog, which ->
                 PrismSettings.setKokoroSpeed(options[which])
@@ -335,7 +388,7 @@ class KokoroSettingsActivity : PrismBaseActivity() {
         val labels = KokoroInstall.VARIANTS.map { KokoroInstall.variantLabel(it) }.toTypedArray()
         val current = KokoroInstall.VARIANTS.indexOf(PrismSettings.getKokoroVariant())
 
-        androidx.appcompat.app.AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Quality")
             .setSingleChoiceItems(labels, current) { dialog, which ->
                 PrismSettings.setKokoroVariant(KokoroInstall.VARIANTS[which])
@@ -352,7 +405,7 @@ class KokoroSettingsActivity : PrismBaseActivity() {
         if (downloading) return
 
         if (KokoroInstall.isModelInstalled()) {
-            androidx.appcompat.app.AlertDialog.Builder(this)
+            com.prism.launcher.theme.PrismDialogs.Builder(this)
                 .setTitle("Remove Kokoro?")
                 .setMessage(
                     "This frees ${KokoroInstall.installedBytes() shr 20} MB. Prism will fall " +
@@ -465,6 +518,7 @@ class KokoroSettingsActivity : PrismBaseActivity() {
         title: String,
         detail: String,
         initial: Boolean,
+        enabled: Boolean = true,
         onChange: (Boolean) -> Unit,
     ): View {
         val row = LinearLayout(this).apply {
@@ -473,6 +527,8 @@ class KokoroSettingsActivity : PrismBaseActivity() {
             val h = IosUi.dp(this@KokoroSettingsActivity, 16f)
             val v = IosUi.dp(this@KokoroSettingsActivity, 10f)
             setPadding(h, v, h, v)
+            isEnabled = enabled
+            alpha = if (enabled) 1f else 0.5f
         }
         val text = TextView(this).apply {
             textSize = 16f
@@ -482,11 +538,12 @@ class KokoroSettingsActivity : PrismBaseActivity() {
         setRowDetail(text, title, detail)
         val toggle = SwitchCompat(this).apply {
             isChecked = initial
+            isEnabled = enabled
             setOnCheckedChangeListener { _, checked -> onChange(checked) }
         }
         row.addView(text)
         row.addView(toggle)
-        row.setOnClickListener { toggle.isChecked = !toggle.isChecked }
+        if (enabled) row.setOnClickListener { toggle.isChecked = !toggle.isChecked }
         return row
     }
 

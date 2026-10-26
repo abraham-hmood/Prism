@@ -139,8 +139,29 @@ class CharacterConversationActivity : PrismBaseActivity() {
         setContentView(stack)
 
         onBackPressedDispatcher.addCallback(this, exitModelStage)
-        adapter.append(Line(greeting(), fromUser = false))
+        loadTranscript()
         primeBackend()
+    }
+
+    /**
+     * Restores this character's transcript, or inserts the greeting for a new one.
+     *
+     * The adapter used to be filled with the greeting on every open and nothing else was ever
+     * read back, so leaving the screen erased the conversation. The store is keyed by character
+     * id, so two characters on the same backend keep separate histories.
+     */
+    private fun loadTranscript() {
+        lifecycleScope.launch {
+            val stored = withContext(Dispatchers.IO) {
+                CharacterChatStore.load(character.id)
+            }
+            if (stored.isEmpty()) {
+                adapter.append(Line(greeting(), fromUser = false))
+            } else {
+                stored.forEach { adapter.append(Line(it.text, it.fromUser)) }
+            }
+            if (adapter.itemCount > 0) messages.scrollToPosition(adapter.itemCount - 1)
+        }
     }
 
     /**
@@ -270,6 +291,7 @@ class CharacterConversationActivity : PrismBaseActivity() {
         if (text.isEmpty()) return
         input.setText("")
         adapter.append(Line(text, fromUser = true))
+        persist(text, fromUser = true)
         messages.scrollToPosition(adapter.itemCount - 1)
 
         // The full roleplay framing, not just the description. See CharacterPrompt for why it is
@@ -305,7 +327,11 @@ class CharacterConversationActivity : PrismBaseActivity() {
                                     history = characterDialog.dropLast(1),
                                 ).first
                             } else {
-                                AiManager.getResponse(applicationContext, prompt).first
+                                AiManager.getResponse(
+                                    applicationContext,
+                                    prompt,
+                                    history = historyBeforeThisTurn,
+                                ).first
                             }
                         CharacterStore.Backend.NORA -> {
                             com.prism.launcher.nora.NoraService.sendChat(applicationContext, prompt)
@@ -321,7 +347,16 @@ class CharacterConversationActivity : PrismBaseActivity() {
                 }.getOrElse { "Something went wrong: ${it.message}" }
             }
             adapter.append(Line(reply, fromUser = false))
+            persist(reply, fromUser = false)
             messages.scrollToPosition(adapter.itemCount - 1)
+        }
+    }
+
+    /** Writes one line outside the UI thread; a transcript must survive leaving the screen. */
+    private fun persist(text: String, fromUser: Boolean) {
+        val id = character.id
+        lifecycleScope.launch(Dispatchers.IO) {
+            CharacterChatStore.append(id, CharacterChatStore.Line(text, fromUser = fromUser))
         }
     }
 

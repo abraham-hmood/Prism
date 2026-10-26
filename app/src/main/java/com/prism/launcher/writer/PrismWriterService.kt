@@ -92,10 +92,30 @@ class PrismWriterService : InputMethodService() {
     private var tts: TextToSpeech? = null
     private var speechRecognizer: SpeechRecognizer? = null
 
+    /**
+     * Live theme reload.
+     *
+     * A keyboard is a window that stays up while the user types, so a theme applied from the
+     * launcher behind it has to reach it without the IME being restarted. The observer repaints the
+     * key surface and the panels; the registration is dropped in [onDestroy] because this service
+     * outlives many input sessions and a leaked listener would keep the whole view tree alive.
+     */
+    private var themeWatcher: (() -> Unit)? = null
+
     override fun onCreate() {
         super.onCreate()
         WriterDictionary.restoreUserWords(PrismSettings.getWriterLearnedWords())
         tts = TextToSpeech(this) { }
+        themeWatcher = com.prism.launcher.theme.PrismThemes.observe {
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                val root = container ?: return@post
+                com.prism.launcher.theme.ThemeSkin.apply(root)
+                refreshLayout()
+                searchBar.applyTheme(resolveDark())
+                if (emojiPanel.visibility == View.VISIBLE) emojiPanel.applyTheme(resolveDark())
+                if (gifPanel.visibility == View.VISIBLE) gifPanel.applyTheme(resolveDark())
+            }
+        }
     }
 
     override fun onCreateInputView(): View {
@@ -175,6 +195,10 @@ class PrismWriterService : InputMethodService() {
             )
         }
         container = root
+        // The non-canvas parts of the keyboard -- the search bar, the suggestion strip, the emoji
+        // and GIF panels -- are ordinary views, so the same walk every screen gets reaches them.
+        // The key surface paints its own pixels and reads the palette in applyTheme instead.
+        com.prism.launcher.theme.ThemeSkin.apply(root)
         refreshLayout()
         return root
     }
@@ -189,6 +213,8 @@ class PrismWriterService : InputMethodService() {
     }
 
     override fun onDestroy() {
+        themeWatcher?.invoke()
+        themeWatcher = null
         PrismSettings.setWriterLearnedWords(WriterDictionary.userWordList())
         runCatching { tts?.shutdown() }
         runCatching { speechRecognizer?.destroy() }
@@ -512,20 +538,33 @@ class PrismWriterService : InputMethodService() {
         Thread({
             val uri = runCatching { cacheGif(gif.url) }.getOrNull()
             android.os.Handler(android.os.Looper.getMainLooper()).post {
-                if (uri == null) {
-                    ic.commitText(gif.url, 1)
-                    toast("Could not fetch that GIF — pasted the link instead")
+                // THE CONNECTION IS RE-READ HERE, not used from before the download. A GIF takes
+                // seconds to fetch; by then the user may have switched fields or apps, and the
+                // captured connection is then stale -- commitContent against it throws inside
+                // RemoteInputConnection and the GIF silently never appears. If there is no live
+                // connection any more, the link is the only thing worth leaving behind.
+                val live = currentInputConnection
+                val liveInfo = currentInputEditorInfo
+                if (uri == null || live == null || liveInfo == null) {
+                    live?.commitText(gif.url, 1)
+                    toast("Could not insert that GIF — pasted the link instead")
                 } else {
                     val description = android.content.ClipDescription("GIF", arrayOf("image/gif"))
                     val info = androidx.core.view.inputmethod.InputContentInfoCompat(
                         uri, description, null
                     )
-                    androidx.core.view.inputmethod.InputConnectionCompat.commitContent(
-                        ic, editor!!, info,
-                        androidx.core.view.inputmethod.InputConnectionCompat
-                            .INPUT_CONTENT_GRANT_READ_URI_PERMISSION,
-                        null,
-                    )
+                    val committed = runCatching {
+                        androidx.core.view.inputmethod.InputConnectionCompat.commitContent(
+                            live, liveInfo, info,
+                            androidx.core.view.inputmethod.InputConnectionCompat
+                                .INPUT_CONTENT_GRANT_READ_URI_PERMISSION,
+                            null,
+                        )
+                    }.getOrDefault(false)
+                    if (!committed) {
+                        live.commitText(gif.url, 1)
+                        toast("This field refused the image — pasted the link instead")
+                    }
                 }
                 showPanel(Panel.NONE)
             }

@@ -197,14 +197,27 @@ class PrismKeyboardView(context: Context) : View(context) {
     fun applyTheme(isDark: Boolean) {
         dark = isDark
 
+        // THE SELECTED THEME IS THE BASE, and the Writer's own overrides sit on top of it.
+        //
+        // The keyboard used to fall back to four hard-coded greys, so a custom theme reached every
+        // screen except the one the user types on. Reading the palette here makes the Writer part
+        // of the theme without a second theming system: an explicit Writer colour still wins,
+        // because someone who picked one meant it, and "unset" now means "follow Prism" rather
+        // than "follow nothing".
+        val palette = com.prism.launcher.theme.PrismThemes.modeFor(isDark).palette
+        val themePanel = palette.card.toInt()
+        val themeKey = palette.raised.toInt()
+        val themeText = palette.text.toInt()
+        val themeAccent = palette.accent.toInt()
+
         val panel = PrismSettings.getWriterPanelColor()
-            .takeIf { it != 0 } ?: if (isDark) DARK_PANEL else LIGHT_PANEL
+            .takeIf { it != 0 } ?: themePanel
         val key = PrismSettings.getWriterKeyColor()
-            .takeIf { it != 0 } ?: if (isDark) DARK_KEY else LIGHT_KEY
+            .takeIf { it != 0 } ?: themeKey.let { if (it == panel) palette.surface.toInt() else it }
         val text = PrismSettings.getWriterKeyTextColor()
-            .takeIf { it != 0 } ?: if (isDark) Color.WHITE else Color.BLACK
+            .takeIf { it != 0 } ?: themeText
         val accent = PrismSettings.getWriterAccentColor()
-            .takeIf { it != 0 } ?: if (isDark) DARK_ACTION else LIGHT_ACTION
+            .takeIf { it != 0 } ?: themeAccent
 
         panelFill.color = panel
         keyFill.color = key
@@ -219,11 +232,27 @@ class PrismKeyboardView(context: Context) : View(context) {
         keyShadow.color = Color.argb(if (isDark) 90 else 45, 0, 0, 0)
         keyShadow.maskFilter = BlurMaskFilter(dp(3f), BlurMaskFilter.Blur.NORMAL)
 
-        hairline.color = if (isDark) 0x22FFFFFF else 0x22000000
+        hairline.color = palette.divider.toInt()
+
+        // The shape definition is the theme's too: a square theme gets square keys, a pill theme
+        // gets pill keys. Derived from the card radius so the keyboard never contradicts the rest
+        // of the interface it sits in.
+        keyCornerRadius = com.prism.launcher.nora.IosUi.dp(
+            context,
+            com.prism.launcher.theme.PrismThemes.modeFor(isDark).shape.card.toFloat(),
+        ).toFloat()
 
         loadBackground()
         invalidate()
     }
+
+    /**
+     * Corner radius of a key, in pixels, resolved from the active theme.
+     *
+     * Negative until [applyTheme] has run, because zero is a meaningful radius (a square theme) and
+     * using it as the "not resolved yet" value would turn every square theme into a rounded one.
+     */
+    private var keyCornerRadius: Float = -1f
 
     /**
      * Loads the user's background picture, downsampled to the view.
@@ -304,8 +333,10 @@ class PrismKeyboardView(context: Context) : View(context) {
         canvas.drawRect(0f, popupHeadroom, width.toFloat(), popupHeadroom + dp(0.5f), hairline)
 
         // iOS key corners are small relative to the key: ~5dp on a ~42dp key. A larger radius is
-        // what makes a keyboard look like a row of pills instead of keys.
-        val radius = dp(5f)
+        // what makes a keyboard look like a row of pills instead of keys. The active theme's corner
+        // radius replaces it when that is larger, which is what lets a square theme look square here
+        // and not only everywhere else.
+        val radius = if (keyCornerRadius >= 0f) keyCornerRadius else dp(5f)
         val letterSize = height * 0.148f
 
         for (key in layout.keys) {

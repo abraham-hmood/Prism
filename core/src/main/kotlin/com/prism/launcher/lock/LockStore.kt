@@ -65,7 +65,9 @@ object LockStore {
     /** What [verify] found. */
     enum class Outcome { NORMAL, DURESS, WRONG }
 
-    private fun file() = File(PrismPlatform.host.dataDir(), FILE).apply { parentFile?.mkdirs() }
+    // noBackupDir, NOT dataDir: a lock credential restored onto a second device is a lock
+    // credential somebody else can attack offline, and Android's Auto Backup would happily copy it.
+    private fun file() = File(PrismPlatform.host.noBackupDir(), FILE).apply { parentFile?.mkdirs() }
 
     // ── State ──────────────────────────────────────────────────────────────
 
@@ -93,22 +95,43 @@ object LockStore {
     /**
      * Writes the primary credential, replacing any existing configuration.
      *
-     * Generates a fresh salt each time. Reusing a salt across a credential change would let anyone
-     * holding both files tell that the new credential is or is not the old one.
+     * ## Why the duress code survives this
+     *
+     * A duress hash is salted with the primary credential's salt, so generating a new salt used to
+     * silently delete it. Re-running setup to change a PIN therefore removed the safety feature the
+     * user had deliberately configured -- and did so without telling them. The salt is kept when
+     * the mechanism is unchanged and a duress code exists, which lets the old hash keep verifying.
+     *
+     * A fresh salt is still generated when there is no duress code to preserve, and when the
+     * mechanism changes (a PIN's duress code cannot mean anything once the lock expects a pattern).
+     *
+     * @return null on success, or a message explaining why the credential was refused.
      */
-    fun configure(mechanism: Mechanism, secret: String) {
-        val salt = newSalt()
-        val json = read() ?: JSONObject()
+    fun configure(mechanism: Mechanism, secret: String, keepDuress: Boolean = true): String? {
+        val existing = read()
+        val sameMechanism = existing?.optString("mechanism") == mechanism.name
+        val preservingDuress = keepDuress && sameMechanism &&
+            existing?.optString("duress_hash").orEmpty().isNotBlank()
+
+        val salt = if (preservingDuress) existing?.optString("salt").orEmpty() else newSalt()
+        if (salt.isBlank()) return "The existing lock configuration is unreadable"
+
+        if (preservingDuress && hash(secret, salt) == existing?.optString("duress_hash")) {
+            return "Your normal credential has to be different from the emergency code"
+        }
+
+        val json = existing ?: JSONObject()
         json.put("mechanism", mechanism.name)
         json.put("salt", salt)
         json.put("hash", hash(secret, salt))
         json.put("enabled", true)
         json.put("length", secret.length)
-        // A duress code set against the old credential's salt would no longer verify, and a stale
-        // one that silently stopped working is worse than none.
-        json.put("duress_hash", "")
+        // Only clear it when it could no longer verify. Otherwise changing the PIN would quietly
+        // disable duress, which is the bug this branch exists to fix.
+        if (!preservingDuress) json.put("duress_hash", "")
         write(json)
         PrismPlatform.log.info(TAG, "Lock configured: ${mechanism.name}")
+        return null
     }
 
     /** How long the primary credential is. Used only to decide when a PIN pad may auto-submit. */
@@ -181,6 +204,17 @@ object LockStore {
 
     private fun read(): JSONObject? = runCatching {
         val source = file()
+        if (!source.isFile) {
+            // One-time move from the pre-noBackupDir location. Reading the old file and writing
+            // the new one is safer than rename(): the two directories can be on different mounts.
+            val legacy = File(PrismPlatform.host.dataDir(), FILE)
+            if (legacy.isFile) {
+                runCatching {
+                    source.writeText(legacy.readText())
+                    legacy.delete()
+                }
+            }
+        }
         if (!source.isFile) return null
         JSONObject(source.readText())
     }.getOrNull()

@@ -20,7 +20,12 @@ import java.util.concurrent.ConcurrentHashMap
  */
 class DnsOverrideService(private val context: Context) {
     
-    private val scope = CoroutineScope(
+    // Recreated by startDnsServer after a stop. A cancelled scope does not run anything launched
+    // into it, so keeping one field meant the DNS server could be started exactly once per process
+    // and silently did nothing on every later start.
+    private var scope = newScope()
+
+    private fun newScope() = CoroutineScope(
         Dispatchers.IO + SupervisorJob() +
             com.prism.launcher.PrismLogger.coroutineHandler("DnsOverride")
     )
@@ -53,6 +58,10 @@ class DnsOverrideService(private val context: Context) {
      */
     suspend fun startDnsServer(gatewayIp: String): Result<String> = withContext(Dispatchers.IO) {
         try {
+            if (dnsServerSocket?.isClosed == false) {
+                return@withContext Result.success("DNS server already running on port ${DnsOverrideService.boundPort}")
+            }
+            scope = newScope()
             dnsServerSocket = tryBindDnsSocket()
             val port = dnsServerSocket!!.localPort
             boundPort = port
@@ -82,10 +91,16 @@ class DnsOverrideService(private val context: Context) {
                 val packet = DatagramPacket(buffer, buffer.size)
                 dnsServerSocket?.receive(packet)
 
-                // Process DNS query in background
-                scope.launch {
-                    handleDnsQuery(packet)
-                }
+                // COPIED BEFORE THE HAND-OFF. `buffer` is reused by the next receive, so a handler
+                // that ran a millisecond later read whatever query arrived next -- answering one
+                // client with another client's transaction id and domain.
+                val copy = DatagramPacket(
+                    packet.data.copyOfRange(0, packet.length),
+                    packet.length,
+                    packet.address,
+                    packet.port,
+                )
+                scope.launch { handleDnsQuery(copy) }
             } catch (e: Exception) {
                 if (isActive) {
                     PrismLogger.logError(TAG, "Error receiving DNS packet", e)

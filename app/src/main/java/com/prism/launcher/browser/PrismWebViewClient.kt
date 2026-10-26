@@ -25,14 +25,26 @@ class PrismWebViewClient(
 ) : WebViewClient() {
 
     private val hostHealthMap = mutableMapOf<String, Long>() // host -> last_failure_timestamp
+
+    private companion object {
+        val PRIVATE_HEADERS = mapOf("DNT" to "1", "Sec-GPC" to "1")
+    }
     private val HEALTH_TRACK_MS = 30000L // 30 seconds
 
     // NOTE: History recording must explicitly check 'isPrivateTab' to ensure
     // private browsing URLs are NEVER logged to a persistent database.
 
     override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-        view.loadUrl(request.url.toString())
+        // loadUrl WITH the privacy headers. The old call reloaded with no headers, so every
+        // in-page navigation from a private tab dropped DNT and Sec-GPC -- only the first URL in
+        // the tab ever carried them.
+        loadWithPrivacy(view, request.url.toString())
         return true
+    }
+
+    /** Loads a URL with the tab's privacy headers, or plainly for a normal tab. */
+    private fun loadWithPrivacy(view: WebView, url: String) {
+        if (isPrivateTab) view.loadUrl(url, PRIVATE_HEADERS) else view.loadUrl(url)
     }
 
     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
@@ -135,9 +147,26 @@ class PrismWebViewClient(
             )
         }
 
-        // 2. Ad-blocking (Private Mode ONLY)
-        if (isPrivateTab && blocklist.shouldBlockHost(host)) {
-            return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+        // 2. Ad-blocking, for EVERY tab.
+        //
+        // This used to read `isPrivateTab && ...`, which meant a normal tab ignored the blocklist
+        // entirely. The setting is a blocklist, not a private-mode feature.
+        if (blocklist.shouldBlockHost(host)) {
+            // 403 with a body rather than a synthetic 200. A 200 tells the page it succeeded and
+            // hands it an empty document; scripts cannot tell the difference between "blocked"
+            // and "the server returned nothing", and neither can a person looking at the screen.
+            val body = "<html><body style=\"font-family:sans-serif;padding:32px;color:#ccc;" +
+                "background:#111\"><h2>Blocked by Prism</h2><p>$host is on your blocklist.</p>" +
+                "<p style=\"color:#888;font-size:0.9em\">Change it in Settings &gt; Browser &amp; " +
+                "Content &gt; Blocklist.</p></body></html>"
+            return WebResourceResponse(
+                "text/html",
+                "utf-8",
+                403,
+                "Blocked",
+                mapOf("Content-Type" to "text/html; charset=utf-8"),
+                ByteArrayInputStream(body.toByteArray()),
+            )
         }
 
         return super.shouldInterceptRequest(view, request)
@@ -233,7 +262,7 @@ class PrismWebViewClient(
         if (host.endsWith(".p2p", ignoreCase = true)) return
         if (!PrismWebCache.hasCopyOf(url.toString())) return
 
-        view.loadUrl("http://$host${PrismWebCache.MESH_SUFFIX}${url.path.orEmpty()}")
+        loadWithPrivacy(view, "http://$host${PrismWebCache.MESH_SUFFIX}${url.path.orEmpty()}")
     }
 
     private fun handleSubResourceFallback(context: android.content.Context?, url: android.net.Uri): WebResourceResponse {

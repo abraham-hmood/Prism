@@ -55,6 +55,9 @@ class P2pHostingActivity : PrismBaseActivity() {
                 
                 if (!active) {
                     P2pDnsManager.deleteRecord(this, site.domain)
+                    // The host keeps an in-memory file map per domain. Without this, an
+                    // unpublished site stayed readable until the process restarted.
+                    PrismWebHost.clearCache(site.domain)
                 } else {
                     val myIp = MeshUtils.getLocalMeshIp()
                     P2pDnsManager.updateRecord(this, site.domain, myIp)
@@ -66,6 +69,7 @@ class P2pHostingActivity : PrismBaseActivity() {
                     sites.removeAll { it.id == site.id }
                     PrismSettings.setP2pHostedSites(sites)
                     P2pDnsManager.deleteRecord(this, site.domain)
+                    PrismWebHost.clearCache(site.domain)
                     refresh()
                 })
             },

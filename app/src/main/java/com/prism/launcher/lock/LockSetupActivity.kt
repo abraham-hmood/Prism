@@ -37,6 +37,11 @@ class LockSetupActivity : PrismBaseActivity() {
 
     private var mechanism: LockStore.Mechanism? = null
     private var firstEntry: String? = null
+    private var biometricEnabled: Boolean = PrismSettings.getLockBiometric()
+
+    /** True when this screen was opened specifically to change the emergency code. */
+    private val editingDuress: Boolean
+        get() = intent.getStringExtra(EXTRA_STEP) == STEP_DURESS
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -50,7 +55,12 @@ class LockSetupActivity : PrismBaseActivity() {
         root.addView(content)
         setContentView(root)
 
-        stepChooseMechanism()
+        if (editingDuress && LockStore.isConfigured()) {
+            mechanism = LockStore.mechanism()
+            stepEnterCredential(duress = true)
+        } else {
+            stepChooseMechanism()
+        }
     }
 
     // ── Step 1: how ────────────────────────────────────────────────────────
@@ -83,12 +93,58 @@ class LockSetupActivity : PrismBaseActivity() {
         }
 
         if (LockGate.biometricAvailable(this)) {
+            val toggle = android.widget.Switch(this).apply {
+                text = "Offer fingerprint unlock"
+                isChecked = PrismSettings.getLockBiometric()
+                setTextColor(IosUi.label(this@LockSetupActivity))
+                setPadding(0, IosUi.dp(this@LockSetupActivity, 14f), 0, 0)
+                setOnCheckedChangeListener { _, checked -> biometricEnabled = checked }
+            }
+            content.addView(toggle)
             body(
-                "\nThis device has a fingerprint sensor, so unlocking with it will be offered too. " +
-                    "Note that a fingerprint cannot trigger the emergency code — it is one identity, " +
-                    "and the emergency code depends on there being a second secret only you know."
+                "A fingerprint cannot trigger the emergency code — it is one identity, and the " +
+                    "emergency code depends on there being a second secret only you know."
+            )
+        } else {
+            biometricEnabled = false
+        }
+
+        if (LockStore.isConfigured()) {
+            content.addView(
+                IosUi.tintedButton(this, "Turn off the lock screen").apply {
+                    setOnClickListener { confirmRemoveLock() }
+                },
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = IosUi.dp(this@LockSetupActivity, 24f) }
             )
         }
+    }
+
+    /**
+     * Removing the lock has to be deliberate and it has to clear both halves.
+     *
+     * `LockStore.clear()` alone leaves `PrismSettings.getLockScreenEnabled()` true, so the next
+     * screen-on asks a configured lock that no longer exists to unlock. Clearing both is what makes
+     * "off" actually off.
+     */
+    private fun confirmRemoveLock() {
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
+            .setTitle("Turn off the lock screen?")
+            .setMessage(
+                "Prism will stop asking for a PIN, pattern or password. Your emergency code is " +
+                    "removed with it, and Android's own lock is not affected either way."
+            )
+            .setPositiveButton("Turn off") { _, _ ->
+                LockStore.clear()
+                PrismSettings.setLockScreenEnabled(false)
+                LockGate.reset()
+                DuressResponder.standDown(this)
+                toast("Lock screen off")
+                finish()
+            }
+            .setNegativeButton("Keep it", null)
+            .show()
     }
 
     // ── Step 2 and 3: what ─────────────────────────────────────────────────
@@ -125,6 +181,20 @@ class LockSetupActivity : PrismBaseActivity() {
                     LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
                 ).apply { topMargin = IosUi.dp(this@LockSetupActivity, 12f) }
             )
+            if (LockStore.hasDuress()) {
+                content.addView(
+                    IosUi.tintedButton(this, "Remove the existing emergency code").apply {
+                        setOnClickListener {
+                            LockStore.clearDuress()
+                            toast("Emergency code removed")
+                            finish()
+                        }
+                    },
+                    LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+                    ).apply { topMargin = IosUi.dp(this@LockSetupActivity, 8f) }
+                )
+            }
         }
     }
 
@@ -226,13 +296,20 @@ class LockSetupActivity : PrismBaseActivity() {
             }
             finishSetup()
         } else {
-            LockStore.configure(mechanism!!, value)
+            val error = LockStore.configure(mechanism!!, value)
+            if (error != null) {
+                toast(error)
+                firstEntry = null
+                stepEnterCredential(duress = false)
+                return
+            }
             stepEnterCredential(duress = true)
         }
     }
 
     private fun finishSetup() {
         PrismSettings.setLockScreenEnabled(true)
+        PrismSettings.setLockBiometric(biometricEnabled && LockGate.biometricAvailable(this))
         LockGate.install(this)
         toast(
             if (LockStore.hasDuress()) "Lock screen on, with an emergency code set"
@@ -267,5 +344,8 @@ class LockSetupActivity : PrismBaseActivity() {
         const val MIN_PIN = 4
         const val MIN_PASSWORD = 6
         const val MIN_PATTERN_DOTS = 4
+
+        const val EXTRA_STEP = "step"
+        const val STEP_DURESS = "duress"
     }
 }

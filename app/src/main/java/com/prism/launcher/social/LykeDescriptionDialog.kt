@@ -87,7 +87,7 @@ object LykeDescriptionDialog {
 
         val buttons = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
 
-        val dialog = androidx.appcompat.app.AlertDialog.Builder(context)
+        val dialog = com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setView(card)
             .create()
 

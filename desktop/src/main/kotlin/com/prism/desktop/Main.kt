@@ -146,6 +146,45 @@ fun main(args: Array<String>) {
         main = AwtMainThread,
     )
 
+    // ONE COPY PER MACHINE, checked before any listener is opened. A second copy cannot bind the
+    // mesh, search, debug-bridge, PRISM_CONNECT, display or speech ports, and its mesh socket joins
+    // UDP 8081 without receiving anything -- so it came up looking half-broken rather than saying
+    // it should not have started. See DesktopInstance.
+    //
+    // ONLY THE WINDOWED RUN IS GUARDED. `prism trust`, `prism diagnose` and the rest are console
+    // commands that exit when they are done; blocking them while the window is open would break
+    // exactly the tool a user reaches for when the window is not behaving.
+    val guiRun = (args.firstOrNull()?.lowercase() ?: "gui") == "gui"
+    if (guiRun && !DesktopInstance.claim()) {
+        System.err.println(
+            "Prism is already running on this computer. Close the other window first; two copies " +
+                "cannot share the mesh, the debug bridge or the display ports.",
+        )
+        if (!java.awt.GraphicsEnvironment.isHeadless()) {
+            runCatching {
+                javax.swing.JOptionPane.showMessageDialog(
+                    null,
+                    "Prism is already running on this computer.\n\nClose the other Prism window " +
+                        "first. Two copies cannot share the mesh, the debug bridge or the display " +
+                        "ports, so the second one would look connected and reach nothing.",
+                    "Prism is already running",
+                    javax.swing.JOptionPane.INFORMATION_MESSAGE,
+                )
+            }
+        }
+        return
+    }
+
+    // THEMES. Same store and same JSON files as the phone build, rooted in this machine's data
+    // directory. Installed before any UI reads a palette, and before a theme can be applied.
+    com.prism.launcher.theme.PrismThemes.install(
+        java.io.File(com.prism.core.PrismPlatform.host.dataDir(), "themes")
+    )
+    // AND THE DESKTOP INTERPRETATION OF THE BUILT-INS. xOS is Prism's macOS look, and on a
+    // desktop it has to actually BE that look rather than the phone's iOS-derived approximation.
+    // The phone never calls this, so its xOS is unchanged.
+    com.prism.launcher.theme.PrismThemes.installDesktopLook()
+
     // The voice underneath Kokoro (PHASE 100). A factory, and one that is allowed to return null: a
     // minimal Linux install has no system speech engine at all, and claiming otherwise would make a
     // machine that cannot speak until Kokoro downloads look like a machine whose voice is broken.
@@ -224,6 +263,13 @@ fun main(args: Array<String>) {
     NoraTuning.load()
     NoraPerformance.load()
 
+    // Same reason as Nora's: without this the Aether page and its trainer always used the
+    // DEFAULT geometry and the default weight-file name, so a connectome resized or trained
+    // elsewhere was reported as untrained and a fresh one was started in its place.
+    com.prism.launcher.aether.AetherConfig.load()
+    com.prism.launcher.aether.AetherTuning.load()
+    com.prism.launcher.aether.AetherPerformance.load()
+
     // Image generation engines, in preference order -- see ImageGeneration.preferred(). Cloud first
     // because a request for a picture usually means a photograph; Nora second because it is the only
     // one that works with no key, no network and no download; the diffusion route last, registered
@@ -257,26 +303,67 @@ fun main(args: Array<String>) {
     }
     com.prism.launcher.trusted.TrustedDevices.registerWithMesh()
 
+    // THE PRISM DEBUG BRIDGE. The listener starts with the app so a target is reachable before
+    // its user opens the device list. Its phrase window is a fullscreen companion window, like the
+    // wireless-display code, because the words have to be readable from wherever the other device
+    // is and cannot be missed behind a page.
+    com.prism.launcher.pdb.Pdb.workDir = {
+        java.io.File(System.getProperty("user.home") ?: ".")
+    }
+    com.prism.launcher.pdb.Pdb.host = com.prism.desktop.DesktopPdbHost()
+    com.prism.launcher.pdb.Pdb.onPrompt = { prompt ->
+        javax.swing.SwingUtilities.invokeLater { PdbUi.prompt = prompt }
+    }
+    com.prism.launcher.pdb.Pdb.onPromptClosed = { id ->
+        javax.swing.SwingUtilities.invokeLater {
+            if (PdbUi.prompt?.id == id) PdbUi.prompt = null
+        }
+    }
+    com.prism.launcher.pdb.Pdb.install()
+
+    // Make every verified bridge visible to an ordinary `adb devices` from app start, not only
+    // after somebody opens the Prism Debug Bridge dialog. The supervisor reconnects after an
+    // adb server restart, a laptop wake, or a phone changing mesh address.
+    com.prism.desktop.AdbBridge.supervise()
+
+    // THE CLIPBOARD, both directions, and the history both sides read from. Installed before
+    // TrustedSharing so the consumer it registers has a store to write into when a share arrives
+    // in the first moments after start.
+    com.prism.launcher.clipboard.ClipboardHistory.install(
+        java.io.File(com.prism.core.PrismPlatform.host.dataDir(), "clipboard")
+    )
+    com.prism.launcher.clipboard.TrustedFileTransfer.install(
+        java.io.File(com.prism.core.PrismPlatform.host.dataDir(), "clipboard-cache")
+    )
+
     // Browser history, both directions. Portable, so it is wired in :core rather than here.
     com.prism.launcher.trusted.TrustedSharing.install()
 
     // The clipboard consumer. AWT gives the SYSTEM clipboard, so a copy on the phone lands where any other
-    // application on this machine can paste it.
+    // application on this machine can paste it. The history receives the entry in :core; this only puts the
+    // text where the rest of the desktop can use it, and marks it so the watcher does not send it straight
+    // back to the device it came from.
     com.prism.launcher.trusted.TrustedDevices.consume(
         com.prism.launcher.trusted.TrustedDevices.Kind.CLIPBOARD
     ) { received ->
-        val text = received.body.optString("text")
+        val entry = received.body.optJSONObject("entry")
+        val text = entry?.optString("text") ?: received.body.optString("text")
         if (text.isNotEmpty()) {
             runCatching {
                 java.awt.Toolkit.getDefaultToolkit().systemClipboard.setContents(
                     java.awt.datatransfer.StringSelection(text), null,
                 )
+                com.prism.desktop.DesktopClipboard.markWritten(text)
                 com.prism.core.PrismPlatform.log.info(
                     "PrismTrust", "Clipboard received from " + received.fromName,
                 )
             }
         }
     }
+
+    // Watches this machine's clipboard so a copy made anywhere becomes a history entry and reaches
+    // paired devices. Reads files as well as text: a copy in the OS file manager is the same act.
+    com.prism.desktop.DesktopClipboard.install()
 
     // The catalogue of apps a phone is offering. A PC cannot RUN one yet -- that is PHASE 111 -- but it
     // can list them and fetch one, which is what was asked for: the download is the whole feature here
@@ -308,6 +395,15 @@ fun main(args: Array<String>) {
     com.prism.core.MeshTls.install(
         java.io.File(com.prism.core.PrismPlatform.host.dataDir(), "tls")
     )
+
+    // THE .P2P REGISTRY (PHASE 49). Installed before anything publishes a name, because the search
+    // and mirror hosts announce during their own install, and attached to the mesh here so the
+    // DNS-sync packets have a consumer from the moment the socket opens. It persists to the data
+    // directory, so a name registered before a restart is still known afterwards.
+    com.prism.core.MeshDns.install(
+        java.io.File(com.prism.core.PrismPlatform.host.dataDir(), "mesh")
+    )
+    com.prism.core.MeshDns.registerWithMesh()
 
     // Folders served as websites (PHASE 52), and this device's model offered to peers (PHASE 53).
     com.prism.launcher.browser.MeshMirror.install(
@@ -361,8 +457,95 @@ fun main(args: Array<String>) {
             null
         }
     }
+    // THE MESH SETTINGS BELONG TO THE SOCKET, not only to the page that displays them. These were
+    // left at their defaults, so a configured port was ignored and the bootstrap/fleet addresses
+    // were never seeded -- the Mesh page showed values that nothing read.
+    com.prism.core.MeshCore.portProvider = {
+        com.prism.launcher.PrismSettings.getMeshBootstrapPort().toIntOrNull()
+            ?.takeIf { it in 1024..65535 }
+            ?: com.prism.core.MeshCore.DEFAULT_PORT
+    }
+    com.prism.core.MeshCore.bootstrapNodes = {
+        val port = com.prism.launcher.PrismSettings.getMeshBootstrapPort()
+        com.prism.launcher.PrismSettings.getAllMeshNodes()
+            .filter { it.isNotBlank() }
+            .map { node -> if (node.contains(':')) node else "$node:$port" }
+    }
     com.prism.core.MeshCore.start()
     com.prism.core.MeshConnect.startServer()
+
+    // RE-ANNOUNCE THE LOCAL NAMES. The registry announces as each name is added, and the search and
+    // mirror hosts add theirs during install -- which happens above, before the socket exists. Those
+    // announcements went nowhere. Announcing again once the listener is up is what actually puts
+    // prism.com and any hosted .p2p site on the mesh.
+    runCatching {
+        com.prism.core.MeshDns.localRecords().forEach { record ->
+            com.prism.core.MeshDns.announce(record.domain)
+        }
+    }.onFailure {
+        com.prism.core.PrismPlatform.log.warn("Mesh", "Could not re-announce local DNS names: " + it.message)
+    }
+
+    // MESH CALLS, MESHVOICE AND THE MAP. Installed after the socket exists, because the call
+    // engine sends on it immediately and the location opcodes are dispatched from the same
+    // listener. The audio device is this platform's own -- 16 kHz mono through javax.sound, the
+    // same frames the phone produces -- and a machine with no microphone still receives audio and
+    // says so on the call page.
+    // ONE FAILURE MUST NOT TAKE THE OTHERS DOWN. These used to share a single runCatching, so a
+    // machine with no usable audio device aborted before DesktopDisplay.install() and wireless
+    // displays were never listening at all -- phone requests then looked like nothing happened on
+    // the desktop. Each subsystem now gets its own failure boundary and its own log line.
+    // SEPARATE BOUNDARIES, because these fail for unrelated reasons. A machine with no usable
+    // microphone used to throw while constructing the audio engine, and the listener installation on
+    // the next line was skipped with it -- so the desktop received calls into an engine nobody was
+    // watching and the caller heard ringing forever. The wire registration and the window listener
+    // are what make a call ARRIVE, and neither needs an audio device to succeed.
+    runCatching {
+        com.prism.launcher.calls.MeshCalls.install()
+    }.onFailure {
+        com.prism.core.PrismPlatform.log.warn("PrismCalls", "Call opcodes did not register: " + it.message)
+    }
+    runCatching {
+        com.prism.launcher.calls.MeshCalls.audio = com.prism.desktop.DesktopCallAudio()
+    }.onFailure {
+        com.prism.core.PrismPlatform.log.warn("PrismCalls", "No call audio device: " + it.message)
+    }
+    // THE WINDOW, not the page, answers. Without this an invitation that arrived while another page
+    // was open rang into an engine with no listener and no visible trace, which is what "the desktop
+    // never detects mesh calls" looked like from the caller's phone.
+    runCatching {
+        com.prism.desktop.DesktopIncomingCalls.install()
+    }.onFailure {
+        com.prism.core.PrismPlatform.log.warn("PrismCalls", "Incoming call banner did not install: " + it.message)
+    }
+    runCatching { com.prism.launcher.trusted.TrustedLocations.install() }
+        .onFailure {
+            com.prism.core.PrismPlatform.log.warn("PrismLocations", "Locations did not install: " + it.message)
+        }
+    // A desktop has no GPS, so this installs the Wi-Fi/BSSID geolocator (DesktopGeolocation),
+    // keeps the place-picked position as a manual override, and runs the minute publisher.
+    runCatching { com.prism.desktop.DesktopLocations.install() }
+        .onFailure {
+            com.prism.core.PrismPlatform.log.warn("PrismLocations", "Desktop locations did not install: " + it.message)
+        }
+    // AND THE POINTER. A desktop is the device a Mouse page has in mind: it has a cursor to
+    // move, and java.awt.Robot can move it. Installed beside locations because both are
+    // trusted-device features whose opcodes are dispatched from the same listener.
+    runCatching { com.prism.desktop.DesktopPointer.install() }
+        .onFailure {
+            com.prism.core.PrismPlatform.log.warn("PrismPointer", "Desktop pointer did not install: " + it.message)
+        }
+    // And this machine as a screen: the beacon and receiver socket. Installed for the same
+    // reason every running Prism is a display -- it has to be discoverable before somebody
+    // opens the list to look for it.
+    runCatching { com.prism.desktop.DesktopDisplay.install() }
+        .onFailure {
+            com.prism.core.PrismPlatform.log.error("PrismDisplay", "Wireless displays did not install", it)
+        }
+    com.prism.launcher.trusted.TrustedLocations.onFindRequest = { name ->
+        com.prism.core.PrismPlatform.log.info("PrismLocations", "Find request from " + name)
+        com.prism.desktop.DesktopCallAudio.playFindChime()
+    }
 
     // Capability gossip expires: a peer that has not heard from this device in ten minutes drops it
     // from the market. Announcing once at boot would make this device vanish from everyone else's
@@ -438,6 +621,25 @@ fun main(args: Array<String>) {
     com.prism.launcher.messaging.Dictation.register(
         com.prism.launcher.messaging.CloudTranscriptionEngine()
     )
+
+    // THE CONSOLE GATE. The lock's promise is that private data refuses while it is engaged, and
+    // this harness reads the same files the UI does -- so a locked Prism answered `prism wallet`,
+    // `prism threads` and `prism clipboard` with everything the lock was supposed to hide. The
+    // commands that touch user data are listed by name rather than gating the whole harness, so
+    // diagnostics, mesh and build commands keep working on a locked machine.
+    val lockGatedCommands = setOf(
+        "wallet", "trust", "relay", "threads", "notifications", "clipboard", "cloud",
+        "profile", "lyke", "writer", "chat", "backup",
+    )
+    if ((args.firstOrNull()?.lowercase() ?: "gui") in lockGatedCommands &&
+        !com.prism.launcher.lock.PrismLockScope.permit(com.prism.launcher.lock.PrismLockScope.Gate.CONSOLE)
+    ) {
+        rule("Locked")
+        println("  Prism is locked, so this command will not read your data.")
+        println("  Unlock Prism in its window, then run it again.")
+        println()
+        return
+    }
 
     when (args.firstOrNull()?.lowercase() ?: "gui") {
         "gui" -> gui(args.getOrNull(1))
@@ -892,7 +1094,8 @@ private fun train(epochs: Int) {
     val brain = NoraBrain()
     var lastEpoch = 0
     val summary = runBlocking {
-        NoraTrainer(brain).train(epochs) { p ->
+        NoraTrainer(brain, textRenderer = com.prism.desktop.aether.DesktopTextRenderer::renderImage)
+            .train(epochs) { p ->
             if (p.epoch != lastEpoch) {
                 lastEpoch = p.epoch
                 println("  epoch ${p.epoch}/${p.totalEpochs}")
@@ -1849,7 +2052,14 @@ private fun quantize(args: List<String>) {
 private fun notifications(args: List<String>) {
     rule("Notification history")
 
-    com.prism.launcher.PrismSettings.setNotificationHistoryEnabled(true)
+    // READING IS NOT ENABLING. This command used to write the setting just by being run, so asking
+    // what had been captured turned capture on -- a privacy switch flipped by a diagnostic. The
+    // setting belongs to Settings > Notifications; this reports its state and says where to change
+    // it.
+    if (!com.prism.launcher.PrismSettings.getNotificationHistoryEnabled()) {
+        println("  Notification history is OFF. Turn it on in Prism Settings > Notifications to collect anything.")
+        println()
+    }
     row("capture", com.prism.desktop.NotificationCapture.describe())
     println()
     println("  " + com.prism.desktop.NotificationCapture.capability())
@@ -1895,12 +2105,12 @@ private fun notifications(args: List<String>) {
 }
 
 private fun shell(args: List<String>) {
-    rule("Windows shell")
+    rule("Desktop shell")
 
     val state = com.prism.desktop.ShellReplacement.state()
     row("supported here", if (state.supported) "yes" else "no")
     row("Prism is the shell", if (state.active) "yes" else "no")
-    row("current value", state.current.ifBlank { "absent -- Windows uses explorer.exe" })
+    row("current value", state.current.ifBlank { "absent -- the desktop's own shell" })
     com.prism.desktop.ShellReplacement.executable()?.let { row("installed as", it.absolutePath) }
     if (state.obstacle.isNotEmpty()) {
         println()
@@ -5373,8 +5583,24 @@ private fun hallucinate(prompt: String) {
  * output than a screenshot -- so the GUI is the default entry point, not the only one.
  */
 private fun gui(page: String? = null) = androidx.compose.ui.window.application {
+    val requested = page?.trim()
+    // `messages` used to match the dead PageId.MESSAGES -- a duplicate "not ported" row that sat
+    // beside the working Messages page and is what `prism gui messages` opened. The duplicate is
+    // gone, so the friendly name is aliased explicitly rather than making the user type
+    // MESSAGES_PAGE.
     val startOn = com.prism.desktop.ui.PageId.entries
-        .firstOrNull { it.name.equals(page?.trim(), ignoreCase = true) }
+        .firstOrNull { it.name.equals(requested, ignoreCase = true) }
+        ?: when (requested?.lowercase()) {
+            "messages" -> com.prism.desktop.ui.PageId.MESSAGES_PAGE
+            "apps", "drawer" -> com.prism.desktop.ui.PageId.APPS
+            "files" -> com.prism.desktop.ui.PageId.FILES
+            "trusted", "devices" -> com.prism.desktop.ui.PageId.TRUSTED
+            "wallet" -> com.prism.desktop.ui.PageId.WALLET
+            "cloud" -> com.prism.desktop.ui.PageId.CLOUD_AI
+            "settings" -> com.prism.desktop.ui.PageId.SETTINGS
+            "diagnostics" -> com.prism.desktop.ui.PageId.DIAGNOSTICS
+            else -> null
+        }
         ?: com.prism.desktop.ui.PageId.NORA_CHAT
     androidx.compose.ui.window.Window(
         onCloseRequest = ::exitApplication,
@@ -5385,5 +5611,118 @@ private fun gui(page: String? = null) = androidx.compose.ui.window.application {
         )
     ) {
         com.prism.desktop.ui.PrismWindow(startOn)
+    }
+
+    // EXTEND. A page the sender is not looking at, rendered fullscreen. Undecorated so the display
+    // is the page rather than a window that contains it.
+    val display = com.prism.desktop.DesktopDisplay.request
+    if (display != null) {
+        androidx.compose.ui.window.Window(
+            onCloseRequest = { com.prism.desktop.DesktopDisplay.dismiss() },
+            title = "Prism display",
+            undecorated = true,
+            resizable = false,
+            state = androidx.compose.ui.window.rememberWindowState(
+                placement = androidx.compose.ui.window.WindowPlacement.Fullscreen,
+            ),
+        ) {
+            com.prism.desktop.DesktopDisplayWindow(display) {
+                com.prism.desktop.DesktopDisplay.dismiss()
+            }
+        }
+    }
+
+    // A RECEIVED SCREEN (MIMIC). This is a picture of the other device, not a page from it: the
+    // old slot transport showed this machine's own Files page even in mimic mode.
+    val mirror = com.prism.desktop.DesktopMirror.session
+    if (mirror != null) {
+        androidx.compose.ui.window.Window(
+            onCloseRequest = { com.prism.desktop.DesktopMirror.stopAndDisconnect() },
+            title = "Prism mirror",
+            undecorated = true,
+            resizable = false,
+            state = androidx.compose.ui.window.rememberWindowState(
+                placement = androidx.compose.ui.window.WindowPlacement.Fullscreen,
+            ),
+        ) {
+            com.prism.desktop.DesktopMirrorWindow(mirror) {
+                com.prism.desktop.DesktopMirror.stopAndDisconnect()
+            }
+        }
+    }
+
+    // The pairing code, before a first-time sender is allowed in. Same fullscreen window, because
+    // the code has to be readable from wherever the other device is.
+    val pairing = com.prism.desktop.DesktopDisplay.pairing
+    if (pairing != null) {
+        androidx.compose.ui.window.Window(
+            onCloseRequest = { com.prism.desktop.DesktopDisplay.cancelPairing() },
+            title = "Prism pairing",
+            undecorated = true,
+            resizable = false,
+            state = androidx.compose.ui.window.rememberWindowState(
+                placement = androidx.compose.ui.window.WindowPlacement.Fullscreen,
+            ),
+        ) {
+            com.prism.desktop.DesktopPairingWindow(pairing) {
+                com.prism.desktop.DesktopDisplay.cancelPairing()
+            }
+        }
+    }
+
+    // THE DEBUG BRIDGE CODE. A target shows a twelve-character code; the person holding the other
+    // device types it there. Like the display pairing code, this is a window rather than a dialog
+    // so it is readable from a distance and impossible to leave behind.
+    val pdbPrompt = PdbUi.prompt
+    if (pdbPrompt != null) {
+        androidx.compose.ui.window.Window(
+            onCloseRequest = {
+                com.prism.launcher.pdb.Pdb.cancelPrompt(pdbPrompt.id)
+                PdbUi.prompt = null
+            },
+            title = "Prism debug bridge",
+            undecorated = true,
+            resizable = false,
+            state = androidx.compose.ui.window.rememberWindowState(
+                placement = androidx.compose.ui.window.WindowPlacement.Fullscreen,
+            ),
+        ) {
+            PdbPhraseWindow(pdbPrompt) { PdbUi.prompt = null }
+        }
+    }
+
+    // A NON-PRISM SCREEN: an attached monitor or television. Positioned over the screen it names
+    // and sized to that screen's bounds rather than using Fullscreen, which would always choose
+    // the primary monitor.
+    val systemScreen = com.prism.desktop.DesktopDisplay.systemScreen
+    if (systemScreen != null) {
+        val density = androidx.compose.ui.platform.LocalDensity.current.density
+        val screen = com.prism.desktop.DesktopScreens.byId(systemScreen)
+        androidx.compose.runtime.LaunchedEffect(screen) {
+            if (screen == null) com.prism.desktop.DesktopDisplay.closeSystemScreen()
+        }
+        if (screen != null) {
+            androidx.compose.ui.window.Window(
+                onCloseRequest = { com.prism.desktop.DesktopDisplay.closeSystemScreen() },
+                title = "Prism display · " + screen.name,
+                undecorated = true,
+                resizable = false,
+                state = androidx.compose.ui.window.rememberWindowState(
+                    position = androidx.compose.ui.window.WindowPosition.Absolute(
+                        (screen.bounds.x / density).dp,
+                        (screen.bounds.y / density).dp,
+                    ),
+                    size = androidx.compose.ui.unit.DpSize(
+                        (screen.bounds.width / density).dp,
+                        (screen.bounds.height / density).dp,
+                    ),
+                    placement = androidx.compose.ui.window.WindowPlacement.Floating,
+                ),
+            ) {
+                com.prism.desktop.DesktopSystemDisplayWindow(screen) {
+                    com.prism.desktop.DesktopDisplay.closeSystemScreen()
+                }
+            }
+        }
     }
 }

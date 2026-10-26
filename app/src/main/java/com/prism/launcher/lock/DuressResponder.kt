@@ -38,9 +38,22 @@ import com.prism.launcher.PrismSettings
  *
  * ## The location it sends
  *
- * Last known, not a fresh fix. Requesting a new fix wakes the GPS, takes seconds, and can show in
- * the status bar -- all three break the rule above. A last-known position minutes old is enough to
- * say which building someone is in, which is what the message is for.
+ * A RECENT fix, and a fresh one when there is none. The first version of this sent the last known
+ * position only, on the argument that waking the GPS is slow and visible. That argument is wrong
+ * for the situation this code exists for: a position that is hours old -- or absent because the
+ * phone had not used location all day -- turns the alert into "no location available", which is
+ * the single sentence an emergency contact can do nothing with.
+ *
+ * So a fix under five minutes old is used as-is, and otherwise one current position is requested
+ * with a short timeout. The alert is sent on a background thread and the unlock is not delayed by
+ * it. The status-bar indicator is a real cost and it is accepted deliberately: a visible alert is
+ * enormously better than an alert that names no place.
+ *
+ * ## The name it sends
+ *
+ * Each contact carries the name THAT PERSON knows the user by, chosen when the contact was added
+ * and required by the form. The message says "Alice triggered an emergency alert", not "Someone
+ * did": the recipient cannot act on "someone", and an anonymous alert reads as a wrong number.
  */
 object DuressResponder {
 
@@ -82,7 +95,6 @@ object DuressResponder {
             return
         }
 
-        val body = composeMessage(context)
         val manager = smsManager(context) ?: run {
             PrismLogger.logWarning(TAG, "No SMS service on this device")
             return
@@ -95,8 +107,13 @@ object DuressResponder {
             return
         }
 
+        // One fix for every contact. Asking twice would take twice as long and could put two
+        // different positions in two alerts about the same moment.
+        val location = currentLocation(context)
+
         contacts.forEach { contact ->
             runCatching {
+                val body = composeMessage(contact, location)
                 // Split, because a location line plus a maps URL runs past 160 characters and an
                 // over-long message is silently dropped by some carriers rather than segmented.
                 val parts = manager.divideMessage(body)
@@ -108,9 +125,13 @@ object DuressResponder {
         }
     }
 
-    private fun composeMessage(context: Context): String {
-        val location = lastKnownLocation(context)
-        val name = PrismSettings.getLykeUserName().ifBlank { "Someone" }
+    private fun composeMessage(contact: EmergencyContacts.Contact, location: Location?): String {
+        // The contact's own name for the user, never a generic one. The profile name is a fallback
+        // only for a contact saved before the field existed; it is still a name the sender chose
+        // to publish, unlike "Someone".
+        val name = contact.knownAs.ifBlank {
+            PrismSettings.getLykeUserName().ifBlank { "Someone you know" }
+        }
 
         return buildString {
             append(name)
@@ -119,15 +140,63 @@ object DuressResponder {
                 val lat = "%.5f".format(location.latitude)
                 val lon = "%.5f".format(location.longitude)
                 append("\n\nLocation: ").append(lat).append(", ").append(lon)
-                append("\nhttps://maps.google.com/?q=").append(lat).append(',').append(lon)
+                append("\nhttps://www.openstreetmap.org/?mlat=").append(lat)
+                    .append("&mlon=").append(lon).append("#map=17/").append(lat).append('/').append(lon)
                 val ageMinutes = (System.currentTimeMillis() - location.time) / 60_000
                 if (ageMinutes > 1) append("\n(position is about ").append(ageMinutes).append(" minutes old)")
             } else {
-                append("\n\nNo location was available.")
+                append("\n\nNo location was available — the phone could not get a fix.")
             }
             append("\n\nSent automatically by Prism.")
         }
     }
+
+    /**
+     * A position good enough to send: a recent cached fix, else one fresh fix.
+     *
+     * Blocking, with a bounded wait, and only ever called on the alert thread. Providers are tried
+     * GPS first and network second; `getCurrentLocation` is the API-30 replacement for the old
+     * single-update listener and is what makes a fresh fix possible without a Looper.
+     */
+    @SuppressLint("MissingPermission")
+    private fun currentLocation(context: Context): Location? {
+        val manager = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+            ?: return null
+        val last = lastKnownLocation(context)
+        if (last != null && System.currentTimeMillis() - last.time < FRESH_FIX_MS) return last
+        if (last != null && android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R) return last
+
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            for (provider in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
+                if (runCatching { manager.isProviderEnabled(provider) }.getOrDefault(false).not()) continue
+                val signal = android.os.CancellationSignal()
+                val latch = java.util.concurrent.CountDownLatch(1)
+                // An AtomicReference rather than a captured `var`: the callback runs on the executor
+                // and the alert thread reads the result, so the handoff has to be a real one.
+                val fix = java.util.concurrent.atomic.AtomicReference<Location?>(null)
+                val delivered = runCatching {
+                    manager.getCurrentLocation(
+                        provider,
+                        signal,
+                        java.util.concurrent.Executor { it.run() },
+                    ) { location ->
+                        fix.set(location)
+                        latch.countDown()
+                    }
+                    latch.await(FIX_TIMEOUT_SECONDS, java.util.concurrent.TimeUnit.SECONDS)
+                }.getOrDefault(false)
+                signal.cancel()
+                if (delivered) fix.get()?.let { return it }
+            }
+        }
+
+        // Returning the stale fix is still better than returning nothing: "about 40 minutes old"
+        // tells the contact where to start looking, and the alternative is no information at all.
+        return last
+    }
+
+    private const val FRESH_FIX_MS = 5 * 60 * 1000L
+    private const val FIX_TIMEOUT_SECONDS = 8L
 
     /**
      * The most recent fix any provider already has.

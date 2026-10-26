@@ -138,6 +138,7 @@ class MessagesAdapter(
     }
 
     private fun resolveAttr(view: android.view.View, attr: Int): Int {
+        com.prism.launcher.theme.ThemeSkin.resolveAttr(view.context, attr)?.let { return it }
         val typed = android.util.TypedValue()
         return if (view.context.theme.resolveAttribute(attr, typed, true)) {
             if (typed.resourceId != 0) view.context.getColor(typed.resourceId) else typed.data

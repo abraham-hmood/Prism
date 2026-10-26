@@ -53,11 +53,26 @@ object PrismDownloadNotifications {
             val manager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
             PrismPlatform.notifier.notifyProgress(CHANNEL, id, fileName, "Starting download…", -1, true)
             try {
+                // A row can disappear (cleared by the user, database pruned, download removed by
+                // another app). Without this counter the loop queried forever and kept a
+                // notification pinned to a download that no longer existed.
+                var missingPolls = 0
                 while (true) {
                     val query = DownloadManager.Query().setFilterById(downloadId)
                     val cursor = manager.query(query) ?: break
+                    if (!cursor.moveToFirst()) {
+                        cursor.close()
+                        missingPolls++
+                        if (missingPolls >= 3) {
+                            PrismPlatform.notifier.notifyProgress(
+                                CHANNEL, id, fileName, "Download is no longer tracked", -1, false
+                            )
+                            break
+                        }
+                        delay(1000)
+                        continue
+                    }
                     cursor.use { c ->
-                        if (!c.moveToFirst()) return@use
                         val status = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
                         val soFar = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR))
                         val total = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES))

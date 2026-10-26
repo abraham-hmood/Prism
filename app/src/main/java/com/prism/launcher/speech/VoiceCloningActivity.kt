@@ -840,7 +840,7 @@ class VoiceCloningActivity : PrismBaseActivity() {
         buttonBar.addView(saveBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         card.addView(buttonBar)
 
-        val dialog = AlertDialog.Builder(this)
+        val dialog = com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setView(card)
             .create()
 
@@ -863,7 +863,7 @@ class VoiceCloningActivity : PrismBaseActivity() {
                 else -> builtins.indexOf(language!!)
             }
 
-            AlertDialog.Builder(this)
+            com.prism.launcher.theme.PrismDialogs.Builder(this)
                 .setTitle("Language")
                 .setSingleChoiceItems(labels, selected) { picker, which ->
                     when {
@@ -993,7 +993,7 @@ class VoiceCloningActivity : PrismBaseActivity() {
             addView(field)
         }
 
-        AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Add a language")
             .setView(wrap)
             .setNegativeButton("Cancel", null)

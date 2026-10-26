@@ -122,6 +122,29 @@ object DesktopTour {
 
         Section("Making it yours", listOf(
             Step(
+                glyph = "☎",
+                title = "Mesh calls, meshvoice and the map",
+                body = "Three pages of their own, in the rail: Dialer, Meshvoice and Maps.\n\n" +
+                    "A call to a trusted device is sealed with your wallet key; one to a device that " +
+                    "is merely on your meshnet is not, and Prism says so once before the first one. " +
+                    "A trusted device that is offline gets a meshnet voicemail instead, which lands " +
+                    "in Meshvoice.\n\n" +
+                    "Maps shows the trusted devices that chose to share their position with this " +
+                    "machine: green while they are online, pink while only their last position is " +
+                    "known. A PC has no phone plan, so the dialer here places mesh calls only.",
+                whereToFind = "Dialer, Meshvoice, Maps",
+            ),
+            Step(
+                glyph = "✉",
+                title = "WhatsApp, Messenger and Signal in one place",
+                body = "None of the three lets another program send as you, so Prism does the part it " +
+                    "can: they appear in Messages and open from here, and the switches are shared " +
+                    "with your phone. On the phone the same connection also adds their " +
+                    "notifications to your message history once notification access is granted.\n\n" +
+                    "Nothing is connected until you choose it, and disconnecting is the same switch.",
+                whereToFind = "Settings > Messaging apps",
+            ),
+            Step(
                 glyph = "✛",
                 title = "The desktop page is a grid you fill",
                 body = "Drag an app onto it from the Apps page. Right-click things -- a server, a " +

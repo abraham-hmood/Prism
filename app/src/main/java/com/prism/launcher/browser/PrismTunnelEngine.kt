@@ -3,7 +3,6 @@ package com.prism.launcher.browser
 import android.content.Context
 import android.util.Log
 import com.prism.launcher.PrismSettings
-import com.prism.launcher.vpn.AppUsageMonitor
 import com.prism.launcher.vpn.PrismProxyClient
 import com.prism.launcher.vpn.PrismProxyServer
 import com.prism.launcher.vpn.PrismSocket
@@ -43,14 +42,13 @@ class PrismTunnelEngine(private val context: Context) {
 
     // Persistent mesh fetcher: custom DNS for P2P resolution + universal SSL for any TLD
     private val httpClient: OkHttpClient by lazy {
-        val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
-            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
-            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
-            override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
-        })
+        // Chain validation plus a per-host pin, instead of the previous empty trust manager.
+        // "Trust every certificate" was not a simplification; it disabled the only check that
+        // makes the mesh resistant to a peer answering for somebody else's name.
+        val meshTrust = com.prism.launcher.vpn.MeshTrustStore.X509
 
         val sslContext = SSLContext.getInstance("TLS")
-        sslContext.init(null, trustAllCerts, java.security.SecureRandom())
+        sslContext.init(null, arrayOf<TrustManager>(meshTrust), java.security.SecureRandom())
 
         val noSniSslFactory = object : SSLSocketFactory() {
             private val delegate: SSLSocketFactory = sslContext.socketFactory
@@ -79,7 +77,17 @@ class PrismTunnelEngine(private val context: Context) {
             private fun SSLSocket.suppressSni() {
                 try {
                     sslParameters = sslParameters.also { it.serverNames = emptyList() }
-                } catch (_: Throwable) { }
+                } catch (error: Throwable) {
+                    // The connection still works, but the host name is now in the handshake in
+                    // clear text. Logged because that is a privacy property the tunnel claims,
+                    // not an implementation detail -- and a silent catch made the claim untrue
+                    // on any platform whose SSLParameters refused the write.
+                    com.prism.launcher.PrismLogger.logWarning(
+                        "PrismTunnel",
+                        "Could not suppress SNI; the host name will be visible to the network: " +
+                            (error.message ?: error.javaClass.simpleName),
+                    )
+                }
             }
         }
 
@@ -117,19 +125,19 @@ class PrismTunnelEngine(private val context: Context) {
                 val request = chain.request()
                 val originalHost = request.url.host
                 if (originalHost.endsWith(".remote", ignoreCase = true)) {
+                    // KEEP THE .remote HOST IN THE URL. Rewriting it here meant OkHttp's DNS lookup
+                    // saw the clean name, found this device's own loopback mirror first, and a
+                    // "fetch from a peer" request was answered by the device asking. The suffix
+                    // is what makes P2pDnsManager.resolve exclude local candidates; the Host
+                    // header carries the real site name to the peer.
                     val cleanHost = originalHost.removeSuffix(".remote")
-                    val newUrl = request.url.newBuilder().host(cleanHost).build()
-                    val newRequest = request.newBuilder()
-                        .url(newUrl)
-                        .header("Host", cleanHost)
-                        .build()
-                    chain.proceed(newRequest)
+                    chain.proceed(request.newBuilder().header("Host", cleanHost).build())
                 } else {
                     chain.proceed(request)
                 }
             }
-            .sslSocketFactory(noSniSslFactory, trustAllCerts[0] as X509TrustManager)
-            .hostnameVerifier { _, _ -> true }
+            .sslSocketFactory(noSniSslFactory, meshTrust)
+            .hostnameVerifier(com.prism.launcher.vpn.MeshTrustStore.Hostnames)
             .socketFactory(object : SocketFactory() {
                 private fun meshSocket(): PrismSocket = PrismSocket().also {
                     PrivateDnsVpnService.protectSocket(it)
@@ -230,12 +238,15 @@ class PrismTunnelEngine(private val context: Context) {
             }
         }
         
-        AppUsageMonitor.start(context, this)
+        // NO FOREGROUND-APP MONITOR. It used to pause this whole engine whenever an app on the
+        // user's bypass list came to the front, which is the opposite of a per-app bypass: the
+        // whitelisted app kept its traffic AND everything else lost the tunnel. The list is applied
+        // where it belongs, with `addDisallowedApplication` when the VpnService is built
+        // (PrivateDnsVpnService.applyAppWhitelist), and that needs no monitoring at all.
     }
 
     fun stop() {
         routingActive = false
-        AppUsageMonitor.stop()
         hostingServer?.stop()
         hostingServer = null
         proxyServer?.stop()
@@ -408,9 +419,28 @@ class PrismTunnelEngine(private val context: Context) {
     private fun startExternalVpnTunnel() {
         WireguardController.init(context)
         val confData = PrismSettings.getExternalVpnProfile()
-        if (confData.isNotEmpty()) {
-            WireguardController.loadProfile(ByteArrayInputStream(confData.toByteArray()))
-            WireguardController.start()
+        if (confData.isEmpty()) {
+            com.prism.launcher.PrismLogger.logError(
+                "PrismTunnel",
+                "External VPN mode is selected but no WireGuard profile has been pasted in Settings.",
+            )
+            return
+        }
+        // A refusal used to be invisible: the tunnel simply was not up while the UI said
+        // otherwise. Say which of the two steps failed, because they need different fixes.
+        if (!WireguardController.loadProfile(ByteArrayInputStream(confData.toByteArray()))) {
+            com.prism.launcher.PrismLogger.logError(
+                "PrismTunnel",
+                "The saved WireGuard profile is not valid .conf text.",
+            )
+            return
+        }
+        if (!WireguardController.start()) {
+            com.prism.launcher.PrismLogger.logError(
+                "PrismTunnel",
+                "Android refused to bring the WireGuard tunnel up. Usually another VPN is already " +
+                    "active, or the profile has no interface address.",
+            )
         }
     }
 
@@ -420,7 +450,8 @@ class PrismTunnelEngine(private val context: Context) {
 
         val request = Request.Builder()
             .url(url)
-            .header("Host", host) 
+            // `.remote` is a resolution hint, not part of the site name the peer serves.
+            .header("Host", host.removeSuffix(".remote"))
             .build()
         
         val callClient = if (connectTimeoutMs != null || readTimeoutMs != null) {

@@ -4,6 +4,16 @@ import com.prism.core.json.JSONArray
 import com.prism.core.json.JSONObject
 
 /**
+ * What every backend is told a tool DOES.
+ *
+ * A tool with an empty description still has to be usable, so it gets a sentence naming it rather
+ * than a blank field the model has to interpret. Custom HTTP tools are the ones who arrive here
+ * without a description; every built-in has one.
+ */
+internal fun described(tool: ToolDefinition): String =
+    tool.description.trim().ifBlank { "Runs the Prism tool " + tool.name + "." }
+
+/**
  * Wire format for backends with native structured tool-calling (OpenAI-compatible Cloud
  * endpoints, and Ollama's `/api/chat`, which deliberately cloned the same `tools`/`tool_calls`
  * JSON shape). One shared adapter for both since the shape only differs in minor, tolerated
@@ -17,7 +27,7 @@ object NativeToolFormat {
         tools.forEach { tool ->
             val function = JSONObject()
                 .put("name", tool.name)
-                .put("description", tool.description)
+                .put("description", described(tool))
                 .put("parameters", tool.parametersSchema)
             array.put(JSONObject().put("type", "function").put("function", function))
         }
@@ -93,14 +103,38 @@ object NativeToolFormat {
  */
 object SyntaxToolFormat {
 
+    /**
+     * Renders every tool into the prompt, including the parts a custom template left out.
+     *
+     * A template decides the MARKUP, not how much the model is told: `- {{name}}` alone would
+     * introduce a tool without saying what it does or what it expects, and the model would have to
+     * guess both. So a missing placeholder is appended rather than omitted. A template with no
+     * `{{tools}}` placeholder at all is treated the same way, for the same reason.
+     */
     fun renderSystemPrompt(syntax: AgenticSyntaxEntity, tools: List<ToolDefinition>): String {
-        val rendered = tools.joinToString("\n") { tool ->
-            syntax.toolFormatTemplate
-                .replace("{{name}}", tool.name)
-                .replace("{{description}}", tool.description)
-                .replace("{{parameters}}", tool.parametersSchema.toString())
+        val rendered = tools.joinToString("\n") { tool -> renderTool(syntax.toolFormatTemplate, tool) }
+        if (!syntax.systemPromptTemplate.contains("{{tools}}")) {
+            return syntax.systemPromptTemplate.trimEnd() + "\n\nTools:\n" + rendered
         }
         return syntax.systemPromptTemplate.replace("{{tools}}", rendered)
+    }
+
+    private fun renderTool(template: String, tool: ToolDefinition): String {
+        val description = described(tool)
+        val parameters = tool.parametersSchema.toString()
+        val body = template
+            .replace("{{name}}", tool.name)
+            .replace("{{description}}", description)
+            .replace("{{parameters}}", parameters)
+        val missing = buildString {
+            if (!template.contains("{{description}}")) append("\n  What it does: ").append(description)
+            if (!template.contains("{{parameters}}")) {
+                append("\n  Arguments (JSON Schema): ").append(parameters)
+            }
+        }
+        // The name has to come first even when the template never mentions it: a tool the model
+        // cannot name is a tool it cannot call.
+        return if (template.contains("{{name}}")) body + missing else "- " + tool.name + missing + "\n" + body
     }
 
     /** Finds every regex match in [rawText] and parses each capture group as a
@@ -109,7 +143,10 @@ object SyntaxToolFormat {
     fun extractToolCalls(syntax: AgenticSyntaxEntity, rawText: String): List<ToolCall> {
         val regex = try { Regex(syntax.callExtractionRegex, RegexOption.DOT_MATCHES_ALL) } catch (e: Exception) { return emptyList() }
         return regex.findAll(rawText).mapNotNull { match ->
-            val jsonText = match.groupValues.getOrNull(1) ?: return@mapNotNull null
+            // Trimmed because a capture group may be the text between two markers rather than a
+            // bare object -- the Prism default profile does exactly that, so nested braces in
+            // "arguments" survive intact.
+            val jsonText = match.groupValues.getOrNull(1)?.trim() ?: return@mapNotNull null
             try {
                 val obj = JSONObject(jsonText)
                 val name = obj.optString("name").ifBlank { return@mapNotNull null }

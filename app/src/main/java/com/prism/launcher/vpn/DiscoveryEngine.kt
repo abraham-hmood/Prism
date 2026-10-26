@@ -114,10 +114,15 @@ class DiscoveryEngine(private val context: android.content.Context, private val 
             
             Log.i("PrismDiscovery", "Remote DNS Write from $address: $action $domain")
             
+            // THE SOURCE ADDRESS IS THE AUTHORITY, because the mesh has no accounts. A peer may
+            // announce a name pointing at itself; it may not repoint somebody else's live name.
+            val source = address.hostAddress?.removePrefix("::ffff:")
             if (action == "ADD" && ip != null) {
-                com.prism.launcher.browser.P2pDnsManager.updateRecord(context, domain, ip)
+                com.prism.launcher.browser.P2pDnsManager.updateRecord(
+                    context, domain, ip, fromMesh = true, sourceIp = source,
+                )
             } else if (action == "DEL") {
-                com.prism.launcher.browser.P2pDnsManager.deleteRecord(context, domain)
+                com.prism.launcher.browser.P2pDnsManager.deleteRecord(context, domain, sourceIp = source)
             }
             
             // Ack the write

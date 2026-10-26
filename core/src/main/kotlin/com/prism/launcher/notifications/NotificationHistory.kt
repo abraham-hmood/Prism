@@ -85,8 +85,30 @@ object NotificationHistory {
 
     private val lock = Any()
 
+    /**
+     * Called after anything is written, so a screen showing captured messages can update itself
+     * rather than polling.
+     *
+     * Listeners run on whichever thread recorded the notification -- for the Android listener that
+     * is a service thread, not the UI thread -- so a view must post to its own thread instead of
+     * redrawing inline. A failing listener must not lose the notification, hence the runCatching.
+     */
+    private val changeListeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+
     /** Newest last. Null until the file has been read. */
     private var records: MutableList<Record>? = null
+
+    fun addChangeListener(listener: () -> Unit) {
+        if (!changeListeners.contains(listener)) changeListeners.add(listener)
+    }
+
+    fun removeChangeListener(listener: () -> Unit) {
+        changeListeners.remove(listener)
+    }
+
+    private fun notifyChange() {
+        changeListeners.forEach { listener -> runCatching { listener() } }
+    }
 
     private fun dir(): File =
         File(PrismPlatform.host.dataDir(), "prism_notifications").apply { mkdirs() }
@@ -149,6 +171,7 @@ object NotificationHistory {
                         ongoing = ongoing,
                     )
                     rewrite(list)
+                    notifyChange()
                     return true
                 }
             }
@@ -183,6 +206,7 @@ object NotificationHistory {
                 // disagreeing with memory is the kind of difference that only shows up much later.
                 rewrite(list)
             }
+            notifyChange()
             return true
         }
     }
@@ -225,14 +249,21 @@ object NotificationHistory {
             records = mutableListOf()
             runCatching { file().delete() }
         }
+        notifyChange()
     }
 
     /** Forgets everything from one app, for the "never record this app" case. */
     fun clear(packageName: String) {
-        synchronized(lock) {
+        val removed = synchronized(lock) {
             val list = loaded()
-            if (list.removeAll { it.packageName == packageName }) rewrite(list)
+            if (list.removeAll { it.packageName == packageName }) {
+                rewrite(list)
+                true
+            } else {
+                false
+            }
         }
+        if (removed) notifyChange()
     }
 
     // ── Storage ────────────────────────────────────────────────────────────

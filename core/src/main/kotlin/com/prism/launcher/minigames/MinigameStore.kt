@@ -32,6 +32,8 @@ object MinigameStore {
     private const val KEY_ATTEMPTS = "alliance_attempts_v1"
     private const val KEY_LAST_GAME = "last_game_v1"
     private const val KEY_SEEN_OPENING = "seen_opening_raid_v1"
+    private const val KEY_MINESWEEPER_RECORD = "minesweeper_record_v1"
+    private const val KEY_PINBALL_BEST = "pinball_best_v1"
     private const val KEY_CHESS_RECORD = "chess_record_v1"
     private const val KEY_PONG_RECORD = "pong_record_v1"
     private const val KEY_CHESS_DIFFICULTY = "chess_difficulty_v1"
@@ -456,6 +458,19 @@ object MinigameStore {
 
     fun recordChess(won: Boolean) = bumpRecord(KEY_CHESS_RECORD, won)
     fun recordPong(won: Boolean) = bumpRecord(KEY_PONG_RECORD, won)
+
+    /** Boards cleared, across every difficulty. */
+    fun minesweeperRecord(): Pair<Int, Int> = recordOf(KEY_MINESWEEPER_RECORD)
+
+    fun recordMinesweeper(won: Boolean) = bumpRecord(KEY_MINESWEEPER_RECORD, won)
+
+    /** The highest pinball score this device has seen. */
+    fun pinballBest(): Int = prefs().getInt(KEY_PINBALL_BEST, 0)
+
+    fun recordPinball(score: Int) {
+        if (score <= pinballBest()) return
+        prefs().edit().putInt(KEY_PINBALL_BEST, score).apply()
+    }
 
     private fun recordOf(key: String): Pair<Int, Int> {
         val raw = prefs().getString(key, "0/0") ?: "0/0"

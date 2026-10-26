@@ -112,39 +112,85 @@ object ModelDiscoveryService {
         }
     }
 
+    /**
+     * GitHub, through the API that actually works unauthenticated.
+     *
+     * ## Why this used to return nothing
+     *
+     * It called `/search/code`, which requires an authenticated request. Unauthenticated it answers
+     * 401, the catch below logged it and the provider returned an empty list -- so the GitHub source
+     * was present in the UI and never produced a single result, on every device, always. The rate
+     * limit cited in the old comment (10/min) is the limit for `search/repositories`, not code
+     * search, and that call needs no token.
+     *
+     * ## Where the download URL comes from
+     *
+     * Repository search finds projects; the file to download is in the project's latest RELEASE,
+     * which is where GGUF and MediaPipe bundles are normally published and which is a fixed, stable
+     * URL. A repository with no release assets is skipped rather than offered as a download that
+     * cannot work -- that was the other half of the old behaviour: results pointed at
+     * `raw.githubusercontent.com/.../main/...`, which 404s for a repository whose model is attached
+     * to a release instead of committed to the tree.
+     */
     class GitHubProvider : DiscoveryProvider {
+        private val client = okhttp3.OkHttpClient.Builder()
+            .callTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+
         override suspend fun search(query: String, category: String): List<DiscoveredModel> {
             val results = mutableListOf<DiscoveredModel>()
-            // GitHub Search API is strictly rate limited (10/min unauth). We use a broad search.
-            val q = "$query+extension:task+extension:tflite+extension:gguf"
-            val searchUrl = "https://api.github.com/search/code?q=$q"
-            
-            try {
-                val conn = com.prism.core.Urls.of(searchUrl).openConnection() as HttpURLConnection
-                conn.setRequestProperty("Accept", "application/vnd.github.v3+json")
-                conn.setRequestProperty("User-Agent", "Prism-Launcher")
-                
-                val response = conn.inputStream.bufferedReader().use { it.readText() }
-                val items = JSONObject(response).getJSONArray("items")
-                
-                for (i in 0 until items.length().coerceAtMost(5)) {
-                    val item = items.getJSONObject(i)
-                    val path = item.getString("path")
-                    val repo = item.getJSONObject("repository").getString("full_name")
-                    
-                    // Construct raw URL
-                    val rawUrl = "https://raw.githubusercontent.com/$repo/main/$path"
-                    results.add(DiscoveredModel(
-                        name = "$repo (${path.substringAfterLast("/")})",
-                        repoId = repo,
-                        downloadUrl = rawUrl,
-                        sizeLabel = "Linked from GitHub",
+            val searchUrl = "https://api.github.com/search/repositories?q=" +
+                java.net.URLEncoder.encode("$query gguf", "UTF-8") + "&per_page=6&sort=stars"
+
+            val repos = runCatching { getJson(searchUrl).optJSONArray("items") }.getOrNull() ?: return results
+            for (i in 0 until minOf(repos.length(), 6)) {
+                val repo = repos.optJSONObject(i) ?: continue
+                val fullName = repo.optString("full_name").takeIf { it.isNotBlank() } ?: continue
+                val file = latestModelAsset(fullName) ?: continue
+                results.add(
+                    DiscoveredModel(
+                        name = "$fullName (${file.first})",
+                        repoId = fullName,
+                        downloadUrl = file.second,
+                        sizeLabel = formatSize(file.third),
                         source = "GitHub",
-                        category = category
-                    ))
-                }
-            } catch (e: Exception) { PrismPlatform.log.warn("GHProvider", "Search failed: ${e.message}") }
+                        category = category,
+                    )
+                )
+            }
             return results
+        }
+
+        /** The first model file attached to the repository's latest release, if any. */
+        private fun latestModelAsset(fullName: String): Triple<String, String, Long>? {
+            val release = runCatching {
+                getJson("https://api.github.com/repos/$fullName/releases/latest")
+            }.getOrNull() ?: return null
+            val assets = release.optJSONArray("assets") ?: return null
+            for (i in 0 until assets.length()) {
+                val asset = assets.optJSONObject(i) ?: continue
+                val name = asset.optString("name")
+                if (!name.endsWith(".gguf", true) && !name.endsWith(".task", true) &&
+                    !name.endsWith(".tflite", true)
+                ) continue
+                val url = asset.optString("browser_download_url").takeIf { it.isNotBlank() } ?: continue
+                return Triple(name, url, asset.optLong("size", 0L))
+            }
+            return null
+        }
+
+        private fun getJson(url: String): JSONObject {
+            val request = okhttp3.Request.Builder().url(url)
+                .header("Accept", "application/vnd.github+json")
+                .header("User-Agent", "Prism-Launcher")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .build()
+            return client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    throw IllegalStateException("GitHub answered ${response.code} for $url")
+                }
+                JSONObject(response.body?.string().orEmpty())
+            }
         }
     }
 

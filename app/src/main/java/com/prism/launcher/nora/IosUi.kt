@@ -15,6 +15,9 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.LinearLayout
 import android.widget.TextView
+import com.prism.launcher.theme.PrismThemes
+import com.prism.launcher.theme.ThemeModeSpec
+import com.prism.launcher.theme.ThemePalette
 
 /**
  * A small iOS-flavoured design system, built in code.
@@ -31,17 +34,38 @@ object IosUi {
         (ctx.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
             Configuration.UI_MODE_NIGHT_YES
 
+    /**
+     * The active theme's values for the appearance currently on screen.
+     *
+     * Every helper below reads this instead of a constant. That is the whole mechanism by which
+     * changing a theme reaches the hundred screens that already use this design system: they keep
+     * calling the same semantic names, and the names resolve to the selected theme.
+     */
+    fun mode(ctx: Context): ThemeModeSpec =
+        previewTheme.get() ?: PrismThemes.mode(light = !isDark(ctx))
+
+    fun palette(ctx: Context): ThemePalette = mode(ctx).palette
+
+    /** Renders one tree with [theme] without changing the selected theme. Used by previews. */
+    fun <T> withTheme(theme: ThemeModeSpec, block: () -> T): T {
+        val previous = previewTheme.get()
+        previewTheme.set(theme)
+        return try { block() } finally { previewTheme.set(previous) }
+    }
+
+    private val previewTheme = ThreadLocal<ThemeModeSpec?>()
+
     // ── Semantic colours ────────────────────────────────────────────────────
 
-    fun groupedBackground(ctx: Context) = if (isDark(ctx)) 0xFF000000.toInt() else 0xFFF2F2F7.toInt()
-    fun cardBackground(ctx: Context) = if (isDark(ctx)) 0xFF1C1C1E.toInt() else 0xFFFFFFFF.toInt()
-    fun label(ctx: Context) = if (isDark(ctx)) 0xFFFFFFFF.toInt() else 0xFF000000.toInt()
-    fun secondaryLabel(ctx: Context) = if (isDark(ctx)) 0x99EBEBF5.toInt() else 0x993C3C43.toInt()
-    fun tertiaryLabel(ctx: Context) = if (isDark(ctx)) 0x4DEBEBF5.toInt() else 0x4D3C3C43.toInt()
-    fun separator(ctx: Context) = if (isDark(ctx)) 0x40545458.toInt() else 0x243C3C43.toInt()
-    fun accent(ctx: Context) = if (isDark(ctx)) 0xFF0A84FF.toInt() else 0xFF007AFF.toInt()
-    fun destructive(ctx: Context) = if (isDark(ctx)) 0xFFFF453A.toInt() else 0xFFFF3B30.toInt()
-    fun fill(ctx: Context) = if (isDark(ctx)) 0x3D767680.toInt() else 0x1F767680.toInt()
+    fun groupedBackground(ctx: Context) = palette(ctx).background.toInt()
+    fun cardBackground(ctx: Context) = palette(ctx).card.toInt()
+    fun label(ctx: Context) = palette(ctx).text.toInt()
+    fun secondaryLabel(ctx: Context) = palette(ctx).muted.toInt()
+    fun tertiaryLabel(ctx: Context) = palette(ctx).faint.toInt()
+    fun separator(ctx: Context) = palette(ctx).divider.toInt()
+    fun accent(ctx: Context) = palette(ctx).accent.toInt()
+    fun destructive(ctx: Context) = palette(ctx).destructive.toInt()
+    fun fill(ctx: Context) = palette(ctx).raised.toInt()
 
     fun dp(ctx: Context, value: Float): Int =
         TypedValue.applyDimension(
@@ -53,21 +77,26 @@ object IosUi {
     /** The grouped-inset card that everything sits on in modern iOS settings screens. */
     fun card(ctx: Context): LinearLayout = LinearLayout(ctx).apply {
         orientation = LinearLayout.VERTICAL
+        val theme = mode(ctx)
         background = GradientDrawable().apply {
             setColor(cardBackground(ctx))
-            cornerRadius = dp(ctx, 12f).toFloat()
+            cornerRadius = dp(ctx, theme.shape.card.toFloat()).toFloat()
+            if (theme.shape.border > 0) {
+                setStroke(dp(ctx, theme.shape.border.toFloat()), separator(ctx))
+            }
         }
-        val p = dp(ctx, 16f)
-        setPadding(p, dp(ctx, 14f), p, dp(ctx, 14f))
+        val p = dp(ctx, theme.density.page.toFloat())
+        setPadding(p, dp(ctx, theme.density.row.toFloat()), p, dp(ctx, theme.density.row.toFloat()))
     }
 
-    /** Section header: uppercase, small, secondary — the iOS grouped-table convention. */
+    /** Section header: uppercase when the theme asks for it, small, secondary. */
     fun sectionHeader(ctx: Context, text: String): TextView = TextView(ctx).apply {
-        this.text = text.uppercase()
+        val theme = mode(ctx)
+        this.text = if (theme.typography.uppercaseHeaders) text.uppercase() else text
         textSize = 13f
-        letterSpacing = 0.06f
+        letterSpacing = 0.06f + theme.typography.letterSpacing
         setTextColor(secondaryLabel(ctx))
-        setPadding(dp(ctx, 20f), dp(ctx, 18f), dp(ctx, 20f), dp(ctx, 7f))
+        setPadding(dp(ctx, theme.density.page.toFloat() + 4f), dp(ctx, 18f), dp(ctx, 20f), dp(ctx, 7f))
     }
 
     /** Footer text under a card, explaining what the section does. */
@@ -91,7 +120,7 @@ object IosUi {
             this.text = text
             textSize = 17f
             gravity = Gravity.CENTER
-            setTextColor(Color.WHITE)
+            setTextColor(palette(ctx).onAccent.toInt())
             // Fake bold rather than a bold Typeface: PrismFontEngine reassigns typeface after
             // layout is built, and the single-argument setter would drop a style set here.
             paint.isFakeBoldText = true
@@ -102,11 +131,13 @@ object IosUi {
         }
 
     /** The filled button's background, exposed so a tint change keeps its ripple. */
-    fun filledBackground(ctx: Context, tint: Int): Drawable =
-        rippleOf(ctx, GradientDrawable().apply {
+    fun filledBackground(ctx: Context, tint: Int): Drawable {
+        val theme = mode(ctx)
+        return rippleOf(ctx, GradientDrawable().apply {
             setColor(tint)
-            cornerRadius = dp(ctx, 12f).toFloat()
+            cornerRadius = dp(ctx, if (theme.shape.pill) 999f else theme.shape.button.toFloat()).toFloat()
         })
+    }
 
     /** Tinted (low-emphasis) button — iOS's secondary action style. */
     fun tintedButton(ctx: Context, text: String, tint: Int = accent(ctx)): TextView =
@@ -116,9 +147,10 @@ object IosUi {
             gravity = Gravity.CENTER
             setTextColor(tint)
             setPadding(0, dp(ctx, 13f), 0, dp(ctx, 13f))
+            val theme = mode(ctx)
             background = rippleOf(ctx, GradientDrawable().apply {
                 setColor((tint and 0x00FFFFFF) or 0x1F000000)
-                cornerRadius = dp(ctx, 12f).toFloat()
+                cornerRadius = dp(ctx, if (theme.shape.pill) 999f else theme.shape.button.toFloat()).toFloat()
             })
             isClickable = true
             isFocusable = true
@@ -126,9 +158,7 @@ object IosUi {
 
     private fun rippleOf(ctx: Context, content: Drawable): Drawable =
         RippleDrawable(
-            ColorStateList.valueOf(
-                if (isDark(ctx)) 0x22FFFFFF else 0x18000000
-            ),
+            ColorStateList.valueOf((palette(ctx).text.toInt() and 0x00FFFFFF) or 0x22000000),
             content, null
         )
 
@@ -151,9 +181,13 @@ object IosUi {
         }
     }
 
-    /** Text field styled as an inset iOS field rather than an underlined Material one. */
+    /** Text field styled as an inset field rather than an underlined Material one. */
     fun fieldBackground(ctx: Context): Drawable = GradientDrawable().apply {
+        val theme = mode(ctx)
         setColor(fill(ctx))
-        cornerRadius = dp(ctx, 9f).toFloat()
+        cornerRadius = dp(ctx, if (theme.shape.pill) 999f else theme.shape.field.toFloat()).toFloat()
+        if (theme.shape.border > 0) {
+            setStroke(dp(ctx, theme.shape.border.toFloat()), separator(ctx))
+        }
     }
 }

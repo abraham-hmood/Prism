@@ -52,7 +52,7 @@ object FileChooser {
 
         val labels = entries.map { it.first }.toTypedArray()
 
-        val builder = AlertDialog.Builder(context)
+        val builder = com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle(if (directories) "Open folder" else "Open file")
             .setItems(labels) { _, which ->
                 val target = entries[which].second ?: return@setItems

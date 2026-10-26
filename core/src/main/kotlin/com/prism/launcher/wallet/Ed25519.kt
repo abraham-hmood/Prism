@@ -152,4 +152,40 @@ object Ed25519 {
 
     fun littleEndian(value: BigInteger): ByteArray =
         WalletCrypto.toFixedBytes(value, 32).reversedArray()
+
+    // ── RFC 8032 signatures ────────────────────────────────────────────────
+    //
+    // BOUNCYCASTLE HERE, AND THE ARITHMETIC ABOVE FOR MONERO. The two are not interchangeable: this
+    // class's own scalar multiplication implements Monero's unreduced, unhashed keys, while an
+    // Ed25519 signature is defined over a seed that is hashed and clamped first. BouncyCastle
+    // implements exactly that standard, has been reviewed for it, and is already a dependency -- so
+    // the signature path uses it rather than a second hand-rolled implementation that would need to
+    // get point decompression, non-canonical S and small-order keys right on its own.
+
+    /** The compressed public key for a 32-byte RFC 8032 seed. */
+    fun publicKeyFromSeed(seed: ByteArray): ByteArray {
+        require(seed.size == 32) { "an ed25519 seed is 32 bytes" }
+        return org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters(seed, 0)
+            .generatePublicKey().encoded
+    }
+
+    /** Signs [message] with a 32-byte seed, returning `R ‖ S`. Deterministic, per RFC 8032. */
+    fun sign(seed: ByteArray, message: ByteArray): ByteArray {
+        require(seed.size == 32) { "an ed25519 seed is 32 bytes" }
+        val signer = org.bouncycastle.crypto.signers.Ed25519Signer()
+        signer.init(true, org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters(seed, 0))
+        signer.update(message, 0, message.size)
+        return signer.generateSignature()
+    }
+
+    /** Verifies `R ‖ S` over [message] against a compressed public key. */
+    fun verify(publicKey: ByteArray, message: ByteArray, signature: ByteArray): Boolean {
+        if (publicKey.size != 32 || signature.size != 64) return false
+        return runCatching {
+            val verifier = org.bouncycastle.crypto.signers.Ed25519Signer()
+            verifier.init(false, org.bouncycastle.crypto.params.Ed25519PublicKeyParameters(publicKey, 0))
+            verifier.update(message, 0, message.size)
+            verifier.verifySignature(signature)
+        }.getOrDefault(false)
+    }
 }

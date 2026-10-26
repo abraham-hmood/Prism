@@ -237,7 +237,7 @@ object DesktopDiagnostics {
     }
 
     /**
-     * The overlay, which is what pairing and social sharing are gated on.
+     * Meshnet membership, which is what pairing and social sharing are gated on.
      *
      * WORTH ITS OWN PANEL because it is the difference between "Prism can see that device" and "Prism
      * will exchange anything with it", and until this existed there was nowhere at all to see which of
@@ -245,24 +245,23 @@ object DesktopDiagnostics {
      */
     private fun overlay(): Panel {
         val checks = mutableListOf<Check>()
-        val address = MeshMembership.overlayAddress()
 
-        checks += if (address != null) {
-            ok("On the overlay", "as " + address)
+        checks += if (MeshMembership.isOnMeshnet()) {
+            ok("On the meshnet", MeshMembership.describe())
         } else {
             warn(
-                "On the overlay",
+                "On the meshnet",
                 "no -- trusted-device pairing and social sharing are unavailable. " +
                     MeshMembership.explain(),
             )
         }
 
         val all = MeshTransport.peers()
-        val onOverlay = MeshMembership.overlayPeers(all)
+        val peers = MeshMembership.meshPeers(all)
         checks += info(
             "Peers eligible to pair",
-            onOverlay.size.toString() + " of " + all.size + " discovered" +
-                (if (all.size > onOverlay.size) " (the rest are only on this network)" else ""),
+            peers.size.toString() + " of " + all.size + " discovered" +
+                (if (all.size > peers.size) " (the rest are only on this network)" else ""),
         )
 
         val active = com.prism.launcher.vpn.PrismServerClient.active()
@@ -271,7 +270,7 @@ object DesktopDiagnostics {
         } else {
             ok("Active server", active.name.ifBlank { active.address } + " at " + active.address + ":" + active.port)
         }
-        return Panel("Overlay membership", checks)
+        return Panel("Meshnet membership", checks)
     }
 
     private fun tunnel(): Panel {

@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
@@ -92,8 +93,27 @@ class CallModeActivity : PrismBaseActivity() {
 
         buildUi()
 
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+        // CALL AUDIO IS PRIVATE AUDIO. SpeechRecognizer's default service may be a cloud one:
+        // the platform is free to stream the microphone to Google, and nothing on screen says so.
+        // A call hands over whole conversations, so on Android 12+ the on-device recogniser is
+        // required and its absence is a refusal, not a silent downgrade. Below 12 there is no
+        // on-device constructor at all; EXTRA_PREFER_OFFLINE is sent and the status line says the
+        // guarantee cannot be made on that release.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val onDevice = runCatching {
+                SpeechRecognizer.isOnDeviceRecognitionAvailable(this)
+            }.getOrDefault(false)
+            if (!onDevice) {
+                statusLabel.text =
+                    "Call mode needs an on-device speech recogniser so the conversation stays on " +
+                        "this phone. None is installed — install one in system settings, or use " +
+                        "the chat screen instead."
+                state = State.ENDED
+                return
+            }
+        } else if (!SpeechRecognizer.isRecognitionAvailable(this)) {
             statusLabel.text = "This device has no speech recogniser, so a call cannot be placed"
+            state = State.ENDED
             return
         }
 
@@ -241,7 +261,21 @@ class CallModeActivity : PrismBaseActivity() {
         state = State.LISTENING
         setStatus("Listening…")
 
-        val recognizerInstance = SpeechRecognizer.createSpeechRecognizer(this).also {
+        // createSpeechRecognizer() is deliberately NOT used on Android 12+: it may bind the
+        // default (possibly cloud) service even when an on-device one exists. The on-device
+        // constructor is the only way to ask for the guarantee.
+        val recognizerInstance = runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                SpeechRecognizer.createOnDeviceSpeechRecognizer(this)
+            } else {
+                SpeechRecognizer.createSpeechRecognizer(this)
+            }
+        }.getOrElse {
+            PrismLogger.logError(TAG, "Could not create an on-device recogniser", it)
+            setStatus("The on-device speech recogniser could not be started")
+            state = State.IDLE
+            return
+        }.also {
             recognizer?.destroy()
             recognizer = it
         }
@@ -301,6 +335,9 @@ class CallModeActivity : PrismBaseActivity() {
                         RecognizerIntent.LANGUAGE_MODEL_FREE_FORM,
                     )
                     putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                    // Ignored by an on-device engine (which is what we bind on 12+), and the
+                    // closest thing to a privacy guarantee on older releases.
+                    putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
                 },
             )
         }.onFailure {

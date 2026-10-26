@@ -1,0 +1,14 @@
+# Target labels
+ llama-populate
+# Source files and their labels
+F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/CMakeFiles/llama-populate
+F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/CMakeFiles/llama-populate.rule
+F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/CMakeFiles/llama-populate-complete.rule
+F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-build.rule
+F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-configure.rule
+F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-download.rule
+F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-install.rule
+F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-mkdir.rule
+F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-patch.rule
+F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-test.rule
+F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-update.rule

@@ -1,6 +1,8 @@
 package com.prism.desktop.ui
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
@@ -12,6 +14,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.pointer.isSecondaryPressed
@@ -53,13 +56,21 @@ fun Modifier.clickableRow(onClick: () -> Unit): Modifier = composed {
 
 @Composable
 fun SectionHeader(text: String) {
+    val colors = LocalPrismColors.current
+    val theme = LocalPrismTheme.current
+    val macOs = LocalMacOsLook.current
     Text(
-        text.uppercase(),
+        if (theme.typography.uppercaseHeaders) text.uppercase() else text.replaceFirstChar { it.uppercase() },
         fontSize = 11.sp,
-        letterSpacing = 1.1.sp,
+        // macOS section titles are sentence case at tracking 0; the spaced small caps are iOS.
+        letterSpacing = if (macOs) 0.sp else 1.1.sp,
         fontWeight = FontWeight.SemiBold,
-        color = Color(0xFF7A7A88),
-        modifier = Modifier.padding(start = 4.dp, top = 20.dp, bottom = 8.dp)
+        color = if (macOs) colors.muted else colors.faint,
+        modifier = Modifier.padding(
+            start = 4.dp,
+            top = if (macOs) 22.dp else 20.dp,
+            bottom = 8.dp,
+        )
     )
 }
 
@@ -68,7 +79,7 @@ fun SectionFooter(text: String) {
     Text(
         text,
         fontSize = 12.sp,
-        color = Color(0xFF83838F),
+        color = LocalPrismColors.current.faint,
         lineHeight = 17.sp,
         modifier = Modifier.padding(start = 4.dp, top = 8.dp, end = 4.dp)
     )
@@ -76,10 +87,30 @@ fun SectionFooter(text: String) {
 
 @Composable
 fun Card(content: @Composable ColumnScope.() -> Unit) {
+    val colors = LocalPrismColors.current
+    val shape = RoundedCornerShape(colors.cardRadius)
     Surface(
-        color = Color(0xFF16161A),
-        shape = RoundedCornerShape(12.dp),
-        modifier = Modifier.fillMaxWidth()
+        color = colors.card,
+        shape = shape,
+        border = if (colors.border > 0) BorderStroke(colors.border.dp, colors.divider) else null,
+        modifier = Modifier
+            .fillMaxWidth()
+            // A shadow and a current are alternatives: Spark sets elevation to zero precisely so
+            // the edge is the only thing that lights up.
+            .then(
+                if (colors.elevation > 0 && colors.edgeEffect != com.prism.launcher.theme.EDGE_ELECTRIC) {
+                    Modifier.shadow(colors.elevation.dp, shape)
+                } else {
+                    Modifier
+                },
+            )
+            .then(
+                if (colors.edgeEffect == com.prism.launcher.theme.EDGE_ELECTRIC) {
+                    Modifier.electricEdge(colors.accent, colors.cardRadius)
+                } else {
+                    Modifier
+                },
+            )
     ) {
         Column(content = content)
     }
@@ -92,7 +123,7 @@ fun Hairline() {
             .fillMaxWidth()
             .padding(start = 16.dp)
             .height(1.dp)
-            .background(Color(0xFF26262E))
+            .background(LocalPrismColors.current.divider)
     )
 }
 
@@ -107,7 +138,7 @@ fun InfoRow(label: String, value: String, mono: Boolean = false) {
         Text(
             value,
             fontSize = 13.sp,
-            color = Color(0xFFA8A8B4),
+            color = LocalPrismColors.current.muted,
             fontFamily = if (mono) FontFamily.Monospace else FontFamily.Default
         )
     }
@@ -121,10 +152,10 @@ fun NavRow(title: String, detail: String, destructive: Boolean = false, onClick:
         Text(
             title,
             fontSize = 15.sp,
-            color = if (destructive) Color(0xFFFF6B6B) else MaterialTheme.colorScheme.onSurface
+            color = if (destructive) LocalPrismColors.current.destructive else MaterialTheme.colorScheme.onSurface
         )
         if (detail.isNotEmpty()) {
-            Text(detail, fontSize = 12.sp, color = Color(0xFF83838F), modifier = Modifier.padding(top = 3.dp))
+            Text(detail, fontSize = 12.sp, color = LocalPrismColors.current.faint, modifier = Modifier.padding(top = 3.dp))
         }
     }
 }
@@ -138,7 +169,7 @@ fun ToggleRow(title: String, detail: String, checked: Boolean, enabled: Boolean 
         Column(Modifier.weight(1f)) {
             Text(title, fontSize = 15.sp)
             if (detail.isNotEmpty()) {
-                Text(detail, fontSize = 12.sp, color = Color(0xFF83838F), lineHeight = 16.sp,
+                Text(detail, fontSize = 12.sp, color = LocalPrismColors.current.faint, lineHeight = 16.sp,
                     modifier = Modifier.padding(top = 3.dp))
             }
         }
@@ -162,9 +193,11 @@ fun CommittingField(
     onCommit: (String) -> Unit
 ) {
     var text by remember(value) { mutableStateOf(value) }
+    val colors = LocalPrismColors.current
     Surface(
-        color = if (enabled) Color(0xFF1E1E24) else Color(0xFF191920),
-        shape = RoundedCornerShape(8.dp),
+        color = if (enabled) colors.surfaceRaised else colors.surface,
+        shape = RoundedCornerShape(if (colors.pill) 999.dp else colors.fieldRadius),
+        border = if (colors.border > 0) BorderStroke(colors.border.dp, colors.divider) else null,
         modifier = modifier
     ) {
         BasicTextField(
@@ -173,7 +206,7 @@ fun CommittingField(
             enabled = enabled,
             singleLine = true,
             textStyle = TextStyle(
-                color = if (enabled) Color(0xFFE6E6EE) else Color(0xFF6C6C78),
+                color = if (enabled) colors.onSurface else colors.faint,
                 fontSize = 14.sp
             ),
             cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
@@ -230,13 +263,61 @@ fun Modifier.rightClickable(onRightClick: () -> Unit): Modifier = this.pointerIn
 fun Modifier.alphaIf(enabled: Boolean): Modifier = if (enabled) this else this.alpha(0.4f)
 
 @Composable
-fun PageScaffold(title: String, subtitle: String? = null, content: @Composable ColumnScope.() -> Unit) {
-    Column(Modifier.fillMaxSize().padding(horizontal = 28.dp)) {
-        Text(title, fontSize = 27.sp, fontWeight = FontWeight.Bold,
-            modifier = Modifier.padding(top = 26.dp, bottom = if (subtitle == null) 6.dp else 2.dp))
+fun PageScaffold(
+    title: String,
+    subtitle: String? = null,
+    // Optional top-right actions, in the same corner the phone puts them. A page that needs one
+    // action (Messages' dialer) should not have to reimplement the header to get it.
+    actions: (@Composable androidx.compose.foundation.layout.RowScope.() -> Unit)? = null,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    val colors = LocalPrismColors.current
+    val macOs = LocalMacOsLook.current
+    Column(
+        Modifier
+            .fillMaxSize()
+            .padding(horizontal = if (macOs) 24.dp else 28.dp)
+    ) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(
+                    top = if (macOs) 16.dp else 26.dp,
+                    bottom = if (subtitle == null) (if (macOs) 10.dp else 6.dp) else 2.dp,
+                ),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            // A macOS toolbar title is 13pt semibold; a page heading inside the content is 20pt.
+            // These pages are the content, so they take the second, not the first.
+            Text(
+                title,
+                fontSize = if (macOs) 20.sp else 27.sp,
+                fontWeight = if (macOs) FontWeight.SemiBold else FontWeight.Bold,
+            )
+            if (actions != null) {
+                Spacer(Modifier.weight(1f))
+                actions()
+            }
+        }
         if (subtitle != null) {
-            Text(subtitle, fontSize = 13.sp, color = Color(0xFF83838F),
-                modifier = Modifier.padding(bottom = 8.dp))
+            Text(
+                subtitle,
+                fontSize = if (macOs) 12.sp else 13.sp,
+                color = if (macOs) colors.muted else colors.faint,
+                modifier = Modifier.padding(bottom = 8.dp),
+            )
+        }
+        if (macOs) {
+            // The hairline under the toolbar, which is what separates chrome from content in
+            // every macOS window.
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .padding(top = if (subtitle == null) 2.dp else 6.dp)
+                    .height(1.dp)
+                    .background(colors.divider)
+            )
+            Spacer(Modifier.height(10.dp))
         }
         content()
     }

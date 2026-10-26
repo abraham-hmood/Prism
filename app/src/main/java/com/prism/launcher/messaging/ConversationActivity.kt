@@ -117,6 +117,16 @@ class ConversationActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // A conversation is a lock gate. Reaching one from a notification or a deep link while
+        // Prism is locked has to show the lock, not the transcript.
+        if (!com.prism.launcher.lock.PrismLockScope.permit(
+                com.prism.launcher.lock.PrismLockScope.Gate.MESSAGES
+            )
+        ) {
+            android.widget.Toast.makeText(this, "Prism is locked", android.widget.Toast.LENGTH_SHORT).show()
+            finish()
+            return
+        }
         binding = ActivityConversationBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
@@ -815,7 +825,23 @@ class ConversationActivity : AppCompatActivity() {
                 runOnUiThread { Toast.makeText(this@ConversationActivity, note, Toast.LENGTH_LONG).show() }
             }
 
-            // 4. Save AI Response, then drop the live bubble — the DB Flow picks up the real row
+            // 4. Save AI Response, then drop the live bubble — the DB Flow picks up the real row.
+            //
+            // UNLESS IT IS A FAILURE RATHER THAN AN ANSWER. Every backend reports its failures as
+            // text with one of these prefixes; storing that as Sam's reply made it look like the
+            // model had answered, and worse, the next turn fed the error back in as "what Sam said
+            // before". The message is shown once and not persisted.
+            val failure = aiText.trim()
+            val isFailure = failure.startsWith("Error:") || failure.startsWith("P2P Model Error:")
+            if (isFailure) {
+                withContext(Dispatchers.Main) {
+                    liveBubble = null
+                    renderMessages()
+                    Toast.makeText(this@ConversationActivity, failure, Toast.LENGTH_LONG).show()
+                }
+                return@launch
+            }
+
             dao.insert(AiMessageEntity(
                 text = aiText,
                 isSent = false,
@@ -838,12 +864,20 @@ class ConversationActivity : AppCompatActivity() {
             val smsManager = getSystemService(SmsManager::class.java)
             if (uri == null) {
                 smsManager.sendTextMessage(address, null, text, null, null)
+                Toast.makeText(this, "Message Sent", Toast.LENGTH_SHORT).show()
             } else {
-                // MMS implementation is complex; for now we simulate visual success in the UI
-                // for the 'Insane AI' demo as per the user's request for rich media.
-                Toast.makeText(this, "MMS feature simulation: Multi-media sent", Toast.LENGTH_SHORT).show()
+                // THE TEXT GOES, THE ATTACHMENT DOES NOT, AND THE USER IS TOLD SO. The old code
+                // showed "MMS feature simulation: Multi-media sent" and a second "Message Sent"
+                // toast without sending anything -- a success message for a message that never
+                // left the device. Sending a real MMS needs a PDU built to the carrier's spec and
+                // is not implemented; saying so is the honest behaviour.
+                smsManager.sendTextMessage(address, null, text, null, null)
+                Toast.makeText(
+                    this,
+                    "Text sent — MMS attachments are not supported yet, so the attachment was not sent",
+                    Toast.LENGTH_LONG,
+                ).show()
             }
-            Toast.makeText(this, "Message Sent", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
             Toast.makeText(this, "Failed: ${e.message}", Toast.LENGTH_SHORT).show()
         }

@@ -28,6 +28,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.isCtrlPressed
 import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
@@ -75,6 +76,7 @@ fun LauncherShell(onExit: () -> Unit) {
     var slots by remember { mutableStateOf(prefs.getAssignments().toList()) }
     var switcherOpen by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf(false) }
+    val colors = LocalPrismColors.current
 
     val pagerState = rememberPagerState(pageCount = { slots.size.coerceAtLeast(1) })
     val scope = rememberCoroutineScope()
@@ -85,6 +87,15 @@ fun LauncherShell(onExit: () -> Unit) {
     }
 
     fun step(delta: Int) = goTo((pagerState.currentPage + delta).coerceIn(slots.indices))
+
+    // A connected display follows the pager. Extend uses this to pick the page AFTER the one on
+    // screen; mimic ignores it and streams the screen itself.
+    LaunchedEffect(pagerState.currentPage, slots) {
+        com.prism.launcher.display.WirelessDisplay.notePage(
+            slots.map { it.serialize() },
+            pagerState.currentPage,
+        )
+    }
 
     // The shell owns the keyboard. Without this the events go wherever the window focused by
     // default and none of the bindings fire.
@@ -102,24 +113,30 @@ fun LauncherShell(onExit: () -> Unit) {
             .onPreviewKeyEvent { event ->
                 if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                 when (event.key) {
+                    // CTRL+TAB, NOT TAB. A plain Tab is how the editor indents, how a code
+                    // block inserts four spaces and how focus moves through any form; claiming
+                    // it in the preview phase made all three impossible. The modifier keeps the
+                    // shell's page step without taking a key every page needs.
                     Key.Tab -> {
-                        if (!switcherOpen) step(if (event.isShiftPressed) -1 else 1)
-                        // Consumed either way: letting Tab through while the switcher is open
-                        // would move focus behind it.
-                        true
+                        if (event.isCtrlPressed) {
+                            if (!switcherOpen) step(if (event.isShiftPressed) -1 else 1)
+                            true
+                        } else false
                     }
                     Key.DirectionDown -> if (switcherOpen) false else { switcherOpen = true; true }
                     Key.DirectionUp, Key.Escape ->
                         if (switcherOpen) { switcherOpen = false; true } else false
-                    Key.One -> { goTo(0); true }
-                    Key.Two -> { goTo(1); true }
-                    Key.Three -> { goTo(2); true }
-                    Key.Four -> { goTo(3); true }
-                    Key.Five -> { goTo(4); true }
-                    Key.Six -> { goTo(5); true }
-                    Key.Seven -> { goTo(6); true }
-                    Key.Eight -> { goTo(7); true }
-                    Key.Nine -> { goTo(8); true }
+                    // Bare digits type. Ctrl+digit jumps, so a PIN field, a phone number, a model
+                    // temperature and a code example can all contain a 1..9 again.
+                    Key.One -> if (event.isCtrlPressed) { goTo(0); true } else false
+                    Key.Two -> if (event.isCtrlPressed) { goTo(1); true } else false
+                    Key.Three -> if (event.isCtrlPressed) { goTo(2); true } else false
+                    Key.Four -> if (event.isCtrlPressed) { goTo(3); true } else false
+                    Key.Five -> if (event.isCtrlPressed) { goTo(4); true } else false
+                    Key.Six -> if (event.isCtrlPressed) { goTo(5); true } else false
+                    Key.Seven -> if (event.isCtrlPressed) { goTo(6); true } else false
+                    Key.Eight -> if (event.isCtrlPressed) { goTo(7); true } else false
+                    Key.Nine -> if (event.isCtrlPressed) { goTo(8); true } else false
                     else -> false
                 }
             }
@@ -206,7 +223,7 @@ fun LauncherShell(onExit: () -> Unit) {
                         payload.label,
                         fontSize = 9.sp,
                         maxLines = 1,
-                        color = Color.White,
+                        color = colors.onSurface,
                     )
                 }
             }
@@ -223,81 +240,75 @@ fun LauncherShell(onExit: () -> Unit) {
     }
 }
 
-/** Maps a slot to the page that fills it. */
+/**
+ * Maps a slot to the page that fills it.
+ *
+ * THE SAME PAGES THE RAIL OPENS, through [PageBody], with two exceptions where the slot index
+ * matters (the desktop grid picks its cell store by index) or no PageId exists (Kinetic Halo). It
+ * used to be a second, partial mapping that told the user Nebula, Editor, Science, Language,
+ * Minigames and Cloud were "not ported" -- while the workbench rendered every one of them two
+ * clicks away. A port that contradicts itself is worse than one that is incomplete.
+ */
 @Composable
 private fun SlotPage(slot: SlotAssignment, index: Int) {
     when (slot) {
-        is SlotAssignment.DesktopGrid -> DesktopGridPage(pageIndex = index)
-        is SlotAssignment.Browser -> BrowserPage()
-        is SlotAssignment.AgenticTools -> AgenticToolsPage()
+        is SlotAssignment.Default, is SlotAssignment.DesktopGrid -> DesktopGridPage(pageIndex = index)
         is SlotAssignment.KineticHalo -> KineticHaloPage()
-        is SlotAssignment.AppDrawer -> AppDrawerPage()
-        is SlotAssignment.FileExplorer -> FileExplorerPage()
-        is SlotAssignment.Messaging -> NoraChatPage()
-        is SlotAssignment.Models -> ModelsPage()
-        is SlotAssignment.ModelStore -> ModelsPage()
-        is SlotAssignment.Default -> DesktopGridPage(pageIndex = index)
-        // The rest name features whose UI is not ported. Naming the specific blocker rather than
-        // showing a generic empty state, for the same reason the rail does.
-        else -> UnportedSlot(slot)
+        is SlotAssignment.Browser -> PageBody(PageId.BROWSER, launcherMode = true, onLauncherModeChange = {})
+        is SlotAssignment.AppDrawer -> PageBody(PageId.APPS, launcherMode = true, onLauncherModeChange = {})
+        is SlotAssignment.Messaging ->
+            PageBody(PageId.MESSAGES_PAGE, launcherMode = true, onLauncherModeChange = {})
+        is SlotAssignment.FileExplorer -> PageBody(PageId.FILES, launcherMode = true, onLauncherModeChange = {})
+        is SlotAssignment.NebulaSocial -> PageBody(PageId.NEBULA, launcherMode = true, onLauncherModeChange = {})
+        is SlotAssignment.VirtualizationOs ->
+            PageBody(PageId.VIRTUALIZATION, launcherMode = true, onLauncherModeChange = {})
+        is SlotAssignment.Models -> PageBody(PageId.MODELS, launcherMode = true, onLauncherModeChange = {})
+        is SlotAssignment.ModelStore -> PageBody(PageId.MODEL_SHOP, launcherMode = true, onLauncherModeChange = {})
+        is SlotAssignment.AgenticTools -> PageBody(PageId.AGENTIC, launcherMode = true, onLauncherModeChange = {})
+        is SlotAssignment.Wallet -> PageBody(PageId.WALLET, launcherMode = true, onLauncherModeChange = {})
+        is SlotAssignment.Editor -> PageBody(PageId.EDITOR, launcherMode = true, onLauncherModeChange = {})
+        is SlotAssignment.Science -> PageBody(PageId.SCIENCE, launcherMode = true, onLauncherModeChange = {})
+        is SlotAssignment.Notifications ->
+            PageBody(PageId.NOTIFICATIONS, launcherMode = true, onLauncherModeChange = {})
+        is SlotAssignment.Language -> PageBody(PageId.LANGUAGE, launcherMode = true, onLauncherModeChange = {})
+        is SlotAssignment.Minigames -> PageBody(PageId.GAMES, launcherMode = true, onLauncherModeChange = {})
+        is SlotAssignment.Cloud -> PageBody(PageId.CLOUD_AI, launcherMode = true, onLauncherModeChange = {})
+        is SlotAssignment.Meshvoice -> PageBody(PageId.MESHVOICE, launcherMode = true, onLauncherModeChange = {})
+        is SlotAssignment.Maps -> PageBody(PageId.MAPS, launcherMode = true, onLauncherModeChange = {})
+        is SlotAssignment.Mouse -> MousePage()
+        is SlotAssignment.Photos -> PhotosPage()
+        is SlotAssignment.PhotoPix -> PhotoPixPage()
+        is SlotAssignment.Custom -> UnsupportedSlot(
+            "Plugin page",
+            "Android loads these from installed APKs. On the desktop a plugin page has to come " +
+                "from a JAR; that loader is the one piece of the plugin system still missing."
+        )
     }
 }
 
+/**
+ * A slot rendered without any launcher chrome, for the wireless display window.
+ *
+ * The display is a page, not a picture, so it uses the same renderer the pager does. Keeping one
+ * entry point means a page that works in the launcher cannot look different on the TV.
+ */
 @Composable
-private fun UnportedSlot(slot: SlotAssignment) {
-    val (label, why) = when (slot) {
-        is SlotAssignment.NebulaSocial -> "Nebula" to
-            "Storage is ported and working; the feed UI is 675 lines of Android views and is the " +
-                "largest single screen left."
-        is SlotAssignment.VirtualizationOs -> "Virtualization" to
-            "Android Virtualization Framework is Android-only; desktop would drive QEMU or libvirt."
-        is SlotAssignment.Custom -> "Plugin page" to
-            "Android loads these from APKs. Desktop will scan a plugins directory for JARs."
-        is SlotAssignment.Wallet -> "Wallet" to
-            "Key derivation, signing and the mining maths are all in :core and already run here; " +
-                "what is Android-only is the Keystore that encrypts the recovery phrase at rest, " +
-                "and the page UI. Desktop needs an equivalent WalletCipher before this can open a " +
-                "wallet safely."
+fun SlotPageForDisplay(slot: SlotAssignment, index: Int) = SlotPage(slot, index)
 
-        // The six below were added to the Android build after this file was written, and each has
-        // a phase of its own from the 2026-09-23 audit. They are named individually rather than
-        // falling into "Unassigned", which would have told the user their page was empty when in
-        // fact the page exists and this platform has not caught up.
-        is SlotAssignment.Editor -> "Editor" to
-            "PHASE 93. The editor front-end is already a web app, so it hosts in JCEF; what is left " +
-                "is the Node runtime and the terminal, both of which are EASIER here than on " +
-                "Android because a desktop has a real shell and a real interpreter."
-        is SlotAssignment.Science -> "Science" to
-            "PHASE 96. The lab notebook is pure Kotlin and ports as-is. The instruments that read " +
-                "hardware -- camera, Wi-Fi scan, microphone -- need a per-platform implementation, " +
-                "and a desktop with no camera cannot do cosmic rays at all."
-        is SlotAssignment.Notifications -> "Notifications" to
-            "PHASE 110. The store and the page are portable. Capturing notifications is not: " +
-                "Windows needs a packaged app identity and Linux needs a D-Bus monitor."
-        is SlotAssignment.Language -> "Language" to
-            "PHASE 94. Nearly all of it is already in :core -- the scheduler, the syllabus, the " +
-                "lexicons and the validators are plain Kotlin. This is a UI port, plus text to " +
-                "speech (PHASE 100) before the spoken half works."
-        is SlotAssignment.Minigames -> "Minigames" to
-            "PHASE 95. The rules engine is in :core and tested there; the views are hand-drawn " +
-                "Canvas work that maps onto Compose closely. Mesh play waits on PHASE 48."
-        is SlotAssignment.Cloud -> "Cloud" to
-            "PHASE 98. The encryption and the file index are in :core and tested. It needs mesh " +
-                "gossip (PHASE 48) to find peers and a desktop WalletCipher (PHASE 81) for the " +
-                "seed every key derives from."
-        else -> "Unassigned" to "Press ↓ to open the switcher, or Edit pages to assign something."
-    }
-
+/** The one honest placeholder: a page whose loader does not exist on this platform. */
+@Composable
+private fun UnsupportedSlot(label: String, why: String) {
+    val colors = LocalPrismColors.current
     Column(
         Modifier.fillMaxSize().padding(48.dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Icon(Icons.Filled.Dashboard, null, tint = Color(0xFF3A3A44), modifier = Modifier.size(56.dp))
+        Icon(Icons.Filled.Extension, null, tint = colors.divider, modifier = Modifier.size(56.dp))
         Spacer(Modifier.height(18.dp))
         Text(label, fontSize = 22.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(10.dp))
-        Text(why, fontSize = 13.sp, color = Color(0xFF9A9AA6), modifier = Modifier.widthIn(max = 460.dp))
+        Text(why, fontSize = 13.sp, color = colors.muted, modifier = Modifier.widthIn(max = 460.dp))
     }
 }
 
@@ -309,21 +320,22 @@ private fun LauncherTopBar(
     onEdit: () -> Unit,
     onExit: () -> Unit,
 ) {
+    val colors = LocalPrismColors.current
     Row(
-        Modifier.fillMaxWidth().background(Color(0xFF121215)).padding(horizontal = 18.dp, vertical = 9.dp),
+        Modifier.fillMaxWidth().background(colors.background).padding(horizontal = 18.dp, vertical = 9.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Icon(slotIcon(slot), null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(17.dp))
         Spacer(Modifier.width(9.dp))
         Text(slotLabel(slot), fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.width(12.dp))
-        Text("${index + 1}/$total", fontSize = 11.sp, color = Color(0xFF55555F))
+        Text("${index + 1}/$total", fontSize = 11.sp, color = colors.faint)
 
         Spacer(Modifier.weight(1f))
-        Text("Tab / Shift+Tab pages   ↓ switcher   1-9 jump", fontSize = 10.sp, color = Color(0xFF48484F))
+        Text("Ctrl+Tab pages   ↓ switcher   Ctrl+1-9 jump", fontSize = 10.sp, color = colors.faint)
         Spacer(Modifier.width(16.dp))
         Text(
-            "Edit pages", fontSize = 12.sp, color = Color(0xFF9A9AA6),
+            "Edit pages", fontSize = 12.sp, color = colors.muted,
             modifier = Modifier.clickableRow { onEdit() }.padding(horizontal = 6.dp, vertical = 2.dp)
         )
         Spacer(Modifier.width(10.dp))
@@ -336,8 +348,9 @@ private fun LauncherTopBar(
 
 @Composable
 private fun PageDots(current: Int, total: Int, onPick: (Int) -> Unit) {
+    val colors = LocalPrismColors.current
     Row(
-        Modifier.fillMaxWidth().background(Color(0xFF121215)).padding(vertical = 9.dp),
+        Modifier.fillMaxWidth().background(colors.background).padding(vertical = 9.dp),
         horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -348,7 +361,7 @@ private fun PageDots(current: Int, total: Int, onPick: (Int) -> Unit) {
                     .padding(horizontal = 4.dp)
                     .size(if (active) 8.dp else 6.dp)
                     .background(
-                        if (active) MaterialTheme.colorScheme.primary else Color(0xFF3A3A44),
+                        if (active) MaterialTheme.colorScheme.primary else colors.divider,
                         RoundedCornerShape(50)
                     )
                     .clickableRow { onPick(i) }
@@ -359,18 +372,19 @@ private fun PageDots(current: Int, total: Int, onPick: (Int) -> Unit) {
 
 @Composable
 private fun PageSwitcher(slots: List<SlotAssignment>, current: Int, onPick: (Int) -> Unit) {
-    Surface(color = Color(0xFF1A1A20), shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp)) {
+    val colors = LocalPrismColors.current
+    Surface(color = colors.surface, shape = RoundedCornerShape(colors.cardRadius)) {
         Column(Modifier.fillMaxWidth().padding(vertical = 14.dp)) {
             Text(
                 "PAGES", fontSize = 10.sp, letterSpacing = 1.2.sp, fontWeight = FontWeight.SemiBold,
-                color = Color(0xFF6C6C78), modifier = Modifier.padding(start = 20.dp, bottom = 10.dp)
+                color = colors.faint, modifier = Modifier.padding(start = 20.dp, bottom = 10.dp)
             )
             LazyRow(contentPadding = PaddingValues(horizontal = 14.dp)) {
                 items(slots.withIndex().toList()) { (i, slot) ->
                     val active = i == current
                     Surface(
-                        color = if (active) Color(0xFF2A2A34) else Color(0xFF202028),
-                        shape = RoundedCornerShape(12.dp),
+                        color = if (active) colors.surfaceRaised else colors.surface,
+                        shape = RoundedCornerShape(colors.cardRadius),
                         modifier = Modifier.padding(horizontal = 5.dp).size(width = 112.dp, height = 96.dp)
                     ) {
                         Column(
@@ -380,15 +394,15 @@ private fun PageSwitcher(slots: List<SlotAssignment>, current: Int, onPick: (Int
                         ) {
                             Icon(
                                 slotIcon(slot), null,
-                                tint = if (active) MaterialTheme.colorScheme.primary else Color(0xFFB9B9C4),
+                                tint = if (active) MaterialTheme.colorScheme.primary else colors.muted,
                                 modifier = Modifier.size(26.dp)
                             )
                             Spacer(Modifier.height(8.dp))
                             Text(
                                 slotLabel(slot), fontSize = 11.sp,
-                                color = if (active) Color.White else Color(0xFF9A9AA6)
+                                color = if (active) colors.onSurface else colors.muted
                             )
-                            Text("${i + 1}", fontSize = 9.sp, color = Color(0xFF55555F))
+                            Text("${i + 1}", fontSize = 9.sp, color = colors.faint)
                         }
                     }
                 }
@@ -411,15 +425,23 @@ private fun SlotEditorDialog(
     onDismiss: () -> Unit,
     onChanged: () -> Unit,
 ) {
+    // ALL NINETEEN KINDS ANDROID OFFERS, not eleven. The missing eight were exactly the pages the
+    // shell could render but the picker would not let anyone assign, which read as "this platform
+    // does not have them" rather than "the list is out of date".
     val options = remember {
         listOf(
-            SlotAssignment.DesktopGrid, SlotAssignment.AppDrawer, SlotAssignment.FileExplorer,
-            SlotAssignment.Messaging, SlotAssignment.Browser, SlotAssignment.NebulaSocial,
-            SlotAssignment.KineticHalo, SlotAssignment.Models, SlotAssignment.ModelStore,
-            SlotAssignment.AgenticTools, SlotAssignment.VirtualizationOs,
+            SlotAssignment.Default, SlotAssignment.DesktopGrid, SlotAssignment.AppDrawer,
+            SlotAssignment.FileExplorer, SlotAssignment.Messaging, SlotAssignment.Browser,
+            SlotAssignment.NebulaSocial, SlotAssignment.KineticHalo, SlotAssignment.Models,
+            SlotAssignment.ModelStore, SlotAssignment.AgenticTools, SlotAssignment.VirtualizationOs,
+            SlotAssignment.Wallet, SlotAssignment.Editor, SlotAssignment.Science,
+            SlotAssignment.Notifications, SlotAssignment.Language, SlotAssignment.Minigames,
+            SlotAssignment.Cloud, SlotAssignment.Meshvoice, SlotAssignment.Maps,
+            SlotAssignment.Mouse, SlotAssignment.Photos, SlotAssignment.PhotoPix,
         )
     }
 
+    val colors = LocalPrismColors.current
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } },
@@ -431,15 +453,15 @@ private fun SlotEditorDialog(
                         Modifier.fillMaxWidth().padding(vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("${i + 1}", fontSize = 11.sp, color = Color(0xFF55555F), modifier = Modifier.width(20.dp))
-                        Icon(slotIcon(slot), null, tint = Color(0xFF9A9AA6), modifier = Modifier.size(17.dp))
+                        Text("${i + 1}", fontSize = 11.sp, color = colors.faint, modifier = Modifier.width(20.dp))
+                        Icon(slotIcon(slot), null, tint = colors.muted, modifier = Modifier.size(17.dp))
                         Spacer(Modifier.width(10.dp))
                         Text(slotLabel(slot), fontSize = 13.sp, modifier = Modifier.weight(1f))
                         // Removal is refused at one page by SlotPreferences itself, so the shell
                         // cannot end up with nothing to show.
                         if (slots.size > 1) {
                             Icon(
-                                Icons.Filled.Close, "Remove", tint = Color(0xFF6C6C78),
+                                Icons.Filled.Close, "Remove", tint = colors.faint,
                                 modifier = Modifier.size(16.dp).clickableRow {
                                     prefs.removeAt(i); onChanged()
                                 }
@@ -449,13 +471,13 @@ private fun SlotEditorDialog(
                 }
 
                 Spacer(Modifier.height(14.dp))
-                Text("ADD A PAGE", fontSize = 10.sp, letterSpacing = 1.1.sp, color = Color(0xFF6C6C78))
+                Text("ADD A PAGE", fontSize = 10.sp, letterSpacing = 1.1.sp, color = colors.faint)
                 Spacer(Modifier.height(6.dp))
                 LazyRow {
                     items(options) { option ->
                         Surface(
-                            color = Color(0xFF202028),
-                            shape = RoundedCornerShape(10.dp),
+                            color = colors.surfaceRaised,
+                            shape = RoundedCornerShape(colors.cardRadius),
                             modifier = Modifier.padding(end = 6.dp)
                         ) {
                             Row(
@@ -464,7 +486,7 @@ private fun SlotEditorDialog(
                                     .padding(horizontal = 10.dp, vertical = 8.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Icon(slotIcon(option), null, tint = Color(0xFF9A9AA6), modifier = Modifier.size(15.dp))
+                                Icon(slotIcon(option), null, tint = colors.muted, modifier = Modifier.size(15.dp))
                                 Spacer(Modifier.width(6.dp))
                                 Text(slotLabel(option), fontSize = 11.sp)
                             }
@@ -496,6 +518,11 @@ private fun slotLabel(slot: SlotAssignment): String = when (slot) {
     is SlotAssignment.Language -> "Language"
     is SlotAssignment.Minigames -> "Minigames"
     is SlotAssignment.Cloud -> "Cloud"
+    is SlotAssignment.Meshvoice -> "Meshvoice"
+    is SlotAssignment.Maps -> "Maps"
+    is SlotAssignment.Mouse -> "Mouse"
+    is SlotAssignment.Photos -> "Photos"
+    is SlotAssignment.PhotoPix -> "PhotoPix"
     is SlotAssignment.Custom -> "Plugin"
 }
 
@@ -519,5 +546,10 @@ private fun slotIcon(slot: SlotAssignment): ImageVector = when (slot) {
     is SlotAssignment.Language -> Icons.Filled.Translate
     is SlotAssignment.Minigames -> Icons.Filled.SportsEsports
     is SlotAssignment.Cloud -> Icons.Filled.CloudQueue
+    is SlotAssignment.Meshvoice -> Icons.Filled.Voicemail
+    is SlotAssignment.Maps -> Icons.Filled.Place
+    is SlotAssignment.Mouse -> Icons.Filled.TouchApp
+    is SlotAssignment.Photos -> Icons.Filled.PhotoLibrary
+    is SlotAssignment.PhotoPix -> Icons.Filled.Brush
     is SlotAssignment.Custom -> Icons.Filled.Extension
 }

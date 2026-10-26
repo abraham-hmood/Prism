@@ -314,14 +314,25 @@ fun NoraTrainingPage() {
     var summary by remember { mutableStateOf("") }
     val lines = remember { mutableStateListOf<String>() }
     var datasetSize by remember { mutableStateOf(-1) }
+    var datasetDetail by remember { mutableStateOf("") }
 
     LaunchedEffect(Unit) {
-        datasetSize = withContext(Dispatchers.IO) { NoraTrainer.loadDataset().size }
+        val summary = withContext(Dispatchers.IO) { NoraTrainer.summarize() }
+        datasetSize = summary.totalFiles
+        datasetDetail = buildString {
+            append("${summary.images} image, ${summary.textFiles} text, ${summary.parquetFiles} parquet")
+            if (summary.validationFiles > 0) append(" · ${summary.validationFiles} validation")
+            if (summary.testFiles > 0) append(" · ${summary.testFiles} test")
+        }
     }
 
     PageScaffold("Training", NoraConfig.datasetDir().absolutePath) {
         Card {
-            InfoRow("Dataset images", if (datasetSize < 0) "counting…" else "$datasetSize")
+            InfoRow("Dataset", if (datasetSize < 0) "counting…" else "$datasetSize file(s)")
+            if (datasetDetail.isNotBlank()) {
+                Hairline()
+                InfoRow("Contents", datasetDetail, mono = true)
+            }
             Hairline()
             InfoRow("Geometry", NoraConfig.geometry.signature(), mono = true)
             Hairline()
@@ -345,7 +356,10 @@ fun NoraTrainingPage() {
                         val result = withContext(Dispatchers.Default) {
                             runCatching {
                                 val brain = NoraBrain()
-                                NoraTrainer(brain).train(n) { p ->
+                                NoraTrainer(
+                                    brain,
+                                    textRenderer = com.prism.desktop.aether.DesktopTextRenderer::renderImage,
+                                ).train(n) { p ->
                                     val line = if (p.phase == "sleep") {
                                         "e${p.epoch}/${p.totalEpochs}  sleep — consolidating"
                                     } else {

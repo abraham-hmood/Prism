@@ -1,6 +1,7 @@
 package com.prism.desktop.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -11,7 +12,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -133,17 +133,26 @@ fun OnboardingOverlay(onDone: () -> Unit) {
                 }
 
                 Spacer(Modifier.height(16.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                // A REAL GAP BETWEEN EVERY CONTROL, not just between Back and Next. The row used to
+                // rely on one 8dp spacer in the middle of the group, so at a narrow window -- or
+                // with the long "Start using Prism" label on the last step -- Next grew until it met
+                // Back and the two read as a single broken control. spacedBy guarantees the gap,
+                // the weight keeps Skip on the left and the actions on the right, and the final
+                // label is short enough to not demand the room in the first place.
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
                     // Skip is on EVERY step, not only the first. Somebody who has read enough should not
                     // have to finish to get out.
                     OutlinedButton(onClick = { finish() }) { Text("Skip", fontSize = 13.sp) }
                     Spacer(Modifier.weight(1f))
                     if (index > 0) {
                         OutlinedButton(onClick = { index-- }) { Text("Back", fontSize = 13.sp) }
-                        Spacer(Modifier.width(8.dp))
                     }
                     Button(onClick = { if (last) finish() else index++ }) {
-                        Text(if (last) "Start using Prism" else "Next")
+                        Text(if (last) "Finish" else "Next", fontSize = 13.sp)
                     }
                 }
             }

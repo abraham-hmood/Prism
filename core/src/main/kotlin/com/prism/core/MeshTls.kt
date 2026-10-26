@@ -92,6 +92,21 @@ object MeshTls {
     @Volatile private var caCert: X509Certificate? = null
 
     private val contexts = ConcurrentHashMap<String, SSLContext>()
+    private val leaves = ConcurrentHashMap<String, Leaf>()
+
+    /**
+     * A minted leaf, with the CA that signed it.
+     *
+     * THE RAW MATERIAL IS PUBLIC because Android's host needs it too. That platform keeps its own
+     * serving code and used to keep its own CA generator with it, which is how two devices on the
+     * same mesh ended up with certificates from two implementations. One `leafFor` feeds both
+     * paths, so there is one CA per device and one way it is used.
+     */
+    data class Leaf(
+        val keyPair: KeyPair,
+        val certificate: X509Certificate,
+        val issuer: X509Certificate,
+    )
 
     /** True once a CA exists, which is what everything else needs. */
     val ready: Boolean get() = caKey != null && caCert != null
@@ -105,6 +120,9 @@ object MeshTls {
      */
     fun install(directory: File): Boolean {
         storage = directory.apply { mkdirs() }
+        // A newly installed CA invalidates every leaf signed by the one it replaced.
+        leaves.clear()
+        contexts.clear()
         val keyFile = File(directory, CA_KEY_FILE)
         val certFile = File(directory, CA_CERT_FILE)
 
@@ -197,6 +215,39 @@ object MeshTls {
         val key = domain.lowercase().trim().ifBlank { return null }
         contexts[key]?.let { return it }
 
+        val leaf = leafFor(key) ?: return null
+
+        return runCatching {
+            val store = KeyStore.getInstance("PKCS12").apply {
+                load(null, null)
+                // The CA goes in the chain so a browser that trusts the root can build a path to it
+                // without having been handed the root separately.
+                setKeyEntry("prism", leaf.keyPair.private, STORE_PASSWORD, arrayOf(leaf.certificate, leaf.issuer))
+            }
+            val managers = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
+                .apply { init(store, STORE_PASSWORD) }
+
+            SSLContext.getInstance("TLS").apply {
+                init(managers.keyManagers, arrayOf(MeshTrust), SecureRandom())
+            }.also { contexts[key] = it }
+        }.getOrElse {
+            PrismPlatform.log.error(TAG, "Could not build an SSL context for $key", it)
+            null
+        }
+    }
+
+    /**
+     * Mints (or returns) the leaf for [domain].
+     *
+     * Cached, and the cache is cleared whenever a CA is installed, because a leaf signed by the
+     * previous CA would no longer chain to the root the user trusts. Returns null when no CA is
+     * loaded -- a caller should then refuse TLS with a reason rather than start a handshake that
+     * cannot complete.
+     */
+    fun leafFor(domain: String): Leaf? {
+        val key = domain.lowercase().trim().ifBlank { return null }
+        leaves[key]?.let { return it }
+
         val issuerKey = caKey ?: return null
         val issuer = caCert ?: return null
 
@@ -222,21 +273,10 @@ object MeshTls {
             builder.addExtension(Extension.basicConstraints, true, BasicConstraints(false))
 
             val signer = JcaContentSignerBuilder("SHA256withECDSA").setProvider("BC").build(issuerKey)
-            val leaf = JcaX509CertificateConverter().setProvider("BC")
+            val certificate = JcaX509CertificateConverter().setProvider("BC")
                 .getCertificate(builder.build(signer))
 
-            val store = KeyStore.getInstance("PKCS12").apply {
-                load(null, null)
-                // The CA goes in the chain so a browser that trusts the root can build a path to it
-                // without having been handed the root separately.
-                setKeyEntry("prism", pair.private, STORE_PASSWORD, arrayOf(leaf, issuer))
-            }
-            val managers = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
-                .apply { init(store, STORE_PASSWORD) }
-
-            SSLContext.getInstance("TLS").apply {
-                init(managers.keyManagers, arrayOf(MeshTrust), SecureRandom())
-            }.also { contexts[key] = it }
+            Leaf(pair, certificate, issuer).also { leaves[key] = it }
         }.getOrElse {
             PrismPlatform.log.error(TAG, "Could not mint a certificate for $key", it)
             null

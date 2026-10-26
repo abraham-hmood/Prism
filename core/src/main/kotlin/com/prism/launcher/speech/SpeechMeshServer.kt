@@ -129,9 +129,15 @@ object SpeechMeshServer {
         runCatching { server?.close() }
         server = null
         acceptor = null
-        synchronized(kokoroLock) {
-            runCatching { kokoro?.release() }
-            kokoro = null
+        // RELEASE WAITS FOR THE CURRENT LINE. The switch that turns sharing off can be flipped
+        // while a peer's sentence is inside ONNX Runtime; closing the session underneath a running
+        // inference is a native crash, not an exception. synthLock is the same lock synthesis
+        // holds, so this is the difference between "stops serving" and "stops the process".
+        synchronized(synthLock) {
+            synchronized(kokoroLock) {
+                runCatching { kokoro?.release() }
+                kokoro = null
+            }
         }
     }
 
@@ -234,6 +240,49 @@ object SpeechMeshServer {
         val voice = request.optString("voice").ifBlank { PrismSettings.KOKORO_DEFAULT_VOICE }
         val speed = request.optDouble("speed", 1.0).toFloat().coerceIn(0.5f, 2.0f)
 
+        // A REMOTE CLONE ARRIVES AS ITS REFERENCE RECORDING. The requesting device owns the
+        // clone; this machine has never seen that voice and has no artifact for it. Sending the
+        // reference is what lets this machine do the same two-stage render a local clone gets,
+        // instead of answering in the clone's published base voice (which is what used to happen,
+        // and sounded like a different person).
+        val reference = request.optString("reference").takeIf { it.isNotBlank() }?.let { encoded ->
+            runCatching { SpeechMeshWire.readFloats(SpeechMeshWire.decode64(encoded)!!) }
+                .getOrElse {
+                    reply(
+                        socket, 400, "application/json",
+                        """{"error":"reference audio is not valid float32"}""".toByteArray(),
+                    )
+                    return
+                }
+        }
+        val pitchHz = request.optDouble("pitch", 0.0).toFloat()
+
+        if (reference != null) {
+            if (!CloneEngines.hasAnyInstalled()) {
+                reply(
+                    socket, 409, "application/json",
+                    JSONObject().put(
+                        "error",
+                        "this machine has no voice-cloning model installed, so it cannot speak a " +
+                            "cloned voice; download one there or speak locally",
+                    ).toString().toByteArray(),
+                )
+                return
+            }
+            val audio = synchronized(synthLock) {
+                engineForClone()?.synthesizeWithReference(text, voice, speed, reference, pitchHz)
+            }
+            if (audio == null || audio.samples.isEmpty()) {
+                reply(
+                    socket, 500, "application/json",
+                    """{"error":"this machine could not render that cloned line"}""".toByteArray(),
+                )
+                return
+            }
+            reply(socket, 200, "audio/wav", SpeechMeshWire.wav(audio.samples, audio.sampleRate))
+            return
+        }
+
         val engine = kokoroEngine()
         if (engine == null) {
             reply(
@@ -268,6 +317,22 @@ object SpeechMeshServer {
             reply(
                 socket, 409, "application/json",
                 """{"error":"no voice-cloning model is installed on this machine"}""".toByteArray(),
+            )
+            return
+        }
+
+        // A synthesises-the-text engine (Pocket TTS) has NO encoder pass to offload: its whole
+        // model is the speaker-conditioned decoder, which has to run on the machine that speaks.
+        // Accepting the request would prepare nothing and return an empty artifact set, which the
+        // client would store as a working clone that then sounds like the base voice.
+        if (engine is CloneEngine.ReferenceSpeechEngine) {
+            reply(
+                socket, 409, "application/json",
+                JSONObject().put(
+                    "error",
+                    "${engine.label} speaks from the reference itself and has no encoder pass to " +
+                        "run remotely; save the clone on this machine or pick a converter engine.",
+                ).toString().toByteArray(),
             )
             return
         }
@@ -327,6 +392,9 @@ object SpeechMeshServer {
                 ?.forEach { runCatching { it.delete() } }
         }
     }
+
+    /** The Kokoro session for a clone render, opened the same way and reused. */
+    private fun engineForClone(): KokoroEngine? = kokoroEngine()
 
     private fun kokoroEngine(): KokoroEngine? = synchronized(kokoroLock) {
         val current = kokoro

@@ -236,6 +236,61 @@ class KokoroEngine private constructor(
     }
 
     /**
+     * Renders [text] in a cloned voice that lives on ANOTHER machine.
+     *
+     * The peer that asks for a cloned voice cannot send the clone itself -- it is this machine's
+     * disk that would have to hold it -- so it sends the REFERENCE RECORDING with the request and
+     * this method runs the same two stages a local clone would: Kokoro speaks the words, then the
+     * active converter re-voices them toward the reference. Pitch matching uses the reference's
+     * pitch, which the client measured.
+     *
+     * Returns null with a logged reason when no converter is installed, which the server turns
+     * into a 409 naming the engine rather than silently answering in the base voice.
+     */
+    fun synthesizeWithReference(
+        text: String,
+        voiceId: String?,
+        speed: Float,
+        reference: FloatArray,
+        pitchHz: Float,
+    ): SpeechMeshWire.Clip? {
+        // The ACTIVE engine is a preference, not a promise that its files are here. A device that
+        // has OpenVoice downloaded but has since selected Seed-VC can still convert, and refusing
+        // because the first choice is missing would make a working machine look empty.
+        val active = CloneEngines.active()
+        val engine = if (active.isInstalled()) active else {
+            CloneEngines.all().firstOrNull { it.isInstalled() } ?: run {
+                PrismPlatform.log.warn(
+                    TAG,
+                    "Remote clone requested, but no voice-cloning model is installed here",
+                )
+                return null
+            }
+        }
+        val voice = voiceId?.ifBlank { null } ?: com.prism.launcher.PrismSettings.KOKORO_DEFAULT_VOICE
+        return runCatching {
+            val chunks = chunkText(text)
+            if (chunks.isEmpty()) return SpeechMeshWire.Clip(FloatArray(0), SAMPLE_RATE)
+            val parts = chunks.map { synthesize(it, voice, speed) }
+            val source = FloatArray(parts.sumOf { it.size })
+            var at = 0
+            for (part in parts) {
+                part.copyInto(source, at)
+                at += part.size
+            }
+            val matched = if (engine.preservesPitch && pitchHz > 0f) {
+                VoicePitch.match(source, SAMPLE_RATE, pitchHz)
+            } else {
+                source
+            }
+            val converted = engine.convert("mesh-remote", matched, SAMPLE_RATE, reference)
+            SpeechMeshWire.Clip(converted.samples, converted.sampleRate)
+        }.onFailure {
+            PrismPlatform.log.warn(TAG, "Remote cloned synthesis failed: " + explain(it))
+        }.getOrNull()
+    }
+
+    /**
      * Turns an ONNX Runtime failure into something a user can act on.
      *
      * ONE CASE IS SINGLED OUT and it is worth the special case. A broken quantisation reports a
@@ -451,7 +506,8 @@ class KokoroEngine private constructor(
         private const val TAG = "PrismSpeech"
 
         /** Kokoro's output rate. Not configurable: it is what the model was trained to produce. */
-        private const val SAMPLE_RATE = 24_000
+        /** Kokoro's native rate. Public because the mesh host reports clips at this rate. */
+        const val SAMPLE_RATE = 24_000
 
         private const val STYLE_WIDTH = 256
 

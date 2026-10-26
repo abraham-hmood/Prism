@@ -17,6 +17,13 @@ captures/
 # Scratch output dir used for CLI verification builds when the IDE holds app/build locks
 build-verify/
 
+# IntelliJ's compiled output for the JVM modules. It was committed once as `core/bin/main`
+# and `desktop/bin/main`, a 216-file shadow source tree that was never compiled but polluted
+# every search. Build output does not belong in the repository; this keeps it from returning.
+/bin/
+core/bin/
+desktop/bin/
+
 # CMake/NDK build tree for the JNI sources. ~300 MB of regenerable object files.
 /app/.cxx/
 
@@ -32,3 +39,11 @@ build-verify/
 /prism-os/scripts/*.log
 #Ignoring prism os fully for now
 /prism-os/
+
+# NINE is synced from its own repository on every build; see syncNineSources in build.gradle.kts.
+/third_party/nine/
+
+PictureThis.md
+PhotoPixCompleteFeatureList.md
+PhotoPixOptionsFeatures.md
+PhotoPixVersionsFeatures.md

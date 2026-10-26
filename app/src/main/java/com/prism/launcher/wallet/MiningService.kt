@@ -240,6 +240,9 @@ class MiningService : Service() {
         State.mode = "solo"
         val coin = CoinRegistry.bySymbol(cfg.coin) ?: run {
             State.status = "Unknown coin ${cfg.coin}"
+            // NOT RUNNING. State.running was set before dispatch, so an unknown coin left the
+            // UI showing a live miner that had already returned.
+            State.running = false
             return
         }
 
@@ -319,6 +322,7 @@ class MiningService : Service() {
 
         if (!node.isEligible()) {
             State.status = "Wallet page not on a desktop slot — not a PrismCoin node"
+            State.running = false
             updateNotification(cfg)
             return
         }
@@ -366,6 +370,7 @@ class MiningService : Service() {
 
         if (!RandomXNative.available) {
             State.status = "RandomX did not load on this device"
+            State.running = false
             updateNotification(cfg)
             return
         }

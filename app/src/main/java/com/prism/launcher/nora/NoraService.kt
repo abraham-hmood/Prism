@@ -145,6 +145,9 @@ class NoraService : Service() {
                     NoraTrainingState.publish(p)
                     if (p.phase == "sleep") {
                         NoraTrainingState.emitLog("epoch ${p.epoch}: sleep — replaying and consolidating")
+                    } else if (p.phase == "validation" || p.phase == "test") {
+                        val label = if (p.phase == "validation") "Validation" else "Final Test"
+                        NoraTrainingState.emitLog("[${label}] epoch ${p.epoch}: ${p.caption}")
                     } else if (p.sample % 5 == 0 || p.sample == p.totalSamples) {
                         NoraTrainingState.emitLog(
                             "e${p.epoch}/${p.totalEpochs} · ${p.sample}/${p.totalSamples} · " +
@@ -527,6 +530,8 @@ class NoraService : Service() {
         if (!throttle()) return
         val text = if (p.phase == "sleep") {
             "Epoch ${p.epoch} of ${p.totalEpochs} · consolidating"
+        } else if (p.phase == "validation" || p.phase == "test") {
+            "Epoch ${p.epoch}/${p.totalEpochs} · ${p.phase}"
         } else {
             "Epoch ${p.epoch}/${p.totalEpochs} · ${p.sample}/${p.totalSamples} · err %.4f"
                 .format(p.errorRms)

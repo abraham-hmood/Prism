@@ -22,7 +22,12 @@ data class ToolDefinition(
      * three places as [requiresActiveLine]: [AgenticEngine.run] omits the tool from what a model
      * is shown, the tool's own handler re-checks before acting, and the Agentic Tools page renders
      * it red and unclickable. */
-    val requiresImageGenerator: Boolean = false
+    val requiresImageGenerator: Boolean = false,
+    /** True for the context-offload pair: never offered unless the user has turned on
+     * On-device context offload in Settings > Intelligence & Messaging. Checked in
+     * [com.prism.launcher.agentic.AgenticEngine.run], again inside the tool before it writes
+     * anything, and reflected in the Agentic Tools page badge. */
+    val requiresContextOffload: Boolean = false,
 )
 
 sealed class ToolExecutorConfig {

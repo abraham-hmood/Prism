@@ -174,10 +174,16 @@ class AetherSettingsActivity : PrismBaseActivity() {
         // Cheap checks only -- AetherService (its own process) is the only place that should
         // ever build a resident connectome. See AetherStudio.hasTrainedWeights's doc comment.
         val trained = AetherStudio.hasTrainedWeights()
+        val summary = AetherStudio.datasetSummary()
         statusLine.text = buildString {
             append(if (trained) "Connectome loaded.\n" else "Untrained -- fresh from infancy.\n")
             append(AetherStudio.status())
-            append("\nDataset: ${AetherStudio.datasetSize()} sample(s) (images + text chunks) in ${AetherConfig.datasetDir().absolutePath}")
+            append("\nDataset: ${summary.totalFiles} file(s) — ")
+            append("${summary.images} image, ${summary.textFiles} text, ${summary.parquetFiles} parquet")
+            append(" · ${summary.trainFiles} training")
+            if (summary.validationFiles > 0) append(", ${summary.validationFiles} validation")
+            if (summary.testFiles > 0) append(", ${summary.testFiles} test")
+            append("\n${AetherConfig.datasetDir().absolutePath}")
         }
     }
 
@@ -451,7 +457,7 @@ class AetherSettingsActivity : PrismBaseActivity() {
 
     private fun applyDeviceMaximum() {
         val max = AetherGeometry.maxForDevice()
-        AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Use this device's maximum?")
             .setMessage(
                 "Largest size that fits in ${AetherGeometry.formatBytes(AetherGeometry.memoryBudgetBytes())} " +
@@ -933,7 +939,7 @@ class AetherSettingsActivity : PrismBaseActivity() {
                 "${AetherTuning.changedCount()} of ${AetherTuning.PARAMS.size + AetherTuning.STRING_PARAMS.size} differ from default",
                 destructive = true
             ) {
-                AlertDialog.Builder(ctx)
+                com.prism.launcher.theme.PrismDialogs.Builder(ctx)
                     .setTitle("Reset every parameter?")
                     .setMessage(
                         "Returns all ${AetherTuning.PARAMS.size + AetherTuning.STRING_PARAMS.size} values to " +
@@ -1158,7 +1164,7 @@ class AetherSettingsActivity : PrismBaseActivity() {
         val card = IosUi.card(this)
         card.addView(
             navRow("Erase connectome", "Delete everything she's learned", destructive = true) {
-                AlertDialog.Builder(this)
+                com.prism.launcher.theme.PrismDialogs.Builder(this)
                     .setTitle("Erase Aether's connectome?")
                     .setMessage("Every weight and every trace is deleted. Training starts from infancy again. Dataset images are kept.")
                     .setPositiveButton("Erase") { _, _ ->

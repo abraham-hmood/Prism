@@ -4,9 +4,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
-import android.util.Log
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
+import com.prism.launcher.PrismLogger
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * One-time WorkManager job that does a full PackageManager scan and populates the
@@ -22,14 +24,29 @@ class AppSyncWorker(
 
     override suspend fun doWork(): Result {
         return try {
+            val entities = withContext(Dispatchers.IO) { queryLauncherApps(ctx) }
+
+            // AN EMPTY SCAN IS NOT AN EMPTY DEVICE. `queryLauncherApps` answering with nothing is
+            // how a package-manager hiccup or a locked-down profile looks, and clearing the table
+            // on that answer would empty the drawer until the next successful sync. Leaving the
+            // existing rows alone and retrying with backoff keeps a stale listing instead of no
+            // listing.
+            if (entities.isEmpty()) {
+                PrismLogger.logWarning(TAG, "Scan returned no launcher apps; keeping the existing list")
+                return Result.retry()
+            }
+
             val dao = AppDatabase.get().installedAppDao()
-            val entities = queryLauncherApps(ctx)
             dao.clearAll()
             dao.insertAll(entities)
-            Log.i(TAG, "Full sync complete — ${entities.size} launcher apps stored.")
+            lastSyncAt = System.currentTimeMillis()
+            PrismLogger.logSuccess(
+                TAG,
+                "Full sync complete — ${entities.size} launcher apps stored."
+            )
             Result.success()
         } catch (t: Throwable) {
-            Log.e(TAG, "Full sync failed", t)
+            PrismLogger.logError(TAG, "Full sync failed; retrying with backoff", t)
             Result.retry()
         }
     }
@@ -37,6 +54,22 @@ class AppSyncWorker(
     companion object {
         const val TAG = "AppSyncWorker"
         const val WORK_NAME = "prism_full_app_sync"
+
+        /**
+         * Unique name for the daily refresh.
+         *
+         * The one-time worker is enqueued with KEEP, which means it runs exactly once in the
+         * lifetime of an install. Without this second job the table only ever changes when a
+         * package broadcast arrives -- and a broadcast missed while the app was force-stopped, or
+         * an app installed before the receiver was registered, stayed wrong forever, with nothing
+         * logged to say why.
+         */
+        const val PERIODIC_WORK_NAME = "prism_app_sync_periodic"
+
+        /** Wall-clock of the last successful scan, for diagnostics. */
+        @Volatile
+        var lastSyncAt: Long = 0L
+            private set
     }
 }
 

@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -19,10 +20,13 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.Hub
+import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.Sms
 import androidx.compose.material3.Icon
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -65,8 +69,32 @@ import kotlinx.coroutines.withContext
  * Reading on open is one query per thread against data that is already local.
  */
 @Composable
-fun MessagesPage(onOpenThread: (PageId) -> Unit) {
+fun MessagesPage(onOpenThread: (PageId) -> Unit, onOpenDialer: () -> Unit = {}) {
     val colors = LocalPrismColors.current
+
+    // MESSAGES ARE A LOCK GATE. Reading conversations, the relayed inbox and the AI threads is
+    // exactly what someone standing in front of an unattended window would do, so the page shows
+    // nothing until Prism is unlocked -- and follows the lock live rather than only on open.
+    val locked = remember { mutableStateOf(com.prism.launcher.lock.PrismLockScope.isLocked()) }
+    DisposableEffect(Unit) {
+        val listener: (Boolean) -> Unit = { locked.value = it }
+        com.prism.launcher.lock.PrismLockScope.onChange(listener)
+        onDispose { com.prism.launcher.lock.PrismLockScope.forget(listener) }
+    }
+    if (locked.value) {
+        PageScaffold("Messages", "Locked") {
+            Card {
+                Text(
+                    "Prism is locked. Messages, the relayed texts and the AI threads stay hidden " +
+                        "until it is unlocked.",
+                    fontSize = 13.sp,
+                    color = colors.muted,
+                    modifier = Modifier.padding(16.dp),
+                )
+            }
+        }
+        return
+    }
 
     var samSnippet by remember { mutableStateOf("") }
     var samCount by remember { mutableStateOf(0) }
@@ -109,7 +137,31 @@ fun MessagesPage(onOpenThread: (PageId) -> Unit) {
         return
     }
 
-    PageScaffold("Messages", "Conversations on this machine") {
+    PageScaffold(
+        "Messages",
+        "Conversations on this machine",
+        // The same corner and the same order as the phone's header: the dialer sits at the top
+        // right, one click from the place calls belong, rather than only inside a tab.
+        actions = {
+            Surface(
+                color = colors.surfaceRaised,
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.clickableRow(onOpenDialer),
+            ) {
+                Row(
+                    Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        Icons.Filled.Phone, "Open the Prism dialer",
+                        tint = colors.accent, modifier = Modifier.size(16.dp),
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text("Dialer", fontSize = 12.sp, color = colors.accent)
+                }
+            }
+        },
+    ) {
         Column(Modifier.verticalScroll(rememberScrollState())) {
 
             SectionHeader("AI THREADS")
@@ -143,6 +195,36 @@ fun MessagesPage(onOpenThread: (PageId) -> Unit) {
                     "phone treats her too: her transcript is her own and she generates through her own " +
                     "pathway, so merging the two would mean one of them pretending to be the other."
             )
+
+            // Connected third-party messengers. They are not threads -- Prism cannot read their
+            // history -- so they are listed as apps that open, with their web client because this
+            // platform has no equivalent of the phone's notification listener.
+            val bridges = com.prism.launcher.messaging.MessagingBridges.enabled()
+            if (bridges.isNotEmpty()) {
+                SectionHeader("CONNECTED APPS")
+                Card {
+                    bridges.forEachIndexed { index, bridge ->
+                        if (index > 0) Hairline()
+                        ThreadRow(
+                            icon = Icons.Filled.Hub,
+                            title = bridge.label,
+                            detail = "Opens in your browser · messages are not read by Prism here",
+                            trailing = "",
+                            colors = colors,
+                            onClick = {
+                                runCatching {
+                                    java.awt.Desktop.getDesktop().browse(java.net.URI(bridge.webUrl))
+                                }
+                            },
+                        )
+                    }
+                }
+                SectionFooter(
+                    "Connect or disconnect these in Prism Settings > Messaging apps. The switches " +
+                        "are shared with the phone, which can also capture their notifications."
+                )
+                Spacer(Modifier.height(8.dp))
+            }
 
             SectionHeader("TEXT MESSAGES")
             if (threads.isNotEmpty()) {

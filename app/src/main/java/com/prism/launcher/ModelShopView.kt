@@ -190,6 +190,7 @@ class ModelShopView @JvmOverloads constructor(
     }
 
     private fun resolveAttr(attr: Int): Int {
+        com.prism.launcher.theme.ThemeSkin.resolveAttr(context, attr)?.let { return it }
         val value = android.util.TypedValue()
         context.theme.resolveAttribute(attr, value, true)
         return if (value.resourceId != 0) {

@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Prism Mirror</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  #screen { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+
+  #badge {
+    position: fixed; top: max(18px, env(safe-area-inset-top)); left: max(20px, env(safe-area-inset-left));
+    display: flex; align-items: center; gap: 9px;
+    padding: 9px 15px; border-radius: 999px;
+    background: rgba(22, 22, 26, .72);
+    -webkit-backdrop-filter: blur(18px); backdrop-filter: blur(18px);
+    border: 1px solid rgba(255, 255, 255, .08);
+    color: rgba(255, 255, 255, .92);
+    font-size: 13px; letter-spacing: .01em;
+    opacity: 0; transition: opacity .45s ease;
+    pointer-events: none;
+  }
+  #badge.visible { opacity: .92; }
+  #dot { width: 7px; height: 7px; border-radius: 50%; background: #ff9f0a; box-shadow: 0 0 10px #ff9f0a; }
+  #dot.live { background: #30d158; box-shadow: 0 0 10px #30d158; }
+
+  #hint {
+    position: fixed; inset: 0; z-index: 2;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 16px; padding: 36px; text-align: center;
+    background: radial-gradient(ellipse at 50% 42%, rgba(10, 132, 255, .16), transparent 62%);
+    transition: opacity .5s ease;
+  }
+  #hint.hidden { opacity: 0; pointer-events: none; }
+  #mark {
+    width: 46px; height: 46px; border-radius: 13px;
+    background: linear-gradient(145deg, #0a84ff, #64d2ff);
+    box-shadow: 0 12px 44px rgba(10, 132, 255, .35);
+    display: flex; align-items: center; justify-content: center;
+  }
+  #mark span { width: 17px; height: 17px; border: 1.5px solid rgba(255,255,255,.9); border-radius: 5px; }
+  #hint h1 { margin: 0; font-weight: 300; font-size: clamp(30px, 4.6vw, 58px); letter-spacing: -.03em; color: #fff; }
+  #hint p { margin: 0; max-width: 40rem; font-size: clamp(14px, 1.5vw, 18px); line-height: 1.55; color: rgba(235, 235, 245, .58); }
+  #hint b { color: rgba(235, 235, 245, .9); font-weight: 500; }
+  #error { color: #ff6961; }
+  #spinner {
+    width: 17px; height: 17px; border-radius: 50%;
+    border: 2px solid rgba(255,255,255,.16); border-top-color: rgba(255,255,255,.8);
+    animation: spin 1s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  #full {
+    position: fixed; right: max(20px, env(safe-area-inset-right)); top: max(18px, env(safe-area-inset-top));
+    z-index: 3; padding: 10px 16px; border-radius: 999px;
+    border: 1px solid rgba(255,255,255,.12);
+    background: rgba(22, 22, 26, .72);
+    -webkit-backdrop-filter: blur(18px); backdrop-filter: blur(18px);
+    color: rgba(255,255,255,.92); font: inherit; font-size: 13px;
+    cursor: pointer; opacity: 0; transition: opacity .3s ease;
+  }
+  #full:hover, #full:focus { opacity: 1; outline: none; }
+  #full.visible { opacity: .75; }
+  @media (max-width: 700px) { #badge, #full { font-size: 11px; } }
+</style>
+</head>
+<body>
+<video id="screen" autoplay muted playsinline></video>
+<div id="badge"><span id="dot"></span><span id="label">Connecting…</span></div>
+<button id="full" type="button" aria-label="Toggle fullscreen">Fullscreen</button>
+<div id="hint">
+  <div id="mark"><span></span></div>
+  <h1>Prism Mirror</h1>
+  <p id="message">Waiting for <b>your phone</b> to send its screen.</p>
+  <div id="spinner"></div>
+</div>
+<script>
+(function () {
+  "use strict";
+
+  var video = document.getElementById("screen");
+  var badge = document.getElementById("badge");
+  var label = document.getElementById("label");
+  var dot = document.getElementById("dot");
+  var hint = document.getElementById("hint");
+  var message = document.getElementById("message");
+  var full = document.getElementById("full");
+  var spinner = document.getElementById("spinner");
+
+  var socket = null;
+  var mediaSource = null;
+  var sourceBuffer = null;
+  var initSegment = null;
+  var initInfo = null;
+  var queue = [];
+  var reconnectTimer = null;
+  var gotFrame = false;
+  var expectingInit = false;
+  var trimPoint = 0;
+
+  function showBadge() { badge.classList.add("visible"); full.classList.add("visible"); }
+  showBadge();
+  var hideBadge = setTimeout(function () { badge.classList.remove("visible"); full.classList.remove("visible"); }, 4200);
+
+  function status(text, live) {
+    clearTimeout(hideBadge);
+    badge.classList.add("visible");
+    full.classList.add("visible");
+    label.textContent = text;
+    dot.classList.toggle("live", !!live);
+    hideBadge = setTimeout(function () { badge.classList.remove("visible"); full.classList.remove("visible"); }, 3500);
+  }
+
+  function waiting(title, detail, isError) {
+    hint.classList.remove("hidden");
+    message.innerHTML = isError ? '<span id="error"></span>' : "";
+    if (isError) {
+      message.firstChild.textContent = title;
+      if (detail) { message.appendChild(document.createElement("br")); message.appendChild(document.createTextNode(detail)); }
+    } else {
+      message.innerHTML = title + (detail ? " " + detail : "");
+    }
+    spinner.style.display = isError ? "none" : "";
+    status(isError ? "Cannot mirror" : "Waiting for the phone…", false);
+  }
+
+  function wsUrl() {
+    var proto = location.protocol === "https:" ? "wss:" : "ws:";
+    return proto + "//" + location.host + location.pathname.replace(/\/$/, "") + "/ws";
+  }
+
+  function connect() {
+    clearTimeout(reconnectTimer);
+    if (socket) { try { socket.close(); } catch (e) {} }
+    queue = [];
+    gotFrame = false;
+    expectingInit = false;
+    initSegment = null;
+    sourceBuffer = null;
+    status("Connecting…", false);
+
+    socket = new WebSocket(wsUrl());
+    socket.binaryType = "arraybuffer";
+    socket.onopen = function () { status("Waiting for the phone…", false); };
+    socket.onmessage = function (event) {
+      if (typeof event.data === "string") {
+        try { onControl(JSON.parse(event.data)); } catch (e) {}
+      } else {
+        onBinary(new Uint8Array(event.data));
+      }
+    };
+    socket.onclose = function () {
+      status("Reconnecting…", false);
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(connect, 1200);
+    };
+    socket.onerror = function () { try { socket.close(); } catch (e) {} };
+  }
+
+  function onControl(msg) {
+    if (msg && msg.type === "init") {
+      initInfo = msg;
+      expectingInit = true;
+    }
+  }
+
+  function onBinary(bytes) {
+    if (expectingInit && initInfo) {
+      expectingInit = false;
+      startMedia(initInfo, bytes);
+      return;
+    }
+    if (!sourceBuffer) return;
+    queue.push(bytes);
+    pump();
+  }
+
+  function startMedia(info, init) {
+    var mime = info.codec && info.codec.indexOf("/") >= 0
+      ? info.codec
+      : 'video/mp4; codecs="' + info.codec + '"';
+
+    if (!window.MediaSource || !MediaSource.isTypeSupported(mime)) {
+      waiting("This browser cannot play the mirror stream.",
+        "Open the address in Chrome, Edge, Safari, or the TV's own browser with H.264 video support.",
+        true);
+      return;
+    }
+
+    initSegment = init;
+    try { if (mediaSource) { video.removeAttribute("src"); video.load(); } } catch (e) {}
+    mediaSource = new MediaSource();
+    video.src = URL.createObjectURL(mediaSource);
+
+    mediaSource.addEventListener("sourceopen", function () {
+      try {
+        sourceBuffer = mediaSource.addSourceBuffer(mime);
+        sourceBuffer.mode = "segments";
+        sourceBuffer.addEventListener("updateend", pump);
+        sourceBuffer.appendBuffer(initSegment);
+        initSegment = null;
+        pump();
+      } catch (e) {
+        waiting("This browser rejected the mirror stream.", "Try another browser on the TV.", true);
+      }
+    }, { once: true });
+
+    video.play().catch(function () {});
+  }
+
+  function pump() {
+    if (!sourceBuffer) return;
+    if (sourceBuffer.updating) return;
+
+    if (queue.length) {
+      try {
+        sourceBuffer.appendBuffer(queue.shift());
+      } catch (e) {
+        queue = [];
+      }
+      return;
+    }
+
+    liveEdge();
+    trim();
+  }
+
+  function liveEdge() {
+    if (!video.buffered.length) return;
+    var end = video.buffered.end(video.buffered.length - 1);
+    if (end - video.currentTime > 0.7) {
+      video.currentTime = Math.max(0, end - 0.2);
+    }
+    if (!gotFrame && end > 0.05) {
+      gotFrame = true;
+      status("Mirroring", true);
+      hint.classList.add("hidden");
+    }
+  }
+
+  /**
+   * MSE keeps everything that was ever appended. A mirror can run for hours, so an untrimmed
+   * buffer is gigabytes of a screen nobody can scrub back to. Keep the last half-minute.
+   */
+  function trim() {
+    if (!sourceBuffer || sourceBuffer.updating || !video.buffered.length) return;
+    var start = video.buffered.start(0);
+    var cut = video.currentTime - 25;
+    if (cut - start > 20 && cut - trimPoint > 10) {
+      trimPoint = cut;
+      try { sourceBuffer.remove(start, cut); } catch (e) {}
+    }
+  }
+
+  video.addEventListener("playing", function () {
+    status("Mirroring", true);
+    hint.classList.add("hidden");
+  });
+  video.addEventListener("waiting", function () {
+    if (gotFrame) status("Buffering…", false);
+  });
+  video.addEventListener("timeupdate", liveEdge);
+
+  function toggleFullscreen() {
+    try {
+      if (!document.fullscreenElement && document.documentElement.requestFullscreen) {
+        var promise = document.documentElement.requestFullscreen();
+        if (promise && promise.catch) promise.catch(function () {});
+      } else if (document.exitFullscreen) {
+        document.exitFullscreen();
+      }
+    } catch (e) {}
+  }
+
+  full.addEventListener("click", toggleFullscreen);
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Enter" || event.key === "f" || event.key === "F") {
+      event.preventDefault();
+      toggleFullscreen();
+    }
+  });
+
+  connect();
+})();
+</script>
+</body>
+</html>

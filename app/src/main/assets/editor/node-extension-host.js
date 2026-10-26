@@ -80,13 +80,38 @@ self.prismLoadModule = function (id, entry) {
   return req(entry);
 };
 
+/**
+ * Which extension a module belongs to, from the file that required it.
+ *
+ * `parent.filename` is the module that called `require`, so an extension's own code and anything it
+ * bundles under its directory resolve to it. A dependency shared from somewhere else returns null
+ * and gets the unscoped API, which is the old behaviour and is only reached by code that is not an
+ * extension.
+ */
+function extensionOf(parent) {
+  const file = parent && parent.filename;
+  if (!file) return null;
+  const ids = Object.keys(roots);
+  for (let i = 0; i < ids.length; i++) {
+    const root = roots[ids[i]];
+    if (root && (file === root || file.indexOf(root + path.sep) === 0)) return ids[i];
+  }
+  return null;
+}
+
 // `require('vscode')` has no package to resolve to -- the module only exists inside a host. VS Code
 // itself answers it from the loader; here the same interception happens at Module._load, which
 // covers nested requires inside an extension's dependencies as well as its own entry file.
+//
+// PER-EXTENSION, because a shared view of the API cannot say who created a panel. An extension that
+// builds its webview from a timer or a socket callback would get whichever extension activated last
+// as the owner, and its view would be filed under another extension's popup.
 const originalLoad = Module._load;
 Module._load = function (request, parent, isMain) {
   if (request === 'vscode') {
     if (!self.prismVscode) throw new Error('The vscode API is not ready yet');
+    const owner = extensionOf(parent);
+    if (owner && typeof self.prismVscodeFor === 'function') return self.prismVscodeFor(owner);
     return self.prismVscode;
   }
   return originalLoad.apply(this, arguments);

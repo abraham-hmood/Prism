@@ -1,5 +1,11 @@
 package com.prism.desktop.ui
 
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
@@ -24,8 +30,10 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.prism.core.AppEntry
@@ -39,6 +47,7 @@ import com.prism.launcher.DesktopItem
 import com.prism.launcher.DesktopShortcutStore
 import com.prism.launcher.HotseatPredictor
 import com.prism.launcher.PrismSettings
+import com.prism.launcher.theme.PrismThemes
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -74,6 +83,7 @@ fun DesktopGridPage(pageIndex: Int = 1) {
         mutableStateOf<List<DesktopItem?>>(store.readGrid(DesktopShortcutStore.GRID_SIZE))
     }
     var apps by remember { mutableStateOf<List<AppEntry>>(emptyList()) }
+    var topApps by remember { mutableStateOf<List<String>>(emptyList()) }
     var wallpaper by remember { mutableStateOf<ImageBitmap?>(null) }
     var openFolder by remember { mutableStateOf<DesktopItem.Folder?>(null) }
     var renaming by remember { mutableStateOf<Pair<Int, DesktopItem.Folder>?>(null) }
@@ -81,9 +91,18 @@ fun DesktopGridPage(pageIndex: Int = 1) {
 
     LaunchedEffect(Unit) {
         apps = withContext(Dispatchers.IO) { catalog.list() }
-        wallpaper = withContext(Dispatchers.IO) {
-            SystemWallpaper().current()?.let { PrismPlatform.images.decode(it, 2560) }
-        }?.toComposeBitmap()
+        // Which icons the user actually launches, so Spark's current can flow from the ones that
+        // matter. Read once: a spark whose strength changed mid-animation would flicker.
+        topApps = withContext(Dispatchers.IO) { AppSync.topLaunched(32) }
+        // A theme that turns the wallpaper off means it: Fusion and Spark carry their own ground,
+        // and loading a photograph underneath one is what made showWallpaper a phone-only promise.
+        wallpaper = if (PrismThemes.active().showWallpaper) {
+            withContext(Dispatchers.IO) {
+                SystemWallpaper().current()?.let { PrismPlatform.images.decode(it, 2560) }
+            }?.toComposeBitmap()
+        } else {
+            null
+        }
     }
 
     val byId = remember(apps) { apps.associateBy { it.id } }
@@ -155,12 +174,21 @@ fun DesktopGridPage(pageIndex: Int = 1) {
         wallpaper?.let {
             Image(it, null, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
         }
+        // A theme that paints its own ground gets the page to itself; otherwise the flat colour
+        // sits over the wallpaper at the user's dim setting. Fusion is the first case.
+        val nebula = colors.backdrop == com.prism.launcher.theme.BACKDROP_NEBULA && wallpaper == null
         Box(
-            Modifier.fillMaxSize().background(
-                colors.background.copy(
-                    alpha = if (wallpaper == null) 1f else PrismSettings.getWallpaperDim() / 100f
+            Modifier.fillMaxSize()
+                .then(if (nebula) Modifier.nebulaBackdrop(dark = true) else Modifier)
+                .background(
+                    colors.background.copy(
+                        alpha = when {
+                            nebula -> 0f
+                            wallpaper == null -> 1f
+                            else -> PrismSettings.getWallpaperDim() / 100f
+                        }
+                    )
                 )
-            )
         )
 
         Column(Modifier.fillMaxSize()) {
@@ -170,6 +198,7 @@ fun DesktopGridPage(pageIndex: Int = 1) {
                     byId = byId,
                     icons = icons,
                     pageIndex = pageIndex,
+                    topApps = topApps,
                     onAccept = ::accept,
                     onClick = { i -> launchItem(cells.getOrNull(i), i) },
                     onPickUp = { i ->
@@ -197,16 +226,19 @@ fun DesktopGridPage(pageIndex: Int = 1) {
                 }
             }
 
-            Taskbar(
-                byId = byId,
-                icons = icons,
-                onLaunch = { e ->
-                    scope.launch(Dispatchers.IO) {
-                        catalog.launch(e)
-                        AppSync.recordLaunch(e.id)
-                    }
-                },
-            )
+            // Under xOS the shell's taskbar carries these instead; see MacOsShell.
+            if (!LocalShellTaskbar.current) {
+                Taskbar(
+                    byId = byId,
+                    icons = icons,
+                    onLaunch = { e ->
+                        scope.launch(Dispatchers.IO) {
+                            catalog.launch(e)
+                            AppSync.recordLaunch(e.id)
+                        }
+                    },
+                )
+            }
         }
     }
 
@@ -242,6 +274,7 @@ private fun DesktopCells(
     byId: Map<String, AppEntry>,
     icons: MutableMap<String, ImageBitmap?>,
     pageIndex: Int,
+    topApps: List<String>,
     onAccept: (Int, DragPayload) -> Unit,
     onClick: (Int) -> Unit,
     onPickUp: (Int) -> DragPayload?,
@@ -249,35 +282,83 @@ private fun DesktopCells(
     onRemove: (Int) -> Unit,
 ) {
     val columns = 6
-    Column(
-        Modifier.fillMaxSize().padding(horizontal = 24.dp, vertical = 18.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp),
-    ) {
-        cells.chunked(columns).forEachIndexed { rowIndex, row ->
-            Row(
-                Modifier.fillMaxWidth().weight(1f),
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                row.forEachIndexed { colIndex, item ->
-                    val index = rowIndex * columns + colIndex
-                    DesktopCell(
-                        key = "grid-$pageIndex-$index",
-                        index = index,
-                        item = item,
-                        byId = byId,
-                        icons = icons,
-                        modifier = Modifier.weight(1f).fillMaxHeight(),
-                        onAccept = onAccept,
-                        onClick = onClick,
-                        onPickUp = onPickUp,
-                        onRename = onRename,
-                        onRemove = onRemove,
-                    )
+    val colors = LocalPrismColors.current
+    val electric = colors.edgeEffect == com.prism.launcher.theme.EDGE_ELECTRIC
+    // Where each cell actually is, in root coordinates. Spark's arcs are drawn between these,
+    // which is only possible because the grid composes every cell (see the note on DesktopCells).
+    val centres = remember { mutableStateMapOf<Int, Offset>() }
+    val weights = remember(topApps, cells) { sparkWeights(cells, topApps) }
+
+    Box(Modifier.fillMaxSize()) {
+        Column(
+            Modifier.fillMaxSize().padding(horizontal = 24.dp, vertical = 18.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            cells.chunked(columns).forEachIndexed { rowIndex, row ->
+                Row(
+                    Modifier.fillMaxWidth().weight(1f),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    row.forEachIndexed { colIndex, item ->
+                        val index = rowIndex * columns + colIndex
+                        DesktopCell(
+                            key = "grid-$pageIndex-$index",
+                            index = index,
+                            item = item,
+                            byId = byId,
+                            icons = icons,
+                            modifier = Modifier.weight(1f).fillMaxHeight(),
+                            onAccept = onAccept,
+                            onClick = onClick,
+                            onPickUp = onPickUp,
+                            onRename = onRename,
+                            onRemove = onRemove,
+                            onCentre = { cellIndex, point -> centres[cellIndex] = point },
+                        )
+                    }
+                    repeat(columns - row.size) { Spacer(Modifier.weight(1f)) }
                 }
-                repeat(columns - row.size) { Spacer(Modifier.weight(1f)) }
+            }
+        }
+
+        if (electric && weights.isNotEmpty()) {
+            var overlayOrigin by remember { mutableStateOf(Offset.Zero) }
+            val transition = rememberInfiniteTransition(label = "sparks")
+            val phase by transition.animateFloat(
+                initialValue = 0f,
+                targetValue = 1f,
+                animationSpec = infiniteRepeatable(tween(2400, easing = LinearEasing)),
+                label = "spark-phase",
+            )
+            Canvas(
+                Modifier.fillMaxSize().onGloballyPositioned {
+                    overlayOrigin = it.positionInRoot()
+                }
+            ) {
+                val local = centres.mapValues { (_, point) -> point - overlayOrigin }
+                drawSparks(local, weights, phase, colors.accent)
             }
         }
     }
+}
+
+/**
+ * How strongly each cell should spark, from the launch counts.
+ *
+ * The most-used app is 1.0 and the least-used is still 0.25, so every app that is actually used
+ * lights up but the favourite clearly throws the longest arcs. An app that has never been launched
+ * is absent rather than dim, because a desktop where every icon crackles is wallpaper, not
+ * electricity.
+ */
+internal fun sparkWeights(cells: List<DesktopItem?>, topApps: List<String>): Map<Int, Float> {
+    if (topApps.isEmpty()) return emptyMap()
+    val rank = topApps.withIndex().associate { (index, appId) -> appId to index }
+    val last = (topApps.size - 1).coerceAtLeast(1).toFloat()
+    return cells.mapIndexedNotNull { index, item ->
+        val appId = (item as? DesktopItem.App)?.appId ?: return@mapIndexedNotNull null
+        val at = rank[appId] ?: return@mapIndexedNotNull null
+        index to (1f - (at / last) * 0.75f).coerceIn(0.25f, 1f)
+    }.toMap()
 }
 
 @Composable
@@ -293,7 +374,9 @@ private fun DesktopCell(
     onPickUp: (Int) -> DragPayload?,
     onRename: (Int, DesktopItem.Folder) -> Unit,
     onRemove: (Int) -> Unit,
+    onCentre: (Int, Offset) -> Unit = { _, _ -> },
 ) {
+    val colors = LocalPrismColors.current
     val controller = LocalDragController.current
     var menuOpen by remember { mutableStateOf(false) }
     var bounds by remember { mutableStateOf(androidx.compose.ui.geometry.Rect.Zero) }
@@ -307,11 +390,12 @@ private fun DesktopCell(
             .onGloballyPositioned {
                 bounds = it.boundsInRoot()
                 origin = Offset(bounds.left, bounds.top)
+                onCentre(index, bounds.center)
             }
             .dropTarget(key) { payload, _ -> onAccept(index, payload) }
             .background(
-                if (hovered) Color(0x335C6CFF) else Color.Transparent,
-                RoundedCornerShape(12.dp),
+                if (hovered) colors.accent.copy(alpha = 0.20f) else Color.Transparent,
+                RoundedCornerShape(colors.cardRadius),
             )
     ) {
         if (item == null) return@Box
@@ -341,7 +425,7 @@ private fun DesktopCell(
 
             Icon(
                 Icons.Filled.MoreVert, "Options",
-                tint = Color(0xAA9A9AA6),
+                tint = colors.faint,
                 modifier = Modifier
                     .align(Alignment.TopEnd)
                     .padding(2.dp)
@@ -393,7 +477,7 @@ fun CellFace(
         Text(
             labelOf(item, byId),
             fontSize = 10.sp, maxLines = 2, overflow = TextOverflow.Ellipsis,
-            textAlign = TextAlign.Center, color = Color(0xFFE8E8F0), lineHeight = 12.sp,
+            textAlign = TextAlign.Center, color = LocalPrismColors.current.onSurface, lineHeight = 12.sp,
         )
     }
 }
@@ -454,8 +538,8 @@ private fun PluginWidgetFace(item: DesktopItem.PluginWidget) {
     }
 
     Surface(
-        color = Color(0xCC1A1A22),
-        shape = RoundedCornerShape(10.dp),
+        color = colors.surfaceRaised,
+        shape = RoundedCornerShape(colors.cardRadius),
         modifier = Modifier.fillMaxSize().padding(3.dp),
     ) {
         Column(Modifier.fillMaxSize().padding(8.dp)) {
@@ -464,7 +548,7 @@ private fun PluginWidgetFace(item: DesktopItem.PluginWidget) {
                 failure.isNotEmpty() && current == null -> Text(
                     item.className.substringAfterLast('.') + ": " + failure,
                     fontSize = 9.sp,
-                    color = Color(0xFFFFC46B),
+                    color = colors.accent.copy(alpha = 0.9f),
                     lineHeight = 12.sp,
                     maxLines = 5,
                     overflow = TextOverflow.Ellipsis,
@@ -496,7 +580,7 @@ private fun DeleteZone() {
     val colors = LocalPrismColors.current
 
     Surface(
-        color = if (armed) Color(0xE6B3261E) else Color(0xCC2A2A34),
+        color = if (armed) colors.destructive else colors.surfaceRaised,
         shape = RoundedCornerShape(bottomStart = 14.dp, bottomEnd = 14.dp),
         modifier = Modifier
             .padding(horizontal = 140.dp)
@@ -534,12 +618,54 @@ private fun DeleteZone() {
  * come first and never move, because a pin whose position depends on a prediction is not a pin.
  *
  * The taskbar is also a drop target: dragging an app onto it pins it.
+ *
+ * THIS PAGE NO LONGER OWNS THE STRIP UNDER xOS. The macOS interpretation puts the pages
+ * themselves -- and this same pin/prediction strip -- in the window's taskbar, so the shell
+ * draws it ([MacOsShell]) and the page leaves the space to the grid. [LocalShellTaskbar] is how
+ * the page knows; see [TaskbarApps] for the part both shells share.
  */
 @Composable
 private fun Taskbar(
     byId: Map<String, AppEntry>,
     icons: MutableMap<String, ImageBitmap?>,
     onLaunch: (AppEntry) -> Unit,
+) {
+    val colors = LocalPrismColors.current
+    TaskbarApps(
+        byId = byId,
+        icons = icons,
+        onLaunch = onLaunch,
+        baseColor = colors.surface,
+        leading = {
+            Icon(Icons.Filled.Hexagon, null, tint = colors.accent, modifier = Modifier.size(19.dp))
+            Spacer(Modifier.width(12.dp))
+        },
+    )
+}
+
+/**
+ * Pins, then predictions, plus the drop target that pins a dragged app.
+ *
+ * Extracted from the desktop page because xOS's taskbar is the same strip: a macOS dock that
+ * could not pin an app dragged onto it would be a worse taskbar than the one it replaced. The
+ * caller supplies what sits at the leading edge -- the Prism mark, or the dock's Launchpad and
+ * page icons -- and the rest is identical in both shells.
+ */
+@Composable
+internal fun TaskbarApps(
+    byId: Map<String, AppEntry>,
+    icons: MutableMap<String, ImageBitmap?>,
+    onLaunch: (AppEntry) -> Unit,
+    baseColor: Color,
+    modifier: Modifier = Modifier,
+    iconSize: Dp = 38.dp,
+    glyphSize: Dp = 26.dp,
+    verticalPadding: Dp = 6.dp,
+    // The dock is not a place to advertise a feature: a sentence sitting between the page icons
+    // and the pins reads as a broken icon. Only the workbench taskbar, which is empty when the
+    // user has pinned nothing, explains itself.
+    showPinHint: Boolean = true,
+    leading: @Composable RowScope.() -> Unit = {},
 ) {
     val colors = LocalPrismColors.current
     val controller = LocalDragController.current
@@ -564,7 +690,7 @@ private fun Taskbar(
     val hovered = controller.payload != null && bounds.contains(controller.position)
 
     Row(
-        Modifier
+        modifier
             .fillMaxWidth()
             .onGloballyPositioned { bounds = it.boundsInRoot() }
             .dropTarget("taskbar") { payload, _ ->
@@ -575,15 +701,14 @@ private fun Taskbar(
                     }
                 }
             }
-            .background(if (hovered) Color(0xF2202030) else Color(0xF2101014))
-            .padding(horizontal = 10.dp, vertical = 6.dp),
+            .background(if (hovered) colors.surfaceRaised else baseColor)
+            .padding(horizontal = 10.dp, vertical = verticalPadding),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Icon(Icons.Filled.Hexagon, null, tint = colors.accent, modifier = Modifier.size(19.dp))
-        Spacer(Modifier.width(12.dp))
+        leading()
 
-        if (pinned.isEmpty() && !hovered) {
-            Text("Drag an app here to pin it", fontSize = 10.sp, color = Color(0xFF44444E))
+        if (showPinHint && pinned.isEmpty() && !hovered) {
+            Text("Drag an app here to pin it", fontSize = 10.sp, color = colors.faint)
         }
         if (hovered) {
             Text("Release to pin", fontSize = 11.sp, color = colors.accent)
@@ -591,26 +716,101 @@ private fun Taskbar(
 
         LazyRow(verticalAlignment = Alignment.CenterVertically) {
             items(pinned) { entry ->
-                TaskbarIcon(entry, icons, onLaunch, onUnpin = {
+                TaskbarIcon(entry, icons, onLaunch, iconSize, glyphSize, onUnpin = {
                     pins = pins - entry.id
                     PrismSettings.setTaskbarPins(pins)
                 })
             }
         }
 
+        // THE OTHER HALF OF BEING A SHELL. When Prism replaced Explorer there is no other
+        // taskbar, so pins and predictions alone would leave the user's open programs invisible.
+        RunningAppsStrip(iconSize, glyphSize)
+
         Spacer(Modifier.weight(1f))
 
         if (suggestions.isNotEmpty()) {
             Text(
                 "PREDICTED", fontSize = 8.sp, letterSpacing = 1.1.sp,
-                color = Color(0xFF4A4A54), modifier = Modifier.padding(end = 8.dp),
+                color = colors.faint, modifier = Modifier.padding(end = 8.dp),
             )
             LazyRow(verticalAlignment = Alignment.CenterVertically) {
                 items(suggestions) { entry ->
-                    TaskbarIcon(entry, icons, onLaunch, pinAction = {
+                    TaskbarIcon(entry, icons, onLaunch, iconSize, glyphSize, pinAction = {
                         pins = pins + entry.id
                         PrismSettings.setTaskbarPins(pins)
                     })
+                }
+            }
+        }
+    }
+}
+
+/**
+ * The open windows, as taskbar buttons.
+ *
+ * POLLED, not pushed. Windows has no portable notification for "a top-level window appeared",
+ * and an event hook is a much larger thing than a strip that refreshes every few seconds. The
+ * poll is off the UI thread and the list is only replaced when it actually differs, so an idle
+ * desktop does not recompose this row over and over.
+ *
+ * A CLICK ACTIVATES THE PROGRAM. It does not close anything, and it does not switch Prism away
+ * from the page -- the point of a shell is that the other program comes forward while Prism stays
+ * behind it, exactly as Explorer behaves.
+ */
+@Composable
+private fun RunningAppsStrip(iconSize: Dp, glyphSize: Dp) {
+    if (!com.prism.desktop.RunningApps.supported) return
+    val colors = LocalPrismColors.current
+    var running by remember { mutableStateOf<List<com.prism.desktop.RunningApps.Entry>>(emptyList()) }
+
+    LaunchedEffect(Unit) {
+        // ONLY WHILE PRISM IS THE SHELL. The OS taskbar already lists these windows when Explorer
+        // or a desktop panel is running, and a second copy on Prism's own strip would make every
+        // ordinary desktop session look busier than the shell it replaced.
+        val active = withContext(Dispatchers.IO) {
+            com.prism.desktop.ShellReplacement.state().active
+        }
+        if (!active) return@LaunchedEffect
+        while (true) {
+            val next = withContext(Dispatchers.IO) { com.prism.desktop.RunningApps.list() }
+            if (next != running) running = next
+            kotlinx.coroutines.delay(4000L)
+        }
+    }
+
+    if (running.isEmpty()) return
+
+    // Bounded, so a dozen open windows scroll inside the strip instead of pushing the pins and
+    // predictions off the end of the taskbar.
+    LazyRow(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.widthIn(max = 440.dp),
+    ) {
+        items(running, key = { it.key }) { entry ->
+            Box(
+                Modifier
+                    .padding(horizontal = 2.dp)
+                    .size(iconSize)
+                    .clickableRow { com.prism.desktop.RunningApps.activate(entry) },
+                contentAlignment = Alignment.Center,
+            ) {
+                val icon = entry.icon
+                if (icon != null) {
+                    Image(icon, null, Modifier.size(glyphSize), contentScale = ContentScale.Fit)
+                } else {
+                    Box(
+                        Modifier
+                            .size(glyphSize * 0.8f)
+                            .background(colors.surfaceRaised, RoundedCornerShape(7.dp)),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            entry.title.take(1).uppercase(),
+                            fontSize = 11.sp,
+                            color = colors.onSurface,
+                        )
+                    }
                 }
             }
         }
@@ -622,6 +822,8 @@ private fun TaskbarIcon(
     entry: AppEntry,
     icons: MutableMap<String, ImageBitmap?>,
     onLaunch: (AppEntry) -> Unit,
+    iconSize: Dp,
+    glyphSize: Dp,
     onUnpin: (() -> Unit)? = null,
     pinAction: (() -> Unit)? = null,
 ) {
@@ -632,7 +834,7 @@ private fun TaskbarIcon(
         Box(
             Modifier
                 .padding(horizontal = 2.dp)
-                .size(38.dp)
+                .size(iconSize)
                 .clickableRow { onLaunch(entry) }
                 .pointerInput(entry.id) {
                     detectDragGesturesAfterLongPress(
@@ -642,7 +844,7 @@ private fun TaskbarIcon(
                 },
             contentAlignment = Alignment.Center,
         ) {
-            IconOrFallback(icons[entry.id], Icons.Filled.Android, 26.dp)
+            IconOrFallback(icons[entry.id], Icons.Filled.Android, glyphSize)
         }
         DropdownMenu(menu, onDismissRequest = { menu = false }) {
             Text(
@@ -670,6 +872,7 @@ private fun TaskbarIcon(
 @Composable
 private fun FolderDialog(folder: DesktopItem.Folder, onDismiss: () -> Unit, onOpen: (File) -> Unit) {
     val rootDir = remember(folder.folderId) { DesktopFolders.resolve(folder.folderId) }
+    val colors = LocalPrismColors.current
     var stack by remember(folder.folderId) { mutableStateOf(listOf(rootDir)) }
     val current = stack.last()
     var entries by remember { mutableStateOf<List<File>>(emptyList()) }
@@ -695,7 +898,7 @@ private fun FolderDialog(folder: DesktopItem.Folder, onDismiss: () -> Unit, onOp
                 Text(folder.name)
                 Text(
                     stack.drop(1).joinToString(" / ") { it.name }.ifBlank { "—" },
-                    fontSize = 10.sp, color = Color(0xFF6C6C78),
+                    fontSize = 10.sp, color = colors.faint,
                 )
             }
         },
@@ -704,7 +907,7 @@ private fun FolderDialog(folder: DesktopItem.Folder, onDismiss: () -> Unit, onOp
                 if (entries.isEmpty()) {
                     Text(
                         "Empty. Drag items onto this folder to fill it.",
-                        fontSize = 12.sp, color = Color(0xFF83838F),
+                        fontSize = 12.sp, color = colors.muted,
                     )
                 }
                 androidx.compose.foundation.lazy.LazyColumn {
@@ -720,14 +923,14 @@ private fun FolderDialog(folder: DesktopItem.Folder, onDismiss: () -> Unit, onOp
                         ) {
                             Icon(
                                 if (file.isDirectory) Icons.Filled.Folder else Icons.AutoMirrored.Filled.InsertDriveFile,
-                                null, tint = Color(0xFF9A9AA6), modifier = Modifier.size(17.dp),
+                                null, tint = colors.muted, modifier = Modifier.size(17.dp),
                             )
                             Spacer(Modifier.width(10.dp))
                             Text(file.name, fontSize = 13.sp, modifier = Modifier.weight(1f))
                             if (file.isDirectory) {
                                 Icon(
                                     Icons.Filled.ChevronRight, null,
-                                    tint = Color(0xFF55555F), modifier = Modifier.size(15.dp),
+                                    tint = colors.faint, modifier = Modifier.size(15.dp),
                                 )
                             }
                         }
@@ -773,7 +976,7 @@ fun IconOrFallback(
     if (icon != null) {
         Image(icon, null, Modifier.size(size))
     } else {
-        Icon(fallback, null, tint = Color(0xFF9A9AA6), modifier = Modifier.size(size))
+        Icon(fallback, null, tint = LocalPrismColors.current.faint, modifier = Modifier.size(size))
     }
 }
 

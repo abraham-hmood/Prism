@@ -439,6 +439,15 @@ object WalletNetwork {
         if (!coin.isValidAddress(toAddress)) {
             return SendResult.Failed("That is not a valid ${coin.symbol} address.")
         }
+
+        // PRISMCOIN HAS NO EXPLORER AND NO RPC. It is a chain this device runs, so a PSC send is
+        // signed locally and submitted straight to the mempool -- going through the endpoint table
+        // below is what made every PSC send say "Prism has no network endpoint for PSC". The local
+        // chain is the network.
+        if (coin.symbol.equals("PSC", ignoreCase = true)) {
+            return sendPsc(fromAddress, privateKey, toAddress, amount)
+        }
+
         val e = endpoints[coin.symbol.uppercase()]
             ?: return SendResult.Failed("Prism has no network endpoint for ${coin.symbol}.")
 
@@ -452,6 +461,55 @@ object WalletNetwork {
         } catch (ex: Exception) {
             PrismPlatform.log.error(TAG, "Send failed for ${coin.symbol}", ex)
             SendResult.Failed(ex.message ?: "The transaction could not be sent.")
+        }
+    }
+
+    /**
+     * A PrismCoin transfer: sign, submit to the mempool, gossip, persist.
+     *
+     * [chain.submit] is doing the real checking -- signature, balance including the fee, and the
+     * exact nonce -- so its rejection reason is passed through rather than replaced with a generic
+     * failure. Broadcasting after acceptance (never before) means a transaction that this node
+     * already knows is invalid is not inflicted on the rest of the mesh.
+     */
+    private fun sendPsc(
+        from: String,
+        privateKey: BigInteger,
+        to: String,
+        amount: BigInteger,
+    ): SendResult {
+        if (amount.signum() <= 0) return SendResult.Failed("Enter an amount greater than zero.")
+
+        val chain = com.prism.launcher.wallet.psc.PrismCoinNode.chain
+        val fee = BigInteger.ZERO
+        if (chain.balanceOf(from) < amount.add(fee)) {
+            return SendResult.Failed("Not enough spendable PrismCoin in this account.")
+        }
+
+        return try {
+            val tx = com.prism.launcher.wallet.psc.PscTransaction(
+                from = from,
+                to = to,
+                amount = amount,
+                fee = fee,
+                nonce = chain.nonceOf(from),
+                publicKey = WalletCrypto.compressedPublicKey(privateKey),
+                note = "",
+            ).sign(privateKey)
+
+            when (val result = chain.submit(tx)) {
+                is com.prism.launcher.wallet.psc.PscChain.TxResult.Rejected ->
+                    SendResult.Failed(result.reason)
+
+                is com.prism.launcher.wallet.psc.PscChain.TxResult.Accepted -> {
+                    com.prism.launcher.wallet.psc.PrismCoinNode.broadcastTransaction(tx)
+                    com.prism.launcher.wallet.psc.PrismCoinNode.save()
+                    SendResult.Broadcast(tx.id())
+                }
+            }
+        } catch (ex: Exception) {
+            PrismPlatform.log.error(TAG, "PSC send failed", ex)
+            SendResult.Failed(ex.message ?: "The PrismCoin transaction could not be sent.")
         }
     }
 

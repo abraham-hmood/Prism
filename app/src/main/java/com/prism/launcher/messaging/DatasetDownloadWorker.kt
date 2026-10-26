@@ -47,9 +47,11 @@ class DatasetDownloadWorker(context: Context, params: WorkerParameters) :
             return Result.success()
         }
 
+        var downloadedAny = false
         for (dataset in candidates) {
             val (files, bytes) = DatasetDownloader.download(dataset, maxBytes)
             if (files > 0) {
+                downloadedAny = true
                 PrismSettings.addDownloadedDatasetRepoId(dataset.repoId)
                 PrismLogger.logInfo(
                     "DatasetDownload",
@@ -57,7 +59,21 @@ class DatasetDownloadWorker(context: Context, params: WorkerParameters) :
                         "${DatasetDiscoveryService.formatSize(bytes)} -- into Nora's/Aether's dataset director" +
                         "${if (files == 1) "y" else "ies"}."
                 )
+            } else {
+                PrismLogger.logWarning(
+                    "DatasetDownload",
+                    "${dataset.repoId} produced no files; it is not being marked as downloaded",
+                )
             }
+        }
+
+        // SUCCESS MEANT "THE JOB FINISHED", NOT "DATA ARRIVED". Every candidate could fail -- an
+        // LFS pointer with no fallback, a repository whose files are all above the cap -- and the
+        // worker still reported success, so nothing anywhere showed that the feature had done
+        // nothing. Retry once (a transient network failure is the common cause), then fail with the
+        // reason in the log rather than pretending.
+        if (!downloadedAny) {
+            return if (runAttemptCount < 2) Result.retry() else Result.failure()
         }
         return Result.success()
     }

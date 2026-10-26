@@ -168,15 +168,17 @@ class SettingsCatalogTest {
     }
 
     @Test
-    fun `every section belongs to a group`() {
+    fun `every section is named by a group`() {
+        // Declared membership, not `groupOf() != "Other"`: a section can now be placed in the
+        // explicit Other group on purpose, and that is still grouped. A section in NO group's
+        // list is what this is looking for -- almost always a name typed differently in two places.
+        val declared = SettingsCatalog.GROUPS.flatMap { it.sections }.toSet()
         val ungrouped = SettingsCatalog.sections()
             .map { it.title }
-            .filter { SettingsCatalog.groupOf(it) == "Other" }
-        // "Other" is a working fallback rather than an error, so this is not a hard failure of the
-        // model -- but a section landing there is almost always a name typed differently in two places.
+            .filterNot { it in declared }
         assertTrue(
             ungrouped.isEmpty(),
-            "these sections fell into Other, which usually means a spelling mismatch: " +
+            "these sections are in no group, which usually means a spelling mismatch: " +
                 ungrouped.joinToString(", "),
         )
     }

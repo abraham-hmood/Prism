@@ -28,6 +28,19 @@ interface PlatformHost {
     /** Private, persistent, app-owned. Connectomes, swap files, spill files. */
     fun dataDir(): File
 
+    /**
+     * Private and persistent, but deliberately excluded from platform backup.
+     *
+     * Credentials and a device's private CA belong here. They are as durable as [dataDir] on the
+     * device, but copying them to another machine would move a security boundary along with the
+     * data: a lock credential that can be restored elsewhere is a lock credential somebody else
+     * can read, and a CA private key in a backup is a CA private key in a backup.
+     *
+     * Defaults to [dataDir] on platforms whose data directory is already excluded from sync;
+     * Android overrides it to `noBackupFilesDir`.
+     */
+    fun noBackupDir(): File = dataDir()
+
     /** Private, disposable. Anything reproducible; may vanish between runs. */
     fun cacheDir(): File
 

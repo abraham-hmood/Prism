@@ -29,6 +29,7 @@ object OpenVoiceEngine : CloneEngine {
         file = "tone_ref_encoder.onnx",
         sizeBytes = 3_259_275L,
         url = "$HF/tone_ref_encoder.onnx",
+        sha256 = "3dd4918cab90e1acf7fa5c6f7539c27710e7a3cdfba550468c5ea49399178bf7",
     )
     val CONVERTER = VoiceCloningModels.Model(
         id = "converter",
@@ -36,6 +37,7 @@ object OpenVoiceEngine : CloneEngine {
         file = "tone_converter.onnx",
         sizeBytes = 128_051_288L,
         url = "$HF/tone_converter.onnx",
+        sha256 = "7d7ee834c230037ead5cd6b64d44fcd842fbab5cd4cf6fe3ab381fad763325e9",
     )
 
     override val models: List<VoiceCloningModels.Model> = listOf(ENCODER, CONVERTER)

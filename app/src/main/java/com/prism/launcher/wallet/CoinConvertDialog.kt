@@ -89,7 +89,8 @@ object CoinConvertDialog {
             } else {
                 "Best open offer: " + open.first().let {
                     "${it.fromAmount.toPlainString()} ${it.fromSymbol} for " +
-                        "${it.toAmount.toPlainString()} ${it.toSymbol}"
+                        "${it.toAmount.toPlainString()} ${it.toSymbol}\n" +
+                        "They receive ${it.toSymbol} at ${it.makerReceiveAddress}"
                 }
             }
         }
@@ -104,7 +105,7 @@ object CoinConvertDialog {
         to.onItemSelectedListener = listener
         refreshQuotes()
 
-        AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("Convert")
             .setView(root)
             .setPositiveButton("Convert") { _, _ ->
@@ -150,8 +151,14 @@ object CoinConvertDialog {
         // rate nobody would take. With an empty book it is quoted one-for-one and the maker is
         // expected to edit it -- there is no oracle to do better, and inventing a rate would be
         // worse than showing an obvious placeholder.
+        //
+        // DIVIDED, NOT MULTIPLIED. Offer.rate() is the maker's price -- what they want per unit of
+        // what they give -- so the taker pays rate per unit received. Multiplying by it would quote
+        // the taker the reciprocal of the market and post nonsense back into the book.
         val open = P2pCoinOffers.matching(give = from, want = to).firstOrNull()
-        val wanted = open?.let { value.multiply(it.rate()) } ?: value
+        val wanted = open?.let {
+            value.divide(it.rate(), java.math.MathContext.DECIMAL64)
+        }?.takeIf { it.signum() > 0 } ?: value
 
         P2pCoinOffers.post(P2pCoinOffers.Offer(
                 peerIp = "",

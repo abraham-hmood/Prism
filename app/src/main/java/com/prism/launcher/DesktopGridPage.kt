@@ -24,6 +24,7 @@ class DesktopGridPage(
     private val onLaunch: (ComponentName) -> Unit,
     private val onDataChanged: () -> Unit,
     private val acceptDrawerDrops: () -> Boolean,
+    private val onRequestPagePicker: (Int) -> Unit = {},
 ) : android.widget.LinearLayout(context) {
 
     private val store = DesktopShortcutStore(gridIndex)
@@ -43,7 +44,7 @@ class DesktopGridPage(
         deleteZone = binding.deleteZone
 
         adapter = DesktopGridAdapter(
-            context.packageManager,
+            context,
             store,
             cellCount,
             onDataChanged,
@@ -52,10 +53,29 @@ class DesktopGridPage(
             onLaunchFolder = { openFolder(it) },
             onDragStarted = { showDeleteZone() },
             onDragEnded   = { hideDeleteZone() },
+            onShowMenu = { entry, anchor, _ ->
+                val activity = context as? LauncherActivity
+                if (activity == null) {
+                    false
+                } else {
+                    // The cell's own handoff (see MenuDragHandoff) starts the drag when the finger
+                    // moves; this only has to put the menu on screen.
+                    activity.showAppContextMenu(entry, anchor)
+                    true
+                }
+            },
         )
         grid.layoutManager = GridLayoutManager(context, 4)
         grid.adapter = adapter
         grid.setHasFixedSize(true)
+
+        // The onboarding tour promises a long-press on an empty spot opens the page picker, and
+        // only a hard vertical overscroll ever did. The empty area of the grid is the obvious
+        // place to keep that promise; an icon keeps its own long-press for dragging.
+        grid.setOnLongClickListener {
+            onRequestPagePicker(gridIndex)
+            true
+        }
 
         widgetLayer = com.prism.launcher.widgets.DesktopWidgetLayer(
             context, grid, store, cellCount,
@@ -86,24 +106,10 @@ class DesktopGridPage(
             },
         )
 
-        // Standard touch-to-move helper (long-press drag within grid)
-        val touchHelper = ItemTouchHelper(
-            object : ItemTouchHelper.SimpleCallback(
-                ItemTouchHelper.UP or ItemTouchHelper.DOWN or ItemTouchHelper.LEFT or ItemTouchHelper.RIGHT,
-                0,
-            ) {
-                override fun onMove(
-                    recyclerView: RecyclerView,
-                    viewHolder: RecyclerView.ViewHolder,
-                    target: RecyclerView.ViewHolder,
-                ): Boolean {
-                    adapter.move(viewHolder.bindingAdapterPosition, target.bindingAdapterPosition)
-                    return true
-                }
-                override fun onSwiped(viewHolder: RecyclerView.ViewHolder, direction: Int) = Unit
-            },
-        )
-        touchHelper.attachToRecyclerView(grid)
+        // NO ItemTouchHelper. It started its own long-press drag from exactly the same view as the
+        // adapter's startDragAndDrop below, so one long press activated two drag systems at once --
+        // and only the ItemTouchHelper's knew nothing about folders, widgets or the delete zone.
+        // The grid's own drop listener is the single drag path.
 
         // Delete zone drag listener
         deleteZone.setOnDragListener { v, event ->
@@ -126,6 +132,9 @@ class DesktopGridPage(
                     val payload = event.clipData?.getItemAt(0)?.text?.toString()
                     val label   = event.clipDescription?.label?.toString() ?: ""
                     deleteItem(label, payload)
+                    // An item dragged out of a folder moves rather than copies, so deleting it
+                    // here has to take its `.link` with it -- otherwise it reappears in the folder.
+                    (event.localState as? FolderDragSource)?.consume()
                     hideDeleteZone()
                     true
                 }
@@ -141,8 +150,9 @@ class DesktopGridPage(
         grid.setOnDragListener { _, event ->
             when (event.action) {
                 DragEvent.ACTION_DROP -> {
-                    // Source position: -1 means external drop (drawer / file explorer)
+                    // Source position: -1 means external drop (drawer / file explorer / folder)
                     val sourcePos = event.localState as? Int ?: -1
+                    val folderSource = event.localState as? FolderDragSource
 
                     // A widget dragged out of the app drawer. Handled before resolveDraggedItem
                     // because a widget is not a DesktopItem yet -- it has no id until the placement
@@ -155,7 +165,8 @@ class DesktopGridPage(
                         return@setOnDragListener dropWidget(event)
                     }
 
-                    val draggedItem = resolveDraggedItem(event, sourcePos) ?: return@setOnDragListener false
+                    val draggedItem = resolveDraggedItem(event, sourcePos, folderSource)
+                        ?: return@setOnDragListener false
 
                     // Gate cross-page drops only
                     val label = event.clipDescription?.label?.toString() ?: ""
@@ -172,8 +183,11 @@ class DesktopGridPage(
                         // Empty cell — simple move (or place for external)
                         adapter.placeAt(targetPos, draggedItem)
                         if (sourcePos >= 0) adapter.clearCellAt(sourcePos)
-                    } else {
-                        applyDropMatrix(draggedItem, target, sourcePos, targetPos)
+                        folderSource?.consume()
+                    } else if (applyDropMatrix(draggedItem, target, sourcePos, targetPos)) {
+                        // Only consume the source when the target actually took it. Dropping onto a
+                        // widget does nothing, and must not delete the item out of its folder.
+                        folderSource?.consume()
                     }
                     hideDeleteZone()
                     true
@@ -252,10 +266,15 @@ class DesktopGridPage(
             it.height = targetH
         }
         deleteZone.visibility = View.VISIBLE
+        binding.deleteZoneContainer.visibility = View.VISIBLE
     }
 
     private fun hideDeleteZone() {
-        deleteZone.visibility = View.INVISIBLE
+        // THE CONTAINER GOES GONE, not the zone INVISIBLE. An invisible child still contributes
+        // the container's padding and the 10%-of-screen height set above, so the whole grid stayed
+        // shifted after every drag. GONE takes the row out of the layout entirely.
+        deleteZone.visibility = View.GONE
+        binding.deleteZoneContainer.visibility = View.GONE
         deleteZone.reset()
     }
 
@@ -310,8 +329,13 @@ class DesktopGridPage(
      * For internal desktop drags (sourcePos >= 0), read live from adapter cells
      * so we work with the real object, not a re-serialized clone.
      */
-    private fun resolveDraggedItem(event: DragEvent, sourcePos: Int): DesktopItem? {
+    private fun resolveDraggedItem(
+        event: DragEvent,
+        sourcePos: Int,
+        folderSource: FolderDragSource?,
+    ): DesktopItem? {
         if (sourcePos >= 0) return adapter.getItemAt(sourcePos)
+        if (folderSource != null) return folderSource.item
 
         val desc = event.clipDescription ?: return null
         val payload = event.clipData?.getItemAt(0)?.text?.toString() ?: return null
@@ -380,98 +404,53 @@ class DesktopGridPage(
 
     // ── Full Interaction Matrix ────────────────────────────────────────────────
 
-    private fun applyDropMatrix(dragged: DesktopItem, target: DesktopItem, srcPos: Int, dstPos: Int) {
-        when (dragged) {
-            is DesktopItem.Widget, is DesktopItem.PluginWidget, is DesktopItem.Occupied -> Unit  // widgets are not folder members; covered cells are not targets
-            is DesktopItem.App -> when (target) {
-                is DesktopItem.Widget, is DesktopItem.PluginWidget, is DesktopItem.Occupied -> Unit  // widgets are not folder members; covered cells are not targets
-                is DesktopItem.App, is DesktopItem.FileRef, is DesktopItem.NetworkedFolder -> {
-                    val f = combineIntoFolder(dragged, target)
-                    adapter.placeAt(dstPos, f)
-                    if (srcPos >= 0) adapter.clearCellAt(srcPos)
-                }
-                is DesktopItem.Folder -> {
-                    addItemToFolder(target, dragged)
-                    if (srcPos >= 0) adapter.clearCellAt(srcPos)
-                }
-                is DesktopItem.DirectoryRef -> {
-                    addItemToStorageFolder(target, dragged)
-                    if (srcPos >= 0) adapter.clearCellAt(srcPos)
-                }
-            }
+    /**
+     * What happens when [dragged], from [srcPos], is dropped on [target] at [dstPos].
+     *
+     * @return true when the target accepted the item. A widget (or a cell it covers) is not a drop
+     *         target at all, and false is what tells the caller not to consume a folder source.
+     */
+    private fun applyDropMatrix(
+        dragged: DesktopItem,
+        target: DesktopItem,
+        srcPos: Int,
+        dstPos: Int,
+    ): Boolean {
+        // Widgets are not folder members and covered cells are not targets. Nothing a drag can do
+        // here is meaningful, so it is refused rather than half-applied.
+        if (target is DesktopItem.Widget || target is DesktopItem.PluginWidget ||
+            target is DesktopItem.Occupied ||
+            dragged is DesktopItem.Widget || dragged is DesktopItem.PluginWidget ||
+            dragged is DesktopItem.Occupied
+        ) return false
 
-            is DesktopItem.Folder -> when (target) {
-                is DesktopItem.Folder -> {
-                    addItemToFolder(target, dragged)
-                    if (srcPos >= 0) adapter.clearCellAt(srcPos)
-                }
-                is DesktopItem.DirectoryRef -> {
-                    addItemToStorageFolder(target, dragged)
-                    if (srcPos >= 0) adapter.clearCellAt(srcPos)
-                }
-                else -> {
-                    if (target is DesktopItem.App || target is DesktopItem.FileRef || target is DesktopItem.NetworkedFolder) {
-                        val f = combineIntoFolder(dragged, target)
-                        adapter.placeAt(dstPos, f)
-                    } else {
-                        if (srcPos >= 0) adapter.move(srcPos, dstPos) else adapter.placeAt(dstPos, dragged)
-                    }
-                    if (srcPos >= 0 && target !is DesktopItem.Folder) adapter.clearCellAt(srcPos)
-                }
+        val absorbed = when (target) {
+            is DesktopItem.Folder -> {
+                addItemToFolder(target, dragged)
+                true
             }
+            is DesktopItem.DirectoryRef -> {
+                addItemToStorageFolder(target, dragged)
+                true
+            }
+            is DesktopItem.App, is DesktopItem.FileRef, is DesktopItem.NetworkedFolder -> {
+                adapter.placeAt(dstPos, combineIntoFolder(dragged, target))
+                true
+            }
+            else -> false
+        }
 
-            is DesktopItem.DirectoryRef -> when (target) {
-                is DesktopItem.Widget, is DesktopItem.PluginWidget, is DesktopItem.Occupied -> Unit  // widgets are not folder members; covered cells are not targets
-                is DesktopItem.App, is DesktopItem.FileRef, is DesktopItem.NetworkedFolder -> {
-                    val f = combineIntoFolder(dragged, target)
-                    adapter.placeAt(dstPos, f)
-                    if (srcPos >= 0) adapter.clearCellAt(srcPos)
-                }
-                is DesktopItem.Folder -> {
-                    addItemToFolder(target, dragged)
-                    if (srcPos >= 0) adapter.clearCellAt(srcPos)
-                }
-                is DesktopItem.DirectoryRef -> {
-                    val f = combineIntoFolder(dragged, target)
-                    adapter.placeAt(dstPos, f)
-                    if (srcPos >= 0) adapter.clearCellAt(srcPos)
-                }
-            }
-
-            is DesktopItem.FileRef -> when (target) {
-                is DesktopItem.Widget, is DesktopItem.PluginWidget, is DesktopItem.Occupied -> Unit  // widgets are not folder members; covered cells are not targets
-                is DesktopItem.App, is DesktopItem.FileRef, is DesktopItem.NetworkedFolder -> {
-                    val f = combineIntoFolder(dragged, target)
-                    adapter.placeAt(dstPos, f)
-                    if (srcPos >= 0) adapter.clearCellAt(srcPos)
-                }
-                is DesktopItem.Folder -> {
-                    addItemToFolder(target, dragged)
-                    if (srcPos >= 0) adapter.clearCellAt(srcPos)
-                }
-                is DesktopItem.DirectoryRef -> {
-                    addItemToStorageFolder(target, dragged)
-                    if (srcPos >= 0) adapter.clearCellAt(srcPos)
-                }
-            }
-
-            is DesktopItem.NetworkedFolder -> when (target) {
-                is DesktopItem.Folder -> {
-                    addItemToFolder(target, dragged)
-                    if (srcPos >= 0) adapter.clearCellAt(srcPos)
-                }
-                else -> {
-                    if (target is DesktopItem.App || target is DesktopItem.FileRef || target is DesktopItem.NetworkedFolder) {
-                        val f = combineIntoFolder(dragged, target)
-                        adapter.placeAt(dstPos, f)
-                    } else {
-                        if (srcPos >= 0) adapter.move(srcPos, dstPos) else adapter.placeAt(dstPos, dragged)
-                    }
-                    if (srcPos >= 0 && target !is DesktopItem.Folder) adapter.clearCellAt(srcPos)
-                }
-            }
+        if (absorbed) {
+            if (srcPos >= 0) adapter.clearCellAt(srcPos)
+        } else if (srcPos >= 0) {
+            // Both ordinary items: a reorder. `move` refuses to disturb widget occupancy, so a
+            // refused move leaves the grid exactly as it was.
+            adapter.move(srcPos, dstPos)
+        } else {
+            adapter.placeAt(dstPos, dragged)
         }
         adapter.persist()
+        return true
     }
 
     // ── Navigation ────────────────────────────────────────────────────────────
@@ -525,6 +504,12 @@ class DesktopGridPage(
         pm: android.content.pm.PackageManager,
         cn: ComponentName,
     ): android.graphics.drawable.Drawable? {
+        // The same icon pack the drawer uses, so the hotseat does not show stock artwork beside a
+        // themed grid. Read per call because the setting can change while the page is alive.
+        val pack = PrismSettings.getIconPackPackage()
+        if (pack.isNotEmpty()) {
+            IconPackEngine.getIconPackDrawable(context, cn, pack)?.let { return it }
+        }
         return try { pm.getActivityIcon(cn) } catch (_: Throwable) {
             try { pm.getApplicationIcon(cn.packageName) } catch (_: Throwable) { null }
         }

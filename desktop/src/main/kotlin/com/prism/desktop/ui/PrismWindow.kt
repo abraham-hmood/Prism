@@ -33,6 +33,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.prism.launcher.PrismSettings
+import com.prism.launcher.SlotAssignment
 import kotlinx.coroutines.launch
 
 /**
@@ -44,10 +45,15 @@ import kotlinx.coroutines.launch
  * product, and reshuffling them into a conventional desktop menu here would make the two builds
  * different applications that happen to share a name.
  *
- * TWO SHELLS OVER THE SAME PAGES.
+ * THREE SHELLS OVER THE SAME PAGES.
  *
  *   WORKBENCH (default)  a persistent rail. Every page reachable in one click, which is what a
  *                        mouse is good at and what a desktop user expects.
+ *
+ *   MACOS (xOS)         [MacOsShell] -- no rail. The pages are icons in a taskbar along the
+ *                        bottom, the app pins and predictions ride in the same strip, and
+ *                        Launchpad carries the pages the dock has no room for. See that file for
+ *                        why this is the xOS interpretation rather than a setting of its own.
  *
  *   LAUNCHER             [LauncherShell] -- the Android navigation model: a horizontal pager over
  *                        user-assignable slots read from the same `prism_slots` store the phone
@@ -73,9 +79,26 @@ fun PrismWindow(startOn: PageId = PageId.NORA_CHAT) {
     androidx.compose.runtime.SideEffect {
         SettingsActions.navigate = { page -> selected = page }
     }
-    // Read once into state rather than polled: the setting is changed from inside this window, so
-    // the toggle updates it directly and there is nothing else that could change it underneath.
-    var launcherMode by remember { mutableStateOf(PrismSettings.getDesktopMobileMode()) }
+    // THE PHONE-STYLE NAVIGATION SWITCH IS GONE, and that is deliberate: it now replaces the
+    // desktop shell instead of choosing a phone-shaped window. The workbench and the xOS dock are
+    // the two presentations left, and which one shows is decided by the theme.
+    val launcherMode = false
+
+    // A display follows the workbench too, not only the launcher pager. In this shell the pages
+    // are the rail, so "the next page" is the next entry.
+    LaunchedEffect(selected) {
+        val pages = PageId.entries.filter { it.ported }
+        val slots = pages.map { railSlot(it).serialize() }
+        val index = pages.indexOf(selected).coerceAtLeast(0)
+        // The rail page, not only its slot. Several rail pages share the Default slot, so a
+        // display told only "Default" drew the desktop grid for whichever page came next. The
+        // whole list travels because extend names the page AFTER the current one.
+        com.prism.launcher.display.WirelessDisplay.notePage(
+            slots,
+            index,
+            pages = pages.map { it.name },
+        )
+    }
 
     // One drag controller and one icon cache for the whole window. Both have to outlive any
     // single page: a drag starts in the drawer and ends on the desktop, and the same
@@ -95,38 +118,36 @@ fun PrismWindow(startOn: PageId = PageId.NORA_CHAT) {
             // nothing about pairing. See TrustedDeviceOfferWatcher.
             TrustedDeviceOfferWatcher()
 
-            // THE LOCK (PHASE 101), mounted LAST so it draws over everything including the trust
-            // watcher and the tour. A lock that a consent dialog could appear on top of would be a
-            // lock somebody could be talked past.
-            //
-            // It locks Prism and not the computer, and the overlay says so in those words. See
-            // PrismLockScope for the decision and its caveats.
-            LockOverlay()
-
-        // THE FIRST-RUN TOUR (PHASE 109), window-wide for the same reason the watcher is: it has to cover
-        // whatever page Prism opened on, and it has to appear exactly once regardless of navigation.
-        var tourDone by remember { mutableStateOf(com.prism.launcher.onboarding.OnboardingTour.seen()) }
-        if (!tourDone) {
-            OnboardingOverlay(onDone = { tourDone = true })
-        }
+            // THE FIRST-RUN TOUR (PHASE 109), window-wide for the same reason the watcher is: it has to cover
+            // whatever page Prism opened on, and it has to appear exactly once regardless of navigation.
+            var tourDone by remember { mutableStateOf(com.prism.launcher.onboarding.OnboardingTour.seen()) }
+            if (!tourDone) {
+                OnboardingOverlay(onDone = { tourDone = true })
+            }
 
             Surface(color = MaterialTheme.colorScheme.background) {
-                if (launcherMode) {
-                    LauncherShell(onExit = {
-                        launcherMode = false
-                        PrismSettings.setDesktopMobileMode(false)
-                    })
-                } else {
-                    Row(Modifier.fillMaxSize()) {
+                // THE THIRD SHELL. xOS on a desktop is macOS, and macOS does not put a list of
+                // everything down the left edge: it puts the things you launch in a taskbar at
+                // the bottom. [MacOsShell] is that -- the pages as dock icons, the full list one
+                // click away in Launchpad -- and it replaces the rail only for xOS, so every
+                // other theme keeps the workbench it was designed around.
+                val macOs = LocalMacOsLook.current
+                val onLauncherModeChange: (Boolean) -> Unit = {}
+                when {
+                    macOs -> MacOsShell(
+                        selected = selected,
+                        onSelect = { selected = it },
+                        launcherMode = launcherMode,
+                        onLauncherModeChange = onLauncherModeChange,
+                        onNavigate = { selected = it },
+                    )
+                    else -> Row(Modifier.fillMaxSize()) {
                         NavigationRail(selected = selected, onSelect = { selected = it })
                         Box(Modifier.weight(1f).fillMaxHeight()) {
                             PageBody(
                                 page = selected,
                                 launcherMode = launcherMode,
-                                onLauncherModeChange = {
-                                    launcherMode = it
-                                    PrismSettings.setDesktopMobileMode(it)
-                                },
+                                onLauncherModeChange = onLauncherModeChange,
                                 // Lets a page move the window. Only the thread list uses it so far, and
                                 // it is a callback rather than a shared navigation object because one
                                 // consumer does not justify a router.
@@ -136,17 +157,111 @@ fun PrismWindow(startOn: PageId = PageId.NORA_CHAT) {
                     }
                 }
             }
+
+            // AN INCOMING MESH CALL, above every page and below the lock. It has to be here rather
+            // than on the dialer page because the call arrives while the user is somewhere else --
+            // and a call nobody can answer is a call nobody could see. See DesktopIncomingCalls.
+            com.prism.desktop.IncomingCallBanner()
+
+            // THE LOCK (PHASE 101), mounted LAST so it draws over everything including the trust
+            // watcher and the tour. A lock that a consent dialog could appear on top of would be a
+            // lock somebody could be talked past.
+            //
+            // IT USED TO BE FIRST, which put it UNDER the full-window Surface: the window painted
+            // over the lock and only a locked-looking flash on startup revealed it existed. Compose
+            // stacks siblings in the order they are emitted, so "last" has to mean last in source
+            // order, not first with a comment claiming otherwise.
+            //
+            // It locks Prism and not the computer, and the overlay says so in those words. See
+            // PrismLockScope for the decision and its caveats.
+            LockOverlay()
         }
     }
 }
 
 /** The page itself, identical in both shells -- only the chrome around it differs. */
 @Composable
-private fun PageBody(
+internal fun PageBody(
     page: PageId,
     launcherMode: Boolean,
     onLauncherModeChange: (Boolean) -> Unit,
     onNavigate: (PageId) -> Unit = {},
+) {
+    // Re-read on navigation rather than only at start-up: the switch lives on the Settings page,
+    // and the page somebody goes to after turning it on should already be windowed. Keyed by the
+    // page because that is the event -- a settings change is observed the next time a page opens.
+    val windowed = remember(page) { PrismSettings.getWindowedPages() }
+    if (windowed) {
+        PageWindow(page) {
+            PageContent(page, launcherMode, onLauncherModeChange, onNavigate)
+        }
+    } else {
+        PageContent(page, launcherMode, onLauncherModeChange, onNavigate)
+    }
+}
+
+/**
+ * A page drawn as a window in the active theme's surfaces.
+ *
+ * The "desktop around it" is the shell's own background; this only has to provide the frame. Its
+ * corners, card colour, hairline and accent dot all come from [LocalPrismColors], so a windowed
+ * page does not become a fourth thing to theme.
+ *
+ * IT IS THE SAME PAGE. Nothing in the body is conditional on being framed -- every page already
+ * lays itself out for whatever space it is given, and a page that needed a different layout inside
+ * a window would be a second implementation with two sets of bugs.
+ */
+@Composable
+private fun PageWindow(page: PageId, content: @Composable () -> Unit) {
+    val colors = LocalPrismColors.current
+    Box(
+        Modifier
+            .fillMaxSize()
+            .padding(horizontal = 18.dp, vertical = 14.dp),
+    ) {
+        Surface(
+            color = colors.card,
+            contentColor = colors.onSurface,
+            shape = RoundedCornerShape(colors.cardRadius),
+            border = androidx.compose.foundation.BorderStroke(1.dp, colors.divider),
+            shadowElevation = 12.dp,
+            modifier = Modifier.fillMaxSize(),
+        ) {
+            Column(Modifier.fillMaxSize()) {
+                Row(
+                    Modifier.fillMaxWidth().height(34.dp).padding(horizontal = 13.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(
+                        Modifier
+                            .size(7.dp)
+                            .background(colors.accent, RoundedCornerShape(50)),
+                    )
+                    Spacer(Modifier.width(9.dp))
+                    Text(
+                        page.label,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = colors.onSurface,
+                        maxLines = 1,
+                    )
+                    Spacer(Modifier.weight(1f))
+                    Text("window", fontSize = 10.sp, color = colors.faint)
+                }
+                Box(Modifier.fillMaxWidth().height(1.dp).background(colors.divider))
+                Box(Modifier.weight(1f).fillMaxWidth()) { content() }
+            }
+        }
+    }
+}
+
+/** The page itself, laid out for the space the shell or the window gives it. */
+@Composable
+private fun PageContent(
+    page: PageId,
+    launcherMode: Boolean,
+    onLauncherModeChange: (Boolean) -> Unit,
+    onNavigate: (PageId) -> Unit,
 ) {
     when (page) {
         PageId.NORA_CHAT -> NoraChatPage()
@@ -163,7 +278,19 @@ private fun PageBody(
         PageId.MODELS -> ModelsPage()
         PageId.IMAGE_GEN -> ImageGenPage()
         PageId.SAM -> ConversationPage()
-        PageId.MESSAGES_PAGE -> MessagesPage(onOpenThread = { requested -> onNavigate(requested) })
+        PageId.MESSAGES_PAGE -> MessagesPage(
+            onOpenThread = { requested -> onNavigate(requested) },
+            onOpenDialer = { onNavigate(PageId.DIALER) },
+        )
+        // Calling and location: pages of their own, not screens buried in Messages. Mesh calls
+        // need no phone plan, and the map only ever draws positions a trusted device chose to
+        // share with this one.
+        PageId.DIALER -> DialerPage()
+        PageId.MESHVOICE -> MeshvoicePage()
+        PageId.MAPS -> MapsPage()
+        PageId.MOUSE -> MousePage()
+        PageId.PHOTOS -> PhotosPage()
+        PageId.PHOTOPIX -> PhotoPixPage()
         PageId.NORA_TOOLS -> NoraExtrasPage()
         PageId.NEBULA -> NebulaPage()
         PageId.TRUSTED -> TrustedDevicesPage()
@@ -196,10 +323,43 @@ private fun PageBody(
         PageId.AETHER -> AetherPage()
         PageId.APPS -> AppDrawerPage()
         PageId.FILES -> FileExplorerPage()
-        PageId.SETTINGS -> PrismSettingsPage(launcherMode, onLauncherModeChange)
+        PageId.SETTINGS -> PrismSettingsPage()
         PageId.DIAGNOSTICS -> DiagnosticsPage()
         else -> NotYetPortedPage(page)
     }
+}
+
+/**
+ * The slot a rail page corresponds to, so a display can render it.
+ *
+ * One-way deliberately: a slot knows which page to draw, a rail page is a navigation entry. Pages
+ * with no slot equivalent (Nora's screens, diagnostics) fall back to the desktop grid rather than
+ * inventing a tag the receiver would not understand.
+ */
+private fun railSlot(page: PageId): SlotAssignment = when (page) {
+    PageId.BROWSER -> SlotAssignment.Browser
+    PageId.DESKTOP -> SlotAssignment.DesktopGrid
+    PageId.APPS -> SlotAssignment.AppDrawer
+    PageId.FILES -> SlotAssignment.FileExplorer
+    PageId.MESSAGES_PAGE, PageId.SAM -> SlotAssignment.Messaging
+    PageId.NEBULA -> SlotAssignment.NebulaSocial
+    PageId.MODELS -> SlotAssignment.Models
+    PageId.MODEL_SHOP -> SlotAssignment.ModelStore
+    PageId.AGENTIC -> SlotAssignment.AgenticTools
+    PageId.WALLET, PageId.WALLET_EXTRAS -> SlotAssignment.Wallet
+    PageId.EDITOR -> SlotAssignment.Editor
+    PageId.SCIENCE, PageId.PROTEINS -> SlotAssignment.Science
+    PageId.NOTIFICATIONS -> SlotAssignment.Notifications
+    PageId.LANGUAGE -> SlotAssignment.Language
+    PageId.GAMES, PageId.GAME_HOST -> SlotAssignment.Minigames
+    PageId.CLOUD_AI -> SlotAssignment.Cloud
+    PageId.MESHVOICE, PageId.DIALER -> SlotAssignment.Meshvoice
+    PageId.MAPS -> SlotAssignment.Maps
+    PageId.MOUSE -> SlotAssignment.Mouse
+    PageId.PHOTOS -> SlotAssignment.Photos
+    PageId.PHOTOPIX -> SlotAssignment.PhotoPix
+    PageId.VIRTUALIZATION -> SlotAssignment.VirtualizationOs
+    else -> SlotAssignment.Default
 }
 
 enum class PageId(
@@ -224,6 +384,12 @@ enum class PageId(
     IMAGE_GEN("Image generation", Icons.Filled.Brush),
     SAM("Sam", Icons.AutoMirrored.Filled.Chat),
     MESSAGES_PAGE("Messages", Icons.Filled.Forum),
+    DIALER("Dialer", Icons.Filled.Phone),
+    MESHVOICE("Meshvoice", Icons.Filled.Voicemail),
+    MAPS("Maps", Icons.Filled.Map),
+    MOUSE("Mouse", Icons.Filled.TouchApp),
+    PHOTOS("Photos", Icons.Filled.PhotoLibrary),
+    PHOTOPIX("PhotoPix", Icons.Filled.Brush),
     NEBULA("Nebula", Icons.Filled.Groups),
     TRUSTED("Trusted devices", Icons.Filled.Devices),
     WALLET("Wallet", Icons.Filled.AccountBalanceWallet),
@@ -238,11 +404,6 @@ enum class PageId(
     SETTINGS("Prism Settings", Icons.Filled.Settings),
     DIAGNOSTICS("Diagnostics", Icons.Filled.Terminal),
 
-    MESSAGES(
-        "Messages", Icons.AutoMirrored.Filled.Chat, ported = false,
-        blocker = "AI conversations port directly. SMS/MMS does not exist on desktop -- Windows " +
-            "has no public API and Linux needs a cellular modem. Messages here will be AI-only."
-    ),
     MESH("Mesh", Icons.Filled.Hub),
     NOTIFICATIONS("Notifications", Icons.Filled.Notifications),
     QUANTIZE("Quantize", Icons.Filled.Compress),
@@ -268,11 +429,15 @@ enum class PageId(
 
 @Composable
 private fun NavigationRail(selected: PageId, onSelect: (PageId) -> Unit) {
+    val colors = LocalPrismColors.current
+    // macOS keeps a sidebar that is its own tinted surface, not the window colour. That, and the
+    // sentence-case headings, are the parts of the look a palette entry cannot express.
+    val macOs = LocalMacOsLook.current
     Column(
         Modifier
-            .width(232.dp)
+            .width(if (macOs) 224.dp else 232.dp)
             .fillMaxHeight()
-            .background(Color(0xFF121215))
+            .background(if (macOs) colors.surface else colors.background)
             // SCROLLABLE ON PURPOSE. The rail lists every page including the unported ones, which
             // is already ~750dp against ~808dp of usable height in the default 840dp window --
             // it fits, but only just, and a Column simply clips whatever does not. So any window
@@ -282,77 +447,103 @@ private fun NavigationRail(selected: PageId, onSelect: (PageId) -> Unit) {
             .padding(vertical = 12.dp)
     ) {
         Row(
-            Modifier.padding(horizontal = 20.dp, vertical = 14.dp),
+            Modifier.padding(
+                start = if (macOs) 17.dp else 20.dp,
+                end = 20.dp,
+                top = if (macOs) 12.dp else 14.dp,
+                bottom = if (macOs) 10.dp else 14.dp,
+            ),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Icon(
                 Icons.Filled.Hexagon, null,
                 tint = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.size(26.dp)
+                modifier = Modifier.size(if (macOs) 23.dp else 26.dp)
             )
-            Spacer(Modifier.width(10.dp))
-            Text("Prism", fontSize = 21.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.width(if (macOs) 8.dp else 10.dp))
+            Text("Prism", fontSize = if (macOs) 18.sp else 21.sp, fontWeight = FontWeight.Bold)
         }
 
-        Spacer(Modifier.height(6.dp))
-        RailSection("NORA")
+        Spacer(Modifier.height(if (macOs) 4.dp else 6.dp))
+        RailSection(if (macOs) "Nora" else "NORA")
         PageId.entries.filter { it.ported && it.ordinal <= PageId.NORA_SETTINGS.ordinal }
             .forEach { RailItem(it, selected, onSelect) }
 
-        Spacer(Modifier.height(10.dp))
-        RailSection("SYSTEM")
+        Spacer(Modifier.height(if (macOs) 6.dp else 10.dp))
+        RailSection(if (macOs) "System" else "SYSTEM")
         PageId.entries.filter { it.ported && it.ordinal > PageId.NORA_SETTINGS.ordinal }
             .forEach { RailItem(it, selected, onSelect) }
 
-        Spacer(Modifier.height(10.dp))
-        RailSection("NOT YET PORTED")
+        Spacer(Modifier.height(if (macOs) 6.dp else 10.dp))
+        RailSection(if (macOs) "Not yet ported" else "NOT YET PORTED")
         PageId.entries.filter { !it.ported }.forEach { RailItem(it, selected, onSelect) }
     }
 }
 
 @Composable
 private fun RailSection(title: String) {
+    val macOs = LocalMacOsLook.current
     Text(
         title,
-        fontSize = 10.sp,
-        letterSpacing = 1.2.sp,
+        fontSize = if (macOs) 11.sp else 10.sp,
+        letterSpacing = if (macOs) 0.sp else 1.2.sp,
         fontWeight = FontWeight.SemiBold,
-        color = Color(0xFF6C6C78),
-        modifier = Modifier.padding(start = 22.dp, top = 8.dp, bottom = 4.dp)
+        color = LocalPrismColors.current.muted,
+        modifier = Modifier.padding(
+            start = if (macOs) 18.dp else 22.dp,
+            top = if (macOs) 10.dp else 8.dp,
+            bottom = if (macOs) 4.dp else 4.dp,
+        )
     )
 }
 
 @Composable
 private fun RailItem(page: PageId, selected: PageId, onSelect: (PageId) -> Unit) {
+    val colors = LocalPrismColors.current
+    val macOs = LocalMacOsLook.current
     val active = page == selected
+    // macOS selects with a solid accent, not a raised grey. White on the accent is the system's
+    // own pairing and stays legible at both of xOS's appearances.
     val tint = when {
-        active -> MaterialTheme.colorScheme.primary
-        page.ported -> Color(0xFFB9B9C4)
-        else -> Color(0xFF55555F)
+        active -> if (macOs) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.primary
+        macOs -> colors.onSurface
+        page.ported -> colors.muted
+        else -> colors.faint
     }
     Surface(
-        color = if (active) Color(0xFF23232B) else Color.Transparent,
-        shape = RoundedCornerShape(10.dp),
+        color = when {
+            active && macOs -> colors.accent
+            active -> colors.surfaceRaised
+            else -> Color.Transparent
+        },
+        shape = RoundedCornerShape(if (macOs) 6.dp else 10.dp),
         modifier = Modifier
-            .padding(horizontal = 10.dp, vertical = 1.dp)
+            .padding(
+                horizontal = if (macOs) 8.dp else 10.dp,
+                vertical = if (macOs) 0.dp else 1.dp,
+            )
             .fillMaxWidth()
     ) {
         Row(
             Modifier
                 .fillMaxWidth()
                 .clickableRow { onSelect(page) }
-                .padding(horizontal = 12.dp, vertical = 9.dp),
+                .padding(
+                    horizontal = if (macOs) 9.dp else 12.dp,
+                    vertical = if (macOs) 7.dp else 9.dp,
+                ),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Icon(page.icon, null, tint = tint, modifier = Modifier.size(19.dp))
-            Spacer(Modifier.width(12.dp))
-            Text(page.label, fontSize = 14.sp, color = tint)
+            Icon(page.icon, null, tint = tint, modifier = Modifier.size(if (macOs) 16.dp else 19.dp))
+            Spacer(Modifier.width(if (macOs) 8.dp else 12.dp))
+            Text(page.label, fontSize = if (macOs) 13.sp else 14.sp, color = tint)
         }
     }
 }
 
 @Composable
 private fun NotYetPortedPage(page: PageId) {
+    val colors = LocalPrismColors.current
     Column(
         Modifier.fillMaxSize().padding(48.dp),
         verticalArrangement = Arrangement.Center,
@@ -360,7 +551,7 @@ private fun NotYetPortedPage(page: PageId) {
     ) {
         Icon(
             page.icon, null,
-            tint = Color(0xFF44444E),
+            tint = colors.divider,
             modifier = Modifier.size(64.dp)
         )
         Spacer(Modifier.height(20.dp))
@@ -369,7 +560,7 @@ private fun NotYetPortedPage(page: PageId) {
         Text(
             page.blocker,
             fontSize = 14.sp,
-            color = Color(0xFF9A9AA6),
+            color = colors.muted,
             modifier = Modifier.widthIn(max = 520.dp)
         )
     }

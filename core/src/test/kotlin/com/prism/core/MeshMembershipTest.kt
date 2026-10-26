@@ -15,24 +15,29 @@ import kotlin.test.assertTrue
  *
  * ## Why this is worth more than most tests
  *
- * The hole it closes was invisible: pairing worked, the pairing code was checked, and nothing anywhere
- * reported that the peer on the other end had simply been sitting on the same café network. The only way
- * to notice was to ask what `isOnMesh()` actually returned, and the answer was "true whenever the gossip
- * listener is running".
+ * The failure it guards against is invisible. Pairing works, the pairing code is checked, and nothing
+ * anywhere says that the picker is empty because the app decided the device was not on a meshnet. The
+ * first version of this gate also asked for a 10.8.0.x WireGuard address on both ends, which is true
+ * for a WireGuard tunnel and false for the phone serving Prism's mesh at its LAN address -- so a working
+ * phone/PC mesh produced "not on a meshnet" on both screens.
  *
- * A regression here would be equally invisible. Somebody widening the rule to be helpful -- accepting a
- * LAN peer when no tunnel is up, say -- would make every one of these tests pass except the ones that
- * assert a refusal, which is exactly why the refusals are asserted from both directions.
+ * The mesh itself is the meshnet. The overlay address is still enough on its own, because a device on
+ * that overlay is reachable before a heartbeat has been exchanged. Pairing still needs the code shown on
+ * the other device; the mesh being unauthenticated is a documented property of the product.
  */
 class MeshMembershipTest {
 
     private lateinit var dir: File
     private lateinit var previousHost: PlatformHost
+    private lateinit var previousOnMesh: () -> Boolean
+    private lateinit var previousPeers: () -> List<String>
     private val sent = mutableListOf<Triple<String, Byte, String>>()
 
     @BeforeTest
     fun open() {
         previousHost = PrismPlatform.host
+        previousOnMesh = MeshTransport.isOnMesh
+        previousPeers = MeshTransport.peers
         dir = File(System.getProperty("java.io.tmpdir"), "prism-mesh-member-" + System.nanoTime())
         dir.mkdirs()
         PrismPlatform.host = object : PlatformHost by JvmHost() {
@@ -43,11 +48,17 @@ class MeshMembershipTest {
         // would make that unobservable.
         TrustedDevices.sender = { ip, opcode, payload -> sent.add(Triple(ip, opcode, payload)); true }
         sent.clear()
+
+        // Most tests are about a live mesh. The refusals turn it off themselves.
+        MeshTransport.isOnMesh = { true }
+        MeshTransport.peers = { emptyList() }
     }
 
     @AfterTest
     fun close() {
         MeshMembership.addressesOverride = null
+        MeshTransport.isOnMesh = previousOnMesh
+        MeshTransport.peers = previousPeers
         PrismPlatform.host = previousHost
         dir.deleteRecursively()
     }
@@ -58,6 +69,10 @@ class MeshMembershipTest {
 
     private fun offOverlay() {
         MeshMembership.addressesOverride = { listOf("192.168.4.41", "169.254.7.7") }
+    }
+
+    private fun meshReaches(vararg peers: String) {
+        MeshTransport.peers = { peers.toList() }
     }
 
     // ── The address test ───────────────────────────────────────────────────
@@ -76,34 +91,67 @@ class MeshMembershipTest {
         assertFalse(MeshMembership.isOverlayAddress("10.8.0.x"), "a non-numeric host part")
     }
 
+    // ── Being on the meshnet ───────────────────────────────────────────────
+
     @Test
-    fun `this device is on the overlay only when it holds a mesh address`() {
+    fun `this device is on the meshnet when the mesh is running or it holds a mesh address`() {
         offOverlay()
-        assertFalse(MeshMembership.isOnOverlay())
+        assertTrue(MeshMembership.isOnMeshnet(), "the live mesh is the meshnet")
+
+        MeshTransport.isOnMesh = { false }
+        assertFalse(MeshMembership.isOnMeshnet(), "no transport and no overlay address")
         assertNull(MeshMembership.overlayAddress())
 
         onOverlayAs("10.8.0.4")
-        assertTrue(MeshMembership.isOnOverlay())
+        assertTrue(MeshMembership.isOnMeshnet(), "the overlay alone is enough")
         assertEquals("10.8.0.4", MeshMembership.overlayAddress())
     }
 
     @Test
-    fun `pairing needs both ends on the overlay`() {
-        onOverlayAs("10.8.0.4")
-        assertTrue(MeshMembership.mayPairWith("10.8.0.9"), "both on the overlay")
-        assertFalse(MeshMembership.mayPairWith("192.168.4.33"), "the peer is only on the Wi-Fi")
-
+    fun `a device with the mesh off is not on the meshnet`() {
         offOverlay()
-        assertFalse(
-            MeshMembership.mayPairWith("10.8.0.9"),
-            "this device is off the overlay, so it must not pair even with a device that is on it",
+        MeshTransport.isOnMesh = { false }
+
+        assertFalse(MeshMembership.isOnMeshnet())
+        assertTrue(
+            MeshMembership.explain().contains("not on the Prism meshnet"),
+            "a device with no mesh should be told that it is",
         )
     }
 
     // ── The gate, through the real handshake ───────────────────────────────
 
     @Test
-    fun `an offer to a LAN peer is never sent`() {
+    fun `pairing needs both ends on the meshnet`() {
+        onOverlayAs("10.8.0.4")
+        assertTrue(MeshMembership.mayPairWith("10.8.0.9"), "both on the overlay")
+        assertFalse(MeshMembership.mayPairWith("192.168.4.33"), "the peer is only on the Wi-Fi")
+
+        offOverlay()
+        MeshTransport.isOnMesh = { false }
+        assertFalse(
+            MeshMembership.mayPairWith("10.8.0.9"),
+            "this device is off the meshnet, so it must not pair even with a device that is on it",
+        )
+    }
+
+    @Test
+    fun `a peer the live mesh reaches can be paired with`() {
+        offOverlay()
+        meshReaches("192.168.4.33")
+
+        assertTrue(MeshMembership.mayPairWith("192.168.4.33"), "the phone on this mesh")
+        assertFalse(MeshMembership.mayPairWith("192.168.4.99"), "a LAN device the mesh cannot reach")
+
+        val code = TrustedDevices.offer(
+            "192.168.4.33", "My PC", "windows", setOf(TrustedDevices.Kind.CLIPBOARD),
+        )
+        assertTrue(!code.isNullOrBlank(), "the offer should be allowed")
+        assertEquals("192.168.4.33", sent.single().first)
+    }
+
+    @Test
+    fun `an offer to a LAN peer that is not on the mesh is never sent`() {
         onOverlayAs("10.8.0.4")
 
         val code = TrustedDevices.offer(
@@ -126,7 +174,7 @@ class MeshMembershipTest {
     }
 
     @Test
-    fun `an inbound offer from a LAN peer is dropped`() {
+    fun `an inbound offer from a LAN peer that is not on the mesh is dropped`() {
         onOverlayAs("10.8.0.4")
         val before = TrustedDevices.all().size
 
@@ -163,8 +211,9 @@ class MeshMembershipTest {
     }
 
     @Test
-    fun `a device that is off the overlay accepts nothing`() {
+    fun `a device that is off the meshnet accepts nothing`() {
         offOverlay()
+        MeshTransport.isOnMesh = { false }
 
         val payload = com.prism.core.json.JSONObject().apply {
             put("fp", "aaaabbbbccccdddd")
@@ -181,24 +230,38 @@ class MeshMembershipTest {
     }
 
     @Test
-    fun `the peer list is filtered to the overlay`() {
-        onOverlayAs("10.8.0.4")
-        val discovered = listOf("10.8.0.9", "192.168.4.33", "10.8.0.12", "169.254.1.1")
-        assertEquals(listOf("10.8.0.9", "10.8.0.12"), MeshMembership.overlayPeers(discovered))
+    fun `the peer list is empty until this device is on a meshnet`() {
+        offOverlay()
+        MeshTransport.isOnMesh = { false }
+        assertEquals(emptyList(), MeshMembership.meshPeers(listOf("10.8.0.9", "192.168.4.33")))
+    }
+
+    @Test
+    fun `the peer list is filtered to the meshnet`() {
+        offOverlay()
+        meshReaches("192.168.4.33")
+
+        val discovered = listOf("10.8.0.9", "192.168.4.33", "192.168.4.99", "169.254.1.1")
+        assertEquals(
+            listOf("10.8.0.9", "192.168.4.33"),
+            MeshMembership.meshPeers(discovered),
+            "an overlay address and the peer the mesh reaches; not every device on the Wi-Fi",
+        )
     }
 
     @Test
     fun `the explanation names what is wrong`() {
         offOverlay()
+        MeshTransport.isOnMesh = { false }
         assertTrue(
             MeshMembership.explain().contains("not on the Prism meshnet"),
-            "a device off the overlay should be told that it is",
+            "a device off the meshnet should be told that it is",
         )
 
-        onOverlayAs("10.8.0.4")
+        MeshTransport.isOnMesh = { true }
         assertTrue(
-            MeshMembership.explain("192.168.4.33").contains("not on the meshnet"),
-            "a LAN peer should be named as the problem",
+            MeshMembership.explain("192.168.4.33").contains("not on your meshnet"),
+            "a LAN peer the mesh cannot reach should be named as the problem",
         )
         assertEquals("", MeshMembership.explain("10.8.0.9"), "a valid pairing has nothing to explain")
     }

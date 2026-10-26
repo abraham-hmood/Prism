@@ -88,7 +88,7 @@ class NoraSettingsActivity : PrismBaseActivity() {
     private val importPicker =
         registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
             if (uri == null) return@registerForActivityResult
-            AlertDialog.Builder(this)
+            com.prism.launcher.theme.PrismDialogs.Builder(this)
                 .setTitle("Import Nora?")
                 .setMessage(
                     "This overwrites her connectome and merges the archive's images into your " +
@@ -220,7 +220,7 @@ class NoraSettingsActivity : PrismBaseActivity() {
                 "${NoraPerformance.changedCount()} differ from default",
                 destructive = true
             ) {
-                AlertDialog.Builder(ctx)
+                com.prism.launcher.theme.PrismDialogs.Builder(ctx)
                     .setTitle("Reset performance settings?")
                     .setMessage(
                         "Turns every storage and acceleration option off and restores their " +
@@ -521,7 +521,7 @@ class NoraSettingsActivity : PrismBaseActivity() {
                 "${NoraTuning.changedCount()} of ${NoraTuning.PARAMS.size} differ from default",
                 destructive = true
             ) {
-                AlertDialog.Builder(ctx)
+                com.prism.launcher.theme.PrismDialogs.Builder(ctx)
                     .setTitle("Reset every parameter?")
                     .setMessage(
                         "Returns all ${NoraTuning.PARAMS.size} values to their built-in defaults. " +
@@ -893,7 +893,7 @@ class NoraSettingsActivity : PrismBaseActivity() {
 
     private fun applyDeviceMaximum() {
         val max = NoraGeometry.maxForDevice()
-        AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Use this device's maximum?")
             .setMessage(
                 "Largest size that fits in ${NoraGeometry.formatBytes(NoraGeometry.memoryBudgetBytes())} " +
@@ -1021,7 +1021,7 @@ class NoraSettingsActivity : PrismBaseActivity() {
 
     private fun pickInterval() {
         val hours = (1..24).toList()
-        AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Autonomous training interval")
             .setItems(hours.map { "$it hour${if (it == 1) "" else "s"}" }.toTypedArray()) { _, i ->
                 PrismSettings.setNoraAutoTrainIntervalHours(hours[i])
@@ -1051,7 +1051,7 @@ class NoraSettingsActivity : PrismBaseActivity() {
         card.addView(IosUi.hairline(ctx))
         card.addView(
             navRow("Erase connectome", "Delete what she has learned at the current size", destructive = true) {
-                AlertDialog.Builder(ctx)
+                com.prism.launcher.theme.PrismDialogs.Builder(ctx)
                     .setTitle("Erase Nora's connectome?")
                     .setMessage(
                         "Everything she has learned at the current size is deleted. Brains " +
@@ -1087,7 +1087,7 @@ class NoraSettingsActivity : PrismBaseActivity() {
             android.os.Environment.isExternalStorageManager()
 
     private fun requestStorageAccessForImport() {
-        AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Storage access needed")
             .setMessage(
                 "Restoring a backup writes her connectome and dataset to " +
@@ -1197,7 +1197,7 @@ class NoraSettingsActivity : PrismBaseActivity() {
     }
 
     private fun dialog(title: String, message: String) {
-        AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle(title)
             .setMessage(message)
             .setPositiveButton("OK", null)
@@ -1319,13 +1319,13 @@ class NoraSettingsActivity : PrismBaseActivity() {
         val label = android.widget.TextView(ctx).apply {
             text = title
             textSize = 16f
-            setTextColor(0xFFE6E6EE.toInt())
+            setTextColor(com.prism.launcher.nora.IosUi.label(ctx))
             layoutParams = android.widget.LinearLayout.LayoutParams(0, -2, 1f)
         }
         val readout = android.widget.TextView(ctx).apply {
             text = value.toString()
             textSize = 16f
-            setTextColor(PrismSettings.getGlowColor())
+            setTextColor(com.prism.launcher.nora.IosUi.accent(ctx))
             setPadding(dp(12), 0, dp(12), 0)
         }
         fun stepper(symbol: String, delta: Int) = android.widget.TextView(ctx).apply {

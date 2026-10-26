@@ -132,7 +132,7 @@ class StremioAddonsActivity : PrismBaseActivity() {
             })
         }
 
-        androidx.appcompat.app.AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Install an add-on")
             .setView(box)
             .setNegativeButton("Cancel", null)

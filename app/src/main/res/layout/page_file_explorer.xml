@@ -33,7 +33,9 @@
             android:layout_height="wrap_content"
             android:layout_centerVertical="true"
             android:layout_marginStart="12dp"
+            android:layout_marginEnd="8dp"
             android:layout_toEndOf="@id/fileExplorerBackBtn"
+            android:layout_toStartOf="@id/fileExplorerPasteBtn"
             android:ellipsize="start"
             android:fontFamily="sans-serif-medium"
             android:singleLine="true"
@@ -41,6 +43,22 @@
             android:textColor="@color/white"
             android:textSize="20sp"
             android:alpha="0.8" />
+
+        <!-- Shown only while something is cut or copied. Paste is the one file operation with
+             no obvious place to start from, and burying it in the long-press background menu
+             left people cutting a file and then finding no way to paste it. -->
+        <ImageButton
+            android:id="@+id/fileExplorerPasteBtn"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_alignParentEnd="true"
+            android:layout_centerVertical="true"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="Paste"
+            android:padding="10dp"
+            android:src="@drawable/ic_paste_24"
+            android:visibility="gone"
+            app:tint="@color/white" />
     </RelativeLayout>
 
     <!-- Modern Glowing Search Bar -->

@@ -301,6 +301,10 @@ object ModelListingScanner {
     fun runOnce(): Pair<Int, Int> {
         prefs().edit().putLong(KEY_LAST_RUN, System.currentTimeMillis()).apply()
 
+        // A purchase nothing has decided about for a day is released before the sweep runs, so the
+        // coins cannot stay committed indefinitely to a listing the network will not answer for.
+        ModelPurchaseLedger.cancelStaleHeld()
+
         var settled = 0
         var cancelled = 0
         for (purchase in ModelPurchaseLedger.held()) {

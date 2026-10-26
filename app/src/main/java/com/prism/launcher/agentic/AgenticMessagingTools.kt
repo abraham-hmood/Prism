@@ -126,7 +126,21 @@ object AgenticMessagingTools {
 
     suspend fun makeCall(context: Context, contact: String): String = withContext(Dispatchers.IO) {
         if (!hasPermission(context, Manifest.permission.CALL_PHONE)) {
-            return@withContext "Error: CALL_PHONE permission not granted. Grant it in Settings > Apps > Prism > Permissions."
+            // ASK, RATHER THAN POINT AT A SETTING. CALL_PHONE was never requested at runtime, so
+            // the tool was permanently blocked and the advice to grant it by hand led to a screen
+            // that does not offer a permission the app has never asked for. The transparent host
+            // raises the system prompt; the tool then works on the next attempt.
+            runCatching {
+                context.startActivity(
+                    Intent(context, AgentPermissionActivity::class.java)
+                        .putExtra(AgentPermissionActivity.EXTRA_PERMISSION, Manifest.permission.CALL_PHONE)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            }.onFailure {
+                return@withContext "Error: CALL_PHONE permission is not granted and the prompt " +
+                    "could not be opened (${it.message})."
+            }
+            return@withContext "I opened the phone-permission prompt. Allow it, then ask me to call again."
         }
         val number = resolveNumber(context, contact)
             ?: return@withContext "Error: couldn't resolve '$contact' to a phone number or a saved contact."

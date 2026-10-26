@@ -1,0 +1,46 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/CMakeFiles/llama-populate"
+		},
+		{
+			"file" : "F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/CMakeFiles/llama-populate.rule"
+		},
+		{
+			"file" : "F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/CMakeFiles/llama-populate-complete.rule"
+		},
+		{
+			"file" : "F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-build.rule"
+		},
+		{
+			"file" : "F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-configure.rule"
+		},
+		{
+			"file" : "F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-download.rule"
+		},
+		{
+			"file" : "F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-install.rule"
+		},
+		{
+			"file" : "F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-mkdir.rule"
+		},
+		{
+			"file" : "F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-patch.rule"
+		},
+		{
+			"file" : "F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-test.rule"
+		},
+		{
+			"file" : "F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"llama-populate"
+		],
+		"name" : "llama-populate"
+	}
+}

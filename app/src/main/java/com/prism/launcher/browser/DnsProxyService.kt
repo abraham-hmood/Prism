@@ -5,6 +5,7 @@ import android.content.Intent
 import android.os.IBinder
 import android.util.Log
 import com.prism.launcher.PrismLogger
+import com.prism.launcher.PrismSettings
 import kotlinx.coroutines.*
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -42,6 +43,7 @@ class DnsProxyService : Service() {
                 // Try port 53 first (works on rooted devices), fall back to 5353.
                 val boundSocket = tryBindDnsPort()
                 socket = boundSocket
+                boundPort = boundSocket.localPort
 
                 PrismLogger.logSuccess(TAG, "DNS Proxy listening on 0.0.0.0:${boundSocket.localPort}")
 
@@ -95,6 +97,11 @@ class DnsProxyService : Service() {
                     // Found in P2P DNS: return the IP
                     PrismLogger.logSuccess(TAG, "DNS Hit: $domain -> $resolvedIp")
                     DnsPacketBuilder.buildResponseA(query.transactionId, domain, resolvedIp)
+                } else if (PrismSettings.getDnsProxyMode() == "fallback") {
+                    // The picker existed but nothing read it, so "Fallback to Global DNS" behaved
+                    // exactly like isolation. Forward the original query now.
+                    forwardToGlobalDns(data.copyOf(incomingPacket.length))
+                        ?: DnsPacketBuilder.buildResponseNXDOMAIN(query.transactionId, domain)
                 } else {
                     // Not found: return NXDOMAIN (enforces P2P-only isolation)
                     PrismLogger.logInfo(TAG, "DNS Miss (P2P Isolation): $domain")
@@ -116,9 +123,34 @@ class DnsProxyService : Service() {
         }
     }
 
+    /**
+     * Forwards the exact client query to the configured upstream resolver.
+     *
+     * Returns the upstream response bytes so the caller can hand them back with the original
+     * transaction id. The socket is protected so, when the Prism VPN is up, this does not loop the
+     * query back into this service.
+     */
+    private fun forwardToGlobalDns(query: ByteArray): ByteArray? {
+        return runCatching {
+            val upstream = PrismSettings.getPrimaryDns()
+            DatagramSocket().use { socket ->
+                PrivateDnsVpnService.protectSocket(socket)
+                socket.soTimeout = 4_000
+                socket.send(DatagramPacket(query, query.size, InetAddress.getByName(upstream), 53))
+                val buffer = ByteArray(4096)
+                val response = DatagramPacket(buffer, buffer.size)
+                socket.receive(response)
+                buffer.copyOf(response.length)
+            }
+        }.onFailure {
+            PrismLogger.logWarning(TAG, "Global DNS fallback failed: ${it.message}")
+        }.getOrNull()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         isRunning = false
+        boundPort = -1
         socket?.close()
         socket = null
         listenerThread?.interrupt()
@@ -138,5 +170,9 @@ class DnsProxyService : Service() {
 
     companion object {
         private const val TAG = "PrismDnsProxy"
+
+        /** The port the service actually bound, or -1 while it is not listening. */
+        @Volatile
+        var boundPort: Int = -1
     }
 }

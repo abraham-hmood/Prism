@@ -746,9 +746,20 @@ class VmController private constructor(private val context: Context) {
                 .newInstance(PrismOsConfig.VSOCK_CID, PrismOsConfig.VSOCK_PORT)
             val socket = Class.forName("android.net.LocalSocket")
                 .getConstructor().newInstance()
-            // Full vsock path requires NDK; placeholder for native implementation
+            // Full vsock path requires NDK; placeholder for native implementation. Logged rather
+            // than swallowed: a guest command that reports success while nothing was sent is the
+            // exact failure that made VM networking look broken with no trace.
             @Suppress("UNUSED_VARIABLE") val unused = listOf(addr, socket, cmd)
-        } catch (_: Exception) { }
+            com.prism.launcher.PrismLogger.logWarning(
+                "PrismVm",
+                "vsock guest command was not sent: the native transport is not implemented",
+            )
+        } catch (error: Exception) {
+            com.prism.launcher.PrismLogger.logWarning(
+                "PrismVm",
+                "vsock unavailable (${error.message ?: error.javaClass.simpleName})",
+            )
+        }
     }
 
     private fun sendAdbTcp(cmd: String) {

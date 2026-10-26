@@ -119,7 +119,22 @@ object EmergencyContacts {
 
     private const val FILE = "lock/emergency.json"
 
-    data class Contact(val name: String, val number: String, val addedAt: Long)
+    /**
+     * One emergency contact.
+     *
+     * [knownAs] is the name THAT PERSON knows the user by, and it is required to add a contact.
+     * The alert used to say "Someone triggered an emergency alert", which is the one piece of
+     * information the recipient already knows -- they cannot act on "someone", and a phone that
+     * buzzes with no name is easy to dismiss as a wrong number. It is stored per contact because
+     * the name a partner uses and the name a colleague uses are not the same, and the alert goes
+     * to both.
+     */
+    data class Contact(
+        val name: String,
+        val number: String,
+        val knownAs: String = "",
+        val addedAt: Long,
+    )
 
     private fun file() = File(PrismPlatform.host.dataDir(), FILE).apply { parentFile?.mkdirs() }
 
@@ -131,17 +146,50 @@ object EmergencyContacts {
             val item = array.optJSONObject(index) ?: return@mapNotNull null
             val number = item.optString("number")
             if (number.isBlank()) null
-            else Contact(item.optString("name"), number, item.optLong("at"))
+            else Contact(
+                name = item.optString("name"),
+                number = number,
+                // Contacts saved before the field existed load with no name. The alert falls back
+                // to the profile name rather than refusing to send: an old contact still has to
+                // receive an alert, and the UI asks for a name the next time it is edited.
+                knownAs = item.optString("knownAs"),
+                addedAt = item.optLong("at"),
+            )
         }
     }.getOrDefault(emptyList())
 
     fun isEmergency(number: String): Boolean =
         all().any { sameNumber(it.number, number) }
 
-    fun add(name: String, number: String) {
-        if (number.isBlank()) return
-        if (isEmergency(number)) return
-        write(all() + Contact(name, number, System.currentTimeMillis()))
+    /**
+     * Adds a contact. Returns false when the number or the name they know the user by is missing.
+     *
+     * THE KNOWN-AS NAME IS REQUIRED HERE TOO, not only in the form. A caller that skips the field
+     * would otherwise produce a contact whose alerts go out anonymous, which is the exact state
+     * this field exists to end.
+     */
+    fun add(name: String, number: String, knownAs: String): Boolean {
+        if (number.isBlank() || knownAs.isBlank()) return false
+        if (isEmergency(number)) return false
+        write(all() + Contact(name, number, knownAs.trim(), System.currentTimeMillis()))
+        return true
+    }
+
+    /**
+     * Sets the name this contact knows the user by, on an existing contact.
+     *
+     * Used for contacts saved before the field existed. Returns false when there is no such
+     * contact or the name is blank.
+     */
+    fun setKnownAs(number: String, knownAs: String): Boolean {
+        if (knownAs.isBlank()) return false
+        val existing = all()
+        val index = existing.indexOfFirst { sameNumber(it.number, number) }
+        if (index < 0) return false
+        val updated = existing.toMutableList()
+        updated[index] = updated[index].copy(knownAs = knownAs.trim())
+        write(updated)
+        return true
     }
 
     fun remove(number: String) {
@@ -153,7 +201,8 @@ object EmergencyContacts {
             val array = JSONArray()
             contacts.forEach {
                 array.put(JSONObject().apply {
-                    put("name", it.name); put("number", it.number); put("at", it.addedAt)
+                    put("name", it.name); put("number", it.number)
+                    put("knownAs", it.knownAs); put("at", it.addedAt)
                 })
             }
             file().writeText(array.toString())

@@ -67,6 +67,13 @@ class DummyLauncherActivity : FragmentActivity() {
             textSize = 46f
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER_HORIZONTAL
+            // The only way out that does not require a full lock cycle. Long-press is invisible
+            // to someone holding the phone, but the NORMAL credential is required, so finding the
+            // affordance is not the same as being able to leave.
+            setOnLongClickListener {
+                promptForExit()
+                true
+            }
         })
         root.addView(TextView(this).apply {
             text = SimpleDateFormat("EEEE, d MMMM", Locale.getDefault()).format(Date())
@@ -157,6 +164,42 @@ class DummyLauncherActivity : FragmentActivity() {
         application.category == android.content.pm.ApplicationInfo.CATEGORY_SOCIAL ||
             application.category == android.content.pm.ApplicationInfo.CATEGORY_IMAGE
     }.getOrDefault(false)
+
+    /**
+     * Asks for the normal lock credential, then returns to the real launcher.
+     *
+     * This is deliberately not a visible button. A decoy with a "leave" control is worse than no
+     * decoy: it is the first thing someone holding the phone would tap. The dialog verifies only
+     * the NORMAL credential -- entering the duress code here does nothing, rather than triggering
+     * a second alert from inside the decoy.
+     */
+    private fun promptForExit() {
+        val field = android.widget.EditText(this).apply {
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+            hint = "Lock credential"
+            setTextColor(Color.WHITE)
+            setHintTextColor(0x88FFFFFF.toInt())
+            val pad = IosUi.dp(this@DummyLauncherActivity, 12f)
+            setPadding(pad, pad, pad, pad)
+        }
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
+            .setTitle("Leave the decoy launcher")
+            .setMessage("Enter the normal lock credential. The emergency code will not work here.")
+            .setView(field)
+            .setPositiveButton("Unlock") { _, _ ->
+                if (LockStore.verify(field.text.toString()) == LockStore.Outcome.NORMAL) {
+                    DuressResponder.standDown(this)
+                    startActivity(
+                        Intent(this, com.prism.launcher.LauncherActivity::class.java)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+                    )
+                    finish()
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
 
     private fun tile(info: ResolveInfo): View {
         val manager = packageManager

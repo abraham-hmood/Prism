@@ -29,6 +29,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import android.provider.OpenableColumns
 import com.prism.launcher.browser.P2pDnsManager
+import com.prism.launcher.mouse.MouseGlow
+import com.prism.launcher.nora.IosUi
 import com.prism.launcher.stremio.StremioStore
 
 class SettingsActivity : PrismBaseActivity() {
@@ -48,6 +50,11 @@ class SettingsActivity : PrismBaseActivity() {
         const val EXTRA_GROUP = "settings_group"
 
         val GROUPS = listOf(
+            Group(
+                "Themes",
+                "Prebuilt and custom interfaces for every screen",
+                listOf("Themes")
+            ),
             Group(
                 "Launcher & Appearance",
                 "Default page, gestures, layout, theme and fonts",
@@ -72,6 +79,15 @@ class SettingsActivity : PrismBaseActivity() {
                     "Decentralized Name System"
                 )
             ),
+            // A top-level group of its own, not a row under diagnostics: this is the screen that
+            // tells you which of the app's forty subsystems is lying to you, and burying it one
+            // level deeper than the thing it replaces would hide the only page worth opening when
+            // "it doesn't work".
+            Group(
+                "System Health",
+                "Self-checks and one-tap repairs for mesh, tunnel, models, speech and storage",
+                listOf("System Health")
+            ),
             Group(
                 "Intelligence & Messaging",
                 "AI engine, models, image generation, Nora, Aether and response behaviour",
@@ -91,6 +107,16 @@ class SettingsActivity : PrismBaseActivity() {
                 "Virtualization",
                 "Run a guest OS inside Prism",
                 listOf("OS Virtualization")
+            ),
+            Group(
+                "Mouse",
+                "RGB glow styles, flows and custom effects",
+                listOf("Mouse")
+            ),
+            Group(
+                "Developer options",
+                "Prism Debug Bridge and developer tooling",
+                listOf("Developer options")
             )
         )
     }
@@ -152,6 +178,26 @@ class SettingsActivity : PrismBaseActivity() {
         })
     }
 
+    /**
+     * The clipboard history, directly under the search-server address.
+     *
+     * A row rather than a fifth group: it is a place to go, not a setting, and it belongs beside
+     * the other "what this device is sharing right now" item at the top of the page.
+     */
+    private fun clipboardHistoryRow(): SettingItem {
+        val entries = com.prism.launcher.clipboard.ClipboardHistory.all()
+        val paired = com.prism.launcher.trusted.TrustedDevices
+            .recipientsFor(com.prism.launcher.trusted.TrustedDevices.Kind.CLIPBOARD)
+        val where = buildString {
+            append(entries.size.toString() + " item(s)")
+            if (entries.isEmpty()) append(" · nothing copied yet")
+            if (paired.isNotEmpty()) append(" · sharing with " + paired.joinToString(", ") { it.name })
+        }
+        return SettingItem.Nav("Clipboard history", where, {
+            startActivity(Intent(this, com.prism.launcher.clipboard.ClipboardHistoryActivity::class.java))
+        })
+    }
+
     /** Which group a header belongs to, falling back so nothing is orphaned. */
     private fun groupOf(header: String): String =
         GROUPS.firstOrNull { header in it.headers }?.title ?: "Other"
@@ -172,15 +218,20 @@ class SettingsActivity : PrismBaseActivity() {
         // outside the map.
         val present = all.groupBy { groupOf(it.header) }
         val ordered = GROUPS.map { it.title } + listOf("Other")
-        return listOf(searchAddressRow()) + ordered.mapNotNull { title ->
+        return listOf(searchAddressRow(), clipboardHistoryRow()) + ordered.mapNotNull { title ->
             val members = present[title] ?: return@mapNotNull null
             if (members.all { it.items.isEmpty() }) return@mapNotNull null
             val summary = GROUPS.firstOrNull { it.title == title }?.summary
                 ?: members.joinToString(", ") { it.header }
             SettingItem.Nav(title, summary, {
-                startActivity(
-                    Intent(this, SettingsActivity::class.java).putExtra(EXTRA_GROUP, title)
-                )
+                if (title == "Themes") {
+                    // One tap, not two: the group contains one destination and it is the gallery.
+                    startActivity(com.prism.launcher.theme.ThemesActivity.intent(this))
+                } else {
+                    startActivity(
+                        Intent(this, SettingsActivity::class.java).putExtra(EXTRA_GROUP, title)
+                    )
+                }
             })
         }
     }
@@ -372,7 +423,10 @@ class SettingsActivity : PrismBaseActivity() {
             startActivity(consent)
             return
         }
-        com.prism.launcher.browser.PrivateDnsVpnService.start(this)
+        // establishTunnel = true. Without it the service saw `!tunnelRequested && !alwaysOn` and
+        // stopped itself immediately, which is why the Settings "Connect" button did nothing on a
+        // default install.
+        com.prism.launcher.browser.PrivateDnsVpnService.start(this, establishTunnel = true)
 
         // The service comes up on its own thread, so rows gated on a LIVE tunnel are still reading
         // "not connected" when the caller's refresh() runs a microsecond from now. One delayed
@@ -388,6 +442,61 @@ class SettingsActivity : PrismBaseActivity() {
         runCatching { (application as PrismApp).tunnelEngine.stop() }
         com.prism.launcher.browser.PrivateDnsVpnService.stop(this)
         refresh()
+    }
+
+    /**
+     * The page-picker sensitivity slider.
+     *
+     * A hosted view rather than a Picker row because the useful part is seeing the value move
+     * continuously: each step is a different willingness to fire, and a list of five named choices
+     * would hide both the current number and the default.
+     */
+    private fun pagePickerSensitivityRow(): android.view.View {
+        val wrapper = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(IosUi.dp(this@SettingsActivity, 20f), IosUi.dp(this@SettingsActivity, 10f),
+                IosUi.dp(this@SettingsActivity, 20f), IosUi.dp(this@SettingsActivity, 10f))
+        }
+
+        val label = TextView(this).apply {
+            textSize = 15f
+            setTextColor(IosUi.label(this@SettingsActivity))
+        }
+        val description = TextView(this).apply {
+            textSize = 12f
+            setTextColor(IosUi.secondaryLabel(this@SettingsActivity))
+            setPadding(0, IosUi.dp(this@SettingsActivity, 2f), 0, IosUi.dp(this@SettingsActivity, 4f))
+        }
+
+        fun describe(value: Int): String = when {
+            value <= 30 -> "hard to trigger by accident"
+            value <= 60 -> "balanced"
+            else -> "easy to trigger"
+        }
+
+        val seek = android.widget.SeekBar(this).apply {
+            max = 100
+            progress = PrismSettings.getPagePickerSensitivity()
+            setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(bar: android.widget.SeekBar?, value: Int, fromUser: Boolean) {
+                    if (!fromUser) return
+                    PrismSettings.setPagePickerSensitivity(value)
+                    label.text = "Swipe sensitivity — $value% · ${describe(value)}"
+                }
+
+                override fun onStartTrackingTouch(bar: android.widget.SeekBar?) {}
+                override fun onStopTrackingTouch(bar: android.widget.SeekBar?) {}
+            })
+        }
+
+        label.text = "Swipe sensitivity — ${seek.progress}% · ${describe(seek.progress)}"
+        description.text = "Higher values make the page-picker swipe fire more easily. The " +
+            "default is deliberately low so reading a page does not change it."
+
+        wrapper.addView(label)
+        wrapper.addView(description)
+        wrapper.addView(seek)
+        return wrapper
     }
 
     private fun vpnServerActionRow(): android.view.View {
@@ -712,7 +821,7 @@ class SettingsActivity : PrismBaseActivity() {
             ),
         )
 
-        androidx.appcompat.app.AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Model Type")
             .setItems(kinds.map { it.first }.toTypedArray()) { _, which ->
                 pendingImportType = kinds[which].third
@@ -771,6 +880,10 @@ class SettingsActivity : PrismBaseActivity() {
                 else
                     androidx.appcompat.app.AppCompatDelegate.MODE_NIGHT_YES
             )
+            // The visible screen is the one the user is watching change. `uiMode` is declared in
+            // the manifest, so AppCompat is not obliged to recreate it; this makes the labels and
+            // rows switch on the same tap instead of after a trip through the back stack.
+            refreshAppearanceNow()
         }
 
         // Root screen or one group's screen — same activity either way, so every
@@ -827,6 +940,55 @@ class SettingsActivity : PrismBaseActivity() {
         return MeshUtils.getLocalMeshIp()
     }
 
+    /**
+     * The flow chooser.
+     *
+     * A RADIO GROUP RATHER THAN A DROPDOWN, because the request calls for one and because the
+     * set is short enough to show at once: three built-ins plus however many the user wrote. The
+     * radio buttons are rebuilt by [refresh], so a flow created in the editor appears here on the
+     * way back without restarting Settings.
+     */
+    private fun mouseFlowChooser(): View {
+        val column = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val h = (16 * resources.displayMetrics.density).toInt()
+            val v = (12 * resources.displayMetrics.density).toInt()
+            setPadding(h, v, h, v)
+        }
+        column.addView(TextView(this).apply {
+            text = "Color flow"
+            textSize = 16f
+            setTextColor(IosUi.label(this@SettingsActivity))
+        })
+        column.addView(TextView(this).apply {
+            text = "How the palette moves: liquid, pop, lava-lamp bubbles or a flow you scripted"
+            textSize = 12f
+            setTextColor(IosUi.secondaryLabel(this@SettingsActivity))
+            setPadding(0, (3 * resources.displayMetrics.density).toInt(), 0, 0)
+        })
+
+        val group = android.widget.RadioGroup(this).apply {
+            orientation = android.widget.RadioGroup.VERTICAL
+            setPadding(0, (6 * resources.displayMetrics.density).toInt(), 0, 0)
+        }
+        val selected = MouseGlow.selectedFlow().id
+        MouseGlow.flows().forEach { flow ->
+            group.addView(android.widget.RadioButton(this).apply {
+                id = View.generateViewId()
+                text = flow.name
+                textSize = 14f
+                setTextColor(IosUi.label(this@SettingsActivity))
+                buttonTintList = android.content.res.ColorStateList.valueOf(IosUi.accent(this@SettingsActivity))
+                isChecked = flow.id == selected
+                setOnClickListener {
+                    MouseGlow.selectFlow(flow.id)
+                }
+            })
+        }
+        column.addView(group)
+        return column
+    }
+
     private fun buildItems(): List<SettingItem> {
         // MINIMUM_INTERVAL_HOURS is the floor the scanner enforces, so the shortest option here
         // matches it rather than offering something it would silently clamp.
@@ -835,6 +997,13 @@ class SettingsActivity : PrismBaseActivity() {
         ).distinct()
 
         return listOf(
+            SettingItem.Header("Themes"),
+            SettingItem.Nav(
+                "Themes",
+                "Browse, create, edit, back up and import interfaces",
+                { startActivity(com.prism.launcher.theme.ThemesActivity.intent(this)) },
+            ),
+
             SettingItem.Header("Launcher"),
             SettingItem.Picker(
                 "Default page",
@@ -981,7 +1150,7 @@ class SettingsActivity : PrismBaseActivity() {
                             this, "Nothing discovered yet", android.widget.Toast.LENGTH_SHORT
                         ).show()
                     } else {
-                        androidx.appcompat.app.AlertDialog.Builder(this)
+                        com.prism.launcher.theme.PrismDialogs.Builder(this)
                             .setTitle("Clear discovered sites?")
                             .setMessage(
                                 "The crawler will rediscover them on its next run. Your own seeds " +
@@ -1366,13 +1535,20 @@ class SettingsActivity : PrismBaseActivity() {
             ),
             SettingItem.Toggle(
                 "Enable DNS Proxy",
-                "Listen on 0.0.0.0:53 for P2P DNS queries from connected devices",
+                if (com.prism.launcher.browser.DnsProxyService.boundPort > 0)
+                    "Listening on port ${com.prism.launcher.browser.DnsProxyService.boundPort} for connected devices"
+                else
+                    "Port 53 where permitted, otherwise 5353. Set the same port on connected devices.",
                 PrismSettings.getDnsProxyEnabled(),
                 { enabled ->
                     PrismSettings.setDnsProxyEnabled(enabled)
                     if (enabled) {
                         startService(android.content.Intent(this@SettingsActivity, com.prism.launcher.browser.DnsProxyService::class.java))
-                        Toast.makeText(this@SettingsActivity, "DNS Proxy started on port 53", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(
+                            this@SettingsActivity,
+                            "DNS Proxy started; it will use port 53 if permitted, otherwise 5353",
+                            Toast.LENGTH_LONG,
+                        ).show()
                     } else {
                         stopService(android.content.Intent(this@SettingsActivity, com.prism.launcher.browser.DnsProxyService::class.java))
                         Toast.makeText(this@SettingsActivity, "DNS Proxy stopped", Toast.LENGTH_SHORT).show()
@@ -1517,6 +1693,34 @@ class SettingsActivity : PrismBaseActivity() {
 
             SettingItem.Header("Intelligence & Messaging"),
             SettingItem.Nav(
+                "Messaging apps",
+                com.prism.launcher.messaging.MessagingBridges.summary() +
+                    " — WhatsApp, Messenger and Signal in one place",
+                {
+                    startActivity(android.content.Intent(
+                        this, com.prism.launcher.messaging.MessagingBridgesActivity::class.java
+                    ))
+                }
+            ),
+            SettingItem.Nav(
+                "Calls, meshcall and meshvoice",
+                run {
+                    val plan = com.prism.launcher.calls.PrismPhonePlan.status()
+                    val planText = if (plan.active) "Plan ready" else "No phone plan"
+                    "$planText — ${com.prism.launcher.calls.PrismCalls.meshDescription()}"
+                },
+                {
+                    com.prism.launcher.calls.PrismCalls.openDialer(this)
+                }
+            ),
+            SettingItem.Nav(
+                "Meshvoice and voicemail",
+                "Voicemails from your phone plan alongside sealed meshnet voicemails",
+                {
+                    com.prism.launcher.calls.PrismCalls.openMeshvoice(this)
+                }
+            ),
+            SettingItem.Nav(
                 "Auto-caption a folder",
                 "Caption every image in a folder and rename each file to match. Shows a preview " +
                     "first -- nothing is renamed until you confirm.",
@@ -1543,6 +1747,26 @@ class SettingsActivity : PrismBaseActivity() {
                     } else {
                         refresh()
                     }
+                }
+            ),
+            SettingItem.Toggle(
+                "On-device context offload",
+                "Let any AI model save long context to this device and retrieve only the parts it " +
+                    "needs. Adds the context_offload and access_context_part tools.",
+                PrismSettings.getContextOffloadEnabled(),
+                { enabled ->
+                    PrismSettings.setContextOffloadEnabled(enabled)
+                    refresh()
+                }
+            ),
+            SettingItem.Toggle(
+                "Relay my texts to my devices",
+                "Send incoming SMS to your trusted devices and show texts they relay here. Sealed " +
+                    "with your wallet phrase. Off means nothing is relayed or ingested.",
+                PrismSettings.getSmsRelayEnabled(),
+                { enabled ->
+                    PrismSettings.setSmsRelayEnabled(enabled)
+                    refresh()
                 }
             ),
             SettingItem.Nav(
@@ -1631,7 +1855,7 @@ class SettingsActivity : PrismBaseActivity() {
                         if (path.isEmpty()) {
                             pickLocalModel()
                         } else {
-                            androidx.appcompat.app.AlertDialog.Builder(this)
+                            com.prism.launcher.theme.PrismDialogs.Builder(this)
                                 .setTitle("Use Kokoro again?")
                                 .setMessage(
                                     "Removing this model does not delete the file. Prism goes back " +
@@ -1800,7 +2024,7 @@ class SettingsActivity : PrismBaseActivity() {
                         if (idx == PrismSettings.AI_BACKEND_NPU && !npu.usable) {
                             // Refused rather than accepted-and-ignored. Storing the choice would
                             // leave the picker reading "NPU" while every token came off the CPU.
-                            androidx.appcompat.app.AlertDialog.Builder(this)
+                            com.prism.launcher.theme.PrismDialogs.Builder(this)
                                 .setTitle("NPU unavailable")
                                 .setMessage(
                                     npu.displayName + System.lineSeparator() +
@@ -1880,6 +2104,22 @@ class SettingsActivity : PrismBaseActivity() {
                 )
             },
 
+            // Developer options is a top-level group rather than a row buried in another screen:
+            // the bridge is a shell, and putting it one level deeper than the trusted devices it
+            // depends on would make the feature hard to find at exactly the moment it is needed.
+            SettingItem.Header("Developer options"),
+            SettingItem.Nav(
+                "Prism Debug Bridge",
+                "Run a shell on a trusted device over the mesh. No USB or wireless debugging needed.",
+                {
+                    startActivity(
+                        android.content.Intent(
+                            this, com.prism.launcher.pdb.PdbActivity::class.java
+                        )
+                    )
+                }
+            ),
+
             SettingItem.Header("Blocklist"),
             SettingItem.Nav(
                 "Manage blocklist",
@@ -1902,6 +2142,18 @@ class SettingsActivity : PrismBaseActivity() {
                 "Host local folders as websites on the mesh",
                 {
                     startActivity(android.content.Intent(this, com.prism.launcher.browser.P2pHostingActivity::class.java))
+                }
+            ),
+            SettingItem.Header("System Health"),
+            SettingItem.Nav(
+                "Open Health & Repair",
+                "Checks every subsystem that can fail quietly, and repairs what can be repaired",
+                {
+                    startActivity(
+                        android.content.Intent(
+                            this, com.prism.launcher.health.SystemHealthActivity::class.java
+                        )
+                    )
                 }
             ),
             SettingItem.Nav(
@@ -2378,6 +2630,43 @@ class SettingsActivity : PrismBaseActivity() {
             // ── The tour ─────────────────────────────────────────────────────
             SettingItem.Header("Getting started"),
             SettingItem.Nav(
+                "Page picker swipe",
+                PrismSettings.getPagePickerSwipe()?.let { trigger ->
+                    "${trigger.direction.label} — at least ${trigger.distanceDp} dp. Tap to change."
+                } ?: "Using the built-in vertical overscroll. Tap to define your own.",
+                { startActivity(Intent(this, PagePickerSwipeActivity::class.java)) }
+            ),
+            SettingItem.Custom(pagePickerSensitivityRow()),
+            SettingItem.Toggle(
+                "Open page switcher from Settings",
+                "Adds an Open page switcher button below and turns the swipe trigger off.",
+                PrismSettings.getPagePickerFromSettings(),
+                { enabled ->
+                    PrismSettings.setPagePickerFromSettings(enabled)
+                    refresh()
+                }
+            ),
+            *if (PrismSettings.getPagePickerFromSettings()) arrayOf(
+                SettingItem.Nav(
+                    "Open page switcher",
+                    "Opens the page picker now",
+                    {
+                        // The picker is an overlay in the launcher's window, which is behind this
+                        // screen. CLEAR_TOP rather than finish(): a group screen is a SECOND
+                        // SettingsActivity over the root one, so finishing it would reveal the
+                        // root Settings page and the launcher would never resume to consume the
+                        // request. Clearing to the launcher brings it back in one step.
+                        PrismSettings.requestOpenPagePicker()
+                        startActivity(
+                            Intent(this, LauncherActivity::class.java).addFlags(
+                                Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                            )
+                        )
+                        finish()
+                    }
+                )
+            ) else emptyArray<SettingItem>(),
+            SettingItem.Nav(
                 "Take the tour again",
                 "Every feature Prism has, and what each one costs",
                 {
@@ -2409,6 +2698,75 @@ class SettingsActivity : PrismBaseActivity() {
                     else -> "On — no emergency code yet"
                 },
                 { startActivity(Intent(this, com.prism.launcher.lock.LockSetupActivity::class.java)) }
+            ),
+            SettingItem.Toggle(
+                "Lock screen enabled",
+                "Turn Prism's own lock on or off. Android's system lock is separate and is never " +
+                    "changed by this.",
+                PrismSettings.getLockScreenEnabled() &&
+                    com.prism.launcher.lock.LockStore.isConfigured(),
+                { enabled ->
+                    if (enabled) {
+                        if (!com.prism.launcher.lock.LockStore.isConfigured()) {
+                            startActivity(Intent(this, com.prism.launcher.lock.LockSetupActivity::class.java))
+                        } else {
+                            com.prism.launcher.lock.LockStore.setEnabled(true)
+                            PrismSettings.setLockScreenEnabled(true)
+                        }
+                    } else {
+                        // Both stores, not just one: a disabled setting with a configured credential
+                        // left behind is exactly how the lock used to come back on its own.
+                        com.prism.launcher.lock.LockStore.setEnabled(false)
+                        PrismSettings.setLockScreenEnabled(false)
+                        com.prism.launcher.lock.LockGate.reset()
+                        com.prism.launcher.lock.DuressResponder.standDown(this)
+                    }
+                    refresh()
+                },
+                isEnabled = com.prism.launcher.lock.LockStore.isConfigured()
+            ),
+            SettingItem.Toggle(
+                "Fingerprint unlock",
+                "Offer the sensor on Prism's lock screen. A fingerprint can never trigger the " +
+                    "emergency code.",
+                PrismSettings.getLockBiometric(),
+                { enabled -> PrismSettings.setLockBiometric(enabled); refresh() },
+                isEnabled = com.prism.launcher.lock.LockStore.isConfigured() &&
+                    com.prism.launcher.lock.LockGate.biometricAvailable(this)
+            ),
+            SettingItem.Nav(
+                "Emergency code",
+                if (com.prism.launcher.lock.LockStore.hasDuress())
+                    "Set — tap to change or remove it"
+                else
+                    "Not set — a second code that opens a decoy launcher and alerts your contacts",
+                {
+                    if (!com.prism.launcher.lock.LockStore.isConfigured()) {
+                        Toast.makeText(this, "Set a lock screen first", Toast.LENGTH_SHORT).show()
+                    } else {
+                        startActivity(
+                            Intent(this, com.prism.launcher.lock.LockSetupActivity::class.java)
+                                .putExtra("step", "duress")
+                        )
+                    }
+                },
+                isEnabled = com.prism.launcher.lock.LockStore.isConfigured()
+            ),
+            SettingItem.Nav(
+                "Leave decoy mode",
+                if (com.prism.launcher.lock.DuressResponder.isActive)
+                    "The decoy launcher is active — tap to return to the real one"
+                else
+                    "Only needed if an emergency unlock left the decoy launcher active",
+                {
+                    com.prism.launcher.lock.DuressResponder.standDown(this)
+                    startActivity(
+                        Intent(this, LauncherActivity::class.java)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+                    )
+                    finish()
+                },
+                isEnabled = com.prism.launcher.lock.DuressResponder.isActive
             ),
             SettingItem.Toggle(
                 "Show the medical card on the lock screen",
@@ -2513,6 +2871,72 @@ class SettingsActivity : PrismBaseActivity() {
                 }
             ),
 
+            // ── Mouse ────────────────────────────────────────────────────────
+            SettingItem.Header("Mouse"),
+            SettingItem.Toggle(
+                "Touchpad view",
+                "Use a glowing touchpad instead of the mouse body",
+                PrismSettings.getMouseTouchpad(),
+                { enabled -> PrismSettings.setMouseTouchpad(enabled); refresh() }
+            ),
+            SettingItem.Picker(
+                "Color style",
+                "The palette of light that flows around the mouse, its buttons and its wheel",
+                MouseGlow.styles().map { it.name },
+                MouseGlow.styles().indexOfFirst { it.id == MouseGlow.selectedStyle().id }
+                    .coerceAtLeast(0),
+                { index ->
+                    MouseGlow.styles().getOrNull(index)?.let { MouseGlow.selectStyle(it.id) }
+                    refresh()
+                }
+            ),
+            SettingItem.Custom(mouseFlowChooser()),
+            SettingItem.Nav(
+                "Create a color style",
+                "Choose any number of colours and name the palette",
+                {
+                    startActivity(
+                        Intent(this, com.prism.launcher.mouse.MouseColorStyleActivity::class.java)
+                    )
+                }
+            ),
+            SettingItem.Nav(
+                "Create a color flow",
+                "Write a Prism flow script to move the light your own way",
+                {
+                    startActivity(
+                        Intent(this, com.prism.launcher.mouse.MouseFlowScriptActivity::class.java)
+                    )
+                }
+            ),
+
+            // ── Wireless displays ────────────────────────────────────────────
+            //
+            // Deliberately outside every group in GROUPS, so it lands under "Other": a display is
+            // a local-network feature, not a launcher preference or a privacy switch.
+            SettingItem.Header("Display"),
+            // The one interface-wide choice in this section: how much of the screen a page may
+            // use. Same stored value the desktop reads, so a phone and a PC agree about it.
+            SettingItem.Toggle(
+                "Windowed pages",
+                "Draw each page as a titled window with the desktop around it",
+                PrismSettings.getWindowedPages(),
+                { PrismSettings.setWindowedPages(it) }
+            ),
+            SettingItem.Nav(
+                "Wireless displays",
+                run {
+                    val target = PrismSettings.getWirelessDisplayTargetName()
+                    if (target.isBlank()) "Mirror this screen to a Prism device, TV or monitor"
+                    else "Mirroring to $target"
+                },
+                {
+                    startActivity(
+                        Intent(this, com.prism.launcher.display.WirelessDisplaysActivity::class.java)
+                    )
+                }
+            ),
+
             // ── Stremio ──────────────────────────────────────────────────────
             //
             // Deliberately NOT in any group in GROUPS, so groupOf() drops it into "Other" -- which
@@ -2551,49 +2975,6 @@ class SettingsActivity : PrismBaseActivity() {
                 }
             )
         )
-    }
-
-    private fun buildSlotPickers(): Array<SettingItem> {
-        val prefs = SlotPreferences()
-        val assignments = prefs.getAssignments()
-        val options = listOf("Browser", "Desktop Grid", "App Drawer", "Messaging", "Nebula Social", "Kinetic Halo", "File Explorer", "Models", "Agentic Tools")
-
-        return assignments.mapIndexed { index, current ->
-            val currentIdx = when(current) {
-                SlotAssignment.Browser -> 0
-                SlotAssignment.DesktopGrid -> 1
-                SlotAssignment.AppDrawer -> 2
-                SlotAssignment.Messaging -> 3
-                SlotAssignment.NebulaSocial -> 4
-                SlotAssignment.KineticHalo -> 5
-                SlotAssignment.FileExplorer -> 6
-                SlotAssignment.Models -> 7
-                SlotAssignment.AgenticTools -> 8
-                else -> 1 // Default to Desktop Grid
-            }
-
-            SettingItem.Picker(
-                "Page ${index + 1} Content",
-                "Built-in page assigned to this slot",
-                options,
-                currentIdx,
-                { idx ->
-                    val assignment = when(idx) {
-                        0 -> SlotAssignment.Browser
-                        1 -> SlotAssignment.DesktopGrid
-                        2 -> SlotAssignment.AppDrawer
-                        3 -> SlotAssignment.Messaging
-                        4 -> SlotAssignment.NebulaSocial
-                        5 -> SlotAssignment.KineticHalo
-                        6 -> SlotAssignment.FileExplorer
-                        7 -> SlotAssignment.Models
-                        8 -> SlotAssignment.AgenticTools
-                        else -> SlotAssignment.Default
-                    }
-                    prefs.setAt(index, assignment)
-                }
-            )
-        }.toTypedArray()
     }
 
     /**
@@ -2731,11 +3112,11 @@ class SettingsActivity : PrismBaseActivity() {
                     .inflate(android.R.layout.simple_list_item_2, parent, false)
                 row.findViewById<TextView>(android.R.id.text1).apply {
                     text = node.name
-                    setTextColor(androidx.core.content.ContextCompat.getColor(this@SettingsActivity, R.color.prism_text_primary))
+                    setTextColor(com.prism.launcher.nora.IosUi.label(this@SettingsActivity))
                 }
                 row.findViewById<TextView>(android.R.id.text2).apply {
                     text = node.address + (node.serverPort?.let { ":$it" } ?: "") + " · " + node.latency + " ms"
-                    setTextColor(androidx.core.content.ContextCompat.getColor(this@SettingsActivity, R.color.prism_text_muted))
+                    setTextColor(com.prism.launcher.nora.IosUi.secondaryLabel(this@SettingsActivity))
                 }
                 return row
             }
@@ -2864,7 +3245,7 @@ class SettingsActivity : PrismBaseActivity() {
         val addBtn = android.widget.Button(this).apply {
             text = "+ ADD PRISM SERVER"
             setBackgroundColor(android.graphics.Color.TRANSPARENT)
-            setTextColor(PrismSettings.getGlowColor())
+            setTextColor(com.prism.launcher.nora.IosUi.accent(this@SettingsActivity))
             setOnClickListener {
                 fleetDialog.dismiss()
                 showServerEditor(null)
@@ -2884,9 +3265,9 @@ class SettingsActivity : PrismBaseActivity() {
                     val t2 = view.findViewById<android.widget.TextView>(android.R.id.text2)
                     
                     t1.text = if (s.isActive) "● ${s.name} (ACTIVE)" else s.name
-                    t1.setTextColor(if (s.isActive) PrismSettings.getGlowColor() else androidx.core.content.ContextCompat.getColor(this@SettingsActivity, R.color.prism_text_primary))
+                    t1.setTextColor(if (s.isActive) com.prism.launcher.nora.IosUi.accent(this@SettingsActivity) else com.prism.launcher.nora.IosUi.label(this@SettingsActivity))
                     t2.text = "${s.address}:${s.port} | User: ${s.username}"
-                    t2.setTextColor(androidx.core.content.ContextCompat.getColor(this@SettingsActivity, R.color.prism_text_muted))
+                    t2.setTextColor(com.prism.launcher.nora.IosUi.secondaryLabel(this@SettingsActivity))
                     
                     view.setOnClickListener {
                         servers.forEach { it.isActive = false }
@@ -2914,7 +3295,7 @@ class SettingsActivity : PrismBaseActivity() {
         val nearbyTitle = TextView(this).apply {
             text = "NEARBY PRISM SERVERS"
             textSize = 12f
-            setTextColor(PrismSettings.getGlowColor())
+            setTextColor(com.prism.launcher.nora.IosUi.accent(this@SettingsActivity))
             setPadding(4, 16, 4, 4)
         }
         container.addView(nearbyTitle)
@@ -3037,11 +3418,11 @@ class SettingsActivity : PrismBaseActivity() {
             ))
         }
 
-        addAction("Edit", PrismSettings.getGlowColor()) {
+        addAction("Edit", com.prism.launcher.nora.IosUi.accent(this)) {
             fleetDialog.dismiss()
             showServerEditor(server)
         }
-        addAction("Test connection", PrismSettings.getGlowColor()) {
+        addAction("Test connection", com.prism.launcher.nora.IosUi.accent(this)) {
             testServerInPopup(server)
         }
         addAction("Delete", android.graphics.Color.rgb(220, 65, 70)) {
@@ -3110,7 +3491,7 @@ class SettingsActivity : PrismBaseActivity() {
         layout.addView(passInput)
         layout.addView(testResult)
 
-        val dialog = AlertDialog.Builder(this, R.style.Theme_PrismSettings)
+        val dialog = com.prism.launcher.theme.PrismDialogs.Builder(this, R.style.Theme_PrismSettings)
             .setTitle(if (existing == null) "Add Prism Server" else "Edit Prism Server")
             .setMessage("Enter your server credentials below.")
             .setView(layout)
@@ -3175,7 +3556,7 @@ class SettingsActivity : PrismBaseActivity() {
     )
 
     private fun testServerInPopup(server: PrismSettings.PrismServer) {
-        val progress = AlertDialog.Builder(this, R.style.Theme_PrismSettings)
+        val progress = com.prism.launcher.theme.PrismDialogs.Builder(this, R.style.Theme_PrismSettings)
             .setTitle("Testing connection")
             .setView(android.widget.ProgressBar(this).apply {
                 isIndeterminate = true
@@ -3253,7 +3634,7 @@ class SettingsActivity : PrismBaseActivity() {
         val limit = PrismSettings.getMaxDiscoveredSeeds()
         val cap = if (limit < 0) "no limit" else "keeping up to $limit found sites"
 
-        androidx.appcompat.app.AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Search seeds - $cap")
             .setMessage(body)
             .setPositiveButton("Close", null)
@@ -3271,7 +3652,7 @@ class SettingsActivity : PrismBaseActivity() {
             hint = "https://example.com"
             setSingleLine(true)
         }
-        androidx.appcompat.app.AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Add search seed")
             .setMessage("Crawls will start from this address as well.")
             .setView(input)
@@ -3357,7 +3738,7 @@ class SettingsActivity : PrismBaseActivity() {
     private fun startCaptionPreview(directory: java.io.File) {
         val captioner = com.prism.launcher.nora.VisionModelCaptioner()
         if (!captioner.isAvailable()) {
-            android.app.AlertDialog.Builder(this)
+            com.prism.launcher.theme.PrismDialogs.Builder(this)
                 .setTitle("No vision model configured")
                 .setMessage(
                     "Auto-captioning needs a cloud model that accepts images. Set one up under " +
@@ -3427,7 +3808,7 @@ class SettingsActivity : PrismBaseActivity() {
         body.append("your content -- expect generic or off-target descriptions on anything ")
         body.append("unusual. Review the list above before applying.")
 
-        val builder = android.app.AlertDialog.Builder(this)
+        val builder = com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("${plan.actionable} file(s) would be renamed")
             .setMessage(body.toString())
             .setNegativeButton("Cancel", null)

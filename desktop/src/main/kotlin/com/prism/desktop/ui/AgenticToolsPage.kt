@@ -178,9 +178,11 @@ fun AgenticToolsPage() {
                 }
             }
             SectionFooter(
-                "Cloud and Ollama models have native tool calling and need no profile. Local " +
-                    "GGUF models do not, so a profile tells Prism how to describe the tools in " +
-                    "the prompt and how to recognise a call in the raw output."
+                "Cloud and Ollama models receive every tool's name, description and argument " +
+                    "schema through their native tool-calling field, so they need no profile. Local " +
+                    "GGUF models have no such field: Prism's default profile puts the same three " +
+                    "things in the prompt and recognises calls in the reply. An imported profile " +
+                    "replaces that default when one is selected."
             )
 
             Spacer(Modifier.height(16.dp))

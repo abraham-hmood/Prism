@@ -76,6 +76,36 @@ class Neuromodulators {
     }
 
     /**
+     * A complete copy of the modulator state, for a held-out evaluation.
+     *
+     * A validation pass runs the same inference loop training does, and that loop updates these
+     * statistics. Left in place, the act of measuring would change the trajectory it is
+     * measuring -- so the caller snapshots before the pass and restores afterwards. `dopamine`
+     * matters most: it is the learning-rate multiplier the next training step reads.
+     */
+    data class Snapshot(
+        val acetylcholine: Float,
+        val noradrenaline: Float,
+        val dopamine: Float,
+        val tonicDopamine: Float,
+        val expectedError: Float,
+        val errorVariance: Float,
+    )
+
+    fun snapshot(): Snapshot = Snapshot(
+        acetylcholine, noradrenaline, dopamine, tonicDopamine, expectedError, errorVariance,
+    )
+
+    fun restore(s: Snapshot) {
+        acetylcholine = s.acetylcholine
+        noradrenaline = s.noradrenaline
+        dopamine = s.dopamine
+        tonicDopamine = s.tonicDopamine
+        expectedError = s.expectedError
+        errorVariance = s.errorVariance
+    }
+
+    /**
      * Updates the modulator state from the current prediction error.
      *
      * [errorRms] must be a PER-UNIT root-mean-square error, not a summed energy. The original

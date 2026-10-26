@@ -2,6 +2,8 @@ package com.prism.launcher.browser
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.ContextWrapper
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.VpnService
 import android.os.Build
@@ -33,7 +35,9 @@ import com.prism.launcher.databinding.IncludeBrowserPageBinding
 @SuppressLint("SetJavaScriptEnabled")
 class BrowserPageView(context: Context) : FrameLayout(context) {
 
-    private val host: LauncherActivity = context as LauncherActivity
+    // Safe to be null: the page can be inflated with a wrapped context (and a latent crash used to
+    // assume otherwise). Everything that genuinely needs the launcher now checks.
+    private val host: LauncherActivity? = context.findLauncherActivity()
     private val binding: IncludeBrowserPageBinding
     private val blocklist = PrismBlocklist.get()
 
@@ -43,13 +47,21 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
         val isPrivate: Boolean,
         var title: String,
         var lastUrl: String,
+        /** Last thumbnail captured while the tab was visible; never captured off-screen at 1x1. */
+        var preview: Bitmap? = null,
     )
 
     private val tabs = ArrayList<Tab>()
     private var activeTabId: Long = 0L
     private var activeCategoryIsPrivate: Boolean = false
     private var privateAuthenticated: Boolean = false
+    private var privateAuthExpiresAt: Long = 0L
     private var lastVpnStateWants: Boolean? = null
+
+    /** Files downloaded from private tabs, deleted when the tab closes. Never in the public list. */
+    private val privateDownloads = java.util.Collections.synchronizedMap(
+        java.util.WeakHashMap<WebView, MutableList<java.io.File>>()
+    )
 
     private val tabsAdapter = BrowserTabsAdapter(
         onSelect = { id -> selectTab(id) },
@@ -73,12 +85,13 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
         binding.tabCategoryGroup.addOnButtonCheckedListener { _, checkedId, isChecked ->
             if (!isChecked) return@addOnButtonCheckedListener
             val targetIsPrivate = checkedId == R.id.privateCategoryBtn
-            if (targetIsPrivate && !privateAuthenticated && PrismSettings.getPrivateTabsLocked()) {
+            if (targetIsPrivate && !hasPrivateAuth() && PrismSettings.getPrivateTabsLocked()) {
                 requestBiometricUnlock {
                     activeCategoryIsPrivate = true
                     refreshTabsList()
                 }
             } else {
+                if (!targetIsPrivate) privateAuthenticated = false
                 activeCategoryIsPrivate = targetIsPrivate
                 refreshTabsList()
             }
@@ -99,7 +112,7 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
             addTab(isPrivate = defaultPrivate, initialUrl = "https://duckduckgo.com/")
         }
 
-        host.attachBrowserPage(this)
+        host?.attachBrowserPage(this)
 
         // Observe P2P DNS Resolution State
         (context as? LifecycleOwner)?.let { owner ->
@@ -153,9 +166,15 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
     }
 
     override fun onDetachedFromWindow() {
-        host.attachBrowserPage(null)
+        host?.attachBrowserPage(null)
+        // A biometric unlock lasts for this visit to private tabs, not for the process.
+        privateAuthenticated = false
+        privateAuthExpiresAt = 0L
         super.onDetachedFromWindow()
     }
+
+    private fun hasPrivateAuth(): Boolean =
+        privateAuthenticated && android.os.SystemClock.elapsedRealtime() < privateAuthExpiresAt
 
     fun resyncPrivateVpn() {
         val active = tabs.firstOrNull { it.id == activeTabId }
@@ -210,8 +229,9 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
 
     private fun createWebView(isPrivate: Boolean): WebView {
         val wv = WebView(context)
-        // Every tab can start a download, private ones included.
-        attachDownloadListener(wv)
+        // Every tab can start a download, private ones included -- but a private one is written
+        // to app-private storage and forgotten when the tab closes.
+        attachDownloadListener(wv, isPrivate)
         val cm = CookieManager.getInstance()
         cm.setAcceptCookie(true)
         cm.setAcceptThirdPartyCookies(wv, !isPrivate)
@@ -303,6 +323,11 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
 
     private fun selectTab(id: Long) {
         val tabToSelect = tabs.firstOrNull { it.id == id } ?: return
+        // Snapshot the tab being left while it still has a real size. A GONE WebView has no
+        // layout to draw, which is exactly why background previews used to be 1x1.
+        tabs.firstOrNull { it.id == activeTabId }?.let { leaving ->
+            if (leaving.id != id) leaving.preview = captureWebPreview(leaving.webView, 720, 900)
+        }
         activeTabId = id
         for (tab in tabs) {
             val show = tab.id == id
@@ -321,7 +346,18 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
         val tab = tabs.removeAt(idx)
         binding.webContainer.removeView(tab.webView)
         tab.webView.stopLoading()
+        privateDownloads.remove(tab.webView)?.forEach { runCatching { it.deleteRecursively() } }
         tab.webView.destroy()
+
+        // The cookie jar is process-global and Android has no per-tab profile, so a private tab
+        // cannot be fully isolated from a public one. Clearing session cookies when the last
+        // private tab goes is the most that can be done without wiping logins for every normal
+        // tab; see the known-limitation note in the README.
+        if (tab.isPrivate && tabs.none { it.isPrivate }) {
+            android.webkit.CookieManager.getInstance().removeSessionCookies(null)
+            privateAuthenticated = false
+            privateAuthExpiresAt = 0L
+        }
 
         if (tabs.isEmpty()) {
             addTab(isPrivate = activeCategoryIsPrivate)
@@ -347,16 +383,24 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
     }
 
     private fun refreshTabsList() {
-        val lockActive = PrismSettings.getPrivateTabsLocked() && !privateAuthenticated
+        val lockActive = PrismSettings.getPrivateTabsLocked() && !hasPrivateAuth()
         val displayed = tabs.filter { it.isPrivate == activeCategoryIsPrivate }
-        
+
         val cards = displayed.map { tab ->
+            // Capture only the visible tab. Drawing every tab used to happen synchronously on
+            // the UI thread for the whole list, and the off-screen ones had no layout to draw.
+            val preview = when {
+                tab.isPrivate && lockActive -> null
+                tab.id == activeTabId -> captureWebPreview(tab.webView, 720, 900)
+                    ?.also { tab.preview = it } ?: tab.preview
+                else -> tab.preview
+            }
             TabCardUi(
                 id = tab.id,
                 title = tab.title,
                 url = tab.lastUrl,
                 isPrivate = tab.isPrivate,
-                preview = if (tab.isPrivate && lockActive) null else captureWebPreview(tab.webView, 720, 900),
+                preview = preview,
                 isLocked = lockActive
             )
         }
@@ -377,7 +421,7 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
      *
      * Attached per WebView -- a download can start from any tab, including a private one.
      */
-    private fun attachDownloadListener(webView: android.webkit.WebView) {
+    private fun attachDownloadListener(webView: android.webkit.WebView, isPrivate: Boolean) {
         webView.setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
             try {
                 val fileName = android.webkit.URLUtil.guessFileName(url, contentDisposition, mimeType)
@@ -386,39 +430,61 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
                     addRequestHeader("User-Agent", userAgent)
                     setTitle(fileName)
                     setDescription("Downloading from Prism")
-                    // Hidden in favour of Prism's own progress notification -- see
-                    // PrismDownloadNotifications. The DOWNLOAD_WITHOUT_NOTIFICATION permission
-                    // this needs is already declared in the manifest.
+                    // Hidden in favour of Prism's own progress notification, except for private
+                    // tabs, which post nothing at all -- a notification naming the file would be
+                    // exactly the record private browsing is meant not to leave.
                     setNotificationVisibility(
                         android.app.DownloadManager.Request.VISIBILITY_HIDDEN
                     )
-                    setDestinationInExternalPublicDir(
-                        android.os.Environment.DIRECTORY_DOWNLOADS, fileName
-                    )
+                    if (isPrivate) {
+                        // App-private external storage: not the public Downloads folder, not in
+                        // the browser's download list, and deleted with the tab. The per-WebView
+                        // directory keeps two private tabs from clearing each other's files.
+                        setDestinationInExternalFilesDir(
+                            context,
+                            android.os.Environment.DIRECTORY_DOWNLOADS,
+                            "private/${webView.hashCode()}/$fileName",
+                        )
+                    } else {
+                        setDestinationInExternalPublicDir(
+                            android.os.Environment.DIRECTORY_DOWNLOADS, fileName
+                        )
+                    }
                 }
                 val manager = context.getSystemService(android.content.Context.DOWNLOAD_SERVICE)
                     as android.app.DownloadManager
                 val downloadId = manager.enqueue(request)
-                // Prism posts its own progress notification for files AND for mesh sites, so the
-                // two look the same; DownloadManager's own is suppressed above to avoid a second,
-                // duplicate notification for the very same download.
-                PrismDownloadNotifications.trackFile(context, downloadId, fileName)
 
-                val local = java.io.File(
-                    android.os.Environment.getExternalStoragePublicDirectory(
-                        android.os.Environment.DIRECTORY_DOWNLOADS
-                    ),
-                    fileName
-                )
-                // The download id is kept so the Downloads list can later delete the file through
-                // DownloadManager, which owns it -- see PrismDownloadsSheet.
-                PrismSettings.recordDownloadedFile(
-                    fileName, url, android.net.Uri.fromFile(local).toString(), downloadId
-                )
-                Toast.makeText(context, "Downloading $fileName", Toast.LENGTH_SHORT).show()
+                if (isPrivate) {
+                    val target = java.io.File(
+                        context.getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS),
+                        "private/${webView.hashCode()}",
+                    )
+                    // The exact DownloadManager filename is not known synchronously; recording
+                    // the tab's directory lets closeTab remove whatever landed in it.
+                    privateDownloads.getOrPut(webView) { mutableListOf() }.add(target)
+                } else {
+                    // Prism posts its own progress notification for files AND for mesh sites.
+                    PrismDownloadNotifications.trackFile(context, downloadId, fileName)
+
+                    val local = java.io.File(
+                        android.os.Environment.getExternalStoragePublicDirectory(
+                            android.os.Environment.DIRECTORY_DOWNLOADS
+                        ),
+                        fileName
+                    )
+                    // The download id is kept so the Downloads list can resolve the real file
+                    // through DownloadManager, which owns it -- see PrismDownloadsSheet.
+                    PrismSettings.recordDownloadedFile(
+                        fileName, url, android.net.Uri.fromFile(local).toString(), downloadId
+                    )
+                    Toast.makeText(context, "Downloading $fileName", Toast.LENGTH_SHORT).show()
+                }
             } catch (e: Exception) {
                 PrismLogger.logError("Browser", "Download failed for $url", e)
-                Toast.makeText(context, "Could not start download", Toast.LENGTH_SHORT).show()
+                if (!isPrivate) {
+                    Toast.makeText(context, "Could not start download", Toast.LENGTH_SHORT).show()
+                }
             }
         }
     }
@@ -462,7 +528,7 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
             return
         }
         val labels = bookmarks.map { it.title }.toTypedArray()
-        androidx.appcompat.app.AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("Bookmarks")
             .setItems(labels) { _, which -> openUrl(bookmarks[which].url) }
             // Long-press is not available on a simple list dialog, so removal is its own step
@@ -475,7 +541,7 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
     private fun showRemoveBookmark(bookmarks: List<PrismSettings.Bookmark>) {
         val labels = bookmarks.map { it.title }.toTypedArray()
         val checked = BooleanArray(bookmarks.size)
-        androidx.appcompat.app.AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("Remove bookmarks")
             .setMultiChoiceItems(labels, checked) { _, which, isChecked -> checked[which] = isChecked }
             .setPositiveButton("Remove") { _, _ ->
@@ -502,15 +568,41 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
     }
 
     private fun openDownloadedFile(file: PrismSettings.DownloadedFile) {
-        try {
-            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
-                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                data = android.net.Uri.parse(
-                    if (file.localPath.isNotBlank()) file.localPath else file.url
+        // RESOLVED THROUGH DownloadManager FIRST. It knows the filename it actually used -- the
+        // guessed one at enqueue time can differ -- and it returns a content:// URI that is
+        // grantable. The old code started a file:// URI, which throws FileUriExposedException on
+        // every Android version this app supports, so "Open" always failed.
+        val uri: android.net.Uri? = runCatching {
+            if (file.downloadId >= 0) {
+                val manager = context.getSystemService(android.content.Context.DOWNLOAD_SERVICE)
+                    as android.app.DownloadManager
+                manager.getUriForDownloadedFile(file.downloadId)
+            } else null
+        }.getOrNull() ?: runCatching {
+            if (file.localPath.startsWith("content://")) android.net.Uri.parse(file.localPath)
+            else {
+                val local = java.io.File(android.net.Uri.parse(file.localPath).path ?: file.localPath)
+                if (!local.isFile) null else androidx.core.content.FileProvider.getUriForFile(
+                    context, "${context.packageName}.fileprovider", local
                 )
             }
-            context.startActivity(intent)
+        }.getOrNull()
+
+        if (uri == null) {
+            Toast.makeText(context, "That file is no longer available", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val mime = android.webkit.MimeTypeMap.getSingleton()
+            .getMimeTypeFromExtension(uri.lastPathSegment?.substringAfterLast('.', "") ?: "") ?: "*/*"
+        try {
+            context.startActivity(
+                android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    setDataAndType(uri, mime)
+                }
+            )
         } catch (e: Exception) {
             Toast.makeText(context, "No app can open ${file.fileName}", Toast.LENGTH_SHORT).show()
         }
@@ -521,6 +613,34 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
         active.lastUrl = url
         binding.urlField.setText(url)
         active.webView.loadUrl(url, privateHeaders(active.isPrivate))
+    }
+
+    /**
+     * Opens a result handed over from another page, such as the app drawer's web results.
+     *
+     * Uses the active tab rather than quietly creating a new one, so the page behaves like the
+     * address bar: the thing the user asked for replaces what they were looking at. A browser
+     * page with no tabs yet gets a public one first.
+     */
+    fun openWebResult(url: String) {
+        if (!url.startsWith("http://") && !url.startsWith("https://")) return
+        closeTabsOverlay()
+        val active = tabs.firstOrNull { it.id == activeTabId }
+        when {
+            active == null -> addTab(isPrivate = false, initialUrl = url)
+            // A result tapped from the drawer is public browsing. Reusing a private tab would
+            // carry it into a session the user opened for a different reason, so use an existing
+            // public tab or create one and leave the private tab alone.
+            active.isPrivate -> {
+                val public = tabs.firstOrNull { !it.isPrivate }
+                if (public == null) addTab(isPrivate = false, initialUrl = url)
+                else {
+                    selectTab(public.id)
+                    openUrl(url)
+                }
+            }
+            else -> openUrl(url)
+        }
     }
 
     /**
@@ -604,6 +724,9 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
             override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
                 super.onAuthenticationSucceeded(result)
                 privateAuthenticated = true
+                // A lock that never expires is not a lock; it is one unlock for the rest of the
+                // process. Two minutes is long enough to move between private tabs.
+                privateAuthExpiresAt = android.os.SystemClock.elapsedRealtime() + 2 * 60_000L
                 onSuccess()
             }
         })
@@ -678,9 +801,10 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
             val autoStart = PrismSettings.getVpnAutoStart()
             if (!autoStart) return
             
-            val prep = VpnService.prepare(host)
+            val launcher = host ?: return
+            val prep = VpnService.prepare(launcher)
             if (prep != null) {
-                host.requestVpnPermission(prep)
+                launcher.requestVpnPermission(prep)
                 return
             }
             // Establish Full Privacy Tunnel
@@ -695,4 +819,19 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
             }
         }
     }
+}
+
+/**
+ * Walks a (possibly wrapped) context to the launcher activity.
+ *
+ * The old code cast directly and would crash the first time a page was inflated with a theme
+ * wrapper. Nothing here should make a page unusable just because it is missing its host.
+ */
+private fun Context.findLauncherActivity(): LauncherActivity? {
+    var current: Context? = this
+    while (current is ContextWrapper) {
+        if (current is LauncherActivity) return current
+        current = current.baseContext
+    }
+    return current as? LauncherActivity
 }

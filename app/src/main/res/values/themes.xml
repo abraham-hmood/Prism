@@ -26,6 +26,15 @@
         <item name="popupMenuStyle">@style/Prism.PopupMenu</item>
     </style>
 
+    <!-- A window that only exists to host a system dialog: the screen-capture consent prompt. -->
+    <style name="Theme.Prism.Transparent" parent="Theme.PrismSettings">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:colorBackgroundCacheHint">@null</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:windowNoTitle">true</item>
+    </style>
+
     <style name="Theme.PrismSettings" parent="Theme.Material3.DayNight.NoActionBar">
         <item name="android:windowBackground">?attr/prismBackground</item>
         <item name="android:statusBarColor">?attr/prismBackground</item>

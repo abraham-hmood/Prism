@@ -461,13 +461,23 @@ object NoraStudio {
     ): String {
         busy = true
         return try {
-            NoraTrainer(brain(ctx)).train(epochs, focus, onProgress = onProgress)
+            NoraTrainer(brain(ctx), textRenderer = NoraTextRenderer::render)
+                .train(epochs, focus, onProgress = onProgress)
         } finally {
             busy = false
         }
     }
 
-    fun datasetSize(ctx: Context): Int = NoraTrainer.loadDataset().size
+    /**
+     * TRAINING file count, without opening anything.
+     *
+     * The old version called `loadDataset()`, which now expands text into word-sized items --
+     * tens of thousands of objects for a real corpus. A status row must not do that on the UI
+     * thread, so this uses the split scanner's cheap counts instead.
+     */
+    fun datasetSize(ctx: Context): Int = NoraTrainer.summarize().trainFiles
+
+    fun datasetSummary(): NoraTrainer.Summary = NoraTrainer.summarize()
 
     // ── MediaStore publishing ───────────────────────────────────────────────
 

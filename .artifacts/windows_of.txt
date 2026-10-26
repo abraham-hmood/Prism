@@ -1,0 +1,6 @@
+
+handle=8000466 visible=True rect=-8,-8,1928,1088 title=Prism
+handle=68293118 visible=False rect=0,0,1,1 title=D3DFocusWindow
+handle=1771984 visible=False rect=-1,-1,135,38 title=theAwtToolkitWindow
+handle=8917330 visible=False rect=0,0,0,0 title=MSCTFIME UI
+handle=24645048 visible=False rect=0,0,0,0 title=Default IME

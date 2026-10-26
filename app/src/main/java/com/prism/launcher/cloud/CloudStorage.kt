@@ -116,10 +116,11 @@ object CloudStorage {
      * files this is for are larger than memory, and holding the whole ciphertext to upload it would
      * fail on exactly those.
      *
-     * A chunk that no peer accepts is recorded with an empty holder list rather than aborting the
-     * upload. The rest of the file is still worth placing — repair can fill the gap later — and
-     * throwing away a 4 GB upload because peer three ran out of room at chunk 900 would be its own
-     * kind of failure.
+     * A chunk that no peer accepts is NOT RECORDED. It used to be added with `holders = []`, which
+     * made the manifest describe a chunk nobody holds as if it were placed: the file counted as
+     * "partly there", repair had nothing to repair against, and a download failed on a chunk that the
+     * UI had already shown as present. Leaving it out keeps the manifest truthful; the upload still
+     * succeeds for the chunks that landed, and the entry's note says how many did not.
      */
     fun upload(
         context: Context,
@@ -143,28 +144,35 @@ object CloudStorage {
         val peers = candidates(context)
         val refs = ArrayList<CloudManifest.ChunkRef>()
         var placed = 0
+        var unplaced = 0
         var bytesDone = 0L
         var cancelled = false
 
         CloudVault.sealFile(source, key) { chunk ->
             val holders = place(context, chunk, peers, replicas)
-            refs.add(
-                CloudManifest.ChunkRef(
-                    id = chunk.id,
-                    index = chunk.index,
-                    bytes = chunk.bytes,
-                    holders = holders,
-                )
-            )
-            if (holders.isNotEmpty()) placed++
             bytesDone += chunk.bytes
+            if (holders.isEmpty()) {
+                unplaced++
+            } else {
+                refs.add(
+                    CloudManifest.ChunkRef(
+                        id = chunk.id,
+                        index = chunk.index,
+                        bytes = chunk.bytes,
+                        holders = holders,
+                    )
+                )
+                placed++
+            }
             val keepGoing = onProgress(chunk.index, placed, bytesDone)
             if (!keepGoing) cancelled = true
             keepGoing
         }
 
         if (refs.isEmpty()) {
-            return UploadResult(null, 0, 0, "That file is empty.")
+            val reason = if (unplaced == 0) "That file is empty."
+            else "No peer accepted any part of that file. Nothing was recorded."
+            return UploadResult(null, placed, unplaced, reason)
         }
 
         val entry = CloudManifest.Entry(
@@ -175,7 +183,13 @@ object CloudStorage {
             size = source.length(),
             createdAt = System.currentTimeMillis(),
             chunks = refs,
-            note = if (cancelled) "$note (upload cancelled part-way)".trim() else note,
+            note = buildString {
+                if (note.isNotBlank()) append(note).append(" ")
+                if (cancelled) append("(upload cancelled part-way) ")
+                if (unplaced > 0) {
+                    append("$unplaced chunk(s) were not accepted by any peer and are not stored. ")
+                }
+            }.trim(),
         )
         CloudManifest.add(root(context), entry)
         PayLaterPolicy.afterWork()

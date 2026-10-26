@@ -1,0 +1,3 @@
+org.mozilla.firefox
+com.amazon.mShop.android.shopping
+com.acorns.android

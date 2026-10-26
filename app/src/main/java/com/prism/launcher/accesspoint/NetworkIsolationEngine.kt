@@ -37,15 +37,20 @@ class NetworkIsolationEngine(private val context: Context) {
             PrismLogger.logInfo(TAG, "Applying isolation rules for AP $accessPointId")
 
             val rules = buildDefaultRules(accessPointId, gatewayIp, vpnTunnelIp, clientSubnet)
-            activeRules[accessPointId] = rules
+            val failed = rules.filter { it.enabled && !applyIptablesRule(it, gatewayIp, clientSubnet) }
 
-            // Apply iptables rules
-            for (rule in rules) {
-                if (rule.enabled) {
-                    applyIptablesRule(rule, gatewayIp, clientSubnet)
-                }
+            // NOTHING IS CLAIMED THAT DID NOT HAPPEN. The iptables calls used to be commented out
+            // while every caller got Result.success, so "isolation applied" meant "a list was built".
+            // The rules need root; when that is unavailable the result now says so and the caller can
+            // show a limitation instead of a guarantee it cannot keep.
+            if (failed.isNotEmpty()) {
+                val reason = "Root is required to enforce network isolation; " +
+                    "${failed.size} rule(s) could not be installed."
+                PrismLogger.logWarning(TAG, reason)
+                return@withContext Result.failure(IllegalStateException(reason))
             }
 
+            activeRules[accessPointId] = rules
             PrismLogger.logSuccess(TAG, "Isolation rules applied for AP $accessPointId")
             Result.success("Isolation rules applied successfully")
         } catch (e: Exception) {
@@ -121,14 +126,16 @@ class NetworkIsolationEngine(private val context: Context) {
     /**
      * Apply a single iptables rule.
      */
-    private fun applyIptablesRule(rule: IsolationRule, gatewayIp: String, clientSubnet: String) {
-        try {
-            val iptablesCommand = buildIptablesCommand(rule, gatewayIp, clientSubnet)
-            executeIptablesCommand(iptablesCommand)
+    private fun applyIptablesRule(rule: IsolationRule, gatewayIp: String, clientSubnet: String): Boolean {
+        val command = buildIptablesCommand(rule, gatewayIp, clientSubnet)
+        if (command.isBlank()) return true
+        val applied = executeIptablesCommand(command)
+        if (applied) {
             PrismLogger.logInfo(TAG, "Applied rule: ${rule.ruleType}")
-        } catch (e: Exception) {
-            PrismLogger.logError(TAG, "Failed to apply iptables rule", e)
+        } else {
+            PrismLogger.logWarning(TAG, "Could not apply ${rule.ruleType}")
         }
+        return applied
     }
 
     /**
@@ -165,18 +172,37 @@ class NetworkIsolationEngine(private val context: Context) {
     }
 
     /**
-     * Execute iptables command (requires root/system privileges).
+     * Runs a rule through `su`, and reports whether it actually ran.
+     *
+     * REQUIRES ROOT. There is no other way to touch the forwarding chain on an unrooted phone, and a
+     * failure is a normal outcome rather than an error to hide -- the caller decides what to tell the
+     * user. A ten-second bound exists because a stuck `su` prompt would otherwise hang the coroutine
+     * that a portal screen is waiting on.
      */
-    private fun executeIptablesCommand(command: String) {
-        try {
-            // In production, this would execute via su/root
-            // For now, we log the command for verification
+    private fun executeIptablesCommand(command: String): Boolean {
+        return try {
             PrismLogger.logInfo(TAG, "iptables: $command")
-            
-            // Actual execution (requires root):
-            // Runtime.getRuntime().exec(arrayOf("su", "-c", command))
+            val process = ProcessBuilder("su", "-c", command)
+                .redirectErrorStream(true)
+                .start()
+            val output = process.inputStream.bufferedReader().use { it.readText() }
+            val finished = process.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)
+            if (!finished) {
+                process.destroy()
+                PrismLogger.logWarning(TAG, "iptables timed out: $command")
+                return false
+            }
+            if (process.exitValue() != 0) {
+                PrismLogger.logWarning(
+                    TAG,
+                    "iptables failed (${process.exitValue()}): ${output.trim().take(200)}",
+                )
+                return false
+            }
+            true
         } catch (e: Exception) {
-            PrismLogger.logError(TAG, "Error executing iptables", e)
+            PrismLogger.logWarning(TAG, "No root shell for iptables: ${e.message}")
+            false
         }
     }
 
@@ -187,12 +213,18 @@ class NetworkIsolationEngine(private val context: Context) {
         try {
             PrismLogger.logInfo(TAG, "Removing isolation rules for AP $accessPointId")
 
-            val rules = activeRules.remove(accessPointId) ?: emptyList()
-            
-            // Flush iptables chains
-            executeIptablesCommand("iptables -F FORWARD")
-            executeIptablesCommand("iptables -t nat -F PREROUTING")
-            executeIptablesCommand("iptables -t nat -F POSTROUTING")
+            activeRules.remove(accessPointId)
+
+            val flushed = listOf(
+                "iptables -F FORWARD",
+                "iptables -t nat -F PREROUTING",
+                "iptables -t nat -F POSTROUTING",
+            ).map { executeIptablesCommand(it) }
+            if (flushed.any { !it }) {
+                return@withContext Result.failure(
+                    IllegalStateException("Root is required to remove firewall rules")
+                )
+            }
 
             PrismLogger.logSuccess(TAG, "Isolation rules removed for AP $accessPointId")
             Result.success("Isolation rules removed successfully")
@@ -209,8 +241,15 @@ class NetworkIsolationEngine(private val context: Context) {
         try {
             PrismLogger.logInfo(TAG, "Blocking device $deviceIp on AP $accessPointId")
             
-            executeIptablesCommand("iptables -A FORWARD -s $deviceIp -j DROP")
-            executeIptablesCommand("iptables -A FORWARD -d $deviceIp -j DROP")
+            val applied = listOf(
+                "iptables -A FORWARD -s $deviceIp -j DROP",
+                "iptables -A FORWARD -d $deviceIp -j DROP",
+            ).map { executeIptablesCommand(it) }
+            if (applied.any { !it }) {
+                return@withContext Result.failure(
+                    IllegalStateException("Root is required to block a device")
+                )
+            }
 
             PrismLogger.logSuccess(TAG, "Device $deviceIp blocked")
             Result.success("Device blocked successfully")
@@ -226,8 +265,15 @@ class NetworkIsolationEngine(private val context: Context) {
         try {
             PrismLogger.logInfo(TAG, "Unblocking device $deviceIp on AP $accessPointId")
             
-            executeIptablesCommand("iptables -D FORWARD -s $deviceIp -j DROP")
-            executeIptablesCommand("iptables -D FORWARD -d $deviceIp -j DROP")
+            val removed = listOf(
+                "iptables -D FORWARD -s $deviceIp -j DROP",
+                "iptables -D FORWARD -d $deviceIp -j DROP",
+            ).map { executeIptablesCommand(it) }
+            if (removed.any { !it }) {
+                return@withContext Result.failure(
+                    IllegalStateException("Root is required to unblock a device")
+                )
+            }
 
             PrismLogger.logSuccess(TAG, "Device $deviceIp unblocked")
             Result.success("Device unblocked successfully")
@@ -248,9 +294,16 @@ class NetworkIsolationEngine(private val context: Context) {
             PrismLogger.logInfo(TAG, "Limiting bandwidth for $deviceIp to ${bandwidthKbps}kbps")
 
             // Use tc (traffic control) commands
-            executeIptablesCommand("tc qdisc add dev wlan0 root handle 1: htb")
-            executeIptablesCommand("tc class add dev wlan0 parent 1: classid 1:1 htb rate ${bandwidthKbps}kbps")
-            executeIptablesCommand("tc filter add dev wlan0 parent 1: protocol ip prio 16 u32 match ip src $deviceIp flowid 1:1")
+            val applied = listOf(
+                "tc qdisc add dev wlan0 root handle 1: htb",
+                "tc class add dev wlan0 parent 1: classid 1:1 htb rate ${bandwidthKbps}kbps",
+                "tc filter add dev wlan0 parent 1: protocol ip prio 16 u32 match ip src $deviceIp flowid 1:1",
+            ).map { executeIptablesCommand(it) }
+            if (applied.any { !it }) {
+                return@withContext Result.failure(
+                    IllegalStateException("Root is required to limit a device's bandwidth")
+                )
+            }
 
             PrismLogger.logSuccess(TAG, "Bandwidth limit applied for $deviceIp")
             Result.success("Bandwidth limit applied successfully")

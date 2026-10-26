@@ -57,6 +57,7 @@ class NebulaSocialPageView @JvmOverloads constructor(
     private val detailStack = ArrayDeque<SocialDetailFrame>()
 
     private fun resolveAttr(attr: Int): Int {
+        com.prism.launcher.theme.ThemeSkin.resolveAttr(context, attr)?.let { return it }
         val typedValue = android.util.TypedValue()
         context.theme.resolveAttribute(attr, typedValue, true)
         return typedValue.data
@@ -322,7 +323,7 @@ class NebulaSocialPageView @JvmOverloads constructor(
             )
         }
 
-        androidx.appcompat.app.AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("Welcome to Lyke")
             .setView(box)
             .setCancelable(false)
@@ -438,13 +439,29 @@ class NebulaSocialPageView @JvmOverloads constructor(
                 }
 
                 override fun onInteraction(postId: String, type: String, actorId: String) {
-                    findViewTreeLifecycleOwner()?.lifecycleScope?.launch(Dispatchers.IO) {
-                        db.socialDao().insertInteraction(SocialInteractionEntity(
-                            postId = postId,
-                            actorId = actorId,
-                            actorName = "You",
-                            type = type
-                        ))
+                    // TOGGLE, AND MOVE THE COUNT. The old handler inserted a second interaction
+                    // row on every tap and never touched the post, so Liked looked broken: the
+                    // number came from a random value written at creation and did not change.
+                    findViewTreeLifecycleOwner()?.lifecycleScope?.launch(Dispatchers.Main) {
+                        withContext(Dispatchers.IO) {
+                            val existing = db.socialDao().findInteraction(postId, actorId, type)
+                            if (existing != null) {
+                                db.socialDao().deleteInteraction(existing.id)
+                                if (type == "like") db.socialDao().adjustLikes(postId, -1)
+                                else db.socialDao().adjustReposts(postId, -1)
+                            } else {
+                                db.socialDao().insertInteraction(SocialInteractionEntity(
+                                    postId = postId,
+                                    actorId = actorId,
+                                    actorName = "You",
+                                    type = type
+                                ))
+                                if (type == "like") db.socialDao().adjustLikes(postId, +1)
+                                else db.socialDao().adjustReposts(postId, +1)
+                            }
+                        }
+                        val posts = withContext(Dispatchers.IO) { db.socialDao().getAllPosts() }
+                        feedAdapter.submitList(posts)
                     }
                 }
             })

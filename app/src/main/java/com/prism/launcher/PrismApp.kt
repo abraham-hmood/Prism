@@ -4,9 +4,12 @@ import android.app.Application
 import android.content.ComponentCallbacks2
 import android.content.Intent
 import android.content.IntentFilter
+import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
+import java.util.concurrent.TimeUnit
 import com.prism.launcher.browser.PrismTunnelEngine
 import com.prism.launcher.browser.DnsProxyService
 
@@ -17,12 +20,89 @@ class PrismApp : Application(), ComponentCallbacks2 {
     lateinit var tunnelEngine: PrismTunnelEngine
         private set
 
+    /** The screen the user is looking at, used to repaint it when the theme changes. */
+    private var resumedThemeActivity: java.lang.ref.WeakReference<android.app.Activity>? = null
+
+    /**
+     * The last screen that was actually resumed, even if it has since been paused.
+     *
+     * A wireless display can be asked for a page while the launcher is in the background. The
+     * page renderer uses this to build that page with an Activity theme, which is what the
+     * Material components in it were written for; the application theme produced the
+     * "Binary XML file ... Error inflating class <unknown>" failure instead of a page.
+     */
+    private var recentHostActivity: java.lang.ref.WeakReference<android.app.Activity>? = null
+
+    /**
+     * The launcher itself, even when another Prism screen is in front of it.
+     *
+     * A wireless display extended from a phone is the phone's PAGER, not whatever activity is
+     * currently on top. The user opens the display picker, long-presses a desktop, and the picker
+     * becomes the most recent activity -- so looking only at [recentActivity] missed the launcher,
+     * fell back to inflating a page from XML, and that is the "Binary XML file ... page_drawer_root"
+     * screen the desktop received. The pager survives under the picker, so keep a direct weak
+     * reference to it.
+     */
+    private var recentLauncherActivity: java.lang.ref.WeakReference<LauncherActivity>? = null
+
+    fun launcherActivity(): LauncherActivity? = recentLauncherActivity?.get()
+        ?.takeIf { !it.isFinishing && !it.isDestroyed }
+
+    /** The activity a background page renderer should borrow a theme from, if one is alive. */
+    fun recentActivity(): android.app.Activity? = recentHostActivity?.get()
+        ?.takeIf { !it.isFinishing && !it.isDestroyed }
+
+    /** True while one of Prism's screens is actually resumed and able to receive a dialog. */
+    fun isScreenVisible(): Boolean = resumedThemeActivity?.get()
+        ?.let { !it.isFinishing && !it.isDestroyed } == true
+
+    /** Last appearance each non-base screen was drawn with; see the lifecycle callback. */
+    private val themedActivityKeys = java.util.WeakHashMap<android.app.Activity, String>()
+
+    /**
+     * Applies the chosen theme to EVERY screen, not only the ones built on `PrismBaseActivity`.
+     *
+     * ## Why here rather than in the base class
+     *
+     * Most screens extend `PrismBaseActivity`, and it applies the theme to itself -- but "most" is
+     * not "all": dialogs' hosts, the lock screen, capture and receiver activities and the
+     * virtualization windows do not, and neither will the next screen someone adds. The base class
+     * can only cover what inherits from it, and forgetting to inherit is invisible: the screen
+     * simply keeps the stock colours.
+     *
+     * `Application` sees every activity in the process, whatever it extends, so this is the one hook
+     * that cannot be missed. It runs after the activity exists and again when it is resumed, which
+     * is what reaches views rebuilt during a resume.
+     *
+     * The base class keeps its own call: it also runs on content changes, and an idempotent walk of
+     * the view tree twice is cheap next to a screen that does not get themed at all.
+     */
+    private fun installThemeCoverage() {
+        registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
+            override fun onActivityCreated(activity: android.app.Activity, savedInstanceState: android.os.Bundle?) {
+                runCatching { com.prism.launcher.theme.ThemeSkin.apply(activity) }
+            }
+
+            override fun onActivityResumed(activity: android.app.Activity) {
+                runCatching { com.prism.launcher.theme.ThemeSkin.apply(activity) }
+            }
+
+            override fun onActivityStarted(activity: android.app.Activity) = Unit
+            override fun onActivityPaused(activity: android.app.Activity) = Unit
+            override fun onActivityStopped(activity: android.app.Activity) = Unit
+            override fun onActivitySaveInstanceState(activity: android.app.Activity, outState: android.os.Bundle) = Unit
+            override fun onActivityDestroyed(activity: android.app.Activity) = Unit
+        })
+    }
+
     override fun onCreate() {
         super.onCreate()
         instance = this
 
         // Initialize Terminal Diagnostics & Crash Interceptor
         PrismLogger.init(this)
+
+        installThemeCoverage()
 
         // Install the platform BEFORE anything in :core runs, in EVERY process this Application
         // runs in -- AetherService's own process needs it exactly as much as the main one does.
@@ -152,6 +232,183 @@ class PrismApp : Application(), ComponentCallbacks2 {
         com.prism.launcher.trusted.TrustedDevices.peerCheck = { ip ->
             com.prism.launcher.mesh.PrismMeshService.isPeer(ip)
         }
+        // THE ADDRESS OF A TRUSTED DEVICE MUST BE ABLE TO CHANGE. Trust is stored against a
+        // fingerprint, but everything that addresses a peer -- calls above all -- uses the last IP
+        // it was paired at. This announces the fingerprint with our current address, so the other
+        // side moves its record instead of dialling yesterday's lease.
+        com.prism.launcher.trusted.TrustedDevices.startPresenceBeacon()
+
+        // THE PRISM DEBUG BRIDGE. The listener starts here rather than from Settings: a target has
+        // to be reachable before it appears in another device's list, and a listener that begins
+        // only while somebody is looking at the list fails the first time it is used. The phrase
+        // is a full-screen activity because it has to be read off THIS screen by the person
+        // holding the other device.
+        // THEME STORE. Installed before any screen can ask for a colour: the launcher's first
+        // views are built from it, and a store that only appeared after Settings was opened would
+        // make the first frame of every launch use the fallback palette.
+        com.prism.launcher.theme.PrismThemes.install(java.io.File(filesDir, "themes"))
+
+        com.prism.launcher.pdb.Pdb.shell = listOf("/system/bin/sh", "-c")
+        com.prism.launcher.pdb.Pdb.workDir = { filesDir }
+        com.prism.launcher.pdb.Pdb.host = com.prism.launcher.pdb.AndroidPdbHost(this)
+        com.prism.launcher.pdb.Pdb.onPrompt = { prompt ->
+            runCatching {
+                startActivity(com.prism.launcher.pdb.PdbPhraseActivity.intent(this, prompt))
+            }.onFailure {
+                com.prism.core.PrismPlatform.log.warn(
+                    "PrismDebugBridge",
+                    "Could not show the bridge phrase: " + it.message,
+                )
+            }
+        }
+        com.prism.launcher.pdb.Pdb.install()
+
+        // WIRELESS DISPLAYS. Every running Prism is a screen another Prism can extend to, so the
+        // beacon and the receiver socket start here rather than on the settings page -- a display
+        // has to be discoverable before anybody opens the list. The receiver activity is started
+        // from the socket callback; when the app is in the background Android may refuse that
+        // launch, which is why the page stays recorded and can be restored next time.
+        com.prism.launcher.display.WirelessDisplay.deviceName = {
+            android.os.Build.MODEL?.takeIf { it.isNotBlank() } ?: "Android device"
+        }
+        com.prism.launcher.display.WirelessDisplay.devicePlatform = { "android" }
+        com.prism.launcher.display.WirelessDisplay.onMirror = { mirror ->
+            com.prism.launcher.display.DisplayRequestNotification.clear(this)
+            runCatching {
+                startActivity(
+                    com.prism.launcher.display.DisplayReceiverActivity.intent(this, mirror)
+                )
+            }.onFailure {
+                com.prism.core.PrismPlatform.log.warn(
+                    "PrismDisplay",
+                    "Could not open the display receiver: " + it.message,
+                )
+            }
+        }
+        // EXTEND: the sender names the page to render. It is the same full-screen window a mirror
+        // uses, so switching modes between connections never leaves two receivers stacked.
+        com.prism.launcher.display.WirelessDisplay.onShow = { show ->
+            com.prism.launcher.display.DisplayRequestNotification.clear(this)
+            runCatching {
+                startActivity(
+                    com.prism.launcher.display.DisplayReceiverActivity.pageIntent(this, show)
+                )
+            }.onFailure {
+                com.prism.core.PrismPlatform.log.warn(
+                    "PrismDisplay",
+                    "Could not open the extended page: " + it.message,
+                )
+            }
+        }
+        com.prism.launcher.display.WirelessDisplay.onMirrorStopped = { localWasSender ->
+            if (!localWasSender) {
+                // Close a viewer that no longer has a sender. A code screen with no stream still
+                // needs its own pairing window, so only the live display is dismissed here.
+                runCatching {
+                    startActivity(
+                        com.prism.launcher.display.DisplayReceiverActivity.closeIntent(this)
+                    )
+                }
+            } else {
+                com.prism.launcher.display.mirror.ScreenMirrorService.stop(this)
+                // EXTEND publishes a page rather than a captured screen; both are this side's
+                // streams and both end with the link.
+                com.prism.launcher.display.PageMirror.stop()
+            }
+        }
+        // A desktop long-pressed this phone, so the link already exists and THIS end has to start
+        // sending. Android only hands out a projection through a consent dialog owned by an
+        // activity; the service may already be capturing from a link that is still live.
+        com.prism.launcher.display.WirelessDisplay.onStartMirror = {
+            runCatching {
+                if (com.prism.launcher.display.mirror.ScreenMirrorService.isRunning()) {
+                    com.prism.launcher.display.mirror.ScreenMirrorService.announce()
+                } else if (isScreenVisible()) {
+                    startActivity(
+                        com.prism.launcher.display.CapturePermissionActivity.intent(this)
+                    )
+                } else {
+                    // A background activity launch is silently dropped on modern Android. The
+                    // notification is the prompt this state can actually show, and its
+                    // full-screen intent is what makes it arrive instead of sitting unread in
+                    // the shade. Starting the consent activity as well costs nothing and still
+                    // works on the manufacturers and versions that allow it.
+                    com.prism.launcher.display.DisplayRequestNotification.screen(
+                        this,
+                        com.prism.launcher.display.WirelessDisplay.connectedTo(),
+                    )
+                    runCatching {
+                        startActivity(
+                            com.prism.launcher.display.CapturePermissionActivity.intent(this)
+                        )
+                    }
+                }
+            }.onFailure {
+                com.prism.core.PrismPlatform.log.warn(
+                    "PrismDisplay",
+                    "Could not ask for screen capture: " + it.message,
+                )
+            }
+        }
+        // EXTEND: render the sender's next page and publish it as a stream. Rendering it on the
+        // receiver would show the receiver's own files and icons, which is not the page the user
+        // pointed at.
+        com.prism.launcher.display.WirelessDisplay.onStartExtend = {
+            com.prism.launcher.display.PageMirror.start(this)
+        }
+        // The pairing code goes on THIS screen, in the same full-screen window the mirror will
+        // occupy, whenever that screen can be opened. The notification fallback above carries the
+        // same code because a background activity launch can be dropped entirely.
+        com.prism.launcher.display.WirelessDisplay.onPairingCode = { code, from, sending, extending ->
+            // The code is useful to the person holding this device, so it is always available in
+            // the notification as well as on the fullscreen page. A background launch is not
+            // guaranteed, and a code nobody can read is a pairing that never happens.
+            com.prism.launcher.display.DisplayRequestNotification.code(
+                this, code, from, sending, extending,
+            )
+            if (isScreenVisible()) {
+                runCatching {
+                    startActivity(
+                        com.prism.launcher.display.DisplayReceiverActivity.codeIntent(
+                            this, code, from, sending, extending,
+                        )
+                    )
+                }.onFailure {
+                    com.prism.core.PrismPlatform.log.warn(
+                        "PrismDisplay",
+                        "Could not open the pairing screen: " + it.message,
+                    )
+                }
+            }
+        }
+        com.prism.launcher.display.WirelessDisplay.onPairingFailed = {
+            com.prism.launcher.display.DisplayRequestNotification.clear(this)
+            runCatching {
+                startActivity(
+                    com.prism.launcher.display.DisplayReceiverActivity.closeIntent(this)
+                )
+            }
+        }
+        com.prism.launcher.display.WirelessDisplay.install()
+
+        // MESH CALLS, MESHVOICE AND THE DIALER. Installed here so a call can arrive before the
+        // user has opened any screen: the audio device, the incoming-call notification and the
+        // plan probe all have to exist for the mesh service to hand a signal to them. The
+        // location feature is installed alongside, because its opcodes are what feed the map and
+        // the find request.
+        runCatching { com.prism.launcher.calls.PrismCalls.install(this) }
+            .onFailure { com.prism.core.PrismPlatform.log.error("PrismCalls", "Calls did not install", it) }
+        runCatching { com.prism.launcher.trusted.PrismLocations.install(this) }
+            .onFailure { com.prism.core.PrismPlatform.log.error("PrismLocations", "Locations did not install", it) }
+
+        // THE CLIPBOARD. The history is installed before TrustedSharing, because the consumer that
+        // receives a share writes into it -- and a share arriving in the first moments after boot
+        // would otherwise be dropped for want of somewhere to put it. The cache directory is where
+        // a copied file is archived on its way to a trusted device; it is cache rather than files
+        // because an archive is disposable the moment it has been sent.
+        com.prism.launcher.clipboard.ClipboardHistory.install(java.io.File(filesDir, "clipboard"))
+        com.prism.launcher.clipboard.TrustedFileTransfer.install(java.io.File(cacheDir, "clipboard"))
+        com.prism.launcher.clipboard.ClipboardCapture.install(this)
 
         // Browser history, both directions, from :core -- the store is portable, so the bridge is too and
         // neither platform writes its own copy of the payload shape.
@@ -256,6 +513,15 @@ class PrismApp : Application(), ComponentCallbacks2 {
         }
     }
 
+    private fun themeAppearanceKey(): String = listOf(
+        PrismSettings.getThemeMode(),
+        PrismSettings.getThemeId(),
+        PrismSettings.getThemeRevision(),
+        com.prism.launcher.theme.PrismThemes.revision,
+        PrismSettings.getFontStyle(),
+        PrismSettings.getCustomFontPath(),
+    ).joinToString("|")
+
     /**
      * Everything that either (a) only the main process needs -- Nora hasn't been split into its
      * own process, so her config/workers/UI-adjacent wiring only ever run here -- or (b) must not
@@ -268,13 +534,65 @@ class PrismApp : Application(), ComponentCallbacks2 {
         // called off -- which is what makes "leave the chat, open an app, come back" free.
         registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
             override fun onActivityStarted(activity: android.app.Activity) = cancelDeferredRelease()
-            override fun onActivityCreated(activity: android.app.Activity, savedInstanceState: android.os.Bundle?) {}
-            override fun onActivityResumed(activity: android.app.Activity) {}
-            override fun onActivityPaused(activity: android.app.Activity) {}
+
+            override fun onActivityCreated(activity: android.app.Activity, savedInstanceState: android.os.Bundle?) {
+                if (activity is LauncherActivity) {
+                    recentLauncherActivity = java.lang.ref.WeakReference(activity)
+                }
+                // The base activity already does this for most screens. This second pass is for
+                // the screens that do not extend it: it reaches the views they have just built.
+                if (activity is PrismBaseActivity) return
+                if (!com.prism.launcher.theme.ThemeSkin.isThemeable(activity)) return
+                com.prism.launcher.theme.ThemeSkin.apply(activity)
+            }
+
+            override fun onActivityResumed(activity: android.app.Activity) {
+                resumedThemeActivity = java.lang.ref.WeakReference(activity)
+                recentHostActivity = java.lang.ref.WeakReference(activity)
+                if (activity is LauncherActivity) {
+                    recentLauncherActivity = java.lang.ref.WeakReference(activity)
+                }
+                if (activity !is PrismBaseActivity && com.prism.launcher.theme.ThemeSkin.isThemeable(activity)) {
+                    com.prism.launcher.theme.ThemeSkin.apply(activity)
+                }
+                // PrismBaseActivity compares its own appearance key and rebuilds. Screens that
+                // do not extend it get the same treatment here, or a theme chosen while they
+                // were behind Settings would only be half-painted by the tree walk on return.
+                if (activity !is PrismBaseActivity) {
+                    val key = themeAppearanceKey()
+                    val previous = themedActivityKeys.put(activity, key)
+                    if (previous != null && previous != key) {
+                        activity.window?.decorView?.post {
+                            if (!activity.isFinishing && !activity.isDestroyed) activity.recreate()
+                        }
+                    }
+                }
+            }
+
+            override fun onActivityPaused(activity: android.app.Activity) {
+                if (resumedThemeActivity?.get() === activity) resumedThemeActivity = null
+            }
+
             override fun onActivityStopped(activity: android.app.Activity) {}
             override fun onActivitySaveInstanceState(activity: android.app.Activity, outState: android.os.Bundle) {}
-            override fun onActivityDestroyed(activity: android.app.Activity) {}
+            override fun onActivityDestroyed(activity: android.app.Activity) {
+                if (recentHostActivity?.get() === activity) recentHostActivity = null
+                if (recentLauncherActivity?.get() === activity) recentLauncherActivity = null
+            }
         })
+
+        // Rebuild whichever screen is open when the theme changes. Views bake their colour,
+        // typeface and shape at construction, so repainting the tree is not enough for layouts
+        // built around a theme; recreating the one visible screen is what makes a selection in
+        // Themes apply everywhere without closing Prism or even Prism Settings.
+        com.prism.launcher.theme.PrismThemes.observe {
+            val activity = resumedThemeActivity?.get() ?: return@observe
+            activity.runOnUiThread {
+                if (activity.isFinishing || activity.isDestroyed) return@runOnUiThread
+                if (!com.prism.launcher.theme.ThemeSkin.isThemeable(activity)) return@runOnUiThread
+                activity.recreate()
+            }
+        }
 
         // SCREEN_ON and SCREEN_OFF cannot be declared in a manifest -- Android requires them to be
         // registered at runtime -- so the lock's watcher is installed from here, where it lives as
@@ -284,6 +602,12 @@ class PrismApp : Application(), ComponentCallbacks2 {
         // launcher to raise the lock screen, and the `:virtualapp` process doing it means a
         // virtualized app's own process can put the lock up over the launcher.
         runCatching { com.prism.launcher.lock.LockGate.install(this) }
+
+        // Live clipboard sharing, if the user turned it on. The launcher process is the one that
+        // has to stay alive for ClipboardCapture's listener to be called while another app has
+        // focus, and Android may refuse a foreground-service start from a background process
+        // start -- which the service logs rather than throws; LauncherActivity.onResume retries.
+        com.prism.launcher.clipboard.ClipboardWatchService.sync(this)
 
         // MediaPipe is Android-only, so :core's agentic engine asks a LocalTextGenerator and
         // Android supplies the one that can also run .task models. Without this the agentic
@@ -338,6 +662,13 @@ class PrismApp : Application(), ComponentCallbacks2 {
             com.prism.launcher.agentic.AgenticImageTools.generateImage(this, prompt)
         }
 
+        // make_plugin: the build is a Gradle invocation, which needs a JDK and an Android SDK --
+        // neither of which :core can assume. The implementation lives here so the portable tool
+        // only has to decide whether a hook exists.
+        com.prism.launcher.agentic.AgenticBuiltinTools.makePluginHandler = { path ->
+            com.prism.launcher.agentic.PluginBuilder.build(this, path)
+        }
+
         // Dataset downloads: git-clone the whole repo instead of fetching one file at a time --
         // JGit, since Android has no native git binary. Same "install the real implementation
         // from :app" reasoning as p2pHostHandler above.
@@ -374,6 +705,16 @@ class PrismApp : Application(), ComponentCallbacks2 {
             OneTimeWorkRequestBuilder<AppSyncWorker>().build(),
         )
 
+        // Re-scan daily as well. The package broadcast is the fast path, but it is a broadcast: a
+        // force-stop, a profile switch or a busy system can drop one, and until now nothing ever
+        // corrected a missed update. KEEP means opening the app five times in a day still queues
+        // one scan, not five.
+        WorkManager.getInstance(this).enqueueUniquePeriodicWork(
+            AppSyncWorker.PERIODIC_WORK_NAME,
+            ExistingPeriodicWorkPolicy.KEEP,
+            PeriodicWorkRequestBuilder<AppSyncWorker>(1, TimeUnit.DAYS).build(),
+        )
+
         // Nora's brain size, before anything can construct a brain from it. Every region, link
         // and analytic model reads its dimensions at construction time, so this has to win the
         // race against the first access — which is why it is here and not lazy.
@@ -407,7 +748,16 @@ class PrismApp : Application(), ComponentCallbacks2 {
 
         // Decentralized Mesh Components
         com.prism.launcher.browser.P2pDnsManager.init(this)
+        // Anything a killed mirror crawl left staged is removed before a new crawl can mistake it
+        // for a complete site.
+        com.prism.launcher.browser.PrismMirrorManager.cleanupInterrupted()
         com.prism.launcher.mesh.PrismMeshService.start()
+
+        // MESHVOICE THAT OUTLIVED THE LAST PROCESS. A voicemail left for a device that was away
+        // is held on disk; this is where the retry loop picks it back up, in the control process
+        // only. The helper processes would otherwise race each other sending the same file.
+        runCatching { com.prism.launcher.calls.MeshCalls.MeshVoice.startOutbox() }
+            .onFailure { PrismLogger.logError("PrismCalls", "Could not resume held meshvoice", it) }
 
         // DNS Proxy Service (Access Point mode)
         if (PrismSettings.getDnsProxyEnabled()) {
@@ -482,6 +832,29 @@ class PrismApp : Application(), ComponentCallbacks2 {
     private fun settleModelPurchases() {
         if (ModelPurchaseLedger.held().isEmpty()) return
         if (!ModelListingScanner.dueNow()) return
+        sweepModelPurchases()
+
+        // AND ON A TIMER, not only at launch. Waiting for the next launch meant a phone left running
+        // for days never settled anything: the seller went unpaid and the buyer's balance stayed
+        // committed even though the scan interval had long since elapsed. The loop is cheap and
+        // does nothing while [ModelListingScanner.dueNow] is false.
+        synchronized(modelSweepLock) {
+            if (!modelSweepStarted) {
+                modelSweepStarted = true
+                Thread({
+                    while (true) {
+                        runCatching { Thread.sleep(MODEL_SWEEP_INTERVAL_MS) }
+                            .onFailure { return@Thread }
+                        if (ModelPurchaseLedger.held().isEmpty()) continue
+                        if (!ModelListingScanner.dueNow()) continue
+                        sweepModelPurchases()
+                    }
+                }, "model-purchase-sweep").apply { isDaemon = true }.start()
+            }
+        }
+    }
+
+    private fun sweepModelPurchases() {
         Thread({
             runCatching {
                 val (settled, cancelled) = ModelListingScanner.runOnce()
@@ -494,6 +867,10 @@ class PrismApp : Application(), ComponentCallbacks2 {
             }.onFailure { PrismLogger.logError("ModelShop", "Purchase settlement failed", it) }
         }, "model-purchase-settle").start()
     }
+
+    private val modelSweepLock = Any()
+    private var modelSweepStarted = false
+    private val MODEL_SWEEP_INTERVAL_MS = 30L * 60L * 1000L
 
     /**
      * Whether this `Application.onCreate()` call is running in one of Prism's secondary processes

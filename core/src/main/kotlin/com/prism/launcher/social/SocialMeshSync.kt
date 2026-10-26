@@ -125,8 +125,8 @@ object SocialMeshSync {
      * publish again.
      */
     fun announce() {
-        if (!MeshMembership.isOnOverlay()) {
-            lastStatus = "off the overlay"
+        if (!MeshMembership.isOnMeshnet()) {
+            lastStatus = "not on the meshnet"
             return
         }
         scope.launch {

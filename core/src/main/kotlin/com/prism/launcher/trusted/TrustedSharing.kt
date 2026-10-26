@@ -2,7 +2,9 @@ package com.prism.launcher.trusted
 
 import com.prism.core.PrismPlatform
 import com.prism.core.json.JSONObject
+import com.prism.launcher.clipboard.ClipboardHistory
 import com.prism.launcher.history.PrismHistory
+import java.io.File
 
 /**
  * The kinds of sharing that are the same code on every platform.
@@ -56,6 +58,43 @@ object TrustedSharing {
         TrustedDevices.onConfirmed = { device ->
             backfill(device)
             runCatching { extraBackfill?.invoke(device) }
+        }
+
+        // THE CLIPBOARD, both directions. Text and files go through the same kind because they are
+        // one history on the user's side; a file entry carries metadata only and its bytes are
+        // fetched over the TCP channel when it is pasted, for the same reason an APK is.
+        TrustedDevices.consume(TrustedDevices.Kind.CLIPBOARD) { received ->
+            val body = received.body
+            // The current build nests the entry; older builds sent a bare `text` field. Both are
+            // accepted so a phone that has not been updated still reaches a desktop's clipboard.
+            val json = body.optJSONObject("entry") ?: JSONObject().apply {
+                put("kind", "text")
+                put("text", body.optString("text"))
+                put("mode", body.optString("mode", "copy"))
+            }
+            if (json.optString("kind") == "file") {
+                ClipboardHistory.recordRemoteFile(
+                    name = json.optString("name"),
+                    directory = json.optBoolean("dir"),
+                    bytes = json.optLong("bytes", 0L),
+                    mode = if (json.optString("mode") == "cut") ClipboardHistory.Mode.CUT
+                    else ClipboardHistory.Mode.COPY,
+                    fromFingerprint = received.fromFingerprint,
+                    fromName = received.fromName,
+                    // THE SENDER'S ID, because that is what /trusted-file/<id> resolves on the
+                    // device holding the file. A fresh id here would make every fetch a 404.
+                    id = json.optString("id"),
+                )
+            } else {
+                val text = json.optString("text")
+                if (text.isNotBlank()) {
+                    ClipboardHistory.recordText(
+                        text = text,
+                        sourceFingerprint = received.fromFingerprint,
+                        sourceName = received.fromName,
+                    )
+                }
+            }
         }
 
         // The catalogue of apps another device is offering. The bytes are not fetched here -- see
@@ -142,14 +181,22 @@ object TrustedSharing {
         }
 
         if (TrustedDevices.Kind.CLIPBOARD in device.outgoing) {
-            val text = runCatching { clipboardReader?.invoke() }.getOrNull().orEmpty()
-            if (text.isNotBlank()) {
-                TrustedDevices.shareWith(
+            // The HISTORY, not just the current clipboard. A pairing is where somebody finds out
+            // what they can suddenly paste on the other machine, and sending one item would hide
+            // everything they had copied before it.
+            val recent = runCatching { ClipboardHistory.all() }.getOrDefault(emptyList())
+                .take(CLIPBOARD_BACKFILL)
+            var sent = 0
+            recent.forEach { entry ->
+                if (entry.remote) return@forEach
+                val ok = TrustedDevices.shareWith(
                     device.fingerprint,
                     TrustedDevices.Kind.CLIPBOARD,
-                    JSONObject().apply { put("text", text) },
+                    JSONObject().apply { put("entry", ClipboardHistory.toJson(entry)) },
                 )
+                if (ok) sent++
             }
+            if (sent > 0) PrismPlatform.log.info(TAG, "Sent $sent clipboard entries to " + device.name)
         }
 
         if (TrustedDevices.Kind.MESSAGES in device.outgoing) {
@@ -166,14 +213,38 @@ object TrustedSharing {
     @Volatile
     var clipboardReader: (() -> String?)? = null
 
-    /** Shares the current clipboard with everyone paired for it. Called when the user copies. */
-    fun shareClipboard(text: String): Int {
+    /** How many clipboard entries a new pairing sends. */
+    private const val CLIPBOARD_BACKFILL = 50
+
+    /**
+     * Records text this device copied and shares it.
+     *
+     * Recording before sharing is the order that matters: a history which only knew about what was
+     * SENT would forget everything copied while no device was paired, which is most of it.
+     */
+    fun publishText(text: String): Int {
         if (text.isBlank()) return 0
-        return TrustedDevices.share(
-            TrustedDevices.Kind.CLIPBOARD,
-            JSONObject().apply { put("text", text) },
-        )
+        val entry = ClipboardHistory.recordText(text) ?: return 0
+        return publish(entry)
     }
+
+    /** Records a file or folder this device copied or cut, and shares its details. */
+    fun publishFile(file: File, cut: Boolean): Int {
+        val entry = ClipboardHistory.recordFile(
+            file = file,
+            mode = if (cut) ClipboardHistory.Mode.CUT else ClipboardHistory.Mode.COPY,
+        )
+        return publish(entry)
+    }
+
+    private fun publish(entry: ClipboardHistory.Entry): Int =
+        TrustedDevices.share(
+            TrustedDevices.Kind.CLIPBOARD,
+            JSONObject().apply { put("entry", ClipboardHistory.toJson(entry)) },
+        )
+
+    /** Kept for callers that only know about the text clipboard. */
+    fun shareClipboard(text: String): Int = publishText(text)
 
     /** How much history a pairing sends. Beyond this is still on the device that has it. */
     private const val HISTORY_BACKFILL = 300

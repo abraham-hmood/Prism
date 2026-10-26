@@ -54,7 +54,7 @@ class NoraSelfTestActivity : PrismBaseActivity() {
 
     private fun pickRoute() {
         val modes = NoraImageryMode.entries.toTypedArray()
-        androidx.appcompat.app.AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Route to test")
             .setItems(modes.map { NoraSelfTest.routeName(it) }.toTypedArray()) { _, i ->
                 route = modes[i]

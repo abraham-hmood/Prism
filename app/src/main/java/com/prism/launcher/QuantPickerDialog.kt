@@ -75,7 +75,7 @@ object QuantPickerDialog {
             )
         })
 
-        val dialog = AlertDialog.Builder(activity)
+        val dialog = com.prism.launcher.theme.PrismDialogs.Builder(activity)
             .setView(root)
             .setNegativeButton("Cancel", null)      // rebound below; see the comment there
             .create()

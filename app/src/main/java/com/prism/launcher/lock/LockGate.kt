@@ -38,6 +38,16 @@ object LockGate {
     /** Set while the lock activity is on screen, so it is not launched on top of itself. */
     @Volatile private var showing = false
 
+    /**
+     * When [showing] was last set, on the monotonic clock.
+     *
+     * Android 10+ can refuse a background activity launch WITHOUT throwing. When that happens the
+     * flag used to stay true forever and the lock silently never appeared again for the life of the
+     * process. A timestamp makes the flag self-healing: if no lock activity has announced itself
+     * within [SHOW_GRACE_MS], the next resume tries again.
+     */
+    @Volatile private var showingSince = 0L
+
     val isLocked: Boolean get() = locked
 
     private var receiver: BroadcastReceiver? = null
@@ -86,11 +96,22 @@ object LockGate {
 
     /** Called by the launcher when it comes forward, in case Home was used to leave the lock. */
     fun showIfLocked(context: Context) {
-        if (locked && !showing && enabled(context)) launch(context)
+        if (!locked || !enabled(context)) return
+
+        if (showing) {
+            val elapsed = android.os.SystemClock.elapsedRealtime() - showingSince
+            if (elapsed in 0 until SHOW_GRACE_MS) return
+            // The launch was blocked, or the activity was destroyed without telling us. Either way
+            // the old flag is a lie, and leaving it set is what made the lock disappear for good.
+            PrismLogger.logWarning(TAG, "Lock was marked showing but never appeared; retrying")
+            showing = false
+        }
+        launch(context)
     }
 
     private fun launch(context: Context) {
         showing = true
+        showingSince = android.os.SystemClock.elapsedRealtime()
         runCatching {
             context.applicationContext.startActivity(
                 Intent(context.applicationContext, PrismLockActivity::class.java).apply {
@@ -108,15 +129,30 @@ object LockGate {
         }
     }
 
+    /** The lock activity reporting that it is on screen, which keeps the retry grace honest. */
+    fun markShown() {
+        showing = true
+        showingSince = android.os.SystemClock.elapsedRealtime()
+    }
+
     /** The lock activity reporting that it let the user in. */
     fun markUnlocked() {
         locked = false
         showing = false
+        showingSince = 0L
     }
 
     /** The lock activity reporting that it is gone without unlocking (it was never configured). */
     fun markDismissed() {
         showing = false
+        showingSince = 0L
+    }
+
+    /** Lets Settings turn the lock off without leaving stale state behind. */
+    fun reset() {
+        locked = false
+        showing = false
+        showingSince = 0L
     }
 
     /** Locks immediately, without waiting for the screen to go off. */
@@ -143,4 +179,7 @@ object LockGate {
 
     /** Whether the running build can show an activity over the keyguard at all. */
     val canShowOverKeyguard: Boolean get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1
+
+    /** How long to wait for a launched lock activity to announce itself. */
+    private const val SHOW_GRACE_MS = 2_000L
 }

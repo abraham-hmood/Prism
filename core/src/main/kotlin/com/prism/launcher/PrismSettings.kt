@@ -1154,9 +1154,19 @@ object PrismSettings {
     fun setDnsProxyMode(value: String) =
         prefs().edit().putString(KEY_DNS_PROXY_MODE, value).apply()
 
-    /** Primary accent color used for glowing borders and staccato highlights */
-    fun getGlowColor(): Int =
-        prefs().getInt(KEY_GLOW_COLOR, DEFAULT_GLOW_COLOR)
+    /**
+     * Primary accent color used for glowing borders and staccato highlights.
+     *
+     * A selected theme owns the accent: otherwise the neon chrome around the drawer, the phone
+     * pages and the desktop would stay cyan while every button and card changed to, say, Clay's
+     * rose. xOS is the one exception -- it is the default, and the Glow Accent setting is the
+     * customization people already know there.
+     */
+    fun getGlowColor(): Int {
+        val theme = com.prism.launcher.theme.PrismThemes.active()
+        if (theme.id != "xos") return theme.light.palette.accent.toInt()
+        return prefs().getInt(KEY_GLOW_COLOR, DEFAULT_GLOW_COLOR)
+    }
 
     fun setGlowColor(value: Int) =
         prefs().edit().putInt(KEY_GLOW_COLOR, value).apply()
@@ -1166,6 +1176,21 @@ object PrismSettings {
 
     fun setThemeMode(value: Int) =
         prefs().edit().putInt(KEY_THEME_MODE, value).apply()
+
+    /** The selected Prism UI theme. Stored here so both hosts and profile sync share it. */
+    fun getThemeId(): String =
+        prefs().getString(KEY_THEME_ID, "xos") ?: "xos"
+
+    fun setThemeId(value: String) =
+        prefs().edit().putString(KEY_THEME_ID, value).apply()
+
+    /** A counter the hosts can read to notice a theme change that did not change the id. */
+    fun getThemeRevision(): Int =
+        prefs().getInt(KEY_THEME_REVISION, 0)
+
+    fun bumpThemeRevision() {
+        prefs().edit().putInt(KEY_THEME_REVISION, getThemeRevision() + 1).apply()
+    }
 
     // ── Desktop shell ───────────────────────────────────────────────────────
 
@@ -1188,6 +1213,27 @@ object PrismSettings {
 
     fun setDesktopMobileMode(value: Boolean) =
         prefs().edit().putBoolean(KEY_DESKTOP_MOBILE_MODE, value).apply()
+
+    // ── Windows, not pages ──────────────────────────────────────────────────
+
+    /**
+     * Whether a page is drawn as a window instead of filling the screen.
+     *
+     * A page is already a self-contained surface with its own title and its own scroll position,
+     * so on a screen with room to spare the honest presentation is a window: inset from the edges,
+     * rounded, titled, with the desktop visible around it. Off by default because a phone page at
+     * full size is not a compromise -- it is the design -- and nobody should discover that their
+     * launcher turned into a desktop by updating.
+     *
+     * ONE SETTING FOR BOTH BUILDS. The phone draws the page in its pager, the desktop in its
+     * shell, but "pages are windows" means the same thing on both and a second switch would let
+     * the two drift.
+     */
+    fun getWindowedPages(): Boolean =
+        prefs().getBoolean(KEY_WINDOWED_PAGES, false)
+
+    fun setWindowedPages(value: Boolean) =
+        prefs().edit().putBoolean(KEY_WINDOWED_PAGES, value).apply()
 
     /**
      * An explicit wallpaper, overriding whatever the OS is using.
@@ -1856,6 +1902,67 @@ object PrismSettings {
     fun setSmsRelayEnabled(value: Boolean) =
         prefs().edit().putBoolean(KEY_SMS_RELAY, value).apply()
 
+    /**
+     * Whether one of the third-party messaging bridges is connected.
+     *
+     * Stored by service id rather than one boolean per app so adding a service is a row in
+     * [com.prism.launcher.messaging.MessagingBridges] rather than another preference. Shared with
+     * the desktop, which is why the keys name the service and not the platform.
+     */
+    fun isMessagingBridgeEnabled(id: String): Boolean =
+        prefs().getBoolean("messaging_bridge_$id", false)
+
+    fun setMessagingBridgeEnabled(id: String, enabled: Boolean) =
+        prefs().edit().putBoolean("messaging_bridge_$id", enabled).apply()
+
+    /** Whether the user has been shown the bridges step, so the tour does not repeat it. */
+    fun getMessagingBridgeSetupSeen(): Boolean =
+        prefs().getBoolean(KEY_MESSAGING_BRIDGES_SEEN, false)
+
+    fun setMessagingBridgeSetupSeen(value: Boolean) =
+        prefs().edit().putBoolean(KEY_MESSAGING_BRIDGES_SEEN, value).apply()
+
+    /**
+     * Whether this device publishes its position to any trusted device at all.
+     *
+     * OFF BY DEFAULT, and the master switch that every per-device consent sits under. Turning it
+     * off stops publication immediately without forgetting the per-device choices, so switching
+     * it back on does not mean re-consenting six devices.
+     */
+    fun getLocationSharingEnabled(): Boolean =
+        prefs().getBoolean(KEY_LOCATION_SHARING, false)
+
+    fun setLocationSharingEnabled(value: Boolean) =
+        prefs().edit().putBoolean(KEY_LOCATION_SHARING, value).apply()
+
+    /**
+     * Fingerprints explicitly allowed to receive this device's position.
+     *
+     * Stored as a newline-separated list because it is a small set that only changes when the user
+     * toggles a switch on the map, and a separate table for it would be a schema for one field.
+     */
+    fun getLocationSharedFingerprints(): Set<String> =
+        (prefs().getString(KEY_LOCATION_FINGERPRINTS, "") ?: "")
+            .lineSequence().map { it.trim() }.filter { it.isNotBlank() }.toSet()
+
+    fun setLocationSharedFingerprints(value: Set<String>) =
+        prefs().edit()
+            .putString(KEY_LOCATION_FINGERPRINTS, value.sorted().joinToString("\n"))
+            .apply()
+
+    /**
+     * Whether the one-time warning about unencrypted mesh calls has been shown.
+     *
+     * Stored so it is shown exactly once, not once per call and not on every launch. It is a
+     * consent record, not a dismissible tip: once the user has chosen to call a non-trusted device
+     * in the clear, repeating the dialog would train them to tap through it.
+     */
+    fun getMeshCallWarningSeen(): Boolean =
+        prefs().getBoolean(KEY_MESH_CALL_WARNING, false)
+
+    fun setMeshCallWarningSeen(value: Boolean) =
+        prefs().edit().putBoolean(KEY_MESH_CALL_WARNING, value).apply()
+
     fun getActiveCloudModel(): CloudModelProfile? {
         val id = getActiveCloudModelId() ?: return null
         return getCloudModels().find { it.id == id }
@@ -1953,6 +2060,180 @@ object PrismSettings {
     fun setOnboardingSeen(value: Boolean) =
         prefs().edit().putBoolean(KEY_ONBOARDING_SEEN, value).apply()
 
+    // ── The page-picker gesture ────────────────────────────────────────────
+
+    /**
+     * The swipe that opens the page picker, or null for the built-in vertical overscroll.
+     *
+     * Stored as a short string rather than a data blob so it survives the settings store being
+     * carried between devices, and so a corrupt value degrades to the default instead of throwing
+     * on every launch.
+     */
+    fun getPagePickerSwipe(): PagePickerSwipe? =
+        PagePickerSwipe.deserialize(prefs().getString(KEY_PAGE_PICKER_SWIPE, "") ?: "")
+
+    fun setPagePickerSwipe(value: PagePickerSwipe?) =
+        prefs().edit().putString(KEY_PAGE_PICKER_SWIPE, value?.toJson() ?: "").apply()
+
+    fun hasCustomPagePickerSwipe(): Boolean = getPagePickerSwipe() != null
+
+    /**
+     * How willing the page-picker gesture is to fire, 0..100. The default is deliberately low.
+     *
+     * This is a multiplier rather than a replacement trigger: lowering it stretches the distance
+     * of both the built-in overscroll and a swipe captured on the tour, so the user keeps the
+     * gesture they trained while making it harder to do by accident.
+     */
+    fun getPagePickerSensitivity(): Int =
+        prefs().getInt(KEY_PAGE_PICKER_SENSITIVITY, PAGE_PICKER_SENSITIVITY_DEFAULT)
+            .coerceIn(0, 100)
+
+    fun setPagePickerSensitivity(value: Int) =
+        prefs().edit().putInt(KEY_PAGE_PICKER_SENSITIVITY, value.coerceIn(0, 100)).apply()
+
+    fun getPagePickerSensitivityScale(): Float =
+        PagePickerSwipe.sensitivityScale(getPagePickerSensitivity())
+
+    /**
+     * When true, the swipe trigger is off and a button in Prism Settings opens the picker instead.
+     *
+     * For anyone who finds a page-changing gesture too easy to hit -- or whose phone has a case
+     * that makes the edge swipe unreliable -- the deliberate button is the whole feature.
+     */
+    fun getPagePickerFromSettings(): Boolean =
+        prefs().getBoolean(KEY_PAGE_PICKER_FROM_SETTINGS, false)
+
+    fun setPagePickerFromSettings(value: Boolean) =
+        prefs().edit().putBoolean(KEY_PAGE_PICKER_FROM_SETTINGS, value).apply()
+
+    /** Asks the launcher to open the page picker the next time it resumes. */
+    fun requestOpenPagePicker() =
+        prefs().edit().putBoolean(KEY_PAGE_PICKER_OPEN_REQUEST, true).apply()
+
+    /** One-shot: true once, then clears the request. */
+    fun consumeOpenPagePickerRequest(): Boolean {
+        if (!prefs().getBoolean(KEY_PAGE_PICKER_OPEN_REQUEST, false)) return false
+        prefs().edit().putBoolean(KEY_PAGE_PICKER_OPEN_REQUEST, false).apply()
+        return true
+    }
+
+    // ── Wireless display ──────────────────────────────────────────────────
+
+    /** Extend shows the page after the current one; mimic shows the current one. */
+    fun getWirelessDisplayMode(): String =
+        prefs().getString(KEY_WIRELESS_DISPLAY_MODE, WIRELESS_DISPLAY_MIMIC)
+            ?.takeIf { it == WIRELESS_DISPLAY_EXTEND || it == WIRELESS_DISPLAY_MIMIC }
+            ?: WIRELESS_DISPLAY_MIMIC
+
+    fun setWirelessDisplayMode(value: String) =
+        prefs().edit().putString(
+            KEY_WIRELESS_DISPLAY_MODE,
+            if (value == WIRELESS_DISPLAY_EXTEND) WIRELESS_DISPLAY_EXTEND else WIRELESS_DISPLAY_MIMIC,
+        ).apply()
+
+    fun getWirelessDisplayTargetIp(): String =
+        prefs().getString(KEY_WIRELESS_DISPLAY_IP, "") ?: ""
+
+    fun getWirelessDisplayTargetName(): String =
+        prefs().getString(KEY_WIRELESS_DISPLAY_NAME, "") ?: ""
+
+    fun setWirelessDisplayTarget(ip: String, name: String) {
+        prefs().edit()
+            .putString(KEY_WIRELESS_DISPLAY_IP, ip)
+            .putString(KEY_WIRELESS_DISPLAY_NAME, name)
+            .apply()
+    }
+
+    fun clearWirelessDisplayTarget() {
+        prefs().edit()
+            .remove(KEY_WIRELESS_DISPLAY_IP)
+            .remove(KEY_WIRELESS_DISPLAY_NAME)
+            .apply()
+    }
+
+    // ── Remote pointer ────────────────────────────────────────────────────
+
+    /**
+     * The trusted device the Mouse page is controlling, by fingerprint.
+     *
+     * A FINGERPRINT, NOT AN ADDRESS. The address changes with every DHCP lease, and a pointer that
+     * followed the old one would start clicking on whichever device inherited it. Empty means the
+     * page picks the first confirmed device instead.
+     */
+    fun getPointerTargetFingerprint(): String =
+        prefs().getString(KEY_POINTER_TARGET, "") ?: ""
+
+    fun setPointerTargetFingerprint(value: String) =
+        prefs().edit().putString(KEY_POINTER_TARGET, value).apply()
+
+    /**
+     * How the Mouse page reaches the target.
+     *
+     * WIFI is the meshnet the pairing already runs on. USB is the USB network link, which exists
+     * only while the cable is connected and tethering is on; [RemotePointer] falls back to Wi-Fi
+     * rather than dropping an event when the cable is not there.
+     */
+    fun getPointerTransport(): String =
+        prefs().getString(KEY_POINTER_TRANSPORT, POINTER_TRANSPORT_WIFI) ?: POINTER_TRANSPORT_WIFI
+
+    fun setPointerTransport(value: String) =
+        prefs().edit().putString(
+            KEY_POINTER_TRANSPORT,
+            if (value == POINTER_TRANSPORT_USB) POINTER_TRANSPORT_USB else POINTER_TRANSPORT_WIFI,
+        ).apply()
+
+    /** True when the Mouse page draws a glowing touchpad instead of the mouse body. */
+    fun getMouseTouchpad(): Boolean =
+        prefs().getBoolean(KEY_MOUSE_TOUCHPAD, false)
+
+    fun setMouseTouchpad(value: Boolean) =
+        prefs().edit().putBoolean(KEY_MOUSE_TOUCHPAD, value).apply()
+
+    /** The palette the Mouse page's RGB glow uses. See `MouseGlow`. */
+    fun getMouseColorStyle(): String =
+        prefs().getString(KEY_MOUSE_COLOR_STYLE, "rainbow") ?: "rainbow"
+
+    fun setMouseColorStyle(value: String) =
+        prefs().edit().putString(KEY_MOUSE_COLOR_STYLE, value).apply()
+
+    /** The motion the Mouse page's RGB glow uses. See `MouseGlow`. */
+    fun getMouseColorFlow(): String =
+        prefs().getString(KEY_MOUSE_COLOR_FLOW, "liquid") ?: "liquid"
+
+    fun setMouseColorFlow(value: String) =
+        prefs().edit().putString(KEY_MOUSE_COLOR_FLOW, value).apply()
+
+    // ── Desktop location ──────────────────────────────────────────────────
+
+    /**
+     * The position a desktop shares when location sharing is on.
+     *
+     * A desktop has no GPS, so this is a place the user picked on the map. Stored as ordinary
+     * settings rather than a sealed file because it is not a tracked position: it is a label the
+     * user chose, and the sealed location cache still protects every fix received from elsewhere.
+     */
+    fun getDesktopLatitude(): Double? =
+        prefs().getFloat(KEY_DESKTOP_LATITUDE, Float.NaN).takeIf { it.isFinite() }?.toDouble()
+
+    fun getDesktopLongitude(): Double? =
+        prefs().getFloat(KEY_DESKTOP_LONGITUDE, Float.NaN).takeIf { it.isFinite() }?.toDouble()
+
+    fun getDesktopLocationLabel(): String =
+        prefs().getString(KEY_DESKTOP_LOCATION_LABEL, "") ?: ""
+
+    fun setDesktopLocation(latitude: Double?, longitude: Double?, label: String) {
+        val edit = prefs().edit()
+        if (latitude == null || longitude == null) {
+            edit.remove(KEY_DESKTOP_LATITUDE).remove(KEY_DESKTOP_LONGITUDE)
+                .remove(KEY_DESKTOP_LOCATION_LABEL)
+        } else {
+            edit.putFloat(KEY_DESKTOP_LATITUDE, latitude.toFloat())
+                .putFloat(KEY_DESKTOP_LONGITUDE, longitude.toFloat())
+                .putString(KEY_DESKTOP_LOCATION_LABEL, label)
+        }
+        edit.apply()
+    }
+
     // ── The lock screen ────────────────────────────────────────────────────
 
     /**
@@ -1973,8 +2254,13 @@ object PrismSettings {
     fun setLockScreenEnabled(value: Boolean) =
         prefs().edit().putBoolean(KEY_LOCKSCREEN, value).apply()
 
-    /** Whether the lock offers fingerprint unlock, when the device has a sensor. */
-    fun getLockBiometric(): Boolean = prefs().getBoolean(KEY_LOCK_BIOMETRIC, true)
+    /**
+     * Whether the lock offers fingerprint unlock, when the device has a sensor.
+     *
+     * Off unless the user turns it on. It used to default to true and was never written, so the
+     * setting existed only as a value nothing in the UI could change.
+     */
+    fun getLockBiometric(): Boolean = prefs().getBoolean(KEY_LOCK_BIOMETRIC, false)
 
     fun setLockBiometric(value: Boolean) =
         prefs().edit().putBoolean(KEY_LOCK_BIOMETRIC, value).apply()
@@ -2433,11 +2719,27 @@ object PrismSettings {
         prefs().edit().putBoolean(KEY_AGENTIC_ENABLED, value).apply()
 
     /**
-     * Which imported "syntax" (custom prompt-injection + tool-call extraction format) to use.
-     * Null means "use the backend's native structured tool-calling" (Cloud/Ollama's own `tools`
-     * request field) -- for local/GGUF models there is no native tool-calling API at all, so a
-     * syntax is *required* for local tool use; if none is selected, AgenticEngine just skips
-     * tool injection for local mode rather than failing.
+     * Whether the context_offload / access_context_part pair is offered to models.
+     *
+     * Separate from [getAgenticToolsEnabled] because it is a privacy decision rather than a
+     * capability one: offloading writes whatever the model is given onto disk, and a user may
+     * want tools without wanting a model deciding what to keep. Off by default; the tools are not
+     * even shown to a model until it is on.
+     */
+    fun getContextOffloadEnabled(): Boolean =
+        prefs().getBoolean(KEY_CONTEXT_OFFLOAD_ENABLED, false)
+
+    fun setContextOffloadEnabled(value: Boolean) =
+        prefs().edit().putBoolean(KEY_CONTEXT_OFFLOAD_ENABLED, value).apply()
+
+    /**
+     * Which "syntax" (prompt-injection + tool-call extraction format) to use.
+     *
+     * Null means "use the backend's native structured tool-calling" -- Cloud and Ollama have a real
+     * `tools` request field. A local/GGUF model has no such field, so with nothing selected
+     * [AgenticEngine] falls back to [com.prism.launcher.agentic.AgenticBuiltinSyntax.DEFAULT]
+     * rather than running a turn in which the tools are never mentioned. Selecting an imported
+     * profile, or [com.prism.launcher.agentic.AgenticBuiltinSyntax.ID] explicitly, always wins.
      */
     fun getActiveAgenticSyntaxId(): String? =
         prefs().getString(KEY_ACTIVE_AGENTIC_SYNTAX_ID, null)
@@ -2546,6 +2848,52 @@ object PrismSettings {
             .apply()
     }
 
+    // ── Clipboard ───────────────────────────────────────────────────────────
+
+    /**
+     * Whether Prism should watch the clipboard from the background so a copy reaches paired
+     * devices immediately, instead of waiting for the launcher to be opened again.
+     *
+     * OFF BY DEFAULT. It is only half a feature on its own -- see
+     * [com.prism.launcher.clipboard.ClipboardWatchPolicy] for the keyboard requirement Android
+     * imposes -- and it costs a persistent notification, so it is something the user turns on
+     * knowing what it buys rather than something that appears on first launch.
+     */
+    fun getClipboardBackgroundWatch(): Boolean =
+        prefs().getBoolean(KEY_CLIPBOARD_BACKGROUND_WATCH, false)
+
+    fun setClipboardBackgroundWatch(value: Boolean) =
+        prefs().edit().putBoolean(KEY_CLIPBOARD_BACKGROUND_WATCH, value).apply()
+
+    /**
+     * Whether the camera roll is backed up to this device and to every trusted device on the mesh.
+     *
+     * OFF BY DEFAULT, and the switch lives under Other because it is a privacy decision before it
+     * is a photo feature: turning it on copies every image and video on the device, encrypted with
+     * the wallet's photo key, onto other people's hardware -- the user's own hardware, but not this
+     * phone. See [com.prism.launcher.photos.PhotoBackup].
+     */
+    fun getPhotoBackup(): Boolean = prefs().getBoolean(KEY_PHOTO_BACKUP, false)
+
+    fun setPhotoBackup(value: Boolean) =
+        prefs().edit().putBoolean(KEY_PHOTO_BACKUP, value).apply()
+
+    /**
+     * The longest edge of a backed-up photo, in pixels.
+     *
+     * 2048 rather than the original: a 48-megapixel JPEG is tens of megabytes, and the backup's
+     * job is to survive the phone, not to be an archival master. The page says what it kept.
+     */
+    fun getPhotoBackupMaxEdge(): Int =
+        prefs().getInt(KEY_PHOTO_BACKUP_MAX_EDGE, 2048).coerceIn(640, 8192)
+
+    fun setPhotoBackupMaxEdge(value: Int) =
+        prefs().edit().putInt(KEY_PHOTO_BACKUP_MAX_EDGE, value.coerceIn(640, 8192)).apply()
+
+    /** JPEG quality for a backed-up photo, 40..95. */
+    fun getPhotoBackupQuality(): Int =
+        prefs().getInt(KEY_PHOTO_BACKUP_QUALITY, 82).coerceIn(40, 95)
+
     private fun prefs() =
         PrismPlatform.host.prefs(PREFS)
 
@@ -2555,6 +2903,10 @@ object PrismSettings {
     private const val KEY_ICON_PACK_PACKAGE  = "icon_pack_package"
     private const val KEY_DEFAULT_PAGE       = "default_page"
     private const val KEY_SHOW_DRAWER_LABELS = "show_drawer_labels"
+    private const val KEY_CLIPBOARD_BACKGROUND_WATCH = "clipboard_background_watch"
+    private const val KEY_PHOTO_BACKUP = "photo_backup"
+    private const val KEY_PHOTO_BACKUP_MAX_EDGE = "photo_backup_max_edge"
+    private const val KEY_PHOTO_BACKUP_QUALITY = "photo_backup_quality"
     private const val KEY_SEARCH_ENGINE      = "search_engine"
     private const val KEY_PRISM_SEARCH_PORT  = "prism_search_port"
     private const val KEY_SEARCH_CRAWL_HOURS = "search_crawl_interval_hours"
@@ -2668,6 +3020,7 @@ object PrismSettings {
     private const val KEY_AI_BACKEND           = "ai_backend_mode"
     private const val KEY_NEBULA_INTERVAL_HOURS = "nebula_generation_interval_hours"
     private const val KEY_AGENTIC_ENABLED       = "agentic_tools_enabled"
+    private const val KEY_CONTEXT_OFFLOAD_ENABLED = "context_offload_enabled"
     private const val KEY_ACTIVE_AGENTIC_SYNTAX_ID = "active_agentic_syntax_id"
     
     private const val KEY_DNS_PROXY_ENABLED  = "dns_proxy_enabled"
@@ -2735,6 +3088,28 @@ object PrismSettings {
     private const val KEY_HISTORY_ENABLED        = "history_enabled"
     private const val KEY_HISTORY_TOOL           = "history_tool_enabled"
     private const val KEY_ONBOARDING_SEEN        = "onboarding_seen"
+    private const val KEY_PAGE_PICKER_SWIPE      = "page_picker_swipe"
+    private const val KEY_PAGE_PICKER_SENSITIVITY = "page_picker_sensitivity"
+    private const val KEY_PAGE_PICKER_FROM_SETTINGS = "page_picker_from_settings"
+    private const val KEY_PAGE_PICKER_OPEN_REQUEST = "page_picker_open_request"
+    const val WIRELESS_DISPLAY_EXTEND = "extend"
+    const val WIRELESS_DISPLAY_MIMIC = "mimic"
+    private const val KEY_WIRELESS_DISPLAY_MODE   = "wireless_display_mode"
+    private const val KEY_WIRELESS_DISPLAY_IP     = "wireless_display_ip"
+    private const val KEY_WIRELESS_DISPLAY_NAME   = "wireless_display_name"
+    private const val KEY_POINTER_TARGET         = "pointer_target_fingerprint"
+    private const val KEY_POINTER_TRANSPORT      = "pointer_transport"
+    private const val KEY_MOUSE_TOUCHPAD         = "mouse_touchpad"
+    private const val KEY_MOUSE_COLOR_STYLE      = "mouse_color_style"
+    private const val KEY_MOUSE_COLOR_FLOW       = "mouse_color_flow"
+    private const val KEY_DESKTOP_LATITUDE       = "desktop_location_latitude"
+    private const val KEY_DESKTOP_LONGITUDE      = "desktop_location_longitude"
+    private const val KEY_DESKTOP_LOCATION_LABEL = "desktop_location_label"
+
+    const val POINTER_TRANSPORT_WIFI = "wifi"
+    const val POINTER_TRANSPORT_USB = "usb"
+
+    const val PAGE_PICKER_SENSITIVITY_DEFAULT = 25
     private const val KEY_DURESS_ACTIVE          = "duress_active"
     private const val KEY_LOCKSCREEN             = "lockscreen_enabled"
     private const val KEY_LOCK_BIOMETRIC         = "lock_biometric"
@@ -2751,11 +3126,16 @@ object PrismSettings {
     private const val KEY_DICTATION_ENGINE       = "dictation_engine_id"
     private const val KEY_WHISPER_MODEL          = "whisper_model_path"
     private const val KEY_SMS_RELAY              = "sms_relay_enabled"
+    private const val KEY_MESSAGING_BRIDGES_SEEN = "messaging_bridges_seen"
+    private const val KEY_LOCATION_SHARING      = "location_sharing_enabled"
+    private const val KEY_LOCATION_FINGERPRINTS = "location_sharing_fingerprints"
+    private const val KEY_MESH_CALL_WARNING    = "mesh_call_warning_seen"
     private const val KEY_CLOUD_ENABLED          = "cloud_enabled"
     private const val KEY_CLOUD_REPLICAS         = "cloud_replicas"
     private const val KEY_CLOUD_SELL_STORAGE     = "cloud_sell_storage"
     private const val KEY_CLOUD_STORAGE_QUOTA    = "cloud_storage_quota_mb"
     private const val KEY_WINDOWS_MODE           = "windows_mode"
+    private const val KEY_WINDOWED_PAGES         = "windowed_pages"
     private const val KEY_WINDOWS_LAYER_URL      = "windows_layer_url"
     private const val KEY_NETWORK_STORAGES       = "network_storages"
     const val KEY_ACCESS_POINTS                 = "access_points"
@@ -2766,6 +3146,8 @@ object PrismSettings {
     private const val KEY_VIRTUALIZE_ANDROID_APPS = "virtualize_android_apps"
     private const val KEY_VIRT_ISO_PATH          = "virt_iso_path"
     private const val KEY_THEME_MODE             = "theme_mode"
+    private const val KEY_THEME_ID               = "theme_id"
+    private const val KEY_THEME_REVISION         = "theme_revision"
     private const val KEY_DESKTOP_MOBILE_MODE    = "desktop_mobile_mode"
     private const val KEY_WALLPAPER_PATH         = "wallpaper_path"
     private const val KEY_WALLPAPER_DIM          = "wallpaper_dim"

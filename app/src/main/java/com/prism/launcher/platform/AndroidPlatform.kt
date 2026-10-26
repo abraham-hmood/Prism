@@ -30,6 +30,9 @@ class AndroidHost(context: Context) : PlatformHost {
 
     override fun dataDir(): File = app.filesDir
 
+    /** Not backed up by Android; see [PlatformHost.noBackupDir]. */
+    override fun noBackupDir(): File = app.noBackupFilesDir
+
     override fun cacheDir(): File = app.cacheDir
 
     /**

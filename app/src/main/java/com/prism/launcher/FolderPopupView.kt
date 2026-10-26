@@ -1,6 +1,7 @@
 package com.prism.launcher
 
 import android.content.Context
+import android.graphics.drawable.GradientDrawable
 import android.view.DragEvent
 import android.view.LayoutInflater
 import android.view.View
@@ -12,7 +13,27 @@ import android.widget.TextView
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.prism.launcher.databinding.ViewFolderPopupBinding
+import com.prism.launcher.nora.IosUi
+import com.prism.launcher.theme.ThemeSkin
 import java.io.File
+
+/**
+ * One row inside a folder popup: the item itself, and the `.link` file that holds it when the
+ * folder is a virtual Prism folder.
+ *
+ * The link file is what makes dragging an item out a MOVE. The drop target cannot know where the
+ * source came from -- a folder listing, another folder, the desktop -- so the drag carries the
+ * file to delete once the drop has succeeded.
+ */
+data class FolderEntry(val item: DesktopItem, val linkFile: File?)
+
+/** The `localState` of a drag that started inside a folder popup. */
+class FolderDragSource(val item: DesktopItem, private val linkFile: File?) {
+    /** Removes the source shortcut after a successful drop, so the item moved rather than copied. */
+    fun consume() {
+        linkFile?.delete()
+    }
+}
 
 class FolderPopupView(
     context: Context,
@@ -33,12 +54,21 @@ class FolderPopupView(
         binding.folderPopupRoot.setOnClickListener { onDismiss() }
         binding.folderCard.setOnClickListener { /* consume */ }
 
-        val glowColor = PrismSettings.getGlowColor()
-        binding.folderCard.background = NeonGlowDrawable(
-            color = glowColor,
-            cornerRadius = 32f * resources.displayMetrics.density,
-            strokeWidth = 4f * resources.displayMetrics.density
-        )
+        // The card is a themed panel first; the glow is a foreground decoration, so a theme
+        // without elevation still gets an opaque, readable folder instead of a bare outline.
+        val mode = IosUi.mode(context)
+        binding.folderCard.background = GradientDrawable().apply {
+            setColor(IosUi.cardBackground(context))
+            cornerRadius = IosUi.dp(context, mode.shape.card.toFloat()).toFloat()
+            if (mode.shape.border > 0) {
+                setStroke(
+                    IosUi.dp(context, mode.shape.border.toFloat()),
+                    IosUi.separator(context),
+                )
+            }
+        }
+        binding.folderCard.foreground = ThemeSkin.glowDrawable(context, mode.shape.card.toFloat(), 4f)
+        binding.folderPopupRoot.setBackgroundColor(mode.palette.overlay.toInt())
 
         showFolder(rootFolder, isRoot = true)
     }
@@ -106,8 +136,8 @@ class FolderPopupView(
         return true
     }
 
-    private fun resolveFolderContents(ctx: Context, item: DesktopItem): List<DesktopItem> {
-        val result = mutableListOf<DesktopItem>()
+    private fun resolveFolderContents(ctx: Context, item: DesktopItem): List<FolderEntry> {
+        val result = mutableListOf<FolderEntry>()
         android.util.Log.d("PrismFolder", "Opening Folder: $item")
 
         when (item) {
@@ -124,7 +154,9 @@ class FolderPopupView(
                 files?.forEach { file ->
                     if (file.name.endsWith(".link")) {
                         try {
-                            DesktopItem.deserialize(file.readText())?.let { result.add(it) }
+                            DesktopItem.deserialize(file.readText())?.let {
+                                result.add(FolderEntry(it, file))
+                            }
                         } catch (e: Exception) {
                             android.util.Log.e("PrismFolder", "Failed to read: ${file.name}", e)
                         }
@@ -133,8 +165,12 @@ class FolderPopupView(
             }
             is DesktopItem.DirectoryRef -> {
                 File(item.absolutePath).listFiles()?.forEach { file ->
-                    if (file.isDirectory) result.add(DesktopItem.DirectoryRef(file.absolutePath, file.name))
-                    else result.add(DesktopItem.FileRef(file.absolutePath))
+                    val entry = if (file.isDirectory) {
+                        DesktopItem.DirectoryRef(file.absolutePath, file.name)
+                    } else {
+                        DesktopItem.FileRef(file.absolutePath)
+                    }
+                    result.add(FolderEntry(entry, null))
                 }
             }
             else -> {}
@@ -149,7 +185,7 @@ class FolderPopupView(
 // ─────────────────────────────────────────────────────────────────────────────
 
 class FolderInternalAdapter(
-    private val items: List<DesktopItem>,
+    private val items: List<FolderEntry>,
     private val onLaunchApp: (android.content.ComponentName) -> Unit,
     private val onLaunchFile: (String) -> Unit,
     private val onLaunchFolder: (DesktopItem) -> Unit,
@@ -165,7 +201,8 @@ class FolderInternalAdapter(
     }
 
     override fun onBindViewHolder(holder: VH, position: Int) {
-        val item = items[position]
+        val entry = items[position]
+        val item = entry.item
         val b = com.prism.launcher.databinding.ItemDesktopCellBinding.bind(holder.itemView)
         val ctx = holder.itemView.context
         val pm = ctx.packageManager
@@ -230,11 +267,15 @@ class FolderInternalAdapter(
             onDragStarted()
             val clip = android.content.ClipData.newPlainText("prism_desktop_item", item.serialize())
             val shadow = android.view.View.DragShadowBuilder(b.icon)
+            // The source marker travels with the drag so the drop target can delete the `.link`
+            // once it has taken the item -- that is what turns "drag out" into a move rather
+            // than a duplicate left behind in the folder.
+            val source = FolderDragSource(item, entry.linkFile)
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
-                holder.itemView.startDragAndDrop(clip, shadow, item, android.view.View.DRAG_FLAG_GLOBAL)
+                holder.itemView.startDragAndDrop(clip, shadow, source, android.view.View.DRAG_FLAG_GLOBAL)
             } else {
                 @Suppress("DEPRECATION")
-                holder.itemView.startDrag(clip, shadow, item, 0)
+                holder.itemView.startDrag(clip, shadow, source, 0)
             }
             true
         }

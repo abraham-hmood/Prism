@@ -24,8 +24,14 @@ object LocalImageService {
         val file = File(modelPath)
         if (!file.exists()) throw IllegalStateException("Model file not found")
 
+        // MEDIAPIPE WANTS A DIRECTORY, NOT THE FILE. The import flow stores one file -- a `.task`
+        // bundle or a bare diffusion checkpoint -- and handing that absolute path to
+        // setImageGeneratorModelDirectory meant MediaPipe looked for a directory that does not
+        // exist, failed to load, and generation returned null with only a stack trace. The parent
+        // directory is what the API documents, and it is where the bundle actually lives.
+        val modelDirectory = if (file.isDirectory) file else file.parentFile ?: file
         val options = ImageGeneratorOptions.builder()
-            .setImageGeneratorModelDirectory(modelPath) // SD typically expects a directory or bundle
+            .setImageGeneratorModelDirectory(modelDirectory.absolutePath)
             .build()
 
         imageGenerator?.close()

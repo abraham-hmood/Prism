@@ -1,0 +1,13 @@
+{
+  "name": "viewprobe",
+  "publisher": "prismtest",
+  "displayName": "View Probe",
+  "version": "1.0.0",
+  "engines": {"vscode": "^1.80.0"},
+  "browser": "./extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "contributes": {
+    "commands": [{"command": "viewprobe.open", "title": "View Probe: Open"}],
+    "views": {"explorer": [{"id": "viewprobe.sidebar", "type": "webview", "name": "Probe"}]}
+  }
+}

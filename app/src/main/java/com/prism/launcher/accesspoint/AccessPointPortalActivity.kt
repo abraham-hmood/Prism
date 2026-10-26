@@ -270,13 +270,18 @@ class AccessPointPortalActivity : PrismBaseActivity() {
 
                 if (result.isSuccess) {
                     dnsOverrideService.startDnsServer(ap.gatewayIp)
-                    networkIsolationEngine.applyIsolationRules(
+                    // A failure here is a limitation, not a crash: isolation needs root, and the
+                    // hotspot still works without it. Say which of the two happened instead of
+                    // discarding the Result, which is what this used to do.
+                    val isolation = networkIsolationEngine.applyIsolationRules(
                         ap.id, ap.gatewayIp, "10.8.0.1", ap.ipRange
                     )
                     val dnsPort = DnsOverrideService.boundPort
                     val dnsNote = if (dnsPort == 53) "" else
                         "\nDNS on port $dnsPort — set manually on connected devices"
-                    statusText.text = "✓ ${result.getOrDefault("${ap.ssidName} started")}$dnsNote"
+                    val isolationNote = if (isolation.isSuccess) "" else
+                        "\nIsolation off: ${isolation.exceptionOrNull()?.message ?: "root required"}"
+                    statusText.text = "✓ ${result.getOrDefault("${ap.ssidName} started")}$dnsNote$isolationNote"
                 } else {
                     statusText.text = "✗ ${result.exceptionOrNull()?.message ?: "Failed to start ${ap.ssidName}"}"
                 }
@@ -297,6 +302,12 @@ class AccessPointPortalActivity : PrismBaseActivity() {
             try {
                 loadingProgress.visibility = android.view.View.VISIBLE
                 val result = accessPointManager.stopAccessPoint(ap.id)
+                if (result.isSuccess) {
+                    // The DNS listener belongs to the hotspot: leaving it bound means a stopped
+                    // access point still answers on the gateway for the rest of the process.
+                    dnsOverrideService.stopDnsServer()
+                    networkIsolationEngine.removeIsolationRules(ap.id)
+                }
                 statusText.text = if (result.isSuccess) {
                     "✓ ${ap.ssidName} stopped"
                 } else {

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Debug-only components.
+
+    Kept out of the main manifest on purpose: VirtualAppCheckReceiver runs the code of whatever
+    package it is handed, so it must not exist in a build that ships. It lives in the same process as
+    a virtualized app (:virtualapp), because that is the process allowed to execute guest code.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+
+        <receiver
+            android:name=".virtualapp.VirtualAppCheckReceiver"
+            android:exported="true"
+            android:process=":virtualapp">
+            <intent-filter>
+                <action android:name="com.prism.launcher.PROBE_VIRTUALIZATION" />
+                <action android:name="com.prism.launcher.PROBE_ALL_VIRTUALIZATION" />
+                <action android:name="com.prism.launcher.RESET_VIRTUALIZATION_CHECK" />
+            </intent-filter>
+        </receiver>
+
+        <!--
+            The same probe, reached by starting a screen instead of sending a broadcast. Android
+            will not create a background process for a broadcast once an app has been put to sleep,
+            which is what stopped the full-device sweep partway through; an activity start is a
+            visible request and is not refused. Debug only, for the same reason the receiver is.
+        -->
+        <activity
+            android:name=".virtualapp.VirtualAppCheckActivity"
+            android:exported="true"
+            android:process=":virtualapp"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+    </application>
+
+</manifest>

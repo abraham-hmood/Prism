@@ -82,8 +82,14 @@ object ModelPayments {
         if (listing.priceMinor.signum() <= 0) {
             return Result.Failed("Free listings are not allowed.")
         }
+        // ONLY A LIVE PURCHASE BLOCKS A RE-BUY. This used to block on anything that was not
+        // CANCELLED, which included a REFUND_REQUESTED purchase whose file had already been handed
+        // back -- so a buyer who refunded a model could never buy it again, and the error said they
+        // already owned something they had returned.
         if (ModelPurchaseLedger.all().any {
-                it.listingId == listing.id && it.state != ModelPurchaseLedger.State.CANCELLED
+                it.listingId == listing.id &&
+                    (it.state == ModelPurchaseLedger.State.HELD ||
+                        it.state == ModelPurchaseLedger.State.PAID)
             }
         ) {
             return Result.Failed("You have already bought this model.")

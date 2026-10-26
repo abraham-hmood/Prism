@@ -1,0 +1,10 @@
+prefix=C:/Program Files (x86)/nexus_core
+exec_prefix=C:/Program Files (x86)/nexus_core
+libdir=C:/Program Files (x86)/nexus_core/lib
+includedir=C:/Program Files (x86)/nexus_core/include
+
+Name: llama
+Description: Port of Facebook's LLaMA model in C/C++
+Version: 0.7.0-dev
+Libs: -L${libdir} -lggml -lggml-base -lllama
+Cflags: -I${includedir}

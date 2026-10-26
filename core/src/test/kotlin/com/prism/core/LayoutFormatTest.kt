@@ -132,6 +132,9 @@ class LayoutFormatTest {
             SlotAssignment.ModelStore to "model_store",
             SlotAssignment.AgenticTools to "agentic_tools",
             SlotAssignment.Wallet to "wallet",
+            SlotAssignment.Meshvoice to "meshvoice",
+            SlotAssignment.Maps to "maps",
+            SlotAssignment.Mouse to "mouse",
         )
         for ((slot, tag) in expected) {
             assertEquals(tag, slot.serialize(), "serialize")
@@ -202,6 +205,40 @@ class LayoutFormatTest {
             "file_explorer;desktop_grid;social",
             PrismPlatform.host.prefs(SlotPreferences.PREFS).getString("page_assignments_v2", null),
         )
+    }
+
+    /**
+     * A page's grid must follow the page when one is inserted before it or removed.
+     *
+     * This is the data-loss bug the audit named: grids are keyed `cells_page_N`, so an insert at
+     * the front used to hand every desktop its neighbour's icons and drop the last page's.
+     */
+    @Test
+    fun `page insertion and removal move the saved grids`() {
+        val prefs = SlotPreferences()
+        prefs.saveAssignments(
+            listOf(
+                SlotAssignment.DesktopGrid,
+                SlotAssignment.DesktopGrid,
+                SlotAssignment.DesktopGrid,
+            ),
+        )
+        DesktopShortcutStore(0).writeGrid(listOf(DesktopItem.App("a/One")))
+        DesktopShortcutStore(1).writeGrid(listOf(DesktopItem.App("b/Two")))
+        DesktopShortcutStore(2).writeGrid(listOf(DesktopItem.App("c/Three")))
+
+        // Inserting at the front makes room for page 0; the old pages move to 1, 2 and 3.
+        prefs.addAt(0, SlotAssignment.Browser)
+        assertNull(DesktopShortcutStore(0).readGrid(24)[0])
+        assertEquals(DesktopItem.App("a/One"), DesktopShortcutStore(1).readGrid(24)[0])
+        assertEquals(DesktopItem.App("b/Two"), DesktopShortcutStore(2).readGrid(24)[0])
+        assertEquals(DesktopItem.App("c/Three"), DesktopShortcutStore(3).readGrid(24)[0])
+
+        // Removing it closes the gap again.
+        prefs.removeAt(0)
+        assertEquals(DesktopItem.App("a/One"), DesktopShortcutStore(0).readGrid(24)[0])
+        assertEquals(DesktopItem.App("b/Two"), DesktopShortcutStore(1).readGrid(24)[0])
+        assertEquals(DesktopItem.App("c/Three"), DesktopShortcutStore(2).readGrid(24)[0])
     }
 
     /** Removal must never empty the rail; add/set address the list positionally. */

@@ -17,7 +17,11 @@ class ConnectedDevicesActivity : PrismBaseActivity() {
 
     private var accessPointId: Long = 0
     private var accessPointName: String = ""
-    
+
+    /** Owns the device table the page displays. A fresh instance per screen is enough: the table is
+     * rebuilt from the kernel on every load, so nothing has to survive an activity restart. */
+    private lateinit var accessPointManager: AccessPointManager
+
     private lateinit var devicesList: RecyclerView
     private lateinit var statusText: TextView
     private lateinit var networkIsolationEngine: NetworkIsolationEngine
@@ -28,6 +32,7 @@ class ConnectedDevicesActivity : PrismBaseActivity() {
         accessPointId = intent.getLongExtra("accessPointId", 0)
         accessPointName = intent.getStringExtra("accessPointName") ?: "Unknown"
         networkIsolationEngine = NetworkIsolationEngine(this)
+        accessPointManager = AccessPointManager(this)
 
         setupUI()
         loadConnectedDevices()
@@ -86,12 +91,26 @@ class ConnectedDevicesActivity : PrismBaseActivity() {
         setContentView(scrollView)
     }
 
+    /**
+     * The devices the access point can see, from the kernel's neighbour table.
+     *
+     * THIS USED TO BE `emptyList()`. The screen had a working adapter, block and limit actions, and
+     * literally nothing to act on — so every control was unreachable and the count always read zero.
+     * [AccessPointManager.getConnectedDevices] now fills the table from `/proc/net/arp` and says so
+     * when the table itself is unavailable, rather than showing an empty list that looks like an empty
+     * network.
+     */
     private fun loadConnectedDevices() {
         lifecycleScope.launch {
             try {
-                // In a real implementation, fetch devices from AccessPointManager
-                val devices = emptyList<ConnectedDevice>()
-                statusText.text = "Connected Devices: ${devices.size}"
+                val devices = accessPointManager.getConnectedDevices(accessPointId)
+                statusText.text = if (devices.isEmpty()) {
+                    "No devices visible. The access point's client list is not exposed by Android, " +
+                        "so this is read from the neighbour table: it fills in as clients send traffic, " +
+                        "and is unavailable on builds that hide the ARP table."
+                } else {
+                    "Connected Devices: ${devices.size}"
+                }
                 devicesList.adapter = ConnectedDevicesAdapter(devices) { device, action ->
                     when (action) {
                         "block" -> blockDevice(device)
@@ -130,7 +149,7 @@ class ConnectedDevicesActivity : PrismBaseActivity() {
             inputType = android.text.InputType.TYPE_CLASS_NUMBER
             setPadding(20, 20, 20, 20)
         }
-        AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Limit Bandwidth")
             .setMessage("Enter bandwidth limit in Kbps (0 = unlimited)")
             .setView(input)
@@ -154,7 +173,7 @@ class ConnectedDevicesActivity : PrismBaseActivity() {
     }
 
     private fun disconnectDevice(device: ConnectedDevice) {
-        AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Disconnect Device")
             .setMessage("Disconnect ${device.deviceName}?")
             .setPositiveButton("Yes") { _, _ -> blockDevice(device) }

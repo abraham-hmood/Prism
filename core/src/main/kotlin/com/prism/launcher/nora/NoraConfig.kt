@@ -519,7 +519,29 @@ object NoraConfig {
     fun weightsDir(): File = File(rootDir(), "connectome").also { it.mkdirs() }
     fun outputDir(): File = File(rootDir(), "output").also { it.mkdirs() }
     fun feedbackDir(): File = File(rootDir(), "feedback").also { it.mkdirs() }
-    fun chatFile(): File = File(rootDir(), "conversation.json")
+    /**
+     * Nora's transcript.
+     *
+     * APP-PRIVATE, NOT UNDER DOCUMENTS. `rootDir()` is /sdcard/Prism, which needs All Files
+     * Access on Android 11+. Without that grant `mkdirs()` fails, every append logged an error and
+     * the next launch read an empty conversation -- the chat looked like it had never been saved.
+     * Datasets, weights and generated output stay in Documents because the user is meant to reach
+     * them; the transcript is the app's own state and belongs where the app can always write it.
+     *
+     * The old file is copied across once, so an install that COULD write there keeps its history.
+     */
+    fun chatFile(): File {
+        val target = File(File(PrismPlatform.host.dataDir(), "Nora"), "conversation.json")
+        val legacy = File(rootDir(), "conversation.json")
+        if (!target.exists() && legacy.isFile) {
+            runCatching {
+                target.parentFile?.mkdirs()
+                legacy.copyTo(target, overwrite = false)
+            }
+        }
+        target.parentFile?.mkdirs()
+        return target
+    }
 
     /**
      * Whether training presents corrupted images and learns to restore them.

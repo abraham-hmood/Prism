@@ -55,6 +55,9 @@ class StratumClient(
     private var writer: BufferedWriter? = null
     private val nextId = AtomicLong(1)
 
+    /** Request ids awaiting a boolean reply, so only mining.submit results move the share count. */
+    private val pendingSubmits = java.util.concurrent.ConcurrentHashMap<Long, Boolean>()
+
     @Volatile var extraNonce1: String = ""
         private set
     @Volatile var extraNonce2Size: Int = 4
@@ -136,22 +139,36 @@ class StratumClient(
                     extraNonce1 = result.optString(1, "")
                     extraNonce2Size = result.optInt(2, 4).coerceIn(1, 8)
                 } else if (result is Boolean) {
-                    onAccepted?.invoke(result)
+                    // ONLY A SUBMIT REPLY IS A SHARE RESULT. `mining.authorize` answers `true` on
+                    // every connect, and the old code counted that as an accepted share -- so a
+                    // freshly connected miner showed one share before it had hashed anything, and
+                    // `mining.resume` or a subscribe acknowledgement could do the same. The id
+                    // map is what makes this response answerable.
+                    val id = message.optLong("id", -1L)
+                    if (pendingSubmits.remove(id) != null) onAccepted?.invoke(result)
                 }
-                message.optJSONObject("error")?.let {
-                    lastError = it.optString("message", "pool returned an error")
+                message.optJSONObject("error")?.let { error ->
+                    lastError = error.optString("message", "pool returned an error")
+                    // A REJECTED SUBMIT IS A RESULT TOO. The pool answers errors with the same
+                    // id and no `result` field, so without this a share that was refused simply
+                    // vanished: neither accepted nor rejected, and the stale id stayed pending.
+                    val id = message.optLong("id", -1L)
+                    if (pendingSubmits.remove(id) != null) onAccepted?.invoke(false)
                 }
             }
         }
     }
 
     fun submit(jobId: String, extraNonce2: String, nTime: String, nonce: String): Boolean = try {
+        val id = nextId.getAndIncrement()
+        pendingSubmits[id] = true
         send(
-            JSONObject().put("id", nextId.getAndIncrement()).put("method", "mining.submit")
+            JSONObject().put("id", id).put("method", "mining.submit")
                 .put("params", JSONArray(listOf(workerName, jobId, extraNonce2, nTime, nonce)))
         )
         true
     } catch (e: Exception) {
+        pendingSubmits.clear()
         lastError = e.message
         false
     }
@@ -166,6 +183,7 @@ class StratumClient(
     }
 
     fun close() {
+        pendingSubmits.clear()
         runCatching { socket?.close() }
         socket = null
         reader = null

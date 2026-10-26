@@ -48,8 +48,18 @@ object MeshCore {
     const val PROTOCOL_HEADER = "PRISM"
     const val DEFAULT_PORT = 8081
 
-    /** How long a peer is kept after its last packet. */
-    private const val PEER_TIMEOUT_MS = 90_000L
+    /**
+     * How long a peer stays in the table after its last packet.
+     *
+     * THIS IS A PRESENCE LEASE, NOT A CACHE TTL. A device that is listed as online and is not there
+     * is worse than one that is missing: the user presses it, nothing happens, and there is no way
+     * to tell a sleeping laptop from a forgotten pairing. Gossip is every fifteen seconds, so this
+     * allows two lost heartbeats before the peer is considered gone.
+     *
+     * IT WAS NINETY SECONDS, which was already generous; the Android service used five MINUTES,
+     * which is why a phone with Prism closed still showed as online. Both now use this one figure.
+     */
+    const val PEER_LEASE_MS = 45_000L
 
     /** Built-in protocol. Everything from 0x0C up belongs to features. */
     private const val OP_HEARTBEAT: Byte = 0x01
@@ -60,6 +70,19 @@ object MeshCore {
     private const val OP_DNS_SYNC_RESP: Byte = 0x09
     private const val OP_DISCOVERY_REQ: Byte = 0x0A
     private const val OP_HEARTBEAT_RESP: Byte = 0x0B
+
+    /**
+     * "I am going away."
+     *
+     * Sent once from [stop]. Without it a device that is shut down cleanly still lingers for the
+     * whole lease, which is the delay users noticed after closing Prism. The lease remains the
+     * authority for a device that was killed or lost its network; this only makes the ordinary
+     * case immediate.
+     *
+     * 0x07 is one of the three codes below 0x0C that nothing else uses. 0x0C was the obvious pick
+     * and is already the model-announce opcode, so this cannot simply follow the heartbeat run.
+     */
+    private const val OP_LEAVE: Byte = 0x07
 
     data class PeerInfo(
         @Volatile var lastSeen: Long,
@@ -88,6 +111,21 @@ object MeshCore {
     @Volatile var lastListenerError: String? = null
         private set
 
+    /**
+     * Why the last datagram failed to go out, and how many have failed.
+     *
+     * THE FAILURE USED TO BE INVISIBLE. `sendPacket` wrapped the send in `runCatching` and dropped
+     * the result, so a machine with a firewall, a closed socket or an unroutable address reported
+     * "mesh up" and an empty peer list with nothing to explain it. Android already counts these
+     * (`PrismMeshService.noteSendFailure`); this is the same counter on the shared transport, and it
+     * is what `MeshCore.listenerHealth()` and the diagnostics page read.
+     */
+    @Volatile var lastSendError: String? = null
+        private set
+
+    @Volatile var sendFailureCount: Long = 0L
+        private set
+
     // ── Platform hooks ─────────────────────────────────────────────────────
 
     /**
@@ -108,6 +146,11 @@ object MeshCore {
      *
      * Opcodes below 0x0C are refused: those are how the mesh keeps itself alive, and a platform that
      * overrode the heartbeat would produce a peer that joins and then stops gossiping.
+     *
+     * A REPLACEMENT IS LOGGED, because it used to be silent. Two features that both claimed an opcode
+     * is not a crash and not a compile error -- the second one simply took the first one's packets,
+     * and the symptom was a feature that worked until something else was enabled. Re-registering the
+     * SAME handler is how an install function that runs twice behaves, so that case stays quiet.
      */
     fun register(opcode: Byte, handler: OpcodeHandler): Boolean {
         if (opcode < 0x0C) {
@@ -117,7 +160,13 @@ object MeshCore {
             )
             return false
         }
-        handlers[opcode] = handler
+        val previous = handlers.put(opcode, handler)
+        if (previous != null && previous !== handler) {
+            PrismPlatform.log.warn(
+                TAG,
+                "Opcode 0x${opcode.toString(16)} changed hands; the previous handler will stop seeing it",
+            )
+        }
         return true
     }
 
@@ -197,6 +246,20 @@ object MeshCore {
         return true
     }
 
+    /**
+     * Whether the peer at [ip] is banned.
+     *
+     * THE GOSSIP PATH IS NOT ENOUGH. Kick and ban stopped datagrams from a node, but every other
+     * service this device exposes -- model download, generation, cloud -- is reached over an
+     * ordinary TCP connection to the proxy port, which knows the peer's ADDRESS and nothing else.
+     * A banned device could still open that connection and be served. This maps the address back to
+     * the node id the ban list is keyed by, so those hosts can refuse it.
+     */
+    fun isPeerBanned(ip: String): Boolean {
+        val nodeId = activePeers[ip]?.nodeId?.takeIf { it.isNotBlank() } ?: return false
+        return nodeId in PrismSettings.getBannedPrismNodeIds()
+    }
+
     private fun evictNode(nodeId: String, permanent: Boolean): Boolean {
         if (nodeId.isBlank()) return false
         val entry = activePeers.entries.firstOrNull { it.value.nodeId == nodeId } ?: return false
@@ -207,27 +270,43 @@ object MeshCore {
         return true
     }
 
-    fun peers(): Map<String, PeerInfo> = activePeers.toMap()
+    /** Peers whose lease has not run out, which is what every caller means by "a peer". */
+    private fun livePeers(): Map<String, PeerInfo> {
+        val cutoff = System.currentTimeMillis() - PEER_LEASE_MS
+        return activePeers.filterValues { it.lastSeen > cutoff }
+    }
 
-    fun peerCount(): Int = activePeers.size
+    fun peers(): Map<String, PeerInfo> = livePeers()
 
-    fun isPeer(ip: String): Boolean = activePeers.containsKey(normalise(ip))
+    fun peerCount(): Int = livePeers().size
+
+    /**
+     * Whether [ip] is a peer that is currently answering.
+     *
+     * PRESENCE, NOT MEMBERSHIP. The table holds an entry until the sweep notices it has gone quiet,
+     * and between those two moments a closed device would otherwise still read as active in the
+     * trusted-devices list. Checking the lease here means the answer changes the instant the lease
+     * expires rather than when the next gossip round happens to run.
+     */
+    fun isPeer(ip: String): Boolean {
+        val info = activePeers[normalise(ip)] ?: return false
+        return System.currentTimeMillis() - info.lastSeen <= PEER_LEASE_MS
+    }
 
     fun peerPort(ip: String): Int? = activePeers[normalise(ip)]?.port
 
     /** The lowest-latency healthy peer, for a caller that just needs somebody to ask. */
-    fun bestPeer(): String? {
-        if (activePeers.isEmpty()) return null
-        val cutoff = System.currentTimeMillis() - 60_000
-        val healthy = activePeers.entries.filter { it.value.lastSeen > cutoff }
-        if (healthy.isEmpty()) return activePeers.keys.firstOrNull()
-        return healthy.minByOrNull { it.value.latency }?.key
-    }
+    fun bestPeer(): String? =
+        livePeers().minByOrNull { it.value.latency }?.key
 
     fun listenerHealth(): String = when {
         !running -> "Not started."
         socket?.isClosed != false -> "Socket closed. ${lastListenerError.orEmpty()}"
-        else -> "Listening on UDP $boundPort · ${activePeers.size} peer(s)"
+        sendFailureCount == 0L -> "Listening on UDP $boundPort · ${activePeers.size} peer(s)"
+        else -> (
+            "Listening on UDP $boundPort · ${activePeers.size} peer(s) · " +
+                "$sendFailureCount send failure(s); last: ${lastSendError.orEmpty()}"
+            )
     }
 
     // ── Lifecycle ──────────────────────────────────────────────────────────
@@ -271,6 +350,11 @@ object MeshCore {
 
     @Synchronized
     fun stop() {
+        // Tell the peers first, while the socket is still open. A datagram send is synchronous, so
+        // the packets are on their way before the socket is closed underneath them.
+        activePeers.forEach { (ip, info) ->
+            sendPacket(ip, info.port, OP_LEAVE, localAnnouncement())
+        }
         running = false
         runCatching { socket?.close() }
         socket = null
@@ -333,12 +417,19 @@ object MeshCore {
 
             val now = System.currentTimeMillis()
             // Expire before gossiping, so a dead peer is not chosen as the one to talk to.
-            activePeers.entries.removeAll { now - it.value.lastSeen > PEER_TIMEOUT_MS }
+            activePeers.entries.removeAll { now - it.value.lastSeen > PEER_LEASE_MS }
 
             if (activePeers.isEmpty()) {
                 // Nothing known: broadcast again rather than sitting idle. A device that joined a network
                 // after Prism started would otherwise never be found.
+                //
+                // THE SLEEP IS NOT OPTIONAL. `continue` skips the sleep at the bottom of this loop, so a
+                // device with no peers -- a laptop on a network where nothing else runs Prism, which is
+                // the common case -- used to broadcast as fast as the CPU could build packets. That is a
+                // broadcast storm on the user's LAN and a core pinned at 100% for as long as the mesh was
+                // on. Discovery still goes out every interval, which is all it was ever meant to do.
                 sendDiscoveryBroadcast(boundPort)
+                runCatching { Thread.sleep(GOSSIP_INTERVAL_MS) }.onFailure { return }
                 continue
             }
             val target = activePeers.keys.randomOrNull() ?: continue
@@ -371,7 +462,7 @@ object MeshCore {
 
         // Our own broadcast coming back. Dropped before it becomes a peer entry for ourselves, which
         // would make the device gossip with itself and count itself in its own peer list.
-        if (MeshUtils.getAllLocalIps().contains(peerIp)) return
+        if (localIps().contains(peerIp)) return
 
         val command = data[5]
         val payload = String(data, 6, data.size - 6)
@@ -439,6 +530,9 @@ object MeshCore {
 
             OP_PEER_LIST_RESP -> ingestPeerList(payload)
 
+            // A clean shutdown, taken immediately rather than waiting out the lease.
+            OP_LEAVE -> activePeers.remove(peerIp)
+
             OP_DNS_SYNC_REQ -> {
                 runCatching { JSONObject(payload).optString("dns") }
                     .getOrNull()?.takeIf { it.isNotBlank() }
@@ -473,24 +567,30 @@ object MeshCore {
     }
 
     /**
-     * Adds peers a neighbour told us about.
+     * Probes peers a neighbour told us about.
      *
-     * Our own addresses are excluded, and so are peers already known — without the second check a
-     * peer-list round would re-send a discovery packet to every peer every time, which is the O(peers²)
-     * traffic the single-random-peer gossip exists to avoid.
+     * HEARSAY IS NOT PRESENCE. This used to insert each listed address straight into the peer table
+     * with a fresh timestamp, which made a device that had closed Prism look online to everybody
+     * that heard a third device mention it -- and, because each peer-list round re-stamped it, the
+     * ghost could outlive the real entry it was copied from. A listed address is now only a hint: we
+     * send it a heartbeat, and it becomes a peer when it answers for itself. The probe is rate
+     * limited per address so a stale list cannot turn into a packet storm.
      */
+    private val probedAt = ConcurrentHashMap<String, Long>()
+
     private fun ingestPeerList(payload: String) {
         val myIps = MeshUtils.getAllLocalIps()
+        val now = System.currentTimeMillis()
         payload.split(",").filter { it.isNotBlank() }.forEach { entry ->
             runCatching {
                 val parts = entry.split(":")
                 val ip = normalise(parts[0].trim())
                 val port = parts.getOrNull(1)?.trim()?.toIntOrNull() ?: DEFAULT_PORT
-                if (ip.isNotEmpty() && !myIps.contains(ip) && !activePeers.containsKey(ip)) {
-                    activePeers[ip] = PeerInfo(System.currentTimeMillis(), port)
-                    sendPacket(ip, port, OP_HEARTBEAT, "{}")
-                    requestDnsSync(ip)
-                }
+                if (ip.isEmpty() || myIps.contains(ip) || isPeer(ip)) return@runCatching
+                val lastProbe = probedAt[ip] ?: 0L
+                if (now - lastProbe < PROBE_INTERVAL_MS) return@runCatching
+                probedAt[ip] = now
+                sendPacket(ip, port, OP_HEARTBEAT, "{}")
             }
         }
     }
@@ -501,6 +601,25 @@ object MeshCore {
         val info = activePeers[normalise(targetIp)] ?: return
         val mine = runCatching { dnsProvider?.invoke() }.getOrNull() ?: return
         sendPacket(targetIp, info.port, OP_DNS_SYNC_REQ, """{"dns":$mine}""")
+    }
+
+    /**
+     * This machine's own addresses, refreshed at most every 1.5 seconds.
+     *
+     * EVERY packet used to enumerate the network interfaces to answer "is this one of mine?".
+     * That is cheap once and expensive at pointer rates: a drag sends a hundred packets a second,
+     * and the listener paid for an interface scan before it could inject any of them.
+     */
+    @Volatile private var localIpsAt = 0L
+    @Volatile private var localIpsCache: Set<String> = emptySet()
+
+    private fun localIps(): Set<String> {
+        val now = System.currentTimeMillis()
+        if (now - localIpsAt < 1_500L) return localIpsCache
+        val fresh = runCatching { MeshUtils.getAllLocalIps() }.getOrDefault(emptySet())
+        localIpsCache = fresh
+        localIpsAt = now
+        return fresh
     }
 
     /**
@@ -516,7 +635,11 @@ object MeshCore {
     }
 
     fun sendPacket(targetIp: String, targetPort: Int, command: Byte, payload: String) {
-        val live = socket ?: return
+        val live = socket
+        if (live == null || live.isClosed) {
+            noteSendFailure("socket is not open (mesh stopped or never started)")
+            return
+        }
         runCatching {
             val payloadBytes = payload.toByteArray()
             val data = ByteArray(6 + payloadBytes.size)
@@ -528,6 +651,21 @@ object MeshCore {
                 pendingRequests["$targetIp:$command"] = System.currentTimeMillis()
             }
             live.send(DatagramPacket(data, data.size, InetAddress.getByName(targetIp), targetPort))
+        }.onFailure { noteSendFailure(it.message ?: it.javaClass.simpleName) }
+    }
+
+    /**
+     * Counts a failed send and logs it sparingly.
+     *
+     * The first failure and then every fiftieth: a peer that has gone away produces one failure per
+     * gossip round for as long as it stays in the table, and logging each one would bury the first --
+     * which is the one that says what is actually wrong.
+     */
+    private fun noteSendFailure(reason: String) {
+        sendFailureCount += 1
+        if (sendFailureCount == 1L || sendFailureCount % 50L == 0L) {
+            lastSendError = reason
+            PrismPlatform.log.warn(TAG, "UDP send failed ($sendFailureCount so far): $reason")
         }
     }
 
@@ -590,6 +728,9 @@ object MeshCore {
 
     private const val GOSSIP_INTERVAL_MS = 15_000L
     private const val KICK_COOLDOWN_MS = 5 * 60 * 1000L
+
+    /** How often an address heard through the peer list may be probed. */
+    private const val PROBE_INTERVAL_MS = 30_000L
 
     /** Short enough that a newly discovered peer has a real latency figure almost immediately. */
     private const val FIRST_GOSSIP_DELAY_MS = 1_200L

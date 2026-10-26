@@ -75,8 +75,10 @@ fun TrustedDevicesPage() {
     var picking by remember { mutableStateOf(false) }
     var chosenPeer by remember { mutableStateOf<Pair<String, String>?>(null) }
     var answering by remember { mutableStateOf<TrustedDevices.PendingOffer?>(null) }
-    var showingCode by remember { mutableStateOf<Pair<String, String>?>(null) }
+    // code, device name, and the address to stop waiting on when the code is dismissed.
+    var showingCode by remember { mutableStateOf<Triple<String, String, String>?>(null) }
     var note by remember { mutableStateOf("") }
+    var settingLocation by remember { mutableStateOf(false) }
 
     // Polled rather than observed. The trust store has no change stream -- it is written by mesh threads
     // that know nothing about a UI -- and a two-second poll of an in-memory map costs nothing next to
@@ -121,6 +123,69 @@ fun TrustedDevicesPage() {
                 "The identity is derived from your recovery phrase and this machine's name, not from its " +
                     "address — an address is a DHCP lease and changes. It is what the far side records, " +
                     "so it is what you check against when a device asks to pair."
+            )
+
+            SectionHeader("location")
+            Card {
+                Column(Modifier.padding(16.dp)) {
+                    val place = com.prism.desktop.DesktopLocations.position()
+                    if (place == null) {
+                        Text(
+                            "No position is set for this machine. A desktop has no GPS, so choose a " +
+                                "place and that is what it shares.",
+                            fontSize = 12.sp,
+                            color = colors.faint,
+                            lineHeight = 18.sp,
+                        )
+                        Spacer(Modifier.height(10.dp))
+                        OutlinedButton(onClick = { settingLocation = true }) {
+                            Text("Set this machine's location", fontSize = 13.sp)
+                        }
+                    } else {
+                        Text(
+                            place.label.ifBlank { "Pinned position" },
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Medium,
+                        )
+                        Text(
+                            "%.5f, %.5f".format(place.latitude, place.longitude),
+                            fontSize = 12.sp,
+                            color = colors.muted,
+                            modifier = Modifier.padding(top = 2.dp),
+                        )
+                        Row(Modifier.padding(top = 8.dp)) {
+                            OutlinedButton(onClick = { settingLocation = true }) {
+                                Text("Change", fontSize = 12.sp)
+                            }
+                            Spacer(Modifier.width(8.dp))
+                            OutlinedButton(onClick = {
+                                com.prism.desktop.DesktopLocations.clear()
+                                revision++
+                            }) { Text("Clear", fontSize = 12.sp) }
+                        }
+                    }
+
+                    Row(
+                        Modifier.padding(top = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Checkbox(
+                            checked = com.prism.launcher.trusted.TrustedLocations.sharingEnabled(),
+                            onCheckedChange = {
+                                com.prism.launcher.trusted.TrustedLocations.setSharingEnabled(it)
+                                if (it) com.prism.desktop.DesktopLocations.publishNow()
+                                revision++
+                            },
+                        )
+                        Text("Share this machine's position", fontSize = 13.sp)
+                    }
+                }
+            }
+            SectionFooter(
+                "Off by default, and off for every device until you allow it individually. This " +
+                    "machine publishes the place you chose; positions are sealed with a key derived " +
+                    "from your wallet, only the newest per device is kept, and one older than a day " +
+                    "is discarded."
             )
 
             SectionHeader(if (devices.isEmpty()) "no trusted devices" else "trusted")
@@ -182,6 +247,21 @@ fun TrustedDevicesPage() {
                                     color = colors.muted,
                                 )
                             }
+                            Row(
+                                Modifier.padding(top = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Checkbox(
+                                    checked = com.prism.launcher.trusted.TrustedLocations
+                                        .isSharingTo(device.fingerprint),
+                                    onCheckedChange = {
+                                        com.prism.launcher.trusted.TrustedLocations
+                                            .setSharingTo(device.fingerprint, it)
+                                        revision++
+                                    },
+                                )
+                                Text("Location sharing", fontSize = 12.sp, color = colors.muted)
+                            }
                         }
                     }
                 }
@@ -201,6 +281,21 @@ fun TrustedDevicesPage() {
             }
             Spacer(Modifier.height(30.dp))
         }
+    }
+
+    if (settingLocation) {
+        DesktopLocationDialog(
+            onDismiss = { settingLocation = false },
+            onChosen = { place ->
+                com.prism.desktop.DesktopLocations.set(
+                    place.lat,
+                    place.lon,
+                    place.name.ifBlank { place.address },
+                )
+                settingLocation = false
+                revision++
+            },
+        )
     }
 
     if (picking) {
@@ -229,7 +324,7 @@ fun TrustedDevicesPage() {
                 } else {
                     // SHOWN, NOT SENT. The other device asks for it, and typing it correctly is what
                     // proves whoever is accepting can see this screen. See PairingCode.
-                    showingCode = code to name
+                    showingCode = Triple(code, name, ip)
                     note = ""
                 }
                 chosenPeer = null
@@ -238,8 +333,18 @@ fun TrustedDevicesPage() {
         )
     }
 
-    showingCode?.let { (code, name) ->
-        PairingCodeDialog(code, name) { showingCode = null }
+    showingCode?.let { (code, name, ip) ->
+        PairingCodeDialog(
+            code = code,
+            deviceName = name,
+            // Dismissing the code stops the pairing. Otherwise the challenge stayed outstanding and
+            // a proof typed on the other device still added it, which made Done mean nothing.
+            onDismiss = {
+                TrustedDevices.cancelOffer(ip)
+                showingCode = null
+                revision++
+            },
+        )
     }
 
     answering?.let { offer ->
@@ -347,11 +452,15 @@ private fun PeerPicker(
     onPick: (ip: String, name: String) -> Unit,
 ) {
     val colors = LocalPrismColors.current
-    val paired = existing.map { it.lastIp }.toSet()
-    // THE OVERLAY, NOT THE LOCAL NETWORK. MeshCore.peers() is everything broadcast discovery found,
-    // which on a shared Wi-Fi includes devices that have nothing to do with this user's mesh.
+    val paired = existing
+        .map { TrustedDevices.normaliseAddress(it.lastIp) }
+        .filter { it.isNotEmpty() }
+        .toSet()
+    // THE MESHNET, NOT EVERY DEVICE ON THE WI-FI. MeshCore.peers() is everything broadcast discovery
+    // found; MeshMembership narrows it to the devices this machine is actually meshed with.
     val peers = remember {
-        com.prism.core.MeshMembership.overlayPeers(MeshCore.peers().keys).filterNot { it in paired }
+        com.prism.core.MeshMembership.meshPeers(MeshCore.peers().keys)
+            .filterNot { TrustedDevices.normaliseAddress(it) in paired }
     }
     val obstacle = remember { com.prism.core.MeshMembership.explain() }
 
@@ -365,7 +474,7 @@ private fun PeerPicker(
                 Text("Devices on your meshnet", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    "Devices on the Prism overlay that have answered a heartbeat. Others on this " +
+                    "Devices on your Prism meshnet that have answered a heartbeat. Others on this " +
                         "Wi-Fi are deliberately not listed.",
                     fontSize = 12.sp,
                     color = colors.faint,
@@ -379,9 +488,9 @@ private fun PeerPicker(
                 } else if (peers.isEmpty()) {
                     Text(
                         "Nobody else is on the meshnet yet. A device on this Wi-Fi is not enough — it " +
-                            "has to be connected to the same Prism server, or to this one if it is " +
-                            "serving. Broadcast being blocked can also hide a peer: a guest network and " +
-                            "AP client isolation both do that silently.",
+                            "has to be running Prism with the mesh on, on a network the mesh can reach. " +
+                            "Broadcast being blocked can also hide a peer: a guest network and AP client " +
+                            "isolation both do that silently.",
                         fontSize = 13.sp,
                         color = colors.muted,
                         lineHeight = 19.sp,

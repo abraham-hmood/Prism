@@ -61,12 +61,28 @@ object AetherStudio {
         // typically been polling since app startup, so there is usually already something ready
         // rather than a wait to insert.
         if (AetherKnowledgeSync.isRunning()) {
-            // Gated: see AetherConfig.akefAutoMerge for why merging independently
-            // initialised connectomes destroys both rather than combining them.
-            if (AetherConfig.akefAutoMerge) AetherKnowledgeSync.applyPending(b, connectomeLoaded)
+            // Gated: see shouldAutoMerge() for the two ways this can be allowed.
+            if (shouldAutoMerge()) AetherKnowledgeSync.applyPending(b, connectomeLoaded)
         }
         return b
     }
+
+    /**
+     * Whether an arriving snapshot may be applied without a second tap.
+     *
+     * AKE auto-merge is off by default for a real reason -- two independently initialised
+     * connectomes are related by a permutation, and averaging them destroys both (see
+     * [AetherConfig.akefAutoMerge]). But the user-facing toggle is "Receive knowledge from peers",
+     * and someone who turned that on has already said what they want: snapshots arrive, and
+     * nothing used to happen with them until they found a separate "tap to receive" row. That is
+     * the reported bug -- the feature looked inert.
+     *
+     * So an explicit receive opt-in counts as consent to merge. The dangerous case, a brain that
+     * never asked to receive anything, still refuses; and the apply is only reached when the
+     * background receiver is running, which itself requires that toggle.
+     */
+    private fun shouldAutoMerge(): Boolean =
+        AetherConfig.akefAutoMerge || PrismSettings.getAetherReceiveKnowledgeEnabled()
 
     fun isTrained(ctx: Context): Boolean { brain(ctx); return connectomeLoaded }
 
@@ -470,7 +486,9 @@ object AetherStudio {
             // training just finished, nothing else is touching these arrays right now. Mirrors
             // train.py's own apply_pending() call at its sleep-consolidation point.
             if (AetherKnowledgeSync.isRunning()) {
-                if (AetherConfig.akefAutoMerge) brainInstance?.let { AetherKnowledgeSync.applyPending(it, connectomeLoaded) }
+                if (shouldAutoMerge()) {
+                    brainInstance?.let { AetherKnowledgeSync.applyPending(it, connectomeLoaded) }
+                }
             }
             announceOverMeshIfEnabled(ctx)
         }
@@ -489,7 +507,18 @@ object AetherStudio {
         AetherMeshSync.announce(ctx)
     }
 
-    fun datasetSize(): Int = AetherTrainer.loadDataset(AetherConfig.datasetDir()).size
+    /**
+     * How many TRAINING files the dataset has.
+     *
+     * Cheap by contract: it counts files and never reads or chunks their contents. The old
+     * implementation called `loadDataset()`, which expanded every `.txt` file into a
+     * six-character sliding window in memory -- a Settings screen opening Aether with a real
+     * corpus on disk froze and then died of heap exhaustion. Callers that need splits or
+     * per-format counts use [datasetSummary].
+     */
+    fun datasetSize(): Int = AetherTrainer.summarize(AetherConfig.datasetDir()).trainFiles
+
+    fun datasetSummary(): AetherTrainer.Summary = AetherTrainer.summarize(AetherConfig.datasetDir())
 
     /** Cheap, see [hasTrainedWeights] -- does not construct a connectome. */
     fun status(): String =

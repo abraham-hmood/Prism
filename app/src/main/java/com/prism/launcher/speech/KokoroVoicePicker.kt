@@ -173,7 +173,7 @@ object KokoroVoicePicker {
             setBackgroundColor(IosUi.separator(context))
         })
 
-        val dialog = AlertDialog.Builder(context).setView(card).create()
+        val dialog = com.prism.launcher.theme.PrismDialogs.Builder(context).setView(card).create()
         dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
 
         val buttons = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }

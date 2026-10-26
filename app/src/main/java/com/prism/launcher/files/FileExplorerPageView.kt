@@ -13,6 +13,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.webkit.MimeTypeMap
 import android.widget.FrameLayout
+import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.TextView
 import android.widget.Toast
@@ -28,7 +29,10 @@ import java.util.Locale
 import com.prism.launcher.LauncherActivity
 import com.prism.launcher.DesktopShortcutStore
 import com.prism.launcher.DesktopItem
+import com.prism.launcher.FileOps
 import com.prism.launcher.PrismSettings
+import com.prism.launcher.clipboard.ClipboardHistory
+import com.prism.launcher.clipboard.TrustedFileTransfer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -81,8 +85,10 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
     private val searchBar: android.widget.EditText
     private var allEntries: List<FileEntry> = emptyList()
     private var externalVolumeRoots: List<FileEntry.ExternalStorageLink> = emptyList()
+    private lateinit var pasteButton: ImageButton
 
     internal fun resolveAttr(context: Context, attr: Int): Int {
+        com.prism.launcher.theme.ThemeSkin.resolveAttr(context, attr)?.let { return it }
         val typedValue = android.util.TypedValue()
         context.theme.resolveAttribute(attr, typedValue, true)
         return typedValue.data
@@ -95,6 +101,8 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
         val backBtn = root.findViewById<ImageView>(R.id.fileExplorerBackBtn)
         val recycler = root.findViewById<RecyclerView>(R.id.fileExplorerList)
         searchBar = root.findViewById(R.id.fileSearchBar)
+        pasteButton = root.findViewById(R.id.fileExplorerPasteBtn)
+        pasteButton.setOnClickListener { performPaste() }
 
         adapter = FileExplorerAdapter(
             onEntryClick = { entry ->
@@ -118,15 +126,16 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
             onDragEnded = {
                 (context as? com.prism.launcher.LauncherActivity)?.setBirdsEyeZoom(false)
             },
-            showOptions = { showOptions(it) }
+            showOptions = { entry, onDismiss -> showOptions(entry, onDismiss) }
         )
 
-        // Apply Glow to Search Bar
+        // Apply the theme's glow to the search field, if it has one. A flat theme leaves the
+        // container bare and lets the themed TextInputLayout draw its own rectangular field.
         val glowContainer = root.findViewById<View>(R.id.fileSearchGlowContainer)
-        glowContainer.background = com.prism.launcher.NeonGlowDrawable(
-            color = com.prism.launcher.PrismSettings.getGlowColor(),
-            cornerRadius = 24f * resources.displayMetrics.density,
-            strokeWidth = 3f * resources.displayMetrics.density
+        glowContainer.background = com.prism.launcher.theme.ThemeSkin.glowDrawable(
+            context,
+            com.prism.launcher.nora.IosUi.mode(context).shape.field.toFloat(),
+            3f,
         )
 
         searchBar.addTextChangedListener(object : android.text.TextWatcher {
@@ -159,7 +168,23 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
         post {
             navigateTo(ExplorerPath.Root)
             checkPermissionsAndLoad()
+            updatePasteButton()
         }
+    }
+
+    /**
+     * The paste button exists while either clipboard holds something.
+     *
+     * TWO SOURCES, because a file copied here lives in [FileOps], and a file copied on another
+     * device lives in the history as a remote entry with no local path yet. They are the same
+     * thing to the user, so the button has to know about both or a shared cut item would arrive
+     * with nowhere to paste it.
+     */
+    private fun updatePasteButton() {
+        val active = ClipboardHistory.active()
+        val sharedFile = active?.kind == ClipboardHistory.Kind.FILE
+        pasteButton.visibility =
+            if (FileExplorerClipboard.hasContent() || sharedFile) View.VISIBLE else View.GONE
     }
 
     private fun showGlobalMenu() {
@@ -170,7 +195,9 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
             onPositive = {},
             customView = android.widget.ListView(context).apply {
                 val actions = mutableListOf("Paste", "Connect to Network Storage")
-                if (FileExplorerClipboard.getCutFile() == null) actions.remove("Paste")
+                if (!FileExplorerClipboard.hasContent() &&
+                    ClipboardHistory.active()?.kind != ClipboardHistory.Kind.FILE
+                ) actions.remove("Paste")
                 
                 adapter = object : android.widget.ArrayAdapter<String>(context, android.R.layout.simple_list_item_1, actions) {
                     override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
@@ -192,23 +219,97 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
         )
     }
 
+    /**
+     * Pastes the clipboard into the directory on screen.
+     *
+     * THE OPERATION IS [FileOps.paste], which owns the guards and is tested: a folder cannot be
+     * pasted into itself, an existing name is disambiguated rather than overwritten, and a cut
+     * across volumes falls back to copy-then-delete. This function only chooses the folder and
+     * reports the outcome -- and it reports the specific reason on failure, which "Paste failed"
+     * did not.
+     */
     private fun performPaste() {
-        val cutFile = FileExplorerClipboard.getCutFile() ?: return
         val targetPath = currentPath
-        if (targetPath is ExplorerPath.Local) {
-            val target = File(targetPath.dir, cutFile.name)
-            if (cutFile.renameTo(target)) {
-                FileExplorerClipboard.clear()
-                navigateTo(targetPath)
-            } else {
-                Toast.makeText(context, "Paste failed", Toast.LENGTH_SHORT).show()
+        val targetDir = (targetPath as? ExplorerPath.Local)?.dir
+        if (targetDir == null) {
+            Toast.makeText(
+                context,
+                "Open a folder before pasting" + if (targetPath is ExplorerPath.Network)
+                    " -- remote upload is not supported yet" else "",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
+
+        // A shared file has no local path until it is fetched. Doing it here, on paste, is what
+        // makes the clipboard entry cheap: a device does not pull a gigabyte the moment somebody
+        // copies it, only when the copy is actually used.
+        val active = ClipboardHistory.active()
+        if (active?.kind == ClipboardHistory.Kind.FILE) {
+            if (active.remote) {
+                downloadAndPaste(active, targetDir)
+                return
             }
-        } else if (targetPath is ExplorerPath.Network) {
-            // Simulated "Upload" via paste
-            Toast.makeText(context, "Uploading ${cutFile.name} to ${targetPath.storage.name}...", Toast.LENGTH_LONG).show()
-            FileExplorerClipboard.clear()
-        } else {
-            Toast.makeText(context, "Cannot paste in Root", Toast.LENGTH_SHORT).show()
+            val file = File(active.path)
+            if (!file.exists()) {
+                ClipboardHistory.remove(active.id)
+                Toast.makeText(context, "That item is no longer on this device", Toast.LENGTH_SHORT).show()
+                updatePasteButton()
+                return
+            }
+            // Loaded into FileOps WITHOUT publishing it: this tap chooses an entry already on
+            // this device, and re-sending it to every trusted device on each paste would turn a
+            // paste into a broadcast.
+            when (active.mode) {
+                ClipboardHistory.Mode.CUT -> FileOps.cut(listOf(file))
+                ClipboardHistory.Mode.COPY -> FileOps.copy(listOf(file))
+            }
+        } else if (!FileExplorerClipboard.hasContent()) {
+            return
+        }
+
+        viewScope.launch {
+            val result = withContext(Dispatchers.IO) { FileOps.paste(targetDir) }
+            updatePasteButton()
+            if (result.ok) {
+                Toast.makeText(
+                    context,
+                    "Pasted ${result.pasted.firstOrNull()?.name.orEmpty()}",
+                    Toast.LENGTH_SHORT,
+                ).show()
+                navigateTo(currentPath)
+            } else {
+                Toast.makeText(context, result.skipped.joinToString("\n"), Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    /** Downloads a file a trusted device shared, then shows it in this folder. */
+    private fun downloadAndPaste(entry: ClipboardHistory.Entry, targetDir: File) {
+        Toast.makeText(
+            context,
+            "Downloading ${entry.name} from ${entry.sourceName.ifBlank { "a trusted device" }}…",
+            Toast.LENGTH_SHORT,
+        ).show()
+        viewScope.launch {
+            val files = withContext(Dispatchers.IO) { TrustedFileTransfer.fetch(entry, targetDir) }
+            updatePasteButton()
+            if (files.isNullOrEmpty()) {
+                Toast.makeText(
+                    context,
+                    "Could not fetch ${entry.name}. The other device may be offline, or the item " +
+                        "may have already been moved.",
+                    Toast.LENGTH_LONG,
+                ).show()
+            } else {
+                Toast.makeText(
+                    context,
+                    "Received ${files.first().name}" +
+                        (if (files.size > 1) " and ${files.size - 1} more" else ""),
+                    Toast.LENGTH_SHORT,
+                ).show()
+                navigateTo(currentPath)
+            }
         }
     }
 
@@ -448,13 +549,13 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
         }, 1200)
     }
 
-    private fun showOptions(entry: FileEntry) {
+    private fun showOptions(entry: FileEntry, onDismiss: () -> Unit = {}) {
         val options = mutableListOf("Open", "Add to Desktop")
         if (entry is FileEntry.Local) {
-            options.addAll(listOf("Move to Trash", "Cut", "Rename", "Host as Website"))
+            options.addAll(listOf("Move to Trash", "Cut", "Copy", "Rename", "Host as Website"))
         }
 
-        PrismDialogFactory.show(
+        val dialog = PrismDialogFactory.show(
             context,
             entry.name,
             "Choose an action:",
@@ -486,8 +587,24 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
                         "Move to Trash" -> if (entry is FileEntry.Local) moveToTrash(entry.file)
                         "Add to Desktop" -> addToDesktop(entry)
                         "Cut" -> if (entry is FileEntry.Local) {
-                            FileExplorerClipboard.setCutFile(entry.file)
-                            Toast.makeText(context, "File cut", Toast.LENGTH_SHORT).show()
+                            FileExplorerClipboard.put(entry.file, FileExplorerClipboard.Mode.CUT)
+                            updatePasteButton()
+                            Toast.makeText(
+                                context,
+                                "${if (entry.file.isDirectory) "Folder" else "File"} cut -- " +
+                                    "use the paste button in the top right",
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                        }
+                        "Copy" -> if (entry is FileEntry.Local) {
+                            FileExplorerClipboard.put(entry.file, FileExplorerClipboard.Mode.COPY)
+                            updatePasteButton()
+                            Toast.makeText(
+                                context,
+                                "${if (entry.file.isDirectory) "Folder" else "File"} copied -- " +
+                                    "use the paste button in the top right",
+                                Toast.LENGTH_SHORT,
+                            ).show()
                         }
                         "Rename" -> if (entry is FileEntry.Local) promptRename(entry.file)
                         "Host as Website" -> if (entry is FileEntry.Local) {
@@ -499,6 +616,8 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
                 }
             }
         )
+        // The row must not start opening files again until this menu is actually gone.
+        dialog.setOnDismissListener { onDismiss() }
     }
 
     private fun moveToTrash(file: File) {
@@ -552,7 +671,7 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
 }
 
 private object FileEntryDiff : DiffUtil.ItemCallback<FileEntry>() {
-    private fun key(e: FileEntry): String = when (e) {
+    fun key(e: FileEntry): String = when (e) {
         is FileEntry.Local -> "local:${e.file.absolutePath}"
         is FileEntry.Network -> "network:${e.storage.name}"
         is FileEntry.InternalStorageLink -> "internal"
@@ -568,10 +687,24 @@ class FileExplorerAdapter(
     private val onEntryClick: (FileEntry) -> Unit,
     private val onDragStarted: () -> Unit,
     private val onDragEnded: () -> Unit,
-    private val showOptions: (FileEntry) -> Unit
+    /** Opens the row's menu; the second argument runs when that menu is dismissed. */
+    private val showOptions: (FileEntry, () -> Unit) -> Unit
 ) : ListAdapter<FileEntry, FileExplorerAdapter.VH>(FileEntryDiff) {
 
     private val items: List<FileEntry> get() = currentList
+
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+
+    /**
+     * The last entry whose context menu was opened, and when.
+     *
+     * THE FLAG THAT STOPS A LONG PRESS FROM ALSO OPENING THE FILE IS NOT PER-BIND. The touch
+     * listener is re-installed every time a row is rebound, and a dialog taking window focus can
+     * rebuild or rebind the list underneath the finger -- which dropped a local `menuShown` back
+     * to false and let the following ACTION_UP open the file under the menu. Held here, the
+     * suppression survives a rebind and cannot be reset by one.
+     */
+    private var menuOpenedFor: String? = null
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
         val view = LayoutInflater.from(parent.context).inflate(R.layout.item_file_grid, parent, false)
@@ -582,7 +715,6 @@ class FileExplorerAdapter(
         val entry = items[position]
         holder.fileName.text = entry.name
         val ctx = holder.itemView.context
-        val glowColor = com.prism.launcher.PrismSettings.getGlowColor()
 
         // Reset state
         holder.fileIcon.colorFilter = null
@@ -636,36 +768,33 @@ class FileExplorerAdapter(
 
         holder.fileIcon.setColorFilter(typeColor)
         
-        val glow = holder.glowDrawable ?: com.prism.launcher.NeonGlowDrawable(
-            color = glowColor,
-            cornerRadius = 16f * ctx.resources.displayMetrics.density,
-            strokeWidth = 2f * ctx.resources.displayMetrics.density
-        ).also { holder.glowDrawable = it }
-        glow.color = glowColor
-        holder.glassView.background = glow
+        holder.glassView.background = com.prism.launcher.theme.ThemeSkin.glowDrawable(
+            ctx,
+            com.prism.launcher.nora.IosUi.mode(ctx).shape.card.toFloat(),
+            2f,
+        )
 
-        val handler = android.os.Handler(android.os.Looper.getMainLooper())
         var isDragging = false
+        var menuShown = false
         var startX = 0f
         var startY = 0f
         val touchSlop = android.view.ViewConfiguration.get(ctx).scaledTouchSlop
-        
-        /**
-         * Set once the long-press menu has opened, so the release that follows is not also a tap.
-         *
-         * THE BUG THIS FIXES: ACTION_UP fired onEntryClick for any gesture that was not a drag, and
-         * a long press is not a drag -- so holding a file showed its menu and then opened the file
-         * underneath it. Three states share this handler (tap, long press, drag) and only two of
-         * them were being told apart.
-         */
-        var menuShown = false
+        val entryKey = FileEntryDiff.key(entry)
+
+        // A row is rebound while this one's menu is still pending? Cancel the old timeout, or it
+        // fires against an entry the row no longer shows.
+        holder.pendingMenu?.let { handler.removeCallbacks(it) }
 
         val showMenuRunnable = Runnable {
             if (!isDragging) {
                 menuShown = true
-                showOptions(entry)
+                menuOpenedFor = entryKey
+                showOptions(entry) {
+                    if (menuOpenedFor == entryKey) menuOpenedFor = null
+                }
             }
         }
+        holder.pendingMenu = showMenuRunnable
 
         holder.itemView.setOnTouchListener { v, event ->
             when (event.action) {
@@ -673,6 +802,7 @@ class FileExplorerAdapter(
                     isDragging = false
                     menuShown = false
                     startX = event.rawX; startY = event.rawY
+                    handler.removeCallbacks(showMenuRunnable)
                     handler.postDelayed(showMenuRunnable, 500)
                 }
                 android.view.MotionEvent.ACTION_MOVE -> {
@@ -693,7 +823,9 @@ class FileExplorerAdapter(
                 android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> {
                     handler.removeCallbacks(showMenuRunnable)
                     if (!isDragging && !menuShown && event.action == android.view.MotionEvent.ACTION_UP) {
-                        onEntryClick(entry)
+                        // The same rule stated where it cannot be lost to a rebind: this entry's
+                        // menu is open, so this release is not a tap on the file underneath it.
+                        if (menuOpenedFor != entryKey) onEntryClick(entry)
                     }
                 }
             }
@@ -706,6 +838,14 @@ class FileExplorerAdapter(
         }
     }
 
+    override fun onViewRecycled(holder: VH) {
+        // A recycled row must not leave a pending long-press that opens the menu for whatever the
+        // holder is reassigned to.
+        holder.pendingMenu?.let { handler.removeCallbacks(it) }
+        holder.pendingMenu = null
+        super.onViewRecycled(holder)
+    }
+
     private fun isImage(ext: String) = ext in listOf("jpg", "jpeg", "png", "webp", "gif")
     private fun isVideo(ext: String) = ext in listOf("mp4", "mkv", "webm", "avi")
     private fun isAudio(ext: String) = ext in listOf("mp3", "wav", "ogg", "flac")
@@ -716,6 +856,8 @@ class FileExplorerAdapter(
         val glassView: View = view.findViewById(R.id.glassBackground)
         /** Reused across rebinds of this holder instead of allocated fresh every bind. */
         var glowDrawable: com.prism.launcher.NeonGlowDrawable? = null
+        /** The long-press timeout scheduled by the current bind, so a rebind or recycle cancels it. */
+        var pendingMenu: Runnable? = null
 
         init {
             // NeonGlowDrawable's BlurMaskFilter isn't supported by hardware-accelerated Canvas.

@@ -48,23 +48,28 @@ class MeshSpeechEngine(private val peer: KokoroMeshShare.SpeechPeer) : TtsEngine
             onDone(null)
             return
         }
-        // A clone's artifacts live on the machine that saved it, not on the peer that will speak.
-        // Sending the clone id would make the peer look for a style tensor that does not exist.
-        // Falling back to the clone's published base voice keeps the words audible, and the
-        // caller is told once in diagnostics rather than silently getting a different timbre.
-        val remoteVoice = voiceId?.let { id ->
-            if (!ClonedVoices.isCloned(id)) return@let id
-            val base = ClonedVoices.find(id)?.baseVoiceId
+        // A clone lives on the machine that saved it. Sending only the clone id made the peer
+        // look up a voice it does not have and answer in the clone's published base voice -- a
+        // different person -- with nothing on screen to say so. New clones therefore send their
+        // reference recording and the peer converts toward it. A LEGACY clone (one saved before
+        // references were stored) has only its OpenVoice tone tensor, which cannot travel this
+        // way; that case still falls back to the base voice, and now says so in the log before
+        // the first word rather than leaving the user to notice.
+        val clone = voiceId?.let { ClonedVoices.find(it) }
+        val reference = clone?.let { ClonedVoices.refFor(it.id) }
+        val remoteVoice = if (clone == null) voiceId else clone.baseVoiceId
+        if (clone != null && reference == null) {
             PrismPlatform.log.info(
                 "PrismSpeech",
-                "Cloned voice $id is not on ${peer.deviceName}; speaking through " +
-                    (base ?: "the default voice") + " there instead",
+                "Legacy clone ${clone.id} has no reference recording, so ${peer.deviceName} " +
+                    "speaks the base voice; re-record it to keep the timbre over the mesh",
             )
-            base
         }
         val mine = ++generation
         Thread({
-            val clip = KokoroMeshShare.synthesizeOn(peer.peerIp, text, remoteVoice, speed)
+            val clip = KokoroMeshShare.synthesizeOn(
+                peer.peerIp, text, remoteVoice, speed, reference, clone?.pitchHz ?: 0f,
+            )
             if (mine != generation) return@Thread
             if (clip == null) {
                 val problem = KokoroMeshShare.lastProblem(peer.peerIp)

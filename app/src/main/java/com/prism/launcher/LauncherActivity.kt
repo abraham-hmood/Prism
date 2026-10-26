@@ -22,6 +22,7 @@ import androidx.recyclerview.widget.RecyclerView
 import androidx.viewpager2.widget.ViewPager2
 import com.prism.launcher.browser.BrowserPageView
 import com.prism.launcher.browser.PrivateDnsVpnService
+import com.prism.launcher.browser.openInDefaultBrowser
 import com.prism.launcher.databinding.ActivityLauncherBinding
 import com.prism.launcher.messaging.MessagingPageView
 import android.widget.Toast
@@ -36,17 +37,23 @@ class LauncherActivity : PrismBaseActivity() {
     private lateinit var desktopShortcutStore: DesktopShortcutStore
     private lateinit var mainAdapter: MainDesktopPagerAdapter
     private var browserPage: BrowserPageView? = null
+    /** A result waiting for the browser page to be created after the pager turns to its slot. */
+    private var pendingBrowserUrl: String? = null
+    private var browserOpenToken: Int = 0
     private var fileExplorerPage: com.prism.launcher.files.FileExplorerPageView? = null
     private var nebulaSocialPage: com.prism.launcher.social.NebulaSocialPageView? = null
     private var discoveredPlugins: List<PluginPageInfo> = emptyList()
     private var pendingPickerSlot: Int = 1
     
-    // Overscroll Gesture State
+    // Page-picker gesture state. The trigger itself is either the built-in vertical overscroll
+    // or the swipe the user captured on the tour / in Settings.
     private var startTouchX = 0f
     private var startTouchY = 0f
+    /** The same point as [startTouchX], but in the root view's coordinates. */
+    private var startTouchLocalX = 0f
     private var touchSlop = 0f
     private var velocityTracker: VelocityTracker? = null
-    private var overscrollTriggered = false
+    private var pagePickerTriggered = false
 
     // Shake-to-lock: locks the current desktop page against swiping/the page-switcher overlay.
     private lateinit var shakeDetector: ShakeDetector
@@ -85,6 +92,30 @@ class LauncherActivity : PrismBaseActivity() {
             documentCreateCallback?.invoke(uri)
             documentCreateCallback = null
         }
+
+    /** The app whose APK an in-flight system save picker is asking where to write. */
+    private var pendingApkBackup: DrawerAppEntry? = null
+
+    private val backupApkLauncher =
+        registerForActivityResult(
+            ActivityResultContracts.CreateDocument("application/vnd.android.package-archive")
+        ) { uri ->
+            val entry = pendingApkBackup
+            pendingApkBackup = null
+            if (uri != null && entry != null) AppContextMenu.backup(this, entry, uri)
+        }
+
+    /** Opens the drawer's long-press menu for [entry], anchored at the row that was held. */
+    fun showAppContextMenu(entry: DrawerAppEntry, anchor: View) {
+        AppContextMenu.show(this, entry, anchor) { onBackup ->
+            pendingApkBackup = onBackup
+            runCatching { backupApkLauncher.launch(AppContextMenu.suggestedFileName(onBackup)) }
+                .onFailure {
+                    pendingApkBackup = null
+                    Toast.makeText(this, "No file picker is available", Toast.LENGTH_SHORT).show()
+                }
+        }
+    }
 
     /**
      * Records a video for Lyke, through the system camera.
@@ -318,6 +349,27 @@ class LauncherActivity : PrismBaseActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityLauncherBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        // A theme may replace the user's wallpaper with its own backdrop. The launcher's window
+        // is translucent so the photograph can show through; painting the root is what makes
+        // that choice visible without also turning every other translucent window opaque.
+        val activeTheme = com.prism.launcher.theme.PrismThemes.active()
+        if (!activeTheme.showWallpaper) {
+            // THE GROUND, NOT A FLAT COLOUR, when the theme paints one. Fusion's nebula is a
+            // drawable (see NebulaDrawable) and painting the root with the palette's background
+            // here -- which is what this did -- would have covered it on the one screen the
+            // theme's own look matters most.
+            val ground = com.prism.launcher.nora.IosUi.groupedBackground(this)
+            binding.root.background = if (
+                activeTheme.backdrop == com.prism.launcher.theme.BACKDROP_NEBULA
+            ) {
+                com.prism.launcher.theme.NebulaDrawable(
+                    ground,
+                    dark = com.prism.launcher.nora.IosUi.isDark(this),
+                )
+            } else {
+                android.graphics.drawable.ColorDrawable(ground)
+            }
+        }
 
         slotPreferences = SlotPreferences()
         desktopShortcutStore = DesktopShortcutStore()
@@ -345,6 +397,7 @@ class LauncherActivity : PrismBaseActivity() {
             acceptDesktopDrawerDrops = {
                 findDesktopPosition() != -1 && findDrawerPosition() != -1
             },
+            onRequestPagePicker = { position -> openPagePicker(position) },
         )
         binding.desktopPager.adapter = mainAdapter
         binding.desktopPager.setCurrentItem(PrismSettings.getDefaultPage(), false)
@@ -355,7 +408,10 @@ class LauncherActivity : PrismBaseActivity() {
                 // position 0: Left, position 1: Center, position 2: Right
                 val page = findPageViewAt(position)
                 val isFileExplorer = page is com.prism.launcher.files.FileExplorerPageView
-                val isDrawer = position >= 2 // App Drawer is usually right-most
+                // BY TYPE, NOT BY POSITION. This used to be `position >= 2`, which treated every
+                // page after the second as the drawer -- so Notifications, or any page the user
+                // put third, rendered permanently zoomed behind a 160 px live blur.
+                val isDrawer = page is DrawerPageView
                 
                 // 1. Calculate Blur Progress
                 val progress = when {
@@ -384,6 +440,7 @@ class LauncherActivity : PrismBaseActivity() {
                 // on a fresh start is "nothing yet" -- the listener has not captured the backlog.
                 (findPageViewAt(position) as? com.prism.launcher.notifications.NotificationsPageView)
                     ?.refresh()
+                publishDisplayPage(position)
             }
         })
 
@@ -410,9 +467,15 @@ class LauncherActivity : PrismBaseActivity() {
                         tryConsumeMinigamesBack() -> Unit
                         tryConsumeCloudBack() -> Unit
                         else -> {
-                            isEnabled = false
-                            onBackPressedDispatcher.onBackPressed()
-                            isEnabled = true
+                            // HOME, NOT AN ACTIVITY TO FINISH. Back used to fall through to
+                            // AppCompatActivity, which finished and immediately relaunched the
+                            // launcher as HOME -- dropping the browser tab, the editor buffer and
+                            // every other page's state to arrive back where the user already was.
+                            // Going to the desktop page is what back means in a launcher.
+                            val home = findDesktopPosition().takeIf { it >= 0 } ?: 0
+                            if (binding.desktopPager.currentItem != home) {
+                                binding.desktopPager.setCurrentItem(home, true)
+                            }
                         }
                     }
                 }
@@ -466,8 +529,27 @@ class LauncherActivity : PrismBaseActivity() {
         }
     }
 
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        // The map page is a View, not an Activity, so its location request comes back through the
+        // launcher that hosts it. Any grant is enough: coarse location still centres the map.
+        if (requestCode == com.prism.launcher.maps.MapsPageView.REQUEST_LOCATION) {
+            val granted = grantResults.any { it == android.content.pm.PackageManager.PERMISSION_GRANTED }
+            com.prism.launcher.maps.MapsPageView.onPermissionResult(requestCode, granted)
+        }
+    }
+
     override fun onResume() {
         super.onResume()
+
+        // The windowed-pages switch lives in Settings, which means the way back is a resume.
+        // Rebuilt only when the value actually changed; a rebuild every resume would recreate
+        // every page (and reload its icons) for people who never touched the setting.
+        if (::mainAdapter.isInitialized) mainAdapter.refreshWindowMode()
 
         // Duress: the decoy replaces the launcher, and the launcher is what Home reaches. Checked
         // on every resume rather than once at startup, because the flag is set while the lock
@@ -494,10 +576,43 @@ class LauncherActivity : PrismBaseActivity() {
         // is not answered stays pending and the far side re-sends it.
         com.prism.launcher.trusted.TrustedDeviceOffers.promptIfPending(this)
 
+        // The clipboard, now that this app is focused. Android 10+ only allows a read at a moment
+        // like this, so the copy the user made in another app and came back from is picked up here
+        // rather than by the change listener, which does not fire for a background app.
+        com.prism.launcher.clipboard.ClipboardCapture.sync()
+        // And the live watcher is brought in line with the setting now that a start is allowed:
+        // returning here is also when a keyboard change made in Settings takes effect.
+        com.prism.launcher.clipboard.ClipboardWatchService.sync(this)
+
         shakeDetector.start()
         // Back in Prism, so the floating copy has nothing left to do — the real feed is on screen
         // behind it, and two players on the same video is one too many.
         com.prism.launcher.social.LykePipActivity.dismiss()
+
+        // The Settings button cannot open the picker itself: the picker lives in this window and
+        // this window is paused behind Settings. It leaves a one-shot request instead, consumed
+        // here as the launcher comes back to the front.
+        if (PrismSettings.consumeOpenPagePickerRequest()) {
+            binding.root.post { openPagePicker(binding.desktopPager.currentItem) }
+        }
+
+        // Back from Settings or another app: an extended display may have connected while this
+        // window was paused and needs to be told which page exists.
+        publishDisplayPage(binding.desktopPager.currentItem)
+    }
+
+    /**
+     * Records the page an extending display should render.
+     *
+     * The slots come from the same store the pager is built from, because the adapter does not
+     * expose its list and a second copy would drift the moment a page is added from Settings. An
+     * empty result (no layout yet) is a no-op rather than an error.
+     */
+    private fun publishDisplayPage(position: Int) {
+        runCatching {
+            val slots = slotPreferences.getAssignments().map { it.serialize() }
+            com.prism.launcher.display.WirelessDisplay.notePage(slots, position)
+        }
     }
 
     override fun onPause() {
@@ -575,7 +690,62 @@ class LauncherActivity : PrismBaseActivity() {
 
     fun attachBrowserPage(page: BrowserPageView?) {
         browserPage = page
+        // The page reports itself before the pager has necessarily laid it out. Consuming the
+        // pending destination here means a tap never depends on a fixed delay winning a race with
+        // page creation -- the browser itself says when it is ready to receive it.
+        if (page != null) {
+            pendingBrowserUrl?.let { url ->
+                pendingBrowserUrl = null
+                page.openWebResult(url)
+            }
+        }
     }
+
+    /**
+     * Opens a web search result in the desktop Browser page, or in the system browser if none is
+     * assigned to a slot.
+     *
+     * The pager has to turn to the browser's slot first, and ViewPager2 does not create a distant
+     * page's view synchronously. This posts a check for that view and keeps the URL pending until
+     * it either appears (including through [attachBrowserPage]) or a couple of layout passes have
+     * gone by and the system browser is the honest fallback.
+     */
+    fun openWebResult(url: String) {
+        if (!url.startsWith("http://") && !url.startsWith("https://")) return
+        // The result was tapped from the search field, so the keyboard is still up. Leaving it
+        // over the browser page hides the thing the tap just opened.
+        currentFocus?.clearFocus()
+        (getSystemService(INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager)
+            ?.hideSoftInputFromWindow(binding.root.windowToken, 0)
+        val position = findBrowserPosition()
+        if (position < 0) {
+            openInDefaultBrowser(this, url)
+            return
+        }
+
+        val token = ++browserOpenToken
+        pendingBrowserUrl = url
+        binding.desktopPager.setCurrentItem(position, false)
+        binding.root.postDelayed({
+            if (token != browserOpenToken || pendingBrowserUrl == null) return@postDelayed
+            val page = findPageViewAt(position) as? BrowserPageView
+            if (page != null) {
+                pendingBrowserUrl = null
+                page.openWebResult(url)
+                return@postDelayed
+            }
+            binding.root.postDelayed({
+                if (token != browserOpenToken || pendingBrowserUrl == null) return@postDelayed
+                val late = findPageViewAt(position) as? BrowserPageView
+                pendingBrowserUrl = null
+                if (late != null) late.openWebResult(url)
+                else openInDefaultBrowser(this, url)
+            }, 350L)
+        }, 250L)
+    }
+
+    fun findBrowserPosition(): Int =
+        slotPreferences.getAssignments().indexOfFirst { it is SlotAssignment.Browser }
 
     fun attachFileExplorerPage(page: com.prism.launcher.files.FileExplorerPageView?) {
         fileExplorerPage = page
@@ -678,48 +848,86 @@ class LauncherActivity : PrismBaseActivity() {
     }
 
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-        handleOverscrollDetection(ev)
+        handlePagePickerGesture(ev)
         return super.dispatchTouchEvent(ev)
     }
 
-    private fun handleOverscrollDetection(ev: MotionEvent) {
+    /**
+     * The page-picker gesture, built-in or user-defined.
+     *
+     * A user-captured vertical swipe keeps the old rule that it only fires where the page cannot
+     * scroll further -- otherwise a long flick through a list would replace pages while the user
+     * was trying to read. A captured horizontal swipe is edge-only (see [PagePickerSwipe]), so
+     * ordinary left/right paging still works everywhere else.
+     *
+     * The built-in fallback is the original hard vertical overscroll, unchanged, for anyone who
+     * has not been through the tour yet or has deliberately reset the trigger.
+     */
+    private fun handlePagePickerGesture(ev: MotionEvent) {
         if (binding.pagePickerOverlay.visibility == View.VISIBLE) return
         if (pageLocked) return
+        // The Settings button replaces the gesture rather than adding to it. An accidental page
+        // change is exactly what somebody choosing this mode is trying to stop.
+        if (PrismSettings.getPagePickerFromSettings()) return
+        // Anything layered ABOVE the pager owns the gesture: the tour and a folder popup both
+        // cover the screen, and a vertical flick over either used to page-swap invisibly.
+        if (com.prism.launcher.onboarding.OnboardingOverlay.isShowing(binding.root)) return
+        if (binding.root.findViewWithTag<FolderPopupView>("folder_popup") != null) return
+
+        val custom = PrismSettings.getPagePickerSwipe()
+        val density = resources.displayMetrics.density
+        val sensitivity = PrismSettings.getPagePickerSensitivityScale()
 
         when (ev.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 startTouchX = ev.rawX
                 startTouchY = ev.rawY
-                overscrollTriggered = false
+                startTouchLocalX = ev.x
+                pagePickerTriggered = false
                 velocityTracker?.clear()
                 velocityTracker = velocityTracker ?: VelocityTracker.obtain()
                 velocityTracker?.addMovement(ev)
             }
             MotionEvent.ACTION_MOVE -> {
-                if (overscrollTriggered) return
-                
+                if (pagePickerTriggered) return
                 velocityTracker?.addMovement(ev)
-                val dy = ev.rawY - startTouchY
                 val dx = ev.rawX - startTouchX
+                val dy = ev.rawY - startTouchY
 
-                // If vertical movement is dominant and significant
-                if (Math.abs(dy) > touchSlop && Math.abs(dy) > Math.abs(dx)) {
-                    val threshold = 700f // Harder threshold to avoid accidental trigger
-                    if (Math.abs(dy) > threshold) {
-                        velocityTracker?.computeCurrentVelocity(1000)
-                        val yVel = velocityTracker?.yVelocity ?: 0f
-                        
-                        val currentPage = findPageViewAt(binding.desktopPager.currentItem)
-                        val direction = if (dy > 0) -1 else 1 // -1 is top, 1 is bottom
-                        
-                        // If we are at the edge OR the page isn't scrollable at all
-                        val isAtEdge = currentPage?.canScrollVertically(direction) == false
-                        
-                        if (isAtEdge && Math.abs(yVel) > 1500f) {
-                            overscrollTriggered = true
-                            window.decorView.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
-                            openPagePicker(binding.desktopPager.currentItem)
-                        }
+                if (custom != null) {
+                    if (!custom.matches(dx, dy, density, sensitivity)) return
+                    // Local, not raw: the edge test compares against the view's own width, and in
+                    // split-screen or a freeform window raw coordinates start at a window offset,
+                    // which would make every left edge look like the middle of the screen.
+                    if (!custom.isEligibleStart(startTouchLocalX, binding.root.width, density)) return
+
+                    if (!custom.direction.isHorizontal) {
+                        // Finger moving up means the content scrolls down: canScrollVertically(1).
+                        val scrollDirection = if (dy < 0) 1 else -1
+                        val page = findPageViewAt(binding.desktopPager.currentItem)
+                        if (page?.canScrollVertically(scrollDirection) == true) return
+                    }
+
+                    pagePickerTriggered = true
+                    window.decorView.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                    openPagePicker(binding.desktopPager.currentItem)
+                    return
+                }
+
+                // Built-in: vertical, hard, and only at a scroll edge.
+                if (Math.abs(dy) > touchSlop && Math.abs(dy) > Math.abs(dx) &&
+                    Math.abs(dy) > 700f * sensitivity
+                ) {
+                    velocityTracker?.computeCurrentVelocity(1000)
+                    val yVel = velocityTracker?.yVelocity ?: 0f
+                    val currentPage = findPageViewAt(binding.desktopPager.currentItem)
+                    val direction = if (dy > 0) -1 else 1
+                    val isAtEdge = currentPage?.canScrollVertically(direction) == false
+
+                    if (isAtEdge && Math.abs(yVel) > 1500f * sensitivity) {
+                        pagePickerTriggered = true
+                        window.decorView.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                        openPagePicker(binding.desktopPager.currentItem)
                     }
                 }
             }
@@ -774,7 +982,14 @@ class LauncherActivity : PrismBaseActivity() {
             }
             startActivity(intent)
         } catch (e: Exception) {
-            // Usually uninstalled while app is running
+            // Usually uninstalled while the app was running -- but that has to be SAID. A tap that
+            // silently does nothing is indistinguishable from a launcher that has stopped working.
+            Toast.makeText(
+                this,
+                "Could not open ${cn.packageName.split(".").last()}",
+                Toast.LENGTH_SHORT,
+            ).show()
+            PrismLogger.logWarning("Launcher", "Could not launch $cn: ${e.message}")
         }
 
         logLaunchStat(cn)
@@ -801,7 +1016,9 @@ class LauncherActivity : PrismBaseActivity() {
         binding.pagePickerOverlay.visibility = View.VISIBLE
         animateMainZoom(true)
         discoveredPlugins = PluginPageDiscovery.discover(packageManager)
-        showPickerPositionsStep(initialSlot.coerceIn(0, 2))
+        // NOT clamped to the first three pages. The picker is opened for the page the user is on,
+        // and on a seven-page setup `coerceIn(0, 2)` silently targeted page three instead.
+        showPickerPositionsStep(initialSlot)
     }
 
     private fun showPickerPositionsStep(initialSlot: Int) {
@@ -827,10 +1044,13 @@ class LauncherActivity : PrismBaseActivity() {
     }
 
     private fun removePageAt(index: Int) {
-        val list = slotPreferences.getAssignments().toMutableList()
-        if (list.size <= 1) return
-        list.removeAt(index)
-        slotPreferences.saveAssignments(list)
+        val before = slotPreferences.getAssignments()
+        if (before.size <= 1 || index !in before.indices) return
+        // THROUGH SlotPreferences, which shifts the per-page desktop grids as it removes the page.
+        // Mutating the list here and saving it directly left every later desktop page showing its
+        // neighbour's icons.
+        slotPreferences.removeAt(index)
+        val list = slotPreferences.getAssignments()
 
         mainAdapter.updateAssignments(list)
         com.prism.launcher.social.SocialBotWorker.schedule(this)
@@ -884,11 +1104,50 @@ class LauncherActivity : PrismBaseActivity() {
                 hint = "Search pages"
                 maxLines = 1
                 textSize = 15f
-                background = com.prism.launcher.nora.IosUi.fieldBackground(this@LauncherActivity)
+                // A GLOSSY FIELD WITH A LIT EDGE. The old one was the standard tinted fill on a
+                // tinted overlay: the same value as the surface around it at low contrast, so the
+                // box was effectively invisible until the keyboard was already open. This is a
+                // raised, light-from-the-top field with a bright accent rim, which reads as a
+                // control at a glance rather than as a gap in the list.
+                background = pickerSearchBackground()
+                elevation = if (com.prism.launcher.nora.IosUi.mode(this@LauncherActivity).shape.elevation > 0) {
+                    com.prism.launcher.nora.IosUi.dp(this@LauncherActivity, 6f).toFloat()
+                } else {
+                    0f
+                }
                 setTextColor(com.prism.launcher.nora.IosUi.label(this@LauncherActivity))
-                setHintTextColor(com.prism.launcher.nora.IosUi.tertiaryLabel(this@LauncherActivity))
-                val pad = com.prism.launcher.nora.IosUi.dp(this@LauncherActivity, 10f)
-                setPadding(pad, pad, pad, pad)
+                // THE HINT FOLLOWS THE THEME. It is the theme's own label colour at a little
+                // under full strength -- dark on the light gloss, light on the dark one -- so it
+                // is clearly a placeholder and still readable against the sheen, and it keeps
+                // following the palette if that palette changes.
+                val hintAlpha = if (com.prism.launcher.nora.IosUi.isDark(this@LauncherActivity)) {
+                    0xCC000000.toInt()
+                } else {
+                    0x99000000.toInt()
+                }
+                setHintTextColor(
+                    (com.prism.launcher.nora.IosUi.label(this@LauncherActivity) and 0x00FFFFFF) or hintAlpha
+                )
+                // The hint sits where the caret does, not in the middle of a tall padded field.
+                includeFontPadding = false
+                val padH = com.prism.launcher.nora.IosUi.dp(this@LauncherActivity, 16f)
+                val padV = com.prism.launcher.nora.IosUi.dp(this@LauncherActivity, 13f)
+                setPadding(padH, padV, padH, padV)
+                minimumHeight = com.prism.launcher.nora.IosUi.dp(this@LauncherActivity, 48f)
+                imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_SEARCH
+
+                // The background is a rounded rectangle, so the shadow needs a rounded outline or
+                // the field casts a square one -- a visible box behind a glossy control.
+                val pickerShape = com.prism.launcher.nora.IosUi.mode(this@LauncherActivity).shape
+                val corner = com.prism.launcher.nora.IosUi.dp(
+                    this@LauncherActivity,
+                    if (pickerShape.pill) 999f else pickerShape.field.toFloat(),
+                ).toFloat()
+                outlineProvider = object : android.view.ViewOutlineProvider() {
+                    override fun getOutline(view: android.view.View, outline: android.graphics.Outline) {
+                        outline.setRoundRect(0, 0, view.width, view.height, corner)
+                    }
+                }
             }
             val margin = com.prism.launcher.nora.IosUi.dp(this, 24f)
             val params = android.widget.LinearLayout.LayoutParams(
@@ -915,6 +1174,77 @@ class LauncherActivity : PrismBaseActivity() {
         field.visibility = View.VISIBLE
         field.setText("")
         adapter.filter("")
+    }
+
+    /**
+     * The background for the page-switcher search field.
+     *
+     * Four layers, from the bottom up:
+     *
+     *  1. the base, a vertical gradient from a lighter top to the field's own colour -- the gloss;
+     *  2. a clipped sheen across the top 45%, which is the highlight a glossy control has;
+     *  3. a wide, translucent accent stroke, which is the light spilling inwards from the rim;
+     *  4. a crisp 1.5dp accent line, which is the rim itself.
+     *
+     * Drawn in code rather than as a drawable XML so the colours come from the same theme helpers
+     * the rest of the launcher uses -- a night-variant XML is one more file to forget to update
+     * when the palette changes.
+     */
+    private fun pickerSearchBackground(): android.graphics.drawable.Drawable {
+        val mode = com.prism.launcher.nora.IosUi.mode(this)
+        val shape = mode.shape
+        val radius = com.prism.launcher.nora.IosUi.dp(
+            this,
+            if (shape.pill) 999f else shape.field.toFloat(),
+        ).toFloat()
+        val accent = com.prism.launcher.nora.IosUi.accent(this)
+
+        val base = android.graphics.drawable.GradientDrawable(
+            android.graphics.drawable.GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(mode.palette.card.toInt(), mode.palette.surface.toInt()),
+        ).apply {
+            cornerRadius = radius
+            setStroke(
+                com.prism.launcher.nora.IosUi.dp(this@LauncherActivity, maxOf(1, shape.border).toFloat())
+                    .coerceAtLeast(1),
+                com.prism.launcher.nora.IosUi.separator(this@LauncherActivity),
+            )
+        }
+        // A flat theme gets a flat field: no gloss, no halo, no accent rim. A theme with
+        // elevation keeps the lit-edge treatment that this control was designed around.
+        if (shape.elevation <= 0) return base
+
+        val sheenPaint = android.graphics.drawable.GradientDrawable(
+            android.graphics.drawable.GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(0x3DFFFFFF, 0x00FFFFFF),
+        ).apply { cornerRadius = radius }
+        val sheen = android.graphics.drawable.ClipDrawable(
+            sheenPaint, android.view.Gravity.TOP, android.graphics.drawable.ClipDrawable.VERTICAL
+        ).apply { level = 4_500 }
+
+        // The halo is the accent at low alpha and a wide stroke; drawn over the base, the part
+        // inside the rim is what reads as light coming off the edge.
+        val halo = android.graphics.drawable.GradientDrawable().apply {
+            setColor(android.graphics.Color.TRANSPARENT)
+            cornerRadius = radius
+            setStroke(
+                com.prism.launcher.nora.IosUi.dp(this@LauncherActivity, 4f).coerceAtLeast(2),
+                (accent and 0x00FFFFFF) or 0x33000000,
+            )
+        }
+        val rim = android.graphics.drawable.GradientDrawable().apply {
+            setColor(android.graphics.Color.TRANSPARENT)
+            cornerRadius = radius
+            setStroke(
+                com.prism.launcher.nora.IosUi.dp(this@LauncherActivity, 1.5f).coerceAtLeast(1),
+                accent,
+            )
+        }
+
+        return android.graphics.drawable.LayerDrawable(arrayOf(base, sheen, halo, rim)).apply {
+            // The sheen must not paint over the rim, or the top edge loses its definition.
+            setLayerInset(1, 2, 2, 2, 2)
+        }
     }
 
     private fun hidePagePicker() {
@@ -956,6 +1286,11 @@ class LauncherActivity : PrismBaseActivity() {
             PagePickChoice.ModelStore -> SlotAssignment.ModelStore
             PagePickChoice.AgenticTools -> SlotAssignment.AgenticTools
             PagePickChoice.Wallet -> SlotAssignment.Wallet
+            PagePickChoice.Meshvoice -> SlotAssignment.Meshvoice
+            PagePickChoice.Maps -> SlotAssignment.Maps
+            PagePickChoice.Mouse -> SlotAssignment.Mouse
+            PagePickChoice.Photos -> SlotAssignment.Photos
+            PagePickChoice.PhotoPix -> SlotAssignment.PhotoPix
             is PagePickChoice.PluginPage -> SlotAssignment.Custom(
                 choice.info.packageName,
                 choice.info.viewClassName,

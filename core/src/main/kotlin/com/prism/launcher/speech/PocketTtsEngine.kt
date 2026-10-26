@@ -90,7 +90,7 @@ object PocketTtsEngine : CloneEngine, CloneEngine.ReferenceSpeechEngine {
     private const val WORK_RATE = 22_050
 
     private const val RELEASE =
-        "https://github.com/ibrahim-hmood/Prism/releases/download/voice-engines-v1"
+        "https://github.com/abraham-hmood/Prism/releases/download/voice-engines-v1"
 
     val MAIN = VoiceCloningModels.Model(
         id = "pocket-main",
@@ -98,6 +98,7 @@ object PocketTtsEngine : CloneEngine, CloneEngine.ReferenceSpeechEngine {
         file = "flow_lm_main_int8.onnx",
         sizeBytes = 76_341_079L,
         url = "$RELEASE/flow_lm_main_int8.onnx",
+        sha256 = "f9bd8106b79a0192c1c43399ab938fb24900a95c1c599870d75a884e99000116",
     )
     val FLOW = VoiceCloningModels.Model(
         id = "pocket-flow",
@@ -105,6 +106,7 @@ object PocketTtsEngine : CloneEngine, CloneEngine.ReferenceSpeechEngine {
         file = "flow_lm_flow_int8.onnx",
         sizeBytes = 9_962_530L,
         url = "$RELEASE/flow_lm_flow_int8.onnx",
+        sha256 = "3dd781ee5abee9e195320bf0106bebd6372a852b3b36352524ee78b40554635d",
     )
     val DECODER = VoiceCloningModels.Model(
         id = "pocket-decoder",
@@ -112,6 +114,7 @@ object PocketTtsEngine : CloneEngine, CloneEngine.ReferenceSpeechEngine {
         file = "mimi_decoder_int8.onnx",
         sizeBytes = 22_684_077L,
         url = "$RELEASE/mimi_decoder_int8.onnx",
+        sha256 = "3630450a3297a101792a6ac66619ebc70ab916b265e6220c2afaef8b1673f925",
     )
     val ENCODER = VoiceCloningModels.Model(
         id = "pocket-encoder",
@@ -119,6 +122,7 @@ object PocketTtsEngine : CloneEngine, CloneEngine.ReferenceSpeechEngine {
         file = "mimi_encoder.onnx",
         sizeBytes = 39_768_446L,
         url = "$RELEASE/mimi_encoder.onnx",
+        sha256 = "853e2ca623b8782d94c3745ec6133bfdff7ce33d9b11128bd29ea03f28d76e3d",
     )
     val TEXT = VoiceCloningModels.Model(
         id = "pocket-text",
@@ -126,6 +130,7 @@ object PocketTtsEngine : CloneEngine, CloneEngine.ReferenceSpeechEngine {
         file = "text_conditioner.onnx",
         sizeBytes = 16_388_344L,
         url = "$RELEASE/text_conditioner.onnx",
+        sha256 = "4ecee995fb69f85c7a7493d11f7b5ee15d9950facc7ab3f5c9c49ef1e03847bb",
     )
     val VOCAB = VoiceCloningModels.Model(
         id = "pocket-vocab",
@@ -133,6 +138,7 @@ object PocketTtsEngine : CloneEngine, CloneEngine.ReferenceSpeechEngine {
         file = "pocket_vocab.tsv",
         sizeBytes = 111_626L,
         url = "$RELEASE/pocket_vocab.tsv",
+        sha256 = "6ee816df99489e74103d83e021bf1515f958b2dbe7c5263705c56abf30bbdbc4",
     )
     val BOS = VoiceCloningModels.Model(
         id = "pocket-bos",
@@ -140,6 +146,7 @@ object PocketTtsEngine : CloneEngine, CloneEngine.ReferenceSpeechEngine {
         file = "pocket_bos.f32",
         sizeBytes = 4_096L,
         url = "$RELEASE/pocket_bos.f32",
+        sha256 = "6ac530a104e3f3d2b2ff15f3fad63540f2619b31db78b159c0595a108f142caf",
     )
 
     override val models: List<VoiceCloningModels.Model> =

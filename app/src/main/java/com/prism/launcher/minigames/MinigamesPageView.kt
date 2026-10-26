@@ -52,6 +52,8 @@ class MinigamesPageView(context: Context) : FrameLayout(context) {
         Game(GAME_PAPER, "Paper Empire", "Build, research, invade. Five hundred levels of it."),
         Game(GAME_CHESS, "Chess", "Full rules, four strengths, and the mesh."),
         Game(GAME_PONG, "Pong", "The original. Still undefeated."),
+        Game(GAME_MINESWEEPER, "Minesweeper", "Tap to open, hold to mark. Beginner to Expert."),
+        Game(GAME_PINBALL, "Pinball", "Three balls, three bumpers, two flippers."),
     )
 
     private var listOpen = false
@@ -192,6 +194,8 @@ class MinigamesPageView(context: Context) : FrameLayout(context) {
     private fun recordFor(id: String): String = when (id) {
         GAME_CHESS -> MinigameStore.chessRecord().let { "${it.first} won, ${it.second} lost" }
         GAME_PONG -> MinigameStore.pongRecord().let { "${it.first} won, ${it.second} lost" }
+        GAME_MINESWEEPER -> MinigameStore.minesweeperRecord().let { "${it.first} cleared, ${it.second} lost" }
+        GAME_PINBALL -> MinigameStore.pinballBest().let { if (it == 0) "No score yet" else "Best $it" }
         GAME_PAPER -> {
             val base = MinigameStore.loadBase()
             "level ${base.level} · ${PaperUi.shortNumber(base.xp)} XP"
@@ -215,6 +219,8 @@ class MinigamesPageView(context: Context) : FrameLayout(context) {
             GAME_PAPER -> openPaperEmpire()
             GAME_CHESS -> openChessMenu()
             GAME_PONG -> openPongMenu()
+            GAME_MINESWEEPER -> openMinesweeperMenu()
+            GAME_PINBALL -> openPinballMenu()
         }
     }
 
@@ -444,6 +450,83 @@ class MinigamesPageView(context: Context) : FrameLayout(context) {
         )
     }
 
+    // -- Minesweeper ----------------------------------------------------------
+
+    private fun openMinesweeperMenu() {
+        val menu = menuSheet("Minesweeper") { body ->
+            body.addView(PaperUi.body(context, "Tap a square to open it, hold it to place a flag. The first tap is always safe."))
+            body.addView(PaperUi.spacer(context, 12f))
+
+            Minesweeper.Difficulty.entries.forEach { difficulty ->
+                body.addView(
+                    PaperUi.button(
+                        context, difficulty.label,
+                        filled = false,
+                        seed = difficulty.ordinal.toLong() + 500,
+                    ) {
+                        startMinesweeper(difficulty)
+                    },
+                    LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ).apply { bottomMargin = PaperUi.dp(context, 6f) },
+                )
+                body.addView(
+                    PaperUi.note(
+                        context,
+                        "${difficulty.rows}×${difficulty.cols} · ${difficulty.mines} mines",
+                    ),
+                )
+            }
+        }
+        show(menu)
+    }
+
+    private fun startMinesweeper(difficulty: Minesweeper.Difficulty) {
+        val container = FrameLayout(context)
+        lateinit var board: MinesweeperView
+        board = MinesweeperView(
+            context,
+            difficulty,
+            onFinished = { won ->
+                MinigameStore.recordMinesweeper(won)
+                openMinesweeperMenu()
+            },
+        )
+        container.addView(board, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+        ))
+        container.addView(
+            PaperUi.button(context, "New game", colour = PencilStyle.BLUE_PENCIL) { board.restart() },
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM or Gravity.END,
+            ).apply { setMargins(0, 0, PaperUi.dp(context, 14f), PaperUi.dp(context, 14f)) },
+        )
+        show(container)
+    }
+
+    // -- Pinball -------------------------------------------------------------
+
+    private fun openPinballMenu() {
+        val menu = menuSheet("Pinball") { body ->
+            body.addView(PaperUi.body(context, "Tap to pull the plunger. The bottom-left half of the screen is the left flipper, the right half is the right one."))
+            body.addView(PaperUi.spacer(context, 10f))
+            body.addView(PaperUi.statLine(context, "Best", "${MinigameStore.pinballBest()}"))
+            body.addView(PaperUi.spacer(context, 12f))
+            body.addView(PaperUi.button(context, "Play", filled = true) { startPinball() })
+        }
+        show(menu)
+    }
+
+    private fun startPinball() {
+        show(
+            PinballView(context) { score ->
+                MinigameStore.recordPinball(score)
+                openPinballMenu()
+            }
+        )
+    }
+
     // -- Matchmaking ----------------------------------------------------------
 
     /**
@@ -547,5 +630,7 @@ class MinigamesPageView(context: Context) : FrameLayout(context) {
         const val GAME_PAPER = "paper"
         const val GAME_CHESS = "chess"
         const val GAME_PONG = "pong"
+        const val GAME_MINESWEEPER = "minesweeper"
+        const val GAME_PINBALL = "pinball"
     }
 }

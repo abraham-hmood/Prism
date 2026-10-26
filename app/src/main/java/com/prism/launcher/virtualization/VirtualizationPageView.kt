@@ -337,7 +337,7 @@ class VirtualizationPageView(context: Context) : FrameLayout(context) {
                 "need a different translator."
         }
 
-        androidx.appcompat.app.AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("Install the Windows layer?")
             .setMessage(message)
             .setPositiveButton("Install") { _, _ -> installWindowsLayer(pendingExe) }
@@ -380,7 +380,7 @@ class VirtualizationPageView(context: Context) : FrameLayout(context) {
             )
         }
 
-        val dialog = androidx.appcompat.app.AlertDialog.Builder(context)
+        val dialog = com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("Installing the Windows layer")
             .setView(body)
             .setCancelable(false)
@@ -412,7 +412,7 @@ class VirtualizationPageView(context: Context) : FrameLayout(context) {
                     ).show()
                     startWineSession(pendingExe)
                 } else {
-                    androidx.appcompat.app.AlertDialog.Builder(context)
+                    com.prism.launcher.theme.PrismDialogs.Builder(context)
                         .setTitle("The install did not finish")
                         .setMessage(error)
                         .setPositiveButton("OK", null)

@@ -259,7 +259,7 @@ class ChessBoardView(
                 Chess.BISHOP -> "Bishop"; else -> "Knight"
             }
         }.toTypedArray()
-        androidx.appcompat.app.AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("Promote to")
             .setItems(labels) { _, which -> sendAndPlay(options[which]) }
             .setCancelable(true)

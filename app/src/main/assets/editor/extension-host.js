@@ -9,9 +9,11 @@
  *
  * WHICH EXTENSION GOES WHERE. An extension declaring `browser` in its manifest was built for the
  * Worker and runs there. One declaring `main` is a Node extension and goes to the Node host, where
- * `fs`, `child_process` and native addons exist. What still does not work is anything needing a UI
- * surface Prism has no equivalent for -- webview panels, tree views, debug adapters -- and those
- * throw by name rather than silently doing nothing.
+ * `fs`, `child_process` and native addons exist. Webview panels and webview view providers are
+ * supported: their HTML is posted to Kotlin, which renders it in the extension's floating popup,
+ * so an extension's own interface appears and follows every reassignment of `webview.html`. What
+ * still does not work is a UI surface Prism has no equivalent for -- tree views, debug adapters --
+ * and those throw by name rather than silently doing nothing.
  *
  * THE `vscode` OBJECT BELOW IS A SHIM, not the real API. It covers what extensions actually reach
  * for; anything missing throws a named error that says so, which is far easier to act on than an
@@ -25,6 +27,23 @@ var providers = { completion: [], hover: [] };
 var activated = Object.create(null);     // extension id -> exports
 var nextCallId = 1;
 var pendingCalls = Object.create(null);
+
+// Webviews. A panel and a resolved webview view are the same thing to Prism: an id, an owner, the
+// HTML the extension last set, and a message channel back into the extension. The popup renders
+// whichever one the extension is currently showing.
+var webviews = Object.create(null);          // panel id -> record
+var webviewProviders = Object.create(null);  // owner|viewId -> provider registration
+var commandOwners = Object.create(null);     // command id -> extension id
+var currentExtensionId = null;               // who is registering right now
+var nextWebviewId = 1;
+
+// Extensions whose popup is waiting for a view. Registration is not always synchronous with
+// `activate`: an extension may await a socket, a language server or a settings read before it
+// calls `registerWebviewViewProvider`. The popup asked once, at the only moment it could, and a
+// provider that appeared a second later used to have nobody left to tell. The request is kept
+// here until a view is actually produced, and a provider registered in the meantime is resolved
+// immediately -- which is exactly what VS Code does when the view becomes visible.
+var pendingViewRequests = Object.create(null);  // extension id -> timer handle
 
 // ---------------------------------------------------------------- main-thread calls
 
@@ -157,6 +176,400 @@ function unsupported(name) {
   };
 }
 
+// ---------------------------------------------------------------- webviews
+
+/**
+ * Tells the page that a webview's state changed.
+ *
+ * The HTML travels with every message rather than being fetched on demand, because only the host
+ * holds it -- a webview's content is a string in the extension's memory, not a file Kotlin can
+ * read. One message per change is also what makes the popup follow the extension: when it swaps
+ * one view for another, the new HTML arrives without the popup asking for anything.
+ */
+function postWebview(record, action) {
+  if (action === 'html' && record.webview && record.webview.html) resolvePendingView(record.owner);
+  self.postMessage({
+    type: 'webview',
+    action: action,
+    panelId: record.panelId,
+    extensionId: record.owner,
+    kind: record.kind,
+    title: record.title,
+    viewType: record.viewType,
+    html: record.webview ? record.webview.html : ''
+  });
+}
+
+/**
+ * The `Webview` object an extension receives.
+ *
+ * `html` is an accessor, not a field, because that is the only way to notice an assignment: a
+ * webview is rendered by setting `panel.webview.html = ...`, often repeatedly as the extension
+ * re-renders. A plain property would leave the popup showing the first render forever.
+ */
+function createWebview(record) {
+  var handlers = [];
+  var html = '';
+
+  var webview = {
+    options: { enableScripts: true, localResourceRoots: [] },
+    cspSource: 'file:',
+
+    /**
+     * A file the webview may load.
+     *
+     * Returns a URI object rather than a bare string because extensions call `.toString()` on it,
+     * interpolate it into HTML, and occasionally read `.fsPath`. Extension files are unpacked inside
+     * Prism's own storage and the popup WebView can read them directly, so no asset translation is
+     * needed -- the path is already the one Android needs.
+     */
+    asWebviewUri: function (uri) {
+      var fsPath = (uri && uri.fsPath) || String(uri || '').replace(/^file:\/\//, '');
+      if (fsPath.charAt(0) !== '/') fsPath = '/' + fsPath;
+      return {
+        scheme: 'file',
+        path: fsPath,
+        fsPath: fsPath,
+        toString: function () {
+          return 'file://' + encodeURI(fsPath)
+            .replace(/\?/g, '%3F')
+            .replace(/#/g, '%23');
+        }
+      };
+    },
+
+    postMessage: function (message) {
+      self.postMessage({ type: 'webview-to-page', panelId: record.panelId, payload: message });
+      return Promise.resolve(true);
+    },
+
+    onDidReceiveMessage: function (handler) {
+      handlers.push(handler);
+      return new Disposable(function () {
+        var i = handlers.indexOf(handler);
+        if (i >= 0) handlers.splice(i, 1);
+      });
+    },
+
+    /** Delivery from the popup. `json` is the string the page forwarded from the rendered view. */
+    receive: function (json) {
+      var value;
+      try { value = typeof json === 'string' ? JSON.parse(json) : json; }
+      catch (e) { value = json; }
+      handlers.slice().forEach(function (handler) {
+        try { handler(value); } catch (e) { report(e); }
+      });
+    }
+  };
+
+  Object.defineProperty(webview, 'html', {
+    get: function () { return html; },
+    set: function (value) {
+      html = value === undefined || value === null ? '' : String(value);
+      if (!record.disposed) postWebview(record, 'html');
+    }
+  });
+
+  return webview;
+}
+
+function newWebviewRecord(kind, owner, viewType, title) {
+  var record = {
+    kind: kind,
+    panelId: (kind === 'view' ? 'view-' : 'panel-') + (nextWebviewId++),
+    owner: owner || 'unknown',
+    viewType: String(viewType || ''),
+    title: String(title || viewType || 'Extension'),
+    disposed: false,
+    visible: true,
+    active: true,
+    disposeHandlers: []
+  };
+  record.webview = createWebview(record);
+  webviews[record.panelId] = record;
+  return record;
+}
+
+function disposeWebview(record) {
+  if (record.disposed) return;
+  record.disposed = true;
+  delete webviews[record.panelId];
+  postWebview(record, 'dispose');
+  record.disposeHandlers.slice().forEach(function (handler) {
+    try { handler(); } catch (e) { report(e); }
+  });
+}
+
+/**
+ * `vscode.window.createWebviewPanel`. One panel is one view the popup can show.
+ *
+ * [owner] exists because `currentExtensionId` is only reliable for work that happens synchronously
+ * inside `activate` or a command. An extension that builds its panel from a timer, a socket callback
+ * or an awaited promise would otherwise be attributed to whichever extension last activated -- so
+ * its view would be filed under the wrong popup and never appear. The per-extension `vscode` object
+ * ([vscodeFor]) passes the real owner, and this falls back to the old global for the Worker path.
+ */
+function createWebviewPanel(viewType, title, showOptions, options, owner) {
+  var record = newWebviewRecord('panel', owner || currentExtensionId, viewType, title);
+  if (options && options.enableScripts === false) record.webview.options = {};
+  // A panel created after the popup asked for a view is the view it was waiting for. The HTML
+  // that follows arrives as its own message; this only keeps the request from timing out first.
+  if (pendingViewRequests[record.owner]) postWebview(record, 'open');
+
+  var panel = {
+    viewType: record.viewType,
+    webview: record.webview,
+    visible: true,
+    active: true,
+    iconPath: options && options.iconPath,
+    onDidDispose: function (handler) {
+      record.disposeHandlers.push(handler);
+      return new Disposable(function () {
+        var i = record.disposeHandlers.indexOf(handler);
+        if (i >= 0) record.disposeHandlers.splice(i, 1);
+      });
+    },
+    // Prism has no side-by-side columns, and a view that is open is visible. The event is here
+    // because extensions subscribe unconditionally.
+    onDidChangeViewState: function () { return new Disposable(function () {}); },
+    reveal: function () {
+      record.visible = true;
+      postWebview(record, 'open');
+    },
+    dispose: function () { disposeWebview(record); }
+  };
+  Object.defineProperty(panel, 'title', {
+    get: function () { return record.title; },
+    set: function (value) {
+      record.title = String(value === undefined || value === null ? '' : value);
+      if (!record.disposed) postWebview(record, 'title');
+    }
+  });
+
+  postWebview(record, 'open');
+  return panel;
+}
+
+/**
+ * `vscode.window.registerWebviewViewProvider`.
+ *
+ * The provider is only asked to build its view when something wants to show it -- opening the
+ * extension's popup, in practice. That matches VS Code: a view that has never been visible has no
+ * HTML and costs nothing.
+ */
+/** Stops waiting for a view from [extensionId]. */
+function resolvePendingView(extensionId) {
+  var timer = pendingViewRequests[extensionId];
+  if (timer !== undefined) {
+    clearTimeout(timer);
+    delete pendingViewRequests[extensionId];
+  }
+}
+
+function registerWebviewViewProvider(viewId, provider, owner) {
+  var id = String(viewId);
+  var extensionOwner = owner || currentExtensionId || 'unknown';
+  var key = extensionOwner + '|' + id;
+  var previous = webviewProviders[key];
+  // A reactivated extension registers again. Keeping the old record would leave a stale view
+  // competing with the new one for "the newest view this extension has".
+  if (previous && previous.record) disposeWebview(previous.record);
+  webviewProviders[key] = {
+    owner: extensionOwner,
+    viewId: id,
+    provider: provider,
+    record: null
+  };
+  // The popup opened before this provider existed. Resolve it now instead of making the user
+  // close and reopen the extension -- which is what "No view yet" used to mean.
+  if (pendingViewRequests[extensionOwner]) {
+    resolveWebviewView(webviewProviders[key]);
+  }
+  return new Disposable(function () {
+    var entry = webviewProviders[key];
+    if (!entry) return;
+    if (entry.record) disposeWebview(entry.record);
+    delete webviewProviders[key];
+  });
+}
+
+/** Builds (once) and shows the view behind a provider registration. */
+function resolveWebviewView(entry) {
+  if (entry.record && !entry.record.disposed) {
+    postWebview(entry.record, 'open');
+    return;
+  }
+
+  var record = newWebviewRecord('view', entry.owner, entry.viewId, entry.viewId);
+  var view = {
+    viewType: record.viewType,
+    title: record.title,
+    description: undefined,
+    badge: undefined,
+    visible: true,
+    webview: record.webview,
+    show: function () {
+      record.visible = true;
+      postWebview(record, 'open');
+    },
+    onDidChangeVisibility: function () { return new Disposable(function () {}); },
+    onDidDispose: function (handler) {
+      record.disposeHandlers.push(handler);
+      return new Disposable(function () {});
+    },
+    onDidChangeTitle: function () { return new Disposable(function () {}); },
+    onDidChangeBadge: function () { return new Disposable(function () {}); }
+  };
+  entry.record = record;
+
+  try {
+    var result = entry.provider.resolveWebviewView(view, { state: null }, {
+      isCancellationRequested: false,
+      onCancellationRequested: function () { return new Disposable(function () {}); }
+    });
+    if (result && typeof result.then === 'function') {
+      result.then(
+        function () { postWebview(record, 'open'); },
+        function (e) { report(e); }
+      );
+    }
+  } catch (e) { report(e); }
+
+  // Sent immediately as well: most providers set `webview.html` synchronously, and waiting for a
+  // promise that may never resolve would leave the popup empty for no reason.
+  postWebview(record, 'open');
+}
+
+/**
+ * Shows whatever this extension is currently displaying.
+ *
+ * THE NEWEST PANEL WINS. An extension that switches views disposes one panel and creates another,
+ * and "render the main view, then render whatever it changed to" means following the newest panel
+ * rather than pinning the first one. A view provider is resolved only when there is no panel.
+ */
+function openExtensionWebview(extensionId) {
+  // Remember the request for a while. An extension that registers its provider after an await --
+  // most of them do -- would otherwise post `none` and the popup would sit on its placeholder
+  // even though a view was about to exist. `resolvePendingView` clears this the moment HTML
+  // arrives; the timeout is only so a genuinely view-less extension stops being retried.
+  resolvePendingView(extensionId);
+  pendingViewRequests[extensionId] = setTimeout(function () {
+    delete pendingViewRequests[extensionId];
+  }, 20000);
+
+  var records = Object.keys(webviews).map(function (key) { return webviews[key]; });
+  var alive = records.filter(function (record) {
+    return record.owner === extensionId && !record.disposed;
+  });
+  var panels = alive.filter(function (record) { return record.kind === 'panel'; });
+  var views = alive.filter(function (record) { return record.kind === 'view'; });
+
+  // Anything that has actually drawn something is what the extension is showing right now, and
+  // the newest of those wins -- that is how "render the main view, then follow it to the next
+  // thing the extension switches to" works.
+  var drawn = alive.filter(function (record) {
+    return record.webview && record.webview.html;
+  });
+  if (drawn.length) {
+    resolvePendingView(extensionId);
+    postWebview(drawn[drawn.length - 1], 'open');
+    return;
+  }
+
+  // Nothing has drawn yet. A webview VIEW PROVIDER is still the extension's main view, and
+  // resolving it is exactly what VS Code does when that view becomes visible. This is the case
+  // the old order missed: an existing but still-empty panel short-circuited the provider, so an
+  // extension whose panel was created before its first render looked like it had no view at all.
+  var keys = Object.keys(webviewProviders).filter(function (key) {
+    return webviewProviders[key].owner === extensionId;
+  });
+  var unresolved = keys.filter(function (key) {
+    var entry = webviewProviders[key];
+    return !entry.record || entry.record.disposed;
+  });
+  var target = unresolved.length ? unresolved[0] : keys[0];
+  if (target) {
+    resolveWebviewView(webviewProviders[target]);
+    return;
+  }
+
+  // An empty panel or view still exists, and its next render arrives as a `html` message. Report
+  // it so the popup keeps listening instead of concluding the extension has no interface.
+  if (panels.length) {
+    postWebview(panels[panels.length - 1], 'open');
+    return;
+  }
+  if (views.length) {
+    postWebview(views[views.length - 1], 'open');
+    return;
+  }
+
+  // If a provider is registered later it resolves itself and clears the pending request; until
+  // then the popup is told to keep its placeholder rather than pretend the extension has no UI.
+  self.postMessage({ type: 'webview', action: 'waiting', extensionId: extensionId });
+}
+
+/**
+ * Registers a command against an explicit owner.
+ *
+ * The owner is not decoration: a command that opens a webview sets `currentExtensionId` from
+ * `commandOwners` before running, which is how the panel it creates ends up in that extension's
+ * popup. A command registered asynchronously after activation used to have a null owner and would
+ * take the panel of whoever happened to be active.
+ */
+function registerCommandFor(owner, id, handler) {
+  commands[id] = handler;
+  commandOwners[id] = owner || null;
+  self.postMessage({ type: 'command-registered', id: id });
+  return new Disposable(function () { delete commands[id]; delete commandOwners[id]; });
+}
+
+// ---------------------------------------------------------------- notebooks
+//
+// The notebook API is almost entirely UI -- controllers, renderers, serializers -- and Prism has
+// no notebook surface. The two classes here exist because they are NAME-SPACE OBJECTS: extensions
+// touch `vscode.NotebookCellOutputItem.error` at module scope, before `activate`, to read the MIME
+// type of an error output. Leaving the class undefined made a minified bundle throw on its very
+// first line (`Cannot read properties of undefined (reading 'error')`) and the extension never
+// activated at all. A working value object costs nothing and gets activation past that line.
+
+function NotebookCellOutputItem(mime, value) {
+  this.mime = mime;
+  this.value = value instanceof Uint8Array ? value : new Uint8Array(value || 0);
+}
+NotebookCellOutputItem.text = function (value, mime) {
+  return new NotebookCellOutputItem(mime || 'text/plain', new TextEncoder().encode(String(value)));
+};
+NotebookCellOutputItem.json = function (value, mime) {
+  return new NotebookCellOutputItem(mime || 'application/json', new TextEncoder().encode(JSON.stringify(value)));
+};
+NotebookCellOutputItem.error = function (error) {
+  var payload = {
+    name: (error && error.name) || 'Error',
+    message: (error && error.message) || String(error),
+    stack: (error && error.stack) || ''
+  };
+  return new NotebookCellOutputItem(
+    'application/vnd.code.notebook.error',
+    new TextEncoder().encode(JSON.stringify(payload))
+  );
+};
+NotebookCellOutputItem.stdout = function (value) {
+  return new NotebookCellOutputItem('application/vnd.code.notebook.stdout', new TextEncoder().encode(String(value)));
+};
+NotebookCellOutputItem.stderr = function (value) {
+  return new NotebookCellOutputItem('application/vnd.code.notebook.stderr', new TextEncoder().encode(String(value)));
+};
+
+function NotebookCellData(kind, value, languageId) {
+  this.kind = kind;
+  this.value = value;
+  this.languageId = languageId;
+  this.outputs = [];
+  this.metadata = {};
+  this.executionSummary = undefined;
+}
+
 var vscode = {
   version: '1.95.0',
   Disposable: Disposable,
@@ -169,12 +582,19 @@ var vscode = {
   CompletionItemKind: CompletionItemKind,
   MarkdownString: MarkdownString,
   Hover: Hover,
+  RelativePattern: function (base, pattern) {
+    this.baseUri = base && base.uri ? base.uri : base;
+    this.pattern = String(pattern);
+    this.base = base;
+    this.baseUri = this.baseUri || base;
+  },
+  NotebookCellOutputItem: NotebookCellOutputItem,
+  NotebookCellData: NotebookCellData,
+  NotebookCellKind: { Markup: 1, Code: 2 },
 
   commands: {
     registerCommand: function (id, handler) {
-      commands[id] = handler;
-      self.postMessage({ type: 'command-registered', id: id });
-      return new Disposable(function () { delete commands[id]; });
+      return registerCommandFor(currentExtensionId, id, handler);
     },
     registerTextEditorCommand: function (id, handler) {
       return vscode.commands.registerCommand(id, handler);
@@ -196,14 +616,36 @@ var vscode = {
     showQuickPick: function (items, options) {
       return callMain('quickPick', { items: items, options: options || {} });
     },
-    createOutputChannel: function (name) {
+    createOutputChannel: function (name, options) {
+      // `{ log: true }` requests a LogOutputChannel, and an extension that asked for one calls
+      // `.info()`, `.warn()` and `.error()` on it immediately. Those were missing, so the first
+      // line of a real extension's logging threw "Cannot read properties of undefined (reading
+      // 'error')" and activation failed before it registered its sidebar. The level variants are
+      // the same append with a prefix; there is no separate channel type to maintain.
+      var write = function (level) {
+        return function (v) {
+          callMain('output', {
+            channel: name,
+            level: level,
+            text: String(v) + '\n'
+          });
+        };
+      };
       return {
         name: name,
+        logLevel: 2,          // LogLevel.Info
         append: function (v) { callMain('output', { channel: name, text: String(v) }); },
         appendLine: function (v) { callMain('output', { channel: name, text: String(v) + '\n' }); },
+        trace: write('trace'),
+        debug: write('debug'),
+        info: write('info'),
+        warn: write('warn'),
+        error: write('error'),
         clear: function () { callMain('output', { channel: name, clear: true }); },
         show: function () { callMain('output', { channel: name, show: true }); },
-        hide: function () {}, dispose: function () {}
+        hide: function () {}, dispose: function () {},
+        replace: function (v) { callMain('output', { channel: name, text: String(v), replace: true }); },
+        onDidChangeLogLevel: function () { return new Disposable(function () {}); }
       };
     },
     setStatusBarMessage: function (text) {
@@ -219,10 +661,38 @@ var vscode = {
       return item;
     },
     get activeTextEditor() { return currentEditor; },
+    // The tab API is read at module scope by extensions that remember which tabs were open. It is
+    // read-only here -- Prism has one editor surface, not VS Code's tab strip -- but `all` and the
+    // two events have to exist, because `tabGroups.all.flatMap(...)` runs before anything else.
+    tabGroups: {
+      all: [],
+      activeTabGroup: undefined,
+      onDidChangeTabs: function (h) { return subscribe('tabs', h); },
+      onDidChangeTabGroups: function (h) { return subscribe('tabGroups', h); },
+      close: function () { return Promise.resolve(true); }
+    },
+    tabs: [],
     onDidChangeActiveTextEditor: function (h) { return subscribe('activeEditor', h); },
+    onDidChangeVisibleTextEditors: function (h) { return subscribe('visibleEditors', h); },
+    onDidChangeTextEditorSelection: function (h) { return subscribe('textEditorSelection', h); },
+    onDidChangeWindowState: function (h) { return subscribe('windowState', h); },
+    onDidChangeActiveColorTheme: function (h) { return subscribe('colorTheme', h); },
     showTextDocument: function (doc) { return callMain('showDocument', { uri: doc && doc.uri && doc.uri.toString() }); },
     createTerminal: unsupported('window.createTerminal'),
-    createWebviewPanel: unsupported('window.createWebviewPanel'),
+    // Webviews are the only extension-owned pixels the host has. A panel or a resolved view is
+    // rendered in the extension's floating popup, so `panel.webview.html = ...` is what puts an
+    // extension's UI on screen -- including when it replaces that HTML later.
+    createWebviewPanel: createWebviewPanel,
+    registerWebviewViewProvider: registerWebviewViewProvider,
+    // A panel opened in a previous session cannot be restored: Prism does not persist the HTML an
+    // extension drew. The registration still has to succeed, because extensions call it during
+    // activation and treat a missing function as a fatal error.
+    registerWebviewPanelSerializer: function () { return new Disposable(function () {}); },
+    registerCustomEditorProvider: function () { return new Disposable(function () {}); },
+    registerFileDecorationProvider: function () { return new Disposable(function () {}); },
+    registerUriHandler: function () { return new Disposable(function () {}); },
+    registerExternalUriOpener: function () { return new Disposable(function () {}); },
+    registerTerminalProfileProvider: function () { return new Disposable(function () {}); },
     createTreeView: unsupported('window.createTreeView')
   },
 
@@ -251,6 +721,42 @@ var vscode = {
     onDidChangeTextDocument: function (h) { return subscribe('textDocumentChanged', h); },
     onDidOpenTextDocument: function (h) { return subscribe('textDocumentOpened', h); },
     onDidSaveTextDocument: function (h) { return subscribe('textDocumentSaved', h); },
+    // File and selection events. Prism raises none of them yet, but every one is subscribed to
+    // unconditionally by real extensions, and a missing function is a hard activation failure.
+    // `subscribe` means a future emitter needs no change here.
+    onDidChangeWorkspaceFolders: function (h) { return subscribe('workspaceFolders', h); },
+    onWillSaveTextDocument: function (h) { return subscribe('willSaveTextDocument', h); },
+    onDidCloseTextDocument: function (h) { return subscribe('textDocumentClosed', h); },
+    onDidCreateFiles: function (h) { return subscribe('filesCreated', h); },
+    onDidDeleteFiles: function (h) { return subscribe('filesDeleted', h); },
+    onDidRenameFiles: function (h) { return subscribe('filesRenamed', h); },
+    onWillCreateFiles: function (h) { return subscribe('willCreateFiles', h); },
+    onWillDeleteFiles: function (h) { return subscribe('willDeleteFiles', h); },
+    onWillRenameFiles: function (h) { return subscribe('willRenameFiles', h); },
+    getWorkspaceFolder: function () { return undefined; },
+    updateWorkspaceFolders: function () { return false; },
+    // Returning a disposable rather than throwing. Registering a provider is how an extension
+    // exposes a virtual scheme (`claude-code://` for Claude's own documents), and the call happens
+    // during activation whether or not anything reads that scheme. Throwing here killed the whole
+    // extension; a provider Prism never consults is a no-op, and the disposable keeps the
+    // extension's unsubscribe path honest.
+    registerFileSystemProvider: function () { return new Disposable(function () {}); },
+    registerNotebookSerializer: function () { return new Disposable(function () {}); },
+    createFileSystemWatcher: function () {
+      return {
+        ignoreCreateEvents: false,
+        ignoreChangeEvents: false,
+        ignoreDeleteEvents: false,
+        onDidCreate: function () { return new Disposable(function () {}); },
+        onDidChange: function () { return new Disposable(function () {}); },
+        onDidDelete: function () { return new Disposable(function () {}); },
+        dispose: function () {}
+      };
+    },
+    applyEdit: function () { return Promise.resolve(true); },
+    registerTextDocumentContentProvider: function () { return new Disposable(function () {}); },
+    onDidChangeTextEditorSelection: function (h) { return subscribe('textEditorSelection', h); },
+    onDidChangeVisibleTextEditors: function (h) { return subscribe('visibleTextEditors', h); },
     openTextDocument: function (target) { return callMain('openDocument', { target: String(target) }); },
     fs: {
       readFile: function (uri) { return callMain('readFile', { path: uri.fsPath || uri.path }); },
@@ -354,9 +860,43 @@ function decodeBytes(content) {
  * not a web extension, and failing loudly at that line is far more useful than handing it an empty
  * object and letting it fail somewhere unrecognisable ten frames later.
  */
+/**
+ * The `vscode` object one extension sees, with its attribution already attached.
+ *
+ * Extensions share a single shim, so the only way to know who created a panel or registered a
+ * command is to capture it at the API call. Doing that per extension -- rather than with a global
+ * "currently activating" id -- is what makes an extension that builds its view asynchronously keep
+ * it. Everything else on the object is inherited unchanged, so this is invisible to the extension.
+ */
+function vscodeFor(extensionId) {
+  if (typeof extensionId !== 'string' || !extensionId) return vscode;
+
+  var scopedWindow = Object.create(vscode.window);
+  scopedWindow.createWebviewPanel = function (viewType, title, showOptions, options) {
+    return createWebviewPanel(viewType, title, showOptions, options, extensionId);
+  };
+  scopedWindow.registerWebviewViewProvider = function (viewId, provider) {
+    return registerWebviewViewProvider(viewId, provider, extensionId);
+  };
+
+  var scopedCommands = Object.create(vscode.commands);
+  scopedCommands.registerCommand = function (id, handler) {
+    return registerCommandFor(extensionId, id, handler);
+  };
+  scopedCommands.registerTextEditorCommand = function (id, handler) {
+    return scopedCommands.registerCommand(id, handler);
+  };
+
+  var scoped = Object.create(vscode);
+  scoped.window = scopedWindow;
+  scoped.commands = scopedCommands;
+  return scoped;
+}
+
 function makeRequire(extensionId) {
+  var api = vscodeFor(extensionId);
   return function (name) {
-    if (name === 'vscode') return vscode;
+    if (name === 'vscode') return api;
     if (typeof self.prismRequire === 'function') return self.prismRequire(extensionId, name);
     throw new Error(
       'Extension "' + extensionId + '" requires the Node module "' + name + '". ' +
@@ -395,13 +935,28 @@ self.onmessage = function (event) {
 
   switch (msg.type) {
     case 'activate':
+      // Registration APIs attribute what they are handed to "the extension activating right now".
+      // It is set before the call because `activate` runs synchronously up to its first await.
+      currentExtensionId = msg.id;
       try {
         var context = buildExtensionContext(msg);
         activateExtension(msg.id, msg.source, context)
           .then(function () { self.postMessage({ type: 'activated', id: msg.id }); })
-          .catch(function (e) { self.postMessage({ type: 'activation-failed', id: msg.id, message: String(e && e.message || e) }); });
+          .catch(function (e) {
+            self.postMessage({
+              type: 'activation-failed',
+              id: msg.id,
+              message: String(e && e.message || e),
+              stack: String(e && e.stack || '')
+            });
+          });
       } catch (e) {
-        self.postMessage({ type: 'activation-failed', id: msg.id, message: String(e && e.message || e) });
+        self.postMessage({
+          type: 'activation-failed',
+          id: msg.id,
+          message: String(e && e.message || e),
+          stack: String(e && e.stack || '')
+        });
       }
       break;
 
@@ -411,6 +966,9 @@ self.onmessage = function (event) {
       break;
 
     case 'run-command':
+      // A command that opens a panel should have it owned by the extension that registered the
+      // command, not by whichever extension happened to activate last.
+      if (commandOwners[msg.id]) currentExtensionId = commandOwners[msg.id];
       var handler = commands[msg.id];
       if (!handler) {
         self.postMessage({ type: 'command-missing', id: msg.id });
@@ -427,6 +985,15 @@ self.onmessage = function (event) {
       collectCompletions(msg).then(function (items) {
         self.postMessage({ type: 'completions', id: msg.id, items: items });
       });
+      break;
+
+    case 'open-view':
+      openExtensionWebview(msg.extensionId);
+      break;
+
+    case 'from-webview':
+      var target = webviews[msg.panelId];
+      if (target) target.webview.receive(msg.payload);
       break;
 
     case 'event':
@@ -626,6 +1193,9 @@ function matchesSelector(selector, language) {
 // Handed to the Node host, which needs the same `vscode` object its own module loader will return
 // for `require('vscode')`. Harmless in a Worker, where nothing reads it.
 self.prismVscode = vscode;
+// The Node host resolves `require('vscode')` itself and knows which extension's module asked, so
+// it uses this to hand each one its own attributed view of the API.
+self.prismVscodeFor = vscodeFor;
 self.prismMakeRequire = makeRequire;
 
 self.postMessage({ type: 'host-ready' });

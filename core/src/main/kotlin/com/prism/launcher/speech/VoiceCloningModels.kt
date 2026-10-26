@@ -24,13 +24,23 @@ import java.net.URL
  */
 object VoiceCloningModels {
 
-    /** One file an engine needs: where it lives, how big it is, what to call it in progress UI. */
+    /**
+     * One file an engine needs: where it lives, how big it is, what it must hash to.
+     *
+     * [sha256] is REQUIRED, not optional. These graphs are 3–358 MB of executable model data
+     * fetched over a network and then handed to ONNX Runtime, so "the bytes that arrived" is not
+     * good enough: a truncated transfer, a CDN serving a previous upload, or an actively swapped
+     * file would all load and produce garbage rather than failing. The digest is the release's
+     * published asset digest (GitHub's release API for the voice-engines tag, and the LFS oid for
+     * the Hugging Face exports), pinned here so it is checked on every install.
+     */
     data class Model(
         val id: String,
         val label: String,
         val file: String,
         val sizeBytes: Long,
         val url: String,
+        val sha256: String,
     ) {
         val sizeLabel: String get() = "%.1f MB".format(sizeBytes / 1_000_000.0)
     }
@@ -39,8 +49,30 @@ object VoiceCloningModels {
 
     fun fileFor(model: Model): File = File(homeDir(), model.file)
 
-    fun isInstalled(model: Model): Boolean =
-        fileFor(model).let { it.isFile && it.length() == model.sizeBytes }
+    /**
+     * Whether a file is present and known-good.
+     *
+     * THE MARKER IS THE POINT. Hashing 358 MB every time a picker asks "is this installed?"
+     * would freeze the page, and size alone is what the old code trusted -- which meant a file
+     * one byte off was reported as MISSING forever and silently re-downloaded in full. So a
+     * successful verified install writes `<file>.sha256`; its presence and contents are the cheap
+     * proof. A file with no marker (an install that predates this) is still reported as installed
+     * if its size matches, and [ensureInstalled] verifies it once and writes the marker the next
+     * time it runs.
+     */
+    fun isInstalled(model: Model): Boolean {
+        val file = fileFor(model)
+        if (!file.isFile || file.length() != model.sizeBytes) return false
+        val marker = markerFor(model)
+        if (!marker.isFile) return true
+        return runCatching { marker.readText().trim().equals(model.sha256, ignoreCase = true) }
+            .getOrDefault(false)
+    }
+
+    /** True when the file is present AND its digest has been verified and recorded. */
+    fun isVerified(model: Model): Boolean = isInstalled(model) && markerFor(model).isFile
+
+    private fun markerFor(model: Model): File = File(homeDir(), "${model.file}.sha256")
 
     fun statusLine(models: List<Model>): String = models.joinToString("  ·  ") { model ->
         if (isInstalled(model)) "${model.label} ${model.sizeLabel} ✓" else "${model.label} ${model.sizeLabel}"
@@ -63,13 +95,56 @@ object VoiceCloningModels {
     ): String? {
         purgeStaleFiles()
         for (model in models) {
-            if (isInstalled(model)) continue
+            if (isVerified(model)) continue
+            val file = fileFor(model)
+
+            // Present but unverified: either a pre-marker install or a corrupted one. Verify
+            // before deciding, because "re-download 358 MB" is a much worse answer than one hash
+            // pass when the file was already correct.
+            if (file.isFile) {
+                val verified = runCatching {
+                    file.length() == model.sizeBytes && digest(file).equals(model.sha256, true)
+                }.getOrDefault(false)
+                if (verified) {
+                    writeMarker(model)
+                    continue
+                }
+                PrismPlatform.log.warn(
+                    TAG,
+                    "Discarding ${model.file}: it does not match the published digest",
+                )
+                file.delete()
+                markerFor(model).delete()
+            }
+
             val error = download(model, onProgress)
             if (error != null) return error
             // Any engine whose file just changed must drop its sessions to pick the new one up.
             CloneEngines.closeAll()
         }
         return null
+    }
+
+    /** Streaming SHA-256, so a 358 MB graph never has to fit in memory twice. */
+    internal fun digest(file: File): String {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        file.inputStream().buffered(64 * 1024).use { input ->
+            val buffer = ByteArray(64 * 1024)
+            while (true) {
+                val read = input.read(buffer)
+                if (read <= 0) break
+                md.update(buffer, 0, read)
+            }
+        }
+        return md.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+    }
+
+    private fun writeMarker(model: Model) {
+        runCatching {
+            markerFor(model).writeText(model.sha256)
+        }.onFailure {
+            PrismPlatform.log.warn(TAG, "Could not record the checksum for ${model.file}")
+        }
     }
 
     /**
@@ -105,11 +180,29 @@ object VoiceCloningModels {
             staging.delete()
             return error
         }
+
+        // VERIFY BEFORE IT BECOMES A MODEL. The staging file is checked against the pinned
+        // digest, and a mismatch is a hard failure with both hashes shown -- not a warning that
+        // lets an unverified graph be loaded later.
+        val actual = digest(staging)
+        if (!actual.equals(model.sha256, ignoreCase = true)) {
+            staging.delete()
+            val message = "${model.file} failed checksum verification: expected " +
+                "${model.sha256.take(16)}…, got ${actual.take(16)}…. The download was " +
+                "truncated or does not match the published file."
+            PrismPlatform.log.error(TAG, message, null)
+            return message
+        }
+
         if (!staging.renameTo(target)) {
             staging.copyTo(target, overwrite = true)
             staging.delete()
         }
-        PrismPlatform.log.info(TAG, "Installed ${model.file} (${target.length()} bytes)")
+        writeMarker(model)
+        PrismPlatform.log.info(
+            TAG,
+            "Installed ${model.file} (${target.length()} bytes, sha256 verified)",
+        )
         null
     }.getOrElse {
         PrismPlatform.log.error(TAG, "Install of ${model.file} failed", it)

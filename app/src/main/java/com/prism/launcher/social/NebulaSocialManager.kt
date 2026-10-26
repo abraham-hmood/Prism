@@ -25,7 +25,7 @@ object NebulaSocialManager {
      * Entry point for generating new AI content.
      * @param manual If true, ignores the Idle/Charging check (user-initiated).
      */
-    suspend fun generateNewContent(context: Context, manual: Boolean = false) = withContext(Dispatchers.IO) {
+    suspend fun generateNewContent(context: Context, manual: Boolean = false): Boolean = withContext(Dispatchers.IO) {
         val mode = PrismSettings.getAiMode()
         val isCloud = mode == PrismSettings.AI_MODE_CLOUD
 
@@ -39,7 +39,7 @@ object NebulaSocialManager {
                 // No strict blockade
             } else {
                 // Local MUST be idle + charging
-                if (!isCharging || !isIdle) return@withContext
+                if (!isCharging || !isIdle) return@withContext false
             }
         }
 
@@ -53,7 +53,7 @@ object NebulaSocialManager {
 
         // 2. Select a random bot to post
         val bots = db.socialDao().getAllBots()
-        if (bots.isEmpty()) return@withContext
+        if (bots.isEmpty()) return@withContext false
 
         val bot = bots.random()
 
@@ -87,8 +87,12 @@ object NebulaSocialManager {
             authorAvatarUrl = bot.avatarUrl,
             content = finalContent,
             imageUrl = finalImageUrl,
-            likesCount = (10..500).random(),
-            repostCount = (1..50).random()
+            // ZERO, NOT A RANDOM NUMBER. These used to be invented in the 10–500 range so the
+            // feed looked lively, which meant every engagement number in Nebula was fiction and
+            // tapping Like changed nothing. They now start at zero and are moved by real
+            // interactions (see SocialDao.adjustLikes/adjustReposts).
+            likesCount = 0,
+            repostCount = 0
         )
 
         db.socialDao().insertPost(post)
@@ -110,6 +114,7 @@ object NebulaSocialManager {
         if (Math.random() < 0.1) {
             generateBotDM(context, bot)
         }
+        true
     }
 
     /**

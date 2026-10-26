@@ -15,6 +15,7 @@ import android.content.pm.ServiceInfo
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.prism.launcher.LauncherActivity
+import com.prism.launcher.PrismLogger
 import com.prism.launcher.PrismSettings
 import com.prism.launcher.R
 import java.io.FileInputStream
@@ -192,7 +193,7 @@ class PrivateDnsVpnService : VpnService() {
         val dnsA = PrismSettings.getPrimaryDns()
         val dnsB = PrismSettings.getSecondaryDns()
 
-        return this.Builder()
+        val builder = this.Builder()
             .setSession("Prism Private DNS")
             .setMtu(1500)
             .addAddress(VPN_ADDRESS, 30)
@@ -201,7 +202,8 @@ class PrivateDnsVpnService : VpnService() {
             .addRoute(dnsA, 32)
             .addRoute(dnsB, 32)
             .addRoute("10.8.0.0", 24)
-            .establish()
+        applyAppWhitelist(builder)
+        return builder.establish()
     }
 
     private fun rebuildTunnelWithFreshRoutes() {
@@ -211,13 +213,14 @@ class PrivateDnsVpnService : VpnService() {
         synchronized(tunnelLock) {
             if (!serviceRunning) return
             try {
-                if (comp.packedIpv4 == sinkPackedIpv4) return
+                if (comp.packedIpv4 == sinkPackedIpv4 && comp.packedIpv6 == sinkPackedIpv6) return
                 
                 ioRunning = false
                 ioThread?.interrupt()
                 tunInterface?.close()
 
                 sinkPackedIpv4 = comp.packedIpv4
+                sinkPackedIpv6 = comp.packedIpv6
                 val pfd = establishLocked(comp) ?: return
                 tunInterface = pfd
                 
@@ -239,15 +242,64 @@ class PrivateDnsVpnService : VpnService() {
             .addAddress(VPN_ADDRESS, 30)
             .addDnsServer(dnsA)
             .addDnsServer(dnsB)
-            .addRoute(dnsA, 32)
-            .addRoute(dnsB, 32)
-            .addRoute("10.8.0.0", 24)
 
-        for (ip in comp.ipv4DottedForRoutes) {
-            try { builder.addRoute(ip, 32) } catch (_: Throwable) { }
+        // ROUTE FAILURES ARE COUNTED AND REPORTED.
+        //
+        // `addRoute` throws for a malformed address or a route the platform refuses, and catching
+        // it silently meant the tunnel came up looking healthy while those destinations were not
+        // in it -- traffic to them went out of the physical interface, outside the blocklist. A
+        // split tunnel that quietly is not split is the exact failure this feature cannot have.
+        val failedRoutes = mutableListOf<String>()
+        fun addRoute(ip: String, prefix: Int) {
+            try {
+                builder.addRoute(ip, prefix)
+            } catch (error: Throwable) {
+                failedRoutes += "$ip/$prefix"
+                Log.e(TAG, "Could not add route $ip/$prefix: ${error.message}")
+            }
         }
 
+        addRoute(dnsA, 32)
+        addRoute(dnsB, 32)
+        addRoute("10.8.0.0", 24)
+
+        // IPv6 needs an address on the interface before routes can be added. Only do it when the
+        // blocklist actually resolved an IPv6 address, so an IPv4-only setup is unchanged.
+        if (comp.ipv6DottedForRoutes.isNotEmpty()) {
+            try { builder.addAddress(VPN_ADDRESS_V6, 64) } catch (error: Throwable) {
+                Log.e(TAG, "Could not add the IPv6 address; IPv6 routes will be skipped: ${error.message}")
+            }
+        }
+
+        for (ip in comp.ipv4DottedForRoutes) addRoute(ip, 32)
+        for (ip in comp.ipv6DottedForRoutes) addRoute(ip, 128)
+
+        lastRouteFailures = failedRoutes
+        if (failedRoutes.isNotEmpty()) {
+            PrismLogger.logWarning(
+                TAG,
+                "${failedRoutes.size} route(s) could not be added and are NOT tunneled: " +
+                    failedRoutes.take(8).joinToString(", ") +
+                    (if (failedRoutes.size > 8) " …" else ""),
+            )
+        }
+
+        applyAppWhitelist(builder)
         return builder.establish()
+    }
+
+    /**
+     * Apps the user chose to keep out of the tunnel.
+     *
+     * The list existed in Settings for months with nothing reading it, so every app was captured
+     * regardless. `addDisallowedApplication` is the platform mechanism for a per-app bypass; a
+     * package that has been uninstalled throws and is skipped rather than failing the whole VPN.
+     */
+    private fun applyAppWhitelist(builder: Builder) {
+        PrismSettings.getAppWhitelist().forEach { packageName ->
+            runCatching { builder.addDisallowedApplication(packageName) }
+                .onFailure { Log.w(TAG, "Could not exclude $packageName from the VPN: ${it.message}") }
+        }
     }
 
     private fun startIoThreadLocked(pfd: ParcelFileDescriptor) {
@@ -303,7 +355,15 @@ class PrivateDnsVpnService : VpnService() {
     }
 
     private fun handlePacket(packet: ByteArray): ByteArray? {
-        if (packet.isEmpty() || (packet[0].toInt() ushr 4) != 4) return null
+        if (packet.isEmpty()) return null
+        if ((packet[0].toInt() ushr 4) == 6) {
+            // Only blocked destinations are routed into the TUN for IPv6, so anything here that
+            // matches the sink set is a host the user blocked; everything else is not ours.
+            val destination = BlockedIpv4RouteTable.destinationPackedIpv6(packet)
+            if (destination != null && destination in sinkPackedIpv6) return null
+            return null
+        }
+        if ((packet[0].toInt() ushr 4) != 4) return null
         val ihlWords = packet[0].toInt() and 0x0f
         val ipHeaderLen = ihlWords * 4
         if (ipHeaderLen < 20 || packet.size < ipHeaderLen) return null
@@ -387,10 +447,11 @@ class PrivateDnsVpnService : VpnService() {
     private fun getDnsSocket(): DatagramSocket? {
         if (dnsSocket == null || dnsSocket?.isClosed == true) {
             try {
-                dnsSocket = DatagramSocket().apply {
-                    protect(this)
-                    soTimeout = 5000
+                val created = DatagramSocket().apply { soTimeout = 5000 }
+                if (!protect(created)) {
+                    PrismLogger.logWarning(TAG, "DNS socket could not be protected; it may loop back into the VPN")
                 }
+                dnsSocket = created
             } catch (e: Exception) {
                 Log.e(TAG, "failed to create DNS socket", e)
             }
@@ -506,8 +567,10 @@ class PrivateDnsVpnService : VpnService() {
     companion object {
         private var instance: PrivateDnsVpnService? = null
         private var sinkPackedIpv4: Set<Int> = emptySet()
+        private var sinkPackedIpv6: Set<Ipv6Key> = emptySet()
         private const val TAG = "PrivateDnsVpnService"
         private const val VPN_ADDRESS = "10.7.0.2"
+        private const val VPN_ADDRESS_V6 = "fd00:7:0:2::2"
         private const val CHANNEL_ID = "prism_vpn"
         private const val NOTIFICATION_ID = 7101
         private const val ROUTE_REFRESH_INTERVAL_MS = 5L * 60L * 1000L
@@ -521,19 +584,43 @@ class PrivateDnsVpnService : VpnService() {
          * into a tunnel" are different questions, and callers asking about connectivity want the
          * first one.
          */
-        fun isRunning(): Boolean = instance?.serviceRunning == true
+        /**
+         * Whether a tunnel interface is actually established.
+         *
+         * "The service object exists" and "traffic is being captured" are different questions.
+         * The old answer was the first one, which is why diagnostics could report the VPN up while
+         * every protected socket was failing and the mesh was unreachable.
+         */
+        fun isTunnelEstablished(): Boolean = instance?.tunInterface != null
 
-        fun protectSocket(socket: java.net.Socket) { instance?.protect(socket) }
-        fun protectSocket(socket: java.net.DatagramSocket) { instance?.protect(socket) }
-        
-        fun protectSocket(socket: java.net.ServerSocket) {
+        fun isRunning(): Boolean = instance?.serviceRunning == true && isTunnelEstablished()
+
+        /**
+         * Routes the last tunnel establishment could not add.
+         *
+         * Public so Diagnostics can show them: an empty tunnel route list is not the same as a
+         * healthy one, and this is the only place the difference is recorded.
+         */
+        @Volatile
+        var lastRouteFailures: List<String> = emptyList()
+            private set
+
+        /** The service object is alive even if no TUN interface was established. */
+        fun isServiceRunning(): Boolean = instance?.serviceRunning == true
+
+        fun protectSocket(socket: java.net.Socket): Boolean =
+            runCatching { instance?.protect(socket) }.getOrNull() ?: false
+
+        fun protectSocket(socket: java.net.DatagramSocket): Boolean =
+            runCatching { instance?.protect(socket) }.getOrNull() ?: false
+
+        fun protectSocket(socket: java.net.ServerSocket): Boolean {
             try {
                 // 1. Try SocketAdapter/Channel-based socket
                 val fdField = socket.javaClass.getDeclaredField("fd")
                 fdField.isAccessible = true
                 val fdObj = fdField.get(socket) as java.io.FileDescriptor
-                protectSocket(fdObj)
-                return
+                return protectSocket(fdObj)
             } catch (_: Exception) { }
 
             try {
@@ -544,20 +631,22 @@ class PrivateDnsVpnService : VpnService() {
                 val fdField = java.net.SocketImpl::class.java.getDeclaredField("fd")
                 fdField.isAccessible = true
                 val fd = fdField.get(impl) as java.io.FileDescriptor
-                protectSocket(fd)
+                return protectSocket(fd)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to protect ServerSocket: ${e.message}")
+                return false
             }
         }
 
-        fun protectSocket(fd: java.io.FileDescriptor) {
-            try {
+        fun protectSocket(fd: java.io.FileDescriptor): Boolean {
+            return try {
                 val descriptorField = java.io.FileDescriptor::class.java.getDeclaredField("descriptor")
                 descriptorField.isAccessible = true
                 val nativeFd = descriptorField.get(fd) as Int
-                instance?.protect(nativeFd)
+                instance?.protect(nativeFd) ?: false
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to protect FD: ${e.message}")
+                false
             }
         }
 

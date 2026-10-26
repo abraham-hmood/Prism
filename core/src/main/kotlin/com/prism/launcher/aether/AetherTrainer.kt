@@ -1,5 +1,6 @@
 package com.prism.launcher.aether
 
+import com.prism.launcher.training.DatasetSplits
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
@@ -90,6 +91,25 @@ class AetherTrainer(
         val caption: String, val loss: Float, val phase: String
     )
 
+    /**
+     * File counts for a status line -- deliberately CHEAP.
+     *
+     * This exists because the old status call (`datasetSize()`) loaded and chunked every
+     * text file just to print a number. On a real corpus that is hundreds of thousands of
+     * String objects on the UI thread of the Settings screen, which is exactly the freeze
+     * and out-of-memory crash tapping Aether used to cause. Counting files needs no read.
+     */
+    data class Summary(
+        val trainFiles: Int,
+        val validationFiles: Int,
+        val testFiles: Int,
+        val images: Int,
+        val textFiles: Int,
+        val parquetFiles: Int,
+    ) {
+        val totalFiles: Int get() = trainFiles + validationFiles + testFiles
+    }
+
     var metabolicCost = 0.2f
     var posWeight = 30.0f
     var prevLoss = 1.0f
@@ -110,20 +130,57 @@ class AetherTrainer(
 
     companion object {
         private val IMAGE_EXTENSIONS = setOf("png", "jpg", "jpeg", "bmp", "webp")
+        private val TEXT_EXTENSIONS = setOf("txt")
+        private val PARQUET_EXTENSIONS = setOf("parquet")
+        private val DATASET_EXTENSIONS = IMAGE_EXTENSIONS + TEXT_EXTENSIONS + PARQUET_EXTENSIONS
 
         /** `train.py`'s `C.TEXT_CHUNK_SIZE` ("1 character every N steps", a slow-reading fix). */
         const val TEXT_CHUNK_SIZE = 6
 
-        /** Filename (minus extension) is the caption for images -- same convention as Nora's and
+        /**
+         * The dataset's training items, from the TRAIN split only.
+         *
+         * Filename (minus extension) is the caption for images -- same convention as Nora's and
          * the source's own dataset folder's `*.png` files. Every `.txt` file's full text is also
-         * expanded into sliding-window [DatasetItem.TextItem]s (see [loadTextChunks]). */
-        fun loadDataset(datasetDir: File): List<DatasetItem> {
-            val files = datasetDir.listFiles() ?: emptyArray()
-            val images = files.filter { it.isFile && it.extension.lowercase() in IMAGE_EXTENSIONS }
-                .map { DatasetItem.ImageItem(it, it.nameWithoutExtension) }
-            val textChunks = files.filter { it.isFile && it.extension.lowercase() == "txt" }
-                .flatMap { loadTextChunks(it) }
-            return images + textChunks
+         * expanded into sliding-window [DatasetItem.TextItem]s, and every `.parquet` file's
+         * conversations become reading/answering items.
+         *
+         * Held-out files (`validation/`, `validation-*.parquet`, ...) are deliberately NOT here:
+         * training on them would make the only honest measurement of the run meaningless.
+         */
+        fun loadDataset(datasetDir: File): List<DatasetItem> =
+            loadItems(DatasetSplits.scan(datasetDir, DATASET_EXTENSIONS).train)
+
+        /** Every split of a dataset. Loaded once by [train]; see [DatasetSplits] for the rules. */
+        fun scanDataset(datasetDir: File): DatasetSplits.Files =
+            DatasetSplits.scan(datasetDir, DATASET_EXTENSIONS)
+
+        fun summarize(datasetDir: File): Summary {
+            val splits = scanDataset(datasetDir)
+            fun kind(entries: List<DatasetSplits.Entry>, ext: Set<String>) =
+                entries.count { it.file.extension.lowercase() in ext }
+            return Summary(
+                trainFiles = splits.train.size,
+                validationFiles = splits.validation.size,
+                testFiles = splits.test.size,
+                images = kind(splits.all, IMAGE_EXTENSIONS),
+                textFiles = kind(splits.all, TEXT_EXTENSIONS),
+                parquetFiles = kind(splits.all, PARQUET_EXTENSIONS),
+            )
+        }
+
+        /** Turns already-classified files into training items. */
+        fun loadItems(entries: List<DatasetSplits.Entry>): List<DatasetItem> {
+            val items = mutableListOf<DatasetItem>()
+            for (entry in entries) {
+                val file = entry.file
+                when (file.extension.lowercase()) {
+                    in IMAGE_EXTENSIONS -> items += DatasetItem.ImageItem(file, file.nameWithoutExtension)
+                    in TEXT_EXTENSIONS -> items += loadTextChunks(file)
+                    in PARQUET_EXTENSIONS -> items += loadParquetItems(file, entry.relativePath)
+                }
+            }
+            return items
         }
 
         /** Ported from `train.py::build_sensory_dataset`'s "CONVERSATIONAL TEXT SLIDING WINDOW"
@@ -132,6 +189,10 @@ class AetherTrainer(
          * of 10 characters or fewer are skipped, matching the source's own `len(full_text) > 10` gate. */
         private fun loadTextChunks(file: File): List<DatasetItem.TextItem> {
             val fullText = try { file.readText(Charsets.UTF_8) } catch (e: Exception) { return emptyList() }
+            return chunkText(fullText, file.name)
+        }
+
+        private fun chunkText(fullText: String, source: String): List<DatasetItem.TextItem> {
             if (fullText.length <= 10) return emptyList()
 
             val chunkSize = TEXT_CHUNK_SIZE
@@ -142,10 +203,44 @@ class AetherTrainer(
                 val pStr = fullText.substring(i, min(i + chunkSize, fullText.length))
                 var tStr = fullText.substring(min(i + 1, fullText.length), min(i + 1 + chunkSize, fullText.length))
                 if (tStr.length < pStr.length) tStr += " ".repeat(pStr.length - tStr.length)
-                items.add(DatasetItem.TextItem(pStr, tStr, file.name))
+                items.add(DatasetItem.TextItem(pStr, tStr, source))
                 i += chunkSize
             }
             return items
+        }
+
+        /**
+         * A parquet file as reading items.
+         *
+         * Chat transcripts are used as EXCHANGES -- read the prompt, learn to produce the reply --
+         * which is what a conversational column actually contains. A parquet of prose has no
+         * `<|role|>` markers, so [AetherParquet.conversations] returns nothing for it; those rows
+         * fall back to the same sliding-window text ingestion a `.txt` file gets, rather than
+         * silently contributing zero samples.
+         */
+        private fun loadParquetItems(file: File, label: String): List<DatasetItem> {
+            val conversations = try {
+                AetherParquet.conversations(file, label)
+            } catch (e: Exception) {
+                AetherLog.warn(AetherLog.Area.TRAIN, "Parquet: could not read ${file.name}: ${e.message}")
+                emptyList()
+            }
+            if (conversations.isNotEmpty()) {
+                val items = mutableListOf<DatasetItem>()
+                for (conversation in conversations) {
+                    for ((prompt, reply) in conversation.exchanges()) {
+                        items += DatasetItem.TextItem(prompt.text, reply.text, label)
+                    }
+                }
+                if (items.isNotEmpty()) return items
+            }
+
+            return try {
+                AetherParquet.strings(file).flatMap { chunkText(it, label) }
+            } catch (e: Exception) {
+                AetherLog.warn(AetherLog.Area.TRAIN, "Parquet: no usable text in ${file.name}: ${e.message}")
+                emptyList()
+            }
         }
     }
 
@@ -167,29 +262,39 @@ class AetherTrainer(
         charGain: FloatArray? = null,
         onProgress: (Progress) -> Unit = {}
     ): String = withContext(Dispatchers.Default) {
-        val dataset = datasetOverride ?: loadDataset(AetherConfig.datasetDir())
+        // ONE SCAN FOR ALL THREE SETS. Split files can live in subdirectories (`validation/`)
+        // or be named as shards (`repo__validation-00000.parquet`) in the dataset root, and a
+        // dataset may have any number of files per split. DatasetSplits owns that rule so the
+        // training set can never quietly include a held-out file.
+        val splitFiles = scanDataset(AetherConfig.datasetDir())
+        val dataset = datasetOverride ?: loadItems(splitFiles.train)
         if (dataset.isEmpty()) {
-            return@withContext "No training images found in ${AetherConfig.datasetDir().absolutePath}"
+            return@withContext "No training images or text found in ${AetherConfig.datasetDir().absolutePath}"
         }
         val safeCheckpointInterval = max(1, checkpointIntervalEpochs)
 
-        // --- VALIDATION / TESTING: genuinely optional, one subdirectory each ---
-        // Mirrors train.py's own detection exactly: "if there is a testing directory... use it
-        // for testing. If not, no testing" -- same for validation, independently. Neither
-        // subdirectory's contents change during a run, so loaded once, up front.
-        val validationDir = File(AetherConfig.datasetDir(), "validation")
-        val testingDir = File(AetherConfig.datasetDir(), "testing")
-        val validationDataset = if (validationDir.isDirectory) loadDataset(validationDir) else emptyList()
-        val testingDataset = if (testingDir.isDirectory) loadDataset(testingDir) else emptyList()
+        // --- VALIDATION / TESTING: genuinely optional, any number of files each ---
+        // Neither set changes during a run, so both are loaded once, up front. A file named
+        // `test-...` in the root and a file in `testing/` are both honoured.
+        // An explicit override is a self-contained set; the user's held-out files would not
+        // belong to it.
+        val validationDataset = if (datasetOverride != null) emptyList() else loadItems(splitFiles.validation)
+        val testingDataset = if (datasetOverride != null) emptyList() else loadItems(splitFiles.test)
         if (validationDataset.isNotEmpty()) {
-            AetherLog.info(AetherLog.Area.TRAIN, "[Validation] ${validationDataset.size} held-out sample(s) found in ${validationDir.absolutePath}.")
+            AetherLog.info(AetherLog.Area.TRAIN, "[Validation] ${validationDataset.size} held-out sample(s) from ${splitFiles.validation.size} file(s).")
         }
         if (testingDataset.isNotEmpty()) {
-            AetherLog.info(AetherLog.Area.TRAIN, "[Testing] ${testingDataset.size} held-out sample(s) found in ${testingDir.absolutePath} -- evaluated once, after training concludes.")
+            AetherLog.info(AetherLog.Area.TRAIN, "[Testing] ${testingDataset.size} held-out sample(s) from ${splitFiles.test.size} file(s) -- evaluated once, after training concludes.")
         }
 
         val rng = java.util.Random()
-        var lastLoss = 0f
+        // NaN, not zero: an untouched 0.0 formats as a PERFECT loss, and the old summary did
+        // exactly that when every sample threw. Losses are accumulated separately so the number
+        // reported is the run's average rather than whichever sample happened to be last.
+        var lastLoss = Float.NaN
+        var lossSum = 0.0
+        var lossCount = 0
+        var successful = 0
         var lastValidationLoss: Float? = null // most recent held-out validation/test loss -- feeds AetherScoring
 
         for (epoch in 1..epochs) {
@@ -233,6 +338,16 @@ class AetherTrainer(
                         lastLoss = if (bioTrainMode) trainStdp(readBack, audio, target, trainLabel, visual)
                                    else trainBackprop(readBack, audio, target, visual)
                     }
+                    if (lastLoss.isFinite()) {
+                        lossSum += lastLoss.toDouble()
+                        lossCount++
+                        successful++
+                    } else {
+                        AetherLog.error(
+                            AetherLog.Area.TRAIN,
+                            "Sample ${item.label} produced a non-finite loss and was discarded",
+                        )
+                    }
                 } catch (e: OutOfMemoryError) {
                     AetherLog.fatal(AetherLog.Area.TRAIN, "Out of memory training on ${item.label}", e)
                     throw e
@@ -262,7 +377,13 @@ class AetherTrainer(
             // archiving) and the final epoch always save, everything in between only every
             // [checkpointIntervalEpochs] epochs -- a training run can never end without a save on
             // disk, but doesn't pay a full connectome write on every single epoch either.
-            if (epoch == 1 || epoch % safeCheckpointInterval == 0 || epoch == epochs) {
+            // A CHECKPOINT IS A CLAIM THAT SOMETHING WAS LEARNED. If every sample in this epoch
+            // failed, the connectome is exactly the one that was loaded; writing it (and telling
+            // the mesh about a new score) would advertise a trained brain that had learned
+            // nothing. Epoch 1 is gated the same way as every other checkpoint.
+            if (successful > 0 &&
+                (epoch == 1 || epoch % safeCheckpointInterval == 0 || epoch == epochs)
+            ) {
                 AetherConfig.weightsDir().mkdirs()
                 brain.save(AetherConfig.weightsFile(brain.geometry))
                 if (AetherKnowledgeSync.isSharing()) {
@@ -291,7 +412,16 @@ class AetherTrainer(
             }
         }
 
-        "Trained ${dataset.size} sample(s) over $epochs epochs (${if (bioTrainMode) "biotrain" else "backprop"}). Final loss %.4f.".format(lastLoss)
+        if (successful == 0) {
+            return@withContext "Training did NOT run: none of the ${dataset.size} sample(s) could be presented " +
+                "successfully. Nothing was saved and no knowledge was shared.\n\n" +
+                "The first failure is in the training log; an empty or unreadable dataset and a " +
+                "geometry too small for the input are the usual causes."
+        }
+        val average = if (lossCount > 0) lossSum / lossCount else Double.NaN
+        "Trained $successful of ${dataset.size} sample(s) over $epochs epochs " +
+            "(${if (bioTrainMode) "biotrain" else "backprop"}). Average training loss %.4f."
+                .format(average)
     }
 
     /**

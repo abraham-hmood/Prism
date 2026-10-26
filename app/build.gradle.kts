@@ -10,6 +10,12 @@ android {
     compileSdk = 35
     ndkVersion = "26.1.10909125"
 
+    // NINE's translator is built as its own CMake project and packaged from here, rather than added
+    // to src/main/cpp with add_subdirectory: both projects build llama.cpp, and two CMake projects
+    // that define the same targets in one build tree cannot coexist. Building it separately also
+    // means a NINE that does not compile is a reported limitation rather than a broken Prism build.
+    sourceSets.getByName("main").jniLibs.srcDir(layout.buildDirectory.dir("nineJniLibs"))
+
     defaultConfig {
         applicationId = "com.prism.launcher"
         minSdk = 26
@@ -320,6 +326,78 @@ dependencies {
  *
  * This only runs when the task actually executes; an up-to-date build does not reinstall anything.
  */
+// ── NINE: build the translator and package it ─────────────────────────────────────────────────────
+//
+// Runs after syncNineSources, so the sources are always the current ones. Configured as its own
+// CMake invocation with the NDK this module already declares, which is what makes the result a
+// genuinely separate build rather than a second project inside Prism's native build tree.
+//
+// A failure here does NOT fail the build. NINE is a moving external project; a commit that does not
+// compile is a reason Windows/Linux program support is absent from this build, not a reason the
+// launcher cannot be built at all. The warning says exactly that, and [NineRuntime] reports the
+// missing library to the UI.
+val nineAbi = "arm64-v8a"
+val nineBuildDir = layout.buildDirectory.dir("nine/$nineAbi")
+
+val buildNineNative = tasks.register("buildNineNative") {
+    group = "nine"
+    description = "Builds NINE's x86-64 translator for arm64-v8a and stages it for packaging."
+    dependsOn(rootProject.tasks.named("syncNineSources"))
+    outputs.dir(nineBuildDir)
+
+    doLast {
+        val nine = rootProject.layout.projectDirectory.dir("third_party/nine").asFile
+        val cmakeFile = File(nine, "app/src/main/cpp/CMakeLists.txt")
+        if (!cmakeFile.isFile) {
+            logger.warn("NINE: sources are not present, so Windows/Linux program support is off in this build.")
+            return@doLast
+        }
+
+        val sdk = android.sdkDirectory
+        val ndk = File(sdk, "ndk/${android.ndkVersion}")
+        val cmake = File(sdk, "cmake/3.22.1/bin/cmake" + if (System.getProperty("os.name").lowercase().contains("win")) ".exe" else "")
+        if (!cmake.isFile || !ndk.isDirectory) {
+            logger.warn("NINE: the NDK or CMake is not installed where this module expects it; skipping.")
+            return@doLast
+        }
+
+        val build = nineBuildDir.get().asFile.apply { mkdirs() }
+        fun run(vararg command: String): Int {
+            val process = ProcessBuilder(*command).directory(build).redirectErrorStream(true).start()
+            val log = process.inputStream.bufferedReader().readText()
+            val code = process.waitFor()
+            if (code != 0) logger.lifecycle(log.takeLast(4000))
+            return code
+        }
+
+        val configure = run(
+            cmake.absolutePath, "-S", cmakeFile.parentFile.absolutePath, "-B", build.absolutePath,
+            "-G", "Ninja",
+            "-DCMAKE_TOOLCHAIN_FILE=${File(ndk, "build/cmake/android.toolchain.cmake").absolutePath}",
+            "-DANDROID_ABI=$nineAbi",
+            "-DANDROID_PLATFORM=android-${android.defaultConfig.minSdk}",
+            "-DCMAKE_BUILD_TYPE=Release",
+        )
+        if (configure != 0) {
+            logger.warn("NINE: CMake configure failed; Windows/Linux program support is off in this build.")
+            return@doLast
+        }
+
+        val compile = run(cmake.absolutePath, "--build", build.absolutePath, "-j", "8")
+        val produced = File(build, "libnexus_core.so")
+        if (compile != 0 || !produced.isFile) {
+            logger.warn("NINE: the translator did not build; Windows/Linux program support is off in this build.")
+            return@doLast
+        }
+
+        val staged = layout.buildDirectory.dir("nineJniLibs/$nineAbi").get().asFile.apply { mkdirs() }
+        produced.copyTo(File(staged, "libnexus_core.so"), overwrite = true)
+        logger.lifecycle("NINE: staged libnexus_core.so (${produced.length() shr 20} MB) for $nineAbi")
+    }
+}
+
+tasks.matching { it.name == "preBuild" }.configureEach { dependsOn(buildNineNative) }
+
 tasks.matching { it.name.matches(Regex("generate(Debug|Release)PythonRequirements")) }.configureEach {
     doFirst {
         // "generateDebugPythonRequirements" -> "debug"

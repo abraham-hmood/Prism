@@ -217,19 +217,50 @@ class NoraBrain {
         if (learning) router.reinforce(feature, winner)
     }
 
-    fun perceive(bitmap: PrismImage, fx: Float = 0.5f, fy: Float = 0.5f, iterations: Int = NoraConfig.PC_ITERATIONS) {
+    /**
+     * @param learning false for a held-out evaluation: the expert router keeps its prototypes
+     *        still, so a validation pass cannot change the brain it is measuring. Weights were
+     *        never touched by perception itself -- [learn] is always a separate call.
+     */
+    fun perceive(
+        bitmap: PrismImage,
+        fx: Float = 0.5f,
+        fy: Float = 0.5f,
+        iterations: Int = NoraConfig.PC_ITERATIONS,
+        learning: Boolean = true,
+    ) {
         val retinal = retinaModel.sample(bitmap, fx, fy)
         v4Model.colourConstancy(retinal)
         retina.l4.copyFrom(retinal)
         retina.clamped = true
 
-        feedforwardSweep()
-        settle(iterations)
+        feedforwardSweep(learning)
+        settle(iterations, learning)
         retina.clamped = false
     }
 
+    /**
+     * One forward pass for a held-out measurement, leaving no trace on the training trajectory.
+     *
+     * [perceive] with `learning = false` still updates the neuromodulators and the LGN precision
+     * map, because those are part of the inferential loop rather than the learning rule. That is
+     * correct during training and wrong during an evaluation: the next training step would then
+     * depend on how many validation samples happened to be scored. This snapshots both and puts
+     * them back, so the only thing that survives is [lastErrorRms] -- the number being measured.
+     */
+    fun evaluateHeldOut(bitmap: PrismImage, fx: Float = 0.5f, fy: Float = 0.5f) {
+        val modulators = neuromod.snapshot()
+        val precision = lgn.precision.clone()
+        try {
+            perceive(bitmap, fx, fy, learning = false)
+        } finally {
+            neuromod.restore(modulators)
+            lgn.precision.copyFrom(precision)
+        }
+    }
+
     /** Bottom-up drive for every region from the analytic encoders. */
-    private fun feedforwardSweep() {
+    private fun feedforwardSweep(learning: Boolean = true) {
         val relayed = lgn.relay(retina.l4)
         val v1Energy = v1Model.forward(relayed)
         v1.l4.copyFrom(v1Energy)
@@ -257,7 +288,7 @@ class NoraBrain {
             linkItV4.propagateError(v4.l4, it.ascending)
             it.representation.copyFrom(it.ascending)
             itModel.sparsify(it.representation)
-            routeExperts(learning = true)
+            routeExperts(learning)
         }
     }
 
@@ -268,7 +299,7 @@ class NoraBrain {
      * errors; ascend, driving each area's representation with the error it is responsible for.
      * This is Rao & Ballard (1999) with the laminar assignment of Bastos et al. (2012).
      */
-    fun settle(iterations: Int) {
+    fun settle(iterations: Int, learning: Boolean = true) {
         for (step in 0 until iterations) {
             val ach = neuromod.acetylcholine
 
@@ -304,7 +335,7 @@ class NoraBrain {
             if (!it.clamped) {
                 itModel.applyTopographicBias(it.representation)
                 itModel.sparsify(it.representation)
-            routeExperts(learning = true)
+                routeExperts(learning)
             }
 
             // ── Neuromodulation ─────────────────────────────────────────────

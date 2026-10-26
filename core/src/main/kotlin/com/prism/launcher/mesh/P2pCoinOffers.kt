@@ -87,6 +87,27 @@ object P2pCoinOffers {
         broadcast()
     }
 
+    /**
+     * Removes an offer a peer posted and tells the book it has been taken.
+     *
+     * There is no escrow, so "taken" is a claim rather than a settlement proof: it carries the
+     * transaction id of the taker's payment so the maker (and anyone watching) can check it, and
+     * the maker's client withdraws the offer on seeing it. That is the most a gossip-only book can
+     * honestly offer -- a maker who never sees the notice keeps advertising, which is why the UI
+     * also tells the taker to keep the payment receipt.
+     */
+    fun take(offer: Offer, transactionId: String) {
+        byPeer[offer.peerIp] = byPeer[offer.peerIp].orEmpty().filterNot { it.id == offer.id }
+        mine = mine.filterNot { it.id == offer.id }
+        MeshTransport.announce(
+            OPCODE_OFFERS,
+            JSONObject()
+                .put("taken", JSONArray().put(offer.id))
+                .put("tx", transactionId)
+                .toString(),
+        )
+    }
+
     private fun broadcast() {
         val array = JSONArray()
         for (o in mine) {
@@ -106,6 +127,23 @@ object P2pCoinOffers {
 
     /** Called by [PrismMeshService] when a peer's offer packet arrives. */
     fun ingestFromPeer(peerIp: String, payload: String) {
+        // A TAKEN NOTICE IS NOT A LIST. It names one offer to withdraw, and handling it as the
+        // peer's (now empty) catalogue would delete every other offer that peer had posted.
+        val takenNotice = runCatching { JSONObject(payload).optJSONArray("taken") }.getOrNull()
+        if (takenNotice != null) {
+            val ids = (0 until takenNotice.length()).mapNotNull {
+                takenNotice.optString(it).takeIf { id -> id.isNotBlank() }
+            }.toSet()
+            if (ids.isEmpty()) return
+            mine = mine.filterNot { it.id in ids }
+            byPeer[MeshUtils.getLocalMeshIp()] = mine
+            for (key in byPeer.keys.toList()) {
+                val remaining = byPeer[key].orEmpty().filterNot { it.id in ids }
+                if (remaining.isEmpty()) byPeer.remove(key) else byPeer[key] = remaining
+            }
+            return
+        }
+
         val parsed = runCatching {
             val array = JSONObject(payload).optJSONArray("offers") ?: JSONArray()
             val now = System.currentTimeMillis()
@@ -138,9 +176,15 @@ object P2pCoinOffers {
         return byPeer.values.flatten()
     }
 
-    /** Offers that would give the caller [want] in exchange for [give], best rate first. */
+    /**
+     * Offers that would give the caller [want] in exchange for [give], best rate first.
+     *
+     * Ascending [Offer.rate], not descending. The rate is quoted from the MAKER's side -- what they
+     * want per unit of what they give -- so for the taker it is the price, and the best offer is the
+     * cheapest one. Sorting it the other way round would put the worst offer in front of the taker.
+     */
     fun matching(give: String, want: String): List<Offer> =
         getAll().filter {
             it.fromSymbol.equals(want, true) && it.toSymbol.equals(give, true)
-        }.sortedByDescending { it.rate() }
+        }.sortedBy { it.rate() }
 }

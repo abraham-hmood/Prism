@@ -48,7 +48,7 @@ object FreeVcEngine : CloneEngine {
     private const val TAG = "PrismSpeech"
 
     private const val RELEASE =
-        "https://github.com/ibrahim-hmood/Prism/releases/download/voice-engines-v1"
+        "https://github.com/abraham-hmood/Prism/releases/download/voice-engines-v1"
 
     val MODEL = VoiceCloningModels.Model(
         id = "freevc-vc",
@@ -56,6 +56,7 @@ object FreeVcEngine : CloneEngine {
         file = "freevc_vc_int8q.onnx",
         sizeBytes = 358_618_472L,
         url = "$RELEASE/freevc_vc_int8q.onnx",
+        sha256 = "d822f9e2f6a5a52173949c2bfc0e32077850a65e04aeddb6f34ec75f542f2775",
     )
 
     override val models: List<VoiceCloningModels.Model> = listOf(MODEL)
@@ -126,14 +127,105 @@ object FreeVcEngine : CloneEngine {
     }
 
     /**
-     * The reference at 16 kHz, padded with silence or cut to exactly [REF_SAMPLES] -- the traced
-     * speaker encoder baked in its 8 s window, so the input has to match it frame for frame.
+     * The reference at 16 kHz, exactly [REF_SAMPLES] long, without turning it into silence.
+     *
+     * THE TRACED GRAPH REQUIRES 8 s, and the previous answer was to copy the recording in and
+     * leave the rest as zeros. For the normal 2–3 s sample that meant the speaker encoder heard
+     * mostly silence and the cloned voice drifted toward the model's average -- the symptom was
+     * reported as "the clone doesn't sound like me" rather than as a padding bug.
+     *
+     * Three changes, in order of what they fix:
+     *
+     *  - Leading and trailing silence is trimmed first. A recording that starts with a second of
+     *    the microphone being unmuted is not a 3 s sample.
+     *  - If it is still shorter than 8 s it is TILED, with a 10 ms crossfade at each join. Repetition
+     *    is not ideal speech, but it keeps every frame voiced, which is what the encoder uses.
+     *  - If it is longer, the most energetic 8 s window is chosen rather than the first one, so a
+     *    cough or a door at the start cannot become the voice.
      */
     private fun fixedReference(reference: FloatArray): FloatArray {
-        val mono = VoicePitch.resample(reference, VoiceCloner.WORK_RATE, RATE)
+        val mono = trimSilence(VoicePitch.resample(reference, VoiceCloner.WORK_RATE, RATE))
+        if (mono.isEmpty()) return FloatArray(REF_SAMPLES)
+
+        if (mono.size >= REF_SAMPLES) {
+            val start = mostEnergeticWindow(mono)
+            return mono.copyOfRange(start, start + REF_SAMPLES)
+        }
+
         val out = FloatArray(REF_SAMPLES)
-        mono.copyInto(out, 0, 0, minOf(mono.size, REF_SAMPLES))
+        // 10 ms at 16 kHz. Short enough not to swallow a syllable, long enough to stop the click
+        // a hard splice produces, which the encoder would hear as a consonant.
+        val fade = minOf(RATE / 100, mono.size / 8).coerceAtLeast(0)
+        var at = 0
+        var first = true
+        while (at < REF_SAMPLES) {
+            if (first || fade == 0) {
+                val count = minOf(mono.size, REF_SAMPLES - at)
+                mono.copyInto(out, at, 0, count)
+                at += count
+            } else {
+                val overlapStart = at - fade
+                for (i in 0 until fade) {
+                    val target = overlapStart + i
+                    if (target !in 0 until REF_SAMPLES) continue
+                    val t = i.toFloat() / fade
+                    out[target] = out[target] * (1f - t) + mono[i] * t
+                }
+                val count = minOf(mono.size - fade, REF_SAMPLES - at)
+                if (count <= 0) break
+                mono.copyInto(out, at, fade, fade + count)
+                at += count
+            }
+            first = false
+        }
         return out
+    }
+
+    /** Drops leading/trailing near-silence, keeping at least a quarter second of quiet audio. */
+    private fun trimSilence(samples: FloatArray): FloatArray {
+        if (samples.size < RATE / 2) return samples
+        val frame = RATE / 50
+        val peak = samples.maxOf { kotlin.math.abs(it) }
+        if (peak <= 1e-5f) return samples
+        val threshold = (peak * 0.02f).coerceAtLeast(1e-4f)
+
+        var start = 0
+        while (start + frame < samples.size && rms(samples, start, frame) < threshold) start += frame
+        var end = samples.size
+        while (end - frame > start && rms(samples, end - frame, frame) < threshold) end -= frame
+
+        // A quiet recording must not be trimmed to nothing; the tiling path handles short input.
+        return if (end - start < RATE / 4) samples else samples.copyOfRange(start, end)
+    }
+
+    private fun rms(samples: FloatArray, from: Int, count: Int): Float {
+        var sum = 0.0
+        val end = minOf(from + count, samples.size)
+        for (i in from until end) sum += samples[i] * samples[i]
+        return kotlin.math.sqrt(sum / (end - from).coerceAtLeast(1)).toFloat()
+    }
+
+    /** Start offset of the loudest [REF_SAMPLES] window, stepping a quarter second at a time. */
+    private fun mostEnergeticWindow(mono: FloatArray): Int {
+        val step = RATE / 4
+        var bestStart = 0
+        var best = -1.0
+        var start = 0
+        while (start + REF_SAMPLES <= mono.size) {
+            var sum = 0.0
+            // Coarse sampling: an 8 s window at 1/16 keeps this to ~8k multiply-adds per offset.
+            var i = start
+            while (i < start + REF_SAMPLES) {
+                sum += mono[i] * mono[i]
+                i += 16
+            }
+            if (sum > best) {
+                best = sum
+                bestStart = start
+            }
+            start += step
+        }
+        return bestStart
     }
 
     /** Seeded gaussian for the prior's z-sample: same voice, same sentence -> same result. */

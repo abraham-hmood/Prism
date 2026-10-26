@@ -92,8 +92,12 @@ object TrustedApps {
     fun all(): List<Offered> =
         catalogue.values.sortedWith(compareBy({ it.deviceName }, { it.label.lowercase() }))
 
-    fun forDevice(fingerprint: String): List<Offered> =
-        all().filter { it.deviceFingerprint == fingerprint }
+    fun forDevice(fingerprint: String): List<Offered> {
+        // BY RECORD, so an app announced before the device's identity moved is still attributed to
+        // it afterwards instead of disappearing from its page.
+        val trust = TrustedDevices.byFingerprint(fingerprint) ?: return emptyList()
+        return all().filter { trust.answersTo(it.deviceFingerprint) }
+    }
 
     fun byKey(key: String): Offered? = catalogue[key]
 

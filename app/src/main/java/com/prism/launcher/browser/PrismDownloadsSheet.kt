@@ -92,7 +92,7 @@ object PrismDownloadsSheet {
             layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, max)
         }
 
-        dialog = AlertDialog.Builder(context, R.style.Theme_PrismSettings)
+        dialog = com.prism.launcher.theme.PrismDialogs.Builder(context, R.style.Theme_PrismSettings)
             .setTitle("Downloads")
             .setMessage("Long-press an item to remove it")
             .setView(recycler)

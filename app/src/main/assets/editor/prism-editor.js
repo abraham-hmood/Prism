@@ -303,15 +303,19 @@
   //
   // THE NODE HOST runs everything else. Most of the marketplace declares `main`, calls
   // `require('fs')` or `child_process`, and cannot load in a Worker at any price. Those go to a
-  // real Node.js runtime living in Prism's own process (libnode.so), which Kotlin owns; this page
-  // talks to it through the bridge. The protocol is deliberately identical to the Worker's, so
-  // everything below handles both without caring which is which.
+  // real Node.js runtime in a PRoot Ubuntu guest, which Kotlin owns; this page talks to it
+  // through the bridge. The protocol is deliberately identical to the Worker's, so everything
+  // below handles both without caring which is which.
 
   var workerHost = null;
   var nodeHost = null;
   var hostCompletionId = 1;
   var hostCompletionWaiters = Object.create(null);
   var registeredCommands = [];
+  // Which host registered each command. Without this a command was broadcast to BOTH hosts, and
+  // the one that did not own it answered `command-missing` -- so a command that ran perfectly well
+  // in the Node host could still make the popup report that it did not exist.
+  var commandHosts = Object.create(null);
 
   /** Every host that is up, for broadcasts (completions, events). */
   function liveHosts() {
@@ -376,7 +380,23 @@
         break;
 
       case 'command-registered':
-        registeredCommands.push(msg.id);
+        commandHosts[msg.id] = hostRef.kind;
+        // A reactivated extension registers its commands again. Pushing blindly put duplicates in
+        // the command palette and made the popup look like it had run the command twice.
+        if (registeredCommands.indexOf(msg.id) < 0) registeredCommands.push(msg.id);
+        // Kotlin keeps the extension view live from this: a command that appears after the popup
+        // opened has to show up in it without the user closing and reopening it.
+        notify('extension-commands', { commands: registeredCommands });
+        break;
+
+      // A command the popup asked for that no host registered. Forwarded rather than swallowed:
+      // the popup offered the command, so it is the popup that has to say it did not run.
+      case 'command-missing':
+        notify('command-missing', { id: msg.id });
+        break;
+
+      case 'command-done':
+        notify('command-done', { id: msg.id });
         break;
 
       case 'completions':
@@ -386,6 +406,35 @@
 
       case 'call':
         handleHostCall(hostRef, msg);
+        break;
+
+      // An extension's webview. Kotlin draws it in the floating extension popup, so the HTML is
+      // forwarded whole -- there is nothing here that can render it, and a later assignment of
+      // `webview.html` arrives as another one of these with the replacement.
+      //
+      // THE PANEL ID IS NAMESPACED BY HOST. The Worker and the Node host each number their own
+      // panels from one, so the first panel in both would be `panel-1`; without the prefix one
+      // extension's view would overwrite the other's HTML in Kotlin. `webviewMessage` splits it
+      // again so the host receives the id it issued.
+      case 'webview':
+        notify('extension-webview', {
+          action: msg.action,
+          panelId: msg.panelId ? hostRef.kind + ':' + msg.panelId : '',
+          extensionId: msg.extensionId,
+          kind: msg.kind,
+          title: msg.title,
+          viewType: msg.viewType,
+          html: msg.html
+        });
+        break;
+
+      // `panel.webview.postMessage(...)`: into the popup's own WebView, which is a separate
+      // document from this page.
+      case 'webview-to-page':
+        notify('extension-webview-message', {
+          panelId: hostRef.kind + ':' + msg.panelId,
+          payload: JSON.stringify(msg.payload === undefined ? null : msg.payload)
+        });
         break;
 
       // A memento write. Fire-and-forget on purpose: the VS Code API's `update` resolves as soon
@@ -515,7 +564,44 @@
     /** Kotlin reporting that the Node runtime went away. */
     nodeHostGone: function (reason) {
       if (nodeHost) { nodeHost.ready = false; nodeHost = null; }
+      // The commands it registered went with it. Leaving their ownership behind would make the
+      // next click on one look for a host that is no longer there.
+      Object.keys(commandHosts).forEach(function (id) {
+        if (commandHosts[id] === 'node') delete commandHosts[id];
+      });
       if (reason) notify('host-error', { message: String(reason) });
+    },
+
+    /**
+     * Asks the hosts for the view this extension is showing.
+     *
+     * The answer arrives as an `extension-webview` notification: `open` with HTML when there is a
+     * view, `none` when the extension has not contributed one. Broadcast to every host for the same
+     * reason commands are: only the extension's own host knows its panels, and the others ignore it.
+     */
+    openExtensionView: function (extensionId) {
+      var hosts = liveHosts();
+      if (!hosts.length) {
+        notify('extension-webview', { action: 'none', extensionId: extensionId });
+        return false;
+      }
+      hosts.forEach(function (hostRef) {
+        hostRef.post({ type: 'open-view', extensionId: extensionId });
+      });
+      return true;
+    },
+
+    /** A message from the popup's WebView, for the extension that owns that panel. */
+    webviewMessage: function (panelId, json) {
+      var value = String(panelId || '');
+      var split = value.indexOf(':');
+      var kind = split < 0 ? '' : value.slice(0, split);
+      var localId = split < 0 ? value : value.slice(split + 1);
+      liveHosts().forEach(function (hostRef) {
+        if (!kind || hostRef.kind === kind) {
+          hostRef.post({ type: 'from-webview', panelId: localId, payload: json });
+        }
+      });
     },
 
     /** Commands contributed by extensions, for the palette. */
@@ -523,11 +609,22 @@
 
     runExtensionCommand: function (id) {
       var hosts = liveHosts();
-      if (!hosts.length) return false;
-      // Broadcast: only the host that registered the id has a handler, and the others answer
-      // 'command-missing', which is ignored. Tracking ownership would be a second thing to keep in
-      // step for no benefit.
-      hosts.forEach(function (hostRef) {
+      if (!hosts.length) {
+        // No host at all is a different failure from a missing command, but the answer the user
+        // needs is the same one: this did not run, and here is why.
+        notify('command-missing', { id: id });
+        return false;
+      }
+      // To the host that registered it, when that is known. A command id is unique across the
+      // editor, so the old broadcast only ever had one real handler; every other host answered
+      // `command-missing`. An id with no known owner still goes to everyone, which covers an
+      // extension that registers commands under a name its manifest did not declare.
+      var owner = commandHosts[id];
+      var targets = owner
+        ? hosts.filter(function (hostRef) { return hostRef.kind === owner; })
+        : hosts;
+      if (!targets.length) return false;
+      targets.forEach(function (hostRef) {
         hostRef.post({ type: 'run-command', id: id, args: [] });
       });
       return true;

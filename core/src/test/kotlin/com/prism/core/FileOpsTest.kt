@@ -208,6 +208,27 @@ class FileOpsTest {
         assertEquals(listOf("b.txt", "c.txt", "a.zip"), out.map { it.name })
     }
 
+    /**
+     * Cutting an item into the folder it is already in does nothing.
+     *
+     * The copy path would invent a "(2)" name for it, and a rename to that name is a change the
+     * user never asked for. It also must not consume the clipboard, so the item can still be
+     * pasted somewhere it belongs.
+     */
+    @Test
+    fun `cutting into the same folder is a no-op`() {
+        val src = file("a.txt", "hello")
+
+        FileOps.cut(listOf(src))
+        val result = FileOps.paste(dir)
+
+        assertFalse(result.ok)
+        assertTrue(result.skipped.single().contains("already in this folder"))
+        assertTrue(src.exists())
+        assertFalse(File(dir, "a (2).txt").exists(), "nothing may be renamed or duplicated")
+        assertTrue(FileOps.clipboard() != null, "the cut survives so it can be pasted elsewhere")
+    }
+
     @Test
     fun `pasting a stale clipboard entry reports it`() {
         val src = file("a.txt")

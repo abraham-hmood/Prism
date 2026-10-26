@@ -77,6 +77,18 @@ class VirtualPackage private constructor(
     var application: android.app.Application? = null
 
     /**
+     * A lifecycle exception that was survived rather than fatal.
+     *
+     * `onStart`, `onResume` and `onPostResume` are run because apps start their real screen from
+     * them, but an exception there is logged and the view from `onCreate` is still shown -- an app
+     * that resumes badly is usually still worth seeing, and the report is worth more than a blank
+     * window. This carries that exception to whatever shows the app, so "it opened but something is
+     * wrong" has a sentence attached.
+     */
+    @Volatile
+    var startupTrouble: String? = null
+
+    /**
      * Only used when the binary manifest could not be parsed at all.
      *
      * Deliberately the old, worse behaviour rather than a refusal to start: a manifest this parser
@@ -97,6 +109,24 @@ class VirtualPackage private constructor(
      */
     fun activityInfo(className: String): android.content.pm.ActivityInfo? =
         archivedActivities[className]
+
+    /**
+     * The app's `<provider>` entries, in the order its manifest declares them.
+     *
+     * Providers are not an optional extra: most modern apps initialise their libraries from one --
+     * `androidx.startup.InitializationProvider`, Firebase's init provider, and every app that builds
+     * its dependency graph in a provider rather than in `Application` -- and skipping them leaves
+     * those libraries uninitialised. That is exactly the failure Amazon reports as
+     * "Service registry not initialized yet", which names the symptom and not the missing provider.
+     */
+    val providers: List<android.content.pm.ProviderInfo> by lazy {
+        runCatching {
+            hostContext?.packageManager
+                ?.getPackageArchiveInfo(apks.first().absolutePath, PackageManager.GET_PROVIDERS)
+                ?.providers.orEmpty().toList()
+                .onEach { it.applicationInfo = applicationInfo }
+        }.getOrNull().orEmpty()
+    }
 
     private val archivedActivities: Map<String, android.content.pm.ActivityInfo> by lazy {
         runCatching {
@@ -135,6 +165,33 @@ class VirtualPackage private constructor(
         }
         val declared = activityInfo(className)?.theme ?: 0
         return if (declared != 0) declared else applicationInfo.theme
+    }
+
+    /**
+     * An ActivityInfo for an activity the archive's PackageManager view does not list.
+     *
+     * Needed because `ActivityInfo` is not optional: the framework reads
+     * `mActivityInfo.parentActivityName` in `Activity.onCreate`, so leaving it null throws a
+     * NullPointerException from inside the framework before the app's own code starts -- reported as
+     * `InvocationTargetException: null`, which names neither the app, the activity, nor the reason.
+     *
+     * Missing entries are common and not errors: an `<activity-alias>` is what most apps now declare
+     * as their launcher entry, and `getPackageArchiveInfo` lists the alias's target, not the alias.
+     * Everything here is filled from what the APK does know, so the activity gets an identity that is
+     * true rather than a null one.
+     */
+    fun synthesizedActivityInfo(className: String, themeRes: Int): android.content.pm.ActivityInfo {
+        val owner = packageName
+        return android.content.pm.ActivityInfo().apply {
+            name = className
+            packageName = owner
+            applicationInfo = this@VirtualPackage.applicationInfo
+            theme = themeRes
+            launchMode = android.content.pm.ActivityInfo.LAUNCH_MULTIPLE
+            screenOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            exported = true
+            enabled = true
+        }
     }
 
     companion object {
@@ -194,6 +251,71 @@ class VirtualPackage private constructor(
             // with SecurityException every single time otherwise.
             VirtualizedAppVault.markReadOnly(apks)
 
+            return assemble(context, packageName, apks, info, File(home, "odex"))
+        }
+
+        /**
+         * Loads an app straight from the copy the system installed, without backing it up.
+         *
+         * Used by the compatibility check ([VirtualAppProbe]), whose whole point is to answer "would
+         * this run in Prism?" for every app on the phone. Copying several gigabytes of APKs to ask
+         * that question, for apps the user may never launch, is the wrong trade -- so this reads the
+         * installed files in place and gives the guest a scratch data directory instead of its real
+         * one.
+         *
+         * What it is NOT is a way to run an app. An app virtualized this way can read Prism's copy of
+         * its own APK but not its own data, and nothing here is sealed; a real launch still goes
+         * through [load] and the vault.
+         */
+        fun loadInstalled(context: Context, packageName: String): VirtualPackage? {
+            hostContext = context.applicationContext
+            val pm = context.packageManager
+
+            val info = runCatching {
+                pm.getPackageInfo(packageName, PackageManager.GET_ACTIVITIES)?.applicationInfo
+            }.getOrNull() ?: run {
+                PrismLogger.logWarning(TAG, "Could not read $packageName's package info")
+                return null
+            }
+
+            val apks = (listOf(info.sourceDir) + (info.splitSourceDirs ?: emptyArray()).asList())
+                .filterNotNull()
+                .map(::File)
+                .filter { it.isFile && it.canRead() }
+                .distinctBy { it.absolutePath }
+
+            if (apks.isEmpty()) {
+                PrismLogger.logWarning(TAG, "No readable APK for $packageName")
+                return null
+            }
+
+            val scratch = File(context.cacheDir, "virtualapp-check/$packageName")
+            // The native libraries are COPIED rather than used where the system put them. dlopen
+            // from another app's lib directory is refused, and the resulting failure looks like the
+            // app's own native code being broken.
+            val nativeDir = File(scratch, "lib").apply { mkdirs() }
+            extractNativeLibraries(apks, nativeDir)
+
+            info.dataDir = File(scratch, "data").apply { mkdirs() }.absolutePath
+            info.nativeLibraryDir = nativeDir.absolutePath
+
+            return assemble(context, packageName, apks, info, File(scratch, "odex"))
+        }
+
+        /**
+         * The part both loaders share: class loader, resources and manifest.
+         *
+         * Kept in one place so an app behaves the same whether it came out of the vault or off the
+         * installed system -- the differences are only in where the files are and which data
+         * directory it is given.
+         */
+        private fun assemble(
+            context: Context,
+            packageName: String,
+            apks: List<File>,
+            info: ApplicationInfo,
+            odexDir: File,
+        ): VirtualPackage? {
             // PARENT IS THE BOOT LOADER, NOT PRISM'S.
             //
             // Class loading is parent-first, so anything both Prism and the app ship would resolve
@@ -209,8 +331,8 @@ class VirtualPackage private constructor(
 
             val loader = DexClassLoader(
                 apks.joinToString(File.pathSeparator) { it.absolutePath },
-                File(home, "odex").apply { mkdirs() }.absolutePath,
-                nativeDir.absolutePath,
+                odexDir.apply { mkdirs() }.absolutePath,
+                info.nativeLibraryDir,
                 bootLoader,
             )
 

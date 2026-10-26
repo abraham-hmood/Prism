@@ -27,6 +27,7 @@ object PrismLogger {
     val logFlow = MutableSharedFlow<LogEntry>(replay = 50, extraBufferCapacity = 100)
 
     private var logFile: File? = null
+    private var appContext: Context? = null
     private var writer: java.io.BufferedWriter? = null
     private var pendingWrites = 0
     private var bytesSinceRotationCheck = 0
@@ -54,6 +55,7 @@ object PrismLogger {
     enum class Level { INFO, WARN, ERROR, SUCCESS, DEBUG }
 
     fun init(context: Context) {
+        appContext = context.applicationContext
         val storage = Environment.getExternalStorageDirectory()
         val prismDir = File(storage, "Prism")
         if (!prismDir.exists()) prismDir.mkdirs()
@@ -200,6 +202,43 @@ object PrismLogger {
         } catch (e: Exception) {
             Log.e(TAG, "Log rotation failed", e)
         }
+    }
+
+    /** Where the diagnostics log is being written, or null before [init]. */
+    fun filePath(): String? = logFile?.absolutePath
+
+    /**
+     * Re-opens file logging after it has given up.
+     *
+     * Resets the failure counter and PROVES the file is writable with a real write before
+     * reporting success: the failures this repairs were write failures, so trusting a mkdirs()
+     * here would report a fix that had not happened. The crash handler is deliberately not
+     * re-installed -- init() wraps the previous handler, and calling it repeatedly would chain
+     * one wrapper per repair.
+     */
+    fun retryFileLogging(): Boolean {
+        val context = appContext ?: return false
+        closeWriterQuietly()
+        fileLoggingDisabled = false
+        consecutiveFailures = 0
+
+        val prismDir = File(Environment.getExternalStorageDirectory(), "Prism")
+        runCatching { if (!prismDir.exists()) prismDir.mkdirs() }
+        val file = File(prismDir, "diagnostics.log")
+        val wrote = runCatching {
+            java.io.FileWriter(file, true).use {
+                it.write("[${getTimestamp()}] [SUCCESS] [$TAG] File logging re-enabled from Health & Repair\n")
+            }
+            true
+        }.getOrDefault(false)
+
+        if (wrote) {
+            logFile = file
+            logInfo(TAG, "File logging re-enabled by System Health")
+        } else {
+            logWarning(TAG, "System Health could not re-enable file logging at ${file.absolutePath}")
+        }
+        return wrote
     }
 
     /** Pushes anything buffered to disk. Safe to call from the crash handler. */

@@ -143,6 +143,76 @@ object MeshBridges {
      * device cannot ask a peer, which is the state the market reports as "cannot offload".
      */
     var generateOnPeer: ((peerIp: String, prompt: String, onToken: (String) -> Unit) -> String?)? = null
+        get() = field ?: ::askPeer
+
+    /**
+     * Runs a prompt on one peer, speaking the host's own protocol.
+     *
+     * THIS WAS DECLARED AND NEVER ASSIGNED, so the market's single-peer offload path was a permanent
+     * no-op: [com.prism.launcher.mesh.MeshInference.runOnPeer] read the null hook and gave up, and nothing
+     * anywhere said why. There is no platform-specific part to it -- [connect] already carries the only
+     * difference between Android and desktop (the tunnel host hint) -- so the default lives here and both
+     * platforms get it.
+     */
+    private fun askPeer(peerIp: String, prompt: String, onToken: (String) -> Unit): String? {
+        val socket = connect(peerIp, MODEL_HOST_PORT, 15_000, P2pModelRegistry.MODEL_HOST_DOMAIN)
+            ?: return null
+        return try {
+            // The host starts answering immediately but a model may still be loading; the timeout is
+            // per read, so a long generation does not trip it as long as tokens keep arriving.
+            socket.soTimeout = 180_000
+            val body = prompt.toByteArray()
+            socket.getOutputStream().apply {
+                write(
+                    ("POST /generate HTTP/1.1\r\n" +
+                        "Content-Type: text/plain; charset=utf-8\r\n" +
+                        "Content-Length: " + body.size + "\r\n" +
+                        "Connection: close\r\n\r\n").toByteArray()
+                )
+                write(body)
+                flush()
+            }
+
+            val input = java.io.BufferedInputStream(socket.getInputStream())
+            val status = readAsciiLine(input) ?: return null
+            if (!status.contains(" 200")) {
+                PrismPlatform.log.warn(TAG, "Peer " + peerIp + " refused the prompt: " + status)
+                return null
+            }
+            while (true) {
+                val line = readAsciiLine(input) ?: break
+                if (line.isEmpty()) break
+            }
+
+            val answer = StringBuilder()
+            val buffer = ByteArray(8 * 1024)
+            while (true) {
+                val read = input.read(buffer)
+                if (read <= 0) break
+                val chunk = String(buffer, 0, read, Charsets.UTF_8)
+                answer.append(chunk)
+                onToken(chunk)
+            }
+            answer.toString().ifBlank { null }
+        } catch (e: Exception) {
+            PrismPlatform.log.warn(TAG, "Peer generation failed: " + e.message)
+            null
+        } finally {
+            runCatching { socket.close() }
+        }
+    }
+
+    private fun readAsciiLine(input: java.io.InputStream): String? {
+        val out = StringBuilder()
+        while (true) {
+            val next = input.read()
+            if (next < 0) return if (out.isEmpty()) null else out.toString()
+            if (next == '\n'.code) return out.toString().trimEnd('\r')
+            out.append(next.toChar())
+        }
+    }
+
+    private const val MODEL_HOST_PORT = 8080
 
     /** What is wired up here, for a diagnostics page. */
     fun describe(): String = buildString {

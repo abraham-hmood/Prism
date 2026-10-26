@@ -33,9 +33,26 @@ object ModelDownloadManager {
         Dispatchers.IO + com.prism.launcher.PrismLogger.coroutineHandler("ModelDownload")
     )
 
+    /**
+     * Downloads in flight, keyed by DownloadManager id.
+     *
+     * ONE GLOBAL ID WAS NOT ENOUGH. The completion receiver compared every finished download
+     * against a single stored id, so starting a second model before the first finished made the
+     * first completion look like a stranger's download and it was never imported. A map, keyed by
+     * the id the system gives back, lets several finish in any order.
+     */
+    private data class Pending(val name: String, val isImage: Boolean)
+
+    private val pending = java.util.concurrent.ConcurrentHashMap<Long, Pending>()
+
     fun download(context: Context, name: String, url: String, isImageModel: Boolean = false) {
         val appContext = context.applicationContext
-        val extension = if (url.endsWith(".task")) "task" else "bin"
+        // THE EXTENSION COMES FROM THE URL. It used to be `task` or, for everything else, `bin` --
+        // so a .gguf arrived named "model.bin", which the loader's format detection then had to
+        // guess at, and a .tflite was stored with a name that says nothing about it.
+        val path = Uri.parse(url).path.orEmpty()
+        val extension = path.substringAfterLast('.', "bin").lowercase()
+            .takeIf { it in setOf("gguf", "task", "tflite", "onnx", "safetensors") } ?: "bin"
         val request = DownloadManager.Request(Uri.parse(url))
             .setTitle("Downloading $name")
             .setDescription("Prism AI Model")
@@ -47,6 +64,9 @@ object ModelDownloadManager {
 
         val dm = appContext.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
         val downloadId = dm.enqueue(request)
+        pending[downloadId] = Pending(name, isImageModel)
+        // Still recorded, because a process that dies mid-download loses `pending` but the
+        // DownloadManager keeps going and delivers the completion to a fresh process.
         PrismSettings.setAiDownloadId(downloadId)
         PrismSettings.setAiDownloadIsImage(isImageModel)
 
@@ -57,14 +77,15 @@ object ModelDownloadManager {
     val completionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
-            if (id != -1L && id == PrismSettings.getAiDownloadId()) {
-                checkDownloadStatus(context.applicationContext, id)
-            }
+            if (id == -1L) return
+            val known = pending[id] != null || id == PrismSettings.getAiDownloadId()
+            if (known) checkDownloadStatus(context.applicationContext, id)
         }
     }
 
     private fun checkDownloadStatus(context: Context, id: Long) {
-        val isImage = PrismSettings.getAiDownloadIsImage()
+        val entry = pending[id]
+        val isImage = entry?.isImage ?: PrismSettings.getAiDownloadIsImage()
         val q = DownloadManager.Query().setFilterById(id)
         val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
         dm.query(q)?.use { cursor ->
@@ -77,6 +98,7 @@ object ModelDownloadManager {
                     val uriString = cursor.getString(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_LOCAL_URI))
                     val downloadedFile = uriString?.let { Uri.parse(it).path }?.let { File(it) }
 
+                    pending.remove(id)
                     if (downloadedFile == null || !downloadedFile.exists() || downloadedFile.length() <= 0L) {
                         downloadedFile?.delete()
                         Toast.makeText(context, "Download finished but the file is missing or empty. Please try again.", Toast.LENGTH_LONG).show()
@@ -85,6 +107,7 @@ object ModelDownloadManager {
                     }
                 } else if (status == DownloadManager.STATUS_FAILED) {
                     val reason = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON))
+                    pending.remove(id)
                     Toast.makeText(context, "Download failed (Reason: $reason)", Toast.LENGTH_LONG).show()
                 }
             }
@@ -97,8 +120,10 @@ object ModelDownloadManager {
      * download itself already has its own OS notification progress); the eager preload inside
      * [registerImportedModel] still happens, just silently. */
     private fun importDownloadedModel(context: Context, sourceFile: File, fileName: String, isImageModel: Boolean) {
-        val modelsDir = File(context.filesDir, "models")
-        if (!modelsDir.exists()) modelsDir.mkdirs()
+        // THE REGISTRY'S DIRECTORY, not filesDir/models. These were two different folders, so a
+        // model downloaded here was invisible to the Models page (and reconciled away) while one
+        // fetched over the mesh landed somewhere this code never looked.
+        val modelsDir = com.prism.launcher.messaging.ModelRegistry.directory()
         val targetFile = File(modelsDir, fileName)
 
         scope.launch {
@@ -251,8 +276,7 @@ object ModelDownloadManager {
         onStage: ((String) -> Unit)? = null,
         onDone: (success: Boolean, errorMessage: String?) -> Unit
     ) {
-        val modelsDir = File(context.filesDir, "models")
-        if (!modelsDir.exists()) modelsDir.mkdirs()
+        val modelsDir = com.prism.launcher.messaging.ModelRegistry.directory()
         val targetFile = File(modelsDir, fileName)
         val contentResolver = context.contentResolver
 

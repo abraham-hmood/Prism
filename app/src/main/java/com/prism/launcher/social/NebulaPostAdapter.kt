@@ -78,6 +78,12 @@ class NebulaPostAdapter(
                 true
             }
 
+            // A SHARE NEEDS A CLICK, NOT ONLY A LONG PRESS. The button had no tap handler at
+            // all: the repost count could never move and the share bubble could only be reached
+            // by holding it down, which nothing on screen said.
+            binding.btnRepost.setOnClickListener {
+                interactionListener?.onInteraction(post.postId, "share", "user")
+            }
             binding.btnRepost.setOnLongClickListener {
                 interactionListener?.onLongPress(it, post.postId, "share")
                 true

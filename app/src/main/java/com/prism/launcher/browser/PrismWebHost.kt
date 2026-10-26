@@ -521,22 +521,39 @@ object PrismWebHost {
         output.flush()
     }
 
+    /**
+     * Lists a hosted folder, whether it is a plain path or a SAF tree.
+     *
+     * The SAF branch is the reason this exists. A folder chosen through the system picker is a
+     * `content://` tree URI, and the old implementation only understood file paths -- so the
+     * manifest for a SAF-hosted site came back empty and peers had nothing to download.
+     */
     private fun collectFiles(context: Context, uri: Uri, relativePath: String, out: MutableList<Pair<String, Any>>) {
-        val doc = if (relativePath.isEmpty()) DocumentFile.fromTreeUri(context, uri) else {
-            // This is simplified; real implementation would need to resolve segments
-            null 
+        if (uri.scheme == "file" || uri.scheme == null) {
+            val root = File(uri.path ?: return)
+            if (root.exists() && root.isDirectory) {
+                root.walkTopDown().filter { it.isFile }.forEach { file ->
+                    val rel = file.absolutePath.removePrefix(root.absolutePath).replace("\\", "/")
+                    out.add(rel.removePrefix("/") to file)
+                }
+            }
+            return
         }
-        
-        // Better: Use File API if it's a local storage path
-        var baseDir = uri.path ?: ""
-        if (baseDir.startsWith("/tree/primary:")) baseDir = baseDir.replace("/tree/primary:", "/storage/emulated/0/")
-        else if (baseDir.startsWith("/document/primary:")) baseDir = baseDir.replace("/document/primary:", "/storage/emulated/0/")
-        
-        val root = File(baseDir)
-        if (root.exists() && root.isDirectory) {
-            root.walkTopDown().filter { it.isFile }.forEach { file ->
-                val rel = file.absolutePath.removePrefix(root.absolutePath).replace("\\", "/")
-                out.add(rel.removePrefix("/") to file)
+
+        val root = runCatching {
+            DocumentFile.fromTreeUri(context, uri) ?: DocumentFile.fromSingleUri(context, uri)
+        }.getOrNull() ?: return
+        walkDocumentTree(root, "", out)
+    }
+
+    private fun walkDocumentTree(dir: DocumentFile, prefix: String, out: MutableList<Pair<String, Any>>) {
+        dir.listFiles().forEach { child ->
+            val name = child.name ?: return@forEach
+            val path = if (prefix.isEmpty()) name else "$prefix/$name"
+            if (child.isDirectory) {
+                walkDocumentTree(child, path, out)
+            } else if (child.isFile) {
+                out.add(path to child)
             }
         }
     }

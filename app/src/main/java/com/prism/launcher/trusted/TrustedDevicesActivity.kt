@@ -98,6 +98,28 @@ class TrustedDevicesActivity : PrismBaseActivity() {
                 "it receives your data and cannot open it, which the list will tell you."
         ))
 
+        // LOCATION IS ITS OWN CONSENT, not a consequence of pairing. A device paired for
+        // clipboard has no business knowing where its owner is, so the switch is here, off by
+        // default, and there is a second one per device below.
+        column.addView(IosUi.sectionHeader(this, "LOCATION"))
+        column.addView(CheckBox(this).apply {
+            text = "Share my position with trusted devices"
+            textSize = 13f
+            isChecked = com.prism.launcher.trusted.TrustedLocations.sharingEnabled()
+            setTextColor(IosUi.label(this@TrustedDevicesActivity))
+            setOnCheckedChangeListener { _, checked ->
+                com.prism.launcher.trusted.TrustedLocations.setSharingEnabled(checked)
+                refresh()
+            }
+        })
+        column.addView(IosUi.sectionFooter(
+            this,
+            "Off by default, and off for every device until you allow it individually in the list " +
+                "above. What is sent is sealed with a key derived from your wallet, only the newest " +
+                "position per device is ever stored, and a position older than a day is discarded. " +
+                "A device you allow can also ask this one to ring so you can find it."
+        ))
+
         column.addView(IosUi.sectionHeader(this, "THIS DEVICE"))
         column.addView(TextView(this).apply {
             text = "${TrustedDevices.localName()}\n" +
@@ -126,9 +148,42 @@ class TrustedDevicesActivity : PrismBaseActivity() {
         )
     }
 
+    /** The last set of devices that read as online, so the ticker only rebuilds when it changes. */
+    private var lastOnline: Set<String> = emptySet()
+
+    private val presenceHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+    /**
+     * Keeps "online" honest while this screen is open.
+     *
+     * The dot used to be decided only when the list was built, so a device that closed Prism stayed
+     * green until the user left and came back. It refreshes on a change rather than on a timer so
+     * an open row does not lose focus or scroll position every few seconds.
+     */
+    private val presenceTicker = object : Runnable {
+        override fun run() {
+            val online = runCatching {
+                TrustedDevices.all().filter { it.online }.map { it.fingerprint }.toSet()
+            }.getOrDefault(emptySet())
+            if (online != lastOnline) {
+                lastOnline = online
+                refresh()
+            }
+            presenceHandler.postDelayed(this, 3_000L)
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         refresh()
+        presenceHandler.postDelayed(presenceTicker, 3_000L)
+    }
+
+    override fun onPause() {
+        // A ticker left running would rebuild the list over whatever the user opened on top of
+        // this screen, and keeps a Handler alive for a screen nobody is looking at.
+        presenceHandler.removeCallbacks(presenceTicker)
+        super.onPause()
         // Offers that arrived while this screen was closed are answered here rather than only through the
         // app-wide prompt: somebody who has just opened this page is already thinking about pairing.
         TrustedDevices.pendingOffers().firstOrNull()?.let { TrustedDeviceOffers.prompt(this, it) { refresh() } }
@@ -136,6 +191,7 @@ class TrustedDevicesActivity : PrismBaseActivity() {
 
     private fun refresh() {
         val devices = TrustedDevices.all()
+        lastOnline = devices.filter { it.online }.map { it.fingerprint }.toSet()
         list.removeAllViews()
 
         if (devices.isEmpty()) {
@@ -232,6 +288,19 @@ class TrustedDevicesActivity : PrismBaseActivity() {
                     setTextColor(IosUi.tertiaryLabel(this@TrustedDevicesActivity))
                 })
             }
+
+            // The per-device location consent. It consumes its own taps, so toggling it does not
+            // also open the sharing dialog the rest of the card opens.
+            card.addView(CheckBox(this).apply {
+                text = "Share my position with this device"
+                textSize = 12f
+                isChecked = com.prism.launcher.trusted.TrustedLocations.isSharingTo(device.fingerprint)
+                setTextColor(IosUi.secondaryLabel(this@TrustedDevicesActivity))
+                setPadding(0, IosUi.dp(this@TrustedDevicesActivity, 4f), 0, 0)
+                setOnCheckedChangeListener { _, checked ->
+                    com.prism.launcher.trusted.TrustedLocations.setSharingTo(device.fingerprint, checked)
+                }
+            })
         }
 
         card.isClickable = true
@@ -261,10 +330,11 @@ class TrustedDevicesActivity : PrismBaseActivity() {
      * list would otherwise appear twice and a second offer to it would be a second row.
      */
     private fun pickDevice() {
-        // ON THE OVERLAY, NOT MERELY ON THE MESH. isOnMesh() is true whenever the gossip listener is
+        // ON THE MESHNET, NOT MERELY ON THE WI-FI. isOnMesh() is true whenever the gossip listener is
         // running, which it is on bare Wi-Fi -- so it was never the right question for pairing. See
-        // MeshMembership: the test is an address in the mesh subnet, on both ends.
-        if (!com.prism.core.MeshMembership.isOnOverlay()) {
+        // MeshMembership: this device must be serving a mesh or connected to one, and the peer must be
+        // part of that same mesh.
+        if (!com.prism.core.MeshMembership.isOnMeshnet()) {
             PrismDialogFactory.show(
                 this,
                 "Not on a meshnet",
@@ -275,12 +345,17 @@ class TrustedDevicesActivity : PrismBaseActivity() {
             return
         }
 
-        val paired = TrustedDevices.all().map { it.lastIp }.toSet()
+        // Normalised, so a paired device whose address the socket spells differently is not offered
+        // as new and paired a second time.
+        val paired = TrustedDevices.all()
+            .map { TrustedDevices.normaliseAddress(it.lastIp) }
+            .filter { it.isNotEmpty() }
+            .toSet()
         val market = runCatching { MeshComputeRegistry.all() }.getOrDefault(emptyList())
-        // Filtered to the overlay as well as gated in TrustedDevices.offer. Both, because a picker that
+        // Filtered to the meshnet as well as gated in TrustedDevices.offer. Both, because a picker that
         // listed a device and then refused to pair with it would be worse than not listing it.
-        val candidates = com.prism.core.MeshMembership.overlayPeers(PrismMeshService.activePeerIps())
-            .filterNot { it in paired }
+        val candidates = com.prism.core.MeshMembership.meshPeers(PrismMeshService.activePeerIps())
+            .filterNot { TrustedDevices.normaliseAddress(it) in paired }
             .map { ip ->
                 val peer = market.firstOrNull { it.peerIp == ip }
                 Triple(ip, peer?.deviceName ?: ip, peer?.platformLabel() ?: "unknown device")
@@ -291,7 +366,7 @@ class TrustedDevicesActivity : PrismBaseActivity() {
                 this,
                 "No other devices",
                 "Nothing else is on this meshnet right now, or everything on it is already paired. A " +
-                    "device appears here once it is running Prism on the same mesh.",
+                    "device appears here once it is running Prism and has joined the same mesh.",
                 positiveText = "OK",
                 negativeText = null,
             )
@@ -379,7 +454,7 @@ class TrustedDevicesActivity : PrismBaseActivity() {
                 if (code == null) {
                     toast("Could not reach $peerName just now; the offer will be retried.")
                 } else {
-                    showPairingCode(code, peerName)
+                    showPairingCode(code, peerName, peerIp)
                 }
                 refresh()
             },
@@ -423,7 +498,7 @@ class TrustedDevicesActivity : PrismBaseActivity() {
                     TrustedDevices.upsert(device.copy(outgoing = emptySet()))
                 } else if (device.lastIp.isNotBlank()) {
                     TrustedDevices.offer(device.lastIp, device.name, device.platform, chosen)
-                        ?.let { showPairingCode(it, device.name) }
+                        ?.let { showPairingCode(it, device.name, device.lastIp) }
                 }
                 refresh()
             },
@@ -439,7 +514,7 @@ class TrustedDevicesActivity : PrismBaseActivity() {
      * Not dismissible by tapping away: the code exists for exactly as long as this pairing is waiting,
      * and somebody who closed it by accident would have nothing to type and no way back to it.
      */
-    private fun showPairingCode(code: String, peerName: String) {
+    private fun showPairingCode(code: String, peerName: String, peerIp: String) {
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = android.view.Gravity.CENTER_HORIZONTAL
@@ -467,14 +542,19 @@ class TrustedDevicesActivity : PrismBaseActivity() {
             setTextColor(IosUi.tertiaryLabel(this@TrustedDevicesActivity))
         })
 
-        PrismDialogFactory.show(
+        val dialog = PrismDialogFactory.show(
             this,
             "Type this on $peerName",
             message = "",
             customView = column,
             positiveText = "Done",
+            negativeText = null,
             onPositive = {},
         )
+        // Closing the code stops the pairing. Without this the challenge stayed outstanding, so a
+        // proof typed on the other device afterwards still paired it -- Done would have meant
+        // nothing beyond hiding the words.
+        dialog.setOnDismissListener { TrustedDevices.cancelOffer(peerIp) }
     }
 
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()

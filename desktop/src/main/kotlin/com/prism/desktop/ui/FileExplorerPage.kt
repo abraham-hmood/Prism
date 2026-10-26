@@ -1,6 +1,7 @@
 package com.prism.desktop.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -13,7 +14,16 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isCtrlPressed
+import androidx.compose.ui.input.key.isMetaPressed
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -58,6 +68,9 @@ fun FileExplorerPage() {
     var descending by remember { mutableStateOf(false) }
     var showHidden by remember { mutableStateOf(false) }
     var refreshToken by remember { mutableStateOf(0) }
+    // Ctrl/Cmd+V belongs to this page while it is open, the same way it belongs to a file manager.
+    // Compose routes keys through focus, so the page has to take it to receive it.
+    val keyFocus = remember { FocusRequester() }
     var status by remember { mutableStateOf<String?>(null) }
     var renaming by remember { mutableStateOf<File?>(null) }
     var creatingFolder by remember { mutableStateOf(false) }
@@ -98,11 +111,72 @@ fun FileExplorerPage() {
         entries.filter { it.absolutePath in selected }
     }
 
-    Column(Modifier.fillMaxSize().background(colors.background)) {
+    /**
+     * The paste action, shared by the toolbar and Ctrl/Cmd+V.
+     *
+     * ONE IMPLEMENTATION because the shortcut and the button must do exactly the same thing --
+     * including fetching a file a trusted device shared, which is the case a second copy would
+     * most easily get wrong.
+     */
+    fun pasteClipboard() {
+        scope.launch {
+            val shared = com.prism.launcher.clipboard.ClipboardHistory.active()
+            if (shared?.kind == com.prism.launcher.clipboard.ClipboardHistory.Kind.FILE) {
+                if (shared.remote) {
+                    status = "Downloading ${shared.name}…"
+                    val received = withContext(Dispatchers.IO) {
+                        com.prism.launcher.clipboard.TrustedFileTransfer.fetch(shared, current)
+                    }
+                    if (received.isNullOrEmpty()) {
+                        status = "Could not fetch ${shared.name}; the other device may be offline"
+                        refresh()
+                        return@launch
+                    }
+                } else {
+                    val file = File(shared.path)
+                    if (!file.exists()) {
+                        status = "${shared.name} is no longer on this device"
+                        com.prism.launcher.clipboard.ClipboardHistory.remove(shared.id)
+                        refresh()
+                        return@launch
+                    }
+                    // Loaded into FileOps without re-sharing: this is choosing an item that is
+                    // already here, not a new copy.
+                    when (shared.mode) {
+                        com.prism.launcher.clipboard.ClipboardHistory.Mode.CUT -> FileOps.cut(listOf(file))
+                        com.prism.launcher.clipboard.ClipboardHistory.Mode.COPY -> FileOps.copy(listOf(file))
+                    }
+                }
+            }
+            val result = withContext(Dispatchers.IO) { FileOps.paste(current) }
+            status = if (result.ok) "Pasted ${result.pasted.size}"
+            else result.skipped.joinToString("; ")
+            refresh()
+        }
+    }
+
+    LaunchedEffect(Unit) { runCatching { keyFocus.requestFocus() } }
+
+    Column(
+        Modifier
+            .fillMaxSize()
+            .background(colors.background)
+            .focusRequester(keyFocus)
+            .focusable()
+            .onPreviewKeyEvent { event ->
+                val paste = event.type == KeyEventType.KeyDown &&
+                    (event.isCtrlPressed || event.isMetaPressed) &&
+                    event.key == Key.V
+                if (paste) pasteClipboard()
+                paste
+            }
+    ) {
         ExplorerToolbar(
             current = current,
             selectionCount = selectedFiles.size,
-            clipboardCount = FileOps.clipboard()?.files?.size ?: 0,
+            clipboardCount = FileOps.clipboard()?.files?.size
+                ?: if (com.prism.launcher.clipboard.ClipboardHistory.active()?.kind ==
+                    com.prism.launcher.clipboard.ClipboardHistory.Kind.FILE) 1 else 0,
             sort = sort,
             descending = descending,
             showHidden = showHidden,
@@ -111,20 +185,22 @@ fun FileExplorerPage() {
             onToggleHidden = { showHidden = !showHidden },
             onCopy = {
                 FileOps.copy(selectedFiles)
+                // Every copy is recorded and shared. The history is what makes the same item
+                // available in the explorer on another device, and the share is what puts it
+                // there; doing it here covers the toolbar and every other caller.
+                selectedFiles.forEach {
+                    com.prism.launcher.trusted.TrustedSharing.publishFile(it, cut = false)
+                }
                 status = "${selectedFiles.size} copied"
             },
             onCut = {
                 FileOps.cut(selectedFiles)
+                selectedFiles.forEach {
+                    com.prism.launcher.trusted.TrustedSharing.publishFile(it, cut = true)
+                }
                 status = "${selectedFiles.size} cut"
             },
-            onPaste = {
-                scope.launch {
-                    val result = withContext(Dispatchers.IO) { FileOps.paste(current) }
-                    status = if (result.ok) "Pasted ${result.pasted.size}"
-                    else result.skipped.joinToString("; ")
-                    refresh()
-                }
-            },
+            onPaste = { pasteClipboard() },
             onRename = { selectedFiles.singleOrNull()?.let { renaming = it } },
             onDelete = { if (selectedFiles.isNotEmpty()) confirmDelete = selectedFiles },
             onNewFolder = { creatingFolder = true },

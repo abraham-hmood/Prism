@@ -28,6 +28,11 @@ sealed interface PagePickChoice {
     data object Language : PagePickChoice
     data object Minigames : PagePickChoice
     data object Cloud : PagePickChoice
+    data object Meshvoice : PagePickChoice
+    data object Maps : PagePickChoice
+    data object Mouse : PagePickChoice
+    data object Photos : PagePickChoice
+    data object PhotoPix : PagePickChoice
 }
 
 class PositionPickerAdapter(
@@ -172,6 +177,11 @@ class VerticalPageOptionsAdapter(
         add(Option("Agentic Tools", "Manage AI tool-calling and custom syntaxes", PagePickChoice.AgenticTools))
         add(Option("Wallet", "Local crypto wallet and miner", PagePickChoice.Wallet))
         add(Option("Cloud", "Mesh cloud computing, encrypted storage, and cloud gaming", PagePickChoice.Cloud))
+        add(Option("Meshvoice", "Carrier voicemail and meshnet voicemail, with export", PagePickChoice.Meshvoice))
+        add(Option("Maps", "Where your trusted devices are, sealed end to end", PagePickChoice.Maps))
+        add(Option("Mouse", "Drive a trusted desktop's pointer from this device", PagePickChoice.Mouse))
+        add(Option("Photos", "Every photo and video on this device, and the encrypted mesh backup", PagePickChoice.Photos))
+        add(Option("PhotoPix", "Layer-based photo editor, as a canvas of its own", PagePickChoice.PhotoPix))
         for (p in plugins) add(Option(p.label, p.packageName, PagePickChoice.PluginPage(p)))
     }
 

@@ -32,6 +32,23 @@ sealed class SlotAssignment {
     data object Minigames : SlotAssignment()
     data object Cloud : SlotAssignment()
 
+    /** Voicemail and the trusted-device map: pages of their own, not Messages panels. */
+    data object Meshvoice : SlotAssignment()
+    data object Maps : SlotAssignment()
+
+    /**
+     * A pointer for another trusted device. Never in the default layout: it only does anything
+     * with a meshnet and a paired device, so offering it to a new user would be a page that
+     * explains why it is empty.
+     */
+    data object Mouse : SlotAssignment()
+
+    /** On-device photos and videos, plus what the encrypted mesh backup holds. */
+    data object Photos : SlotAssignment()
+
+    /** The layer-based PhotoPix editor as a page of its own. Never in the default layout. */
+    data object PhotoPix : SlotAssignment()
+
     fun serialize(): String = when (this) {
         is Default -> "default"
         is Browser -> "browser"
@@ -52,6 +69,11 @@ sealed class SlotAssignment {
         is Language -> "language"
         is Minigames -> "minigames"
         is Cloud -> "cloud"
+        is Meshvoice -> "meshvoice"
+        is Maps -> "maps"
+        is Mouse -> "mouse"
+        is Photos -> "photos"
+        is PhotoPix -> "photopix"
         is Custom -> "custom|$packageName|$viewClassName"
     }
 
@@ -76,6 +98,11 @@ sealed class SlotAssignment {
             if (raw == "language") return Language
             if (raw == "minigames") return Minigames
             if (raw == "cloud") return Cloud
+            if (raw == "meshvoice") return Meshvoice
+            if (raw == "maps") return Maps
+            if (raw == "mouse") return Mouse
+            if (raw == "photos") return Photos
+            if (raw == "photopix") return PhotoPix
             val parts = raw.split("|")
             if (parts.size == 3 && parts[0] == "custom") {
                 return Custom(parts[1], parts[2])
@@ -176,17 +203,27 @@ class SlotPreferences {
         }
     }
     
+    /**
+     * Inserts a page at [index], moving every later page -- and its desktop grid -- one slot right.
+     *
+     * The grid move is the point. Desktop contents are stored under `cells_page_N`, so without
+     * shifting them an insert at the front hands every desktop page its neighbour's icons and
+     * silently drops the last page's. See [DesktopShortcutStore.shiftPageIndices].
+     */
     fun addAt(index: Int, assignment: SlotAssignment) {
         val list = getAssignments()
         if (index <= list.size) {
+            DesktopShortcutStore.shiftPageIndices(from = index, delta = 1)
             list.add(index, assignment)
             saveAssignments(list)
         }
     }
-    
+
+    /** Removes the page at [index], closing the gap in the saved grids behind it. */
     fun removeAt(index: Int) {
         val list = getAssignments()
         if (index in list.indices && list.size > 1) { // Keep at least one page
+            DesktopShortcutStore.shiftPageIndices(from = index, delta = -1)
             list.removeAt(index)
             saveAssignments(list)
         }

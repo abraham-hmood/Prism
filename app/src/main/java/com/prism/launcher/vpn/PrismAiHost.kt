@@ -57,6 +57,15 @@ object PrismAiHost {
         val input = inputOverride ?: socket.getInputStream()
         val output = socket.getOutputStream()
         try {
+            // A BANNED PEER IS REFUSED HERE TOO. Kick and ban only filtered the gossip datagrams,
+            // so a banned device could still open the tunnel and fetch models or run prompts. The
+            // ban list is keyed by node id; this is the address-to-id lookup that lets a TCP host
+            // use it.
+            val peerIp = socket.inetAddress?.hostAddress.orEmpty()
+            if (peerIp.isNotBlank() && com.prism.launcher.mesh.PrismMeshService.isPeerBanned(peerIp)) {
+                sendError(output, 403, "This device is banned from this peer")
+                return@withContext
+            }
             // Lines the proxy already consumed, if any. When this is non-empty the request line and
             // the headers must come from HERE and not from the stream, which is now positioned at
             // the body.
@@ -94,6 +103,25 @@ object PrismAiHost {
                 val path = requestLine.removePrefix("GET ").substringBefore(" ").trim()
                 com.prism.launcher.trusted.TrustedAppTransfer.serve(
                     context,
+                    socket.inetAddress?.hostAddress.orEmpty(),
+                    path,
+                    output,
+                )
+                return@withContext
+            }
+
+            // A copied file or folder being pasted on a trusted device. Same tunnel and same
+            // reason as an app: the announcement travels as a clipboard share and the bytes need
+            // a stream. The route is implemented once in :core so the desktop serves it too.
+            if (requestLine.startsWith("GET /trusted-file/")) {
+                if (!preLines.isNotEmpty()) {
+                    while (true) {
+                        val line = readLine(input) ?: break
+                        if (line.isEmpty()) break
+                    }
+                }
+                val path = requestLine.removePrefix("GET ").substringBefore(" ").trim()
+                com.prism.launcher.clipboard.TrustedFileTransfer.serve(
                     socket.inetAddress?.hostAddress.orEmpty(),
                     path,
                     output,
@@ -233,12 +261,27 @@ object PrismAiHost {
             }
         }
 
+        // HOSTING IS A DECISION, AND THIS ROUTE USED TO IGNORE IT. The switch in Settings stopped
+        // announcements but not the port, so a peer that already knew the address could copy any
+        // model in the folder. Refuse explicitly, so the other end can tell "off" from "broken".
+        if (!PrismSettings.getP2pModelHostingEnabled()) {
+            sendError(output, 403, "Model hosting is turned off on this device")
+            return
+        }
+
         val raw = requestLine.removePrefix("GET /model/").substringBefore(" ").trim()
         val name = java.net.URLDecoder.decode(raw, "UTF-8")
-        val dir = java.io.File(context.filesDir, "models")
-        val file = java.io.File(dir, name)
 
-        if (name.isBlank() || !file.canonicalPath.startsWith(dir.canonicalPath + java.io.File.separator)) {
+        // THE SAME DIRECTORY THE SELLER COPIED INTO. This served filesDir/models while the upload
+        // flow (and mesh transfers) use documentsDir()/Models, so every paid download 404'd after
+        // the buyer had already committed the coins. destinationFor also applies the same name
+        // sanitising the writer used, so a listing whose title contains spaces resolves.
+        val file = com.prism.launcher.mesh.P2pModelTransfer.destinationFor(name)
+        val dir = file.parentFile
+
+        if (name.isBlank() || dir == null ||
+            !file.canonicalPath.startsWith(dir.canonicalPath + java.io.File.separator)
+        ) {
             sendError(output, 403, "Forbidden")
             return
         }

@@ -66,8 +66,28 @@ import kotlinx.coroutines.withContext
  * says where the effect lands rather than pretending it is local.
  */
 @Composable
-fun PrismSettingsPage(mobileMode: Boolean, onMobileModeChange: (Boolean) -> Unit) {
+fun PrismSettingsPage() {
     val colors = LocalPrismColors.current
+    val scope = rememberCoroutineScope()
+    // The shell's state is a file or a registry value, not a preference, so it is read rather than
+    // remembered from the last time this page wrote it. A second Prism window, or a manual `reg
+    // delete`, must show up here as it is.
+    var shellState by remember {
+        mutableStateOf(
+            com.prism.desktop.ShellReplacement.State(
+                supported = false,
+                active = false,
+                current = "",
+                obstacle = "",
+            ),
+        )
+    }
+    var shellNote by remember { mutableStateOf("") }
+    // Read off the UI thread: state() runs `reg query` on Windows, and a settings page must not
+    // block on a child process while it is being laid out.
+    LaunchedEffect(Unit) {
+        shellState = withContext(Dispatchers.IO) { com.prism.desktop.ShellReplacement.state() }
+    }
 
     var query by remember { mutableStateOf("") }
     // Groups start closed apart from the desktop's own, so the page opens as a readable index rather than
@@ -78,6 +98,9 @@ fun PrismSettingsPage(mobileMode: Boolean, onMobileModeChange: (Boolean) -> Unit
     // not appear or disappear until the page was left and re-entered.
     var revision by remember { mutableStateOf(0) }
     var dialog by remember { mutableStateOf<SettingsActions.Dialog?>(null) }
+    // The clipboard history is a dialog rather than a page: it is a picker, and leaving Settings
+    // to open a second full screen to tap one row is two navigations for one action.
+    var clipboardOpen by remember { mutableStateOf(false) }
 
     // The page is what can host a dialog, so it lends that ability to the action handler. Reset on every
     // composition rather than once, so a page that is left and re-entered does not leave a stale
@@ -96,6 +119,14 @@ fun PrismSettingsPage(mobileMode: Boolean, onMobileModeChange: (Boolean) -> Unit
         SettingsActions.Dialog.SPEECH_MODEL -> SpeechModelDialog(onDismiss = {
             dialog = null
             // A model may have been set or removed, and the row's summary says which.
+            revision++
+        })
+        SettingsActions.Dialog.WIRELESS_DISPLAYS -> WirelessDisplaysDialog(onDismiss = {
+            dialog = null
+            revision++
+        })
+        SettingsActions.Dialog.PDB -> PdbDialog(onDismiss = {
+            dialog = null
             revision++
         })
         null -> Unit
@@ -160,33 +191,131 @@ fun PrismSettingsPage(mobileMode: Boolean, onMobileModeChange: (Boolean) -> Unit
                 return@Column
             }
 
-            // The desktop's own first: they are what somebody came to this page for on a PC, and they
+            // Themes lead the page: changing the interface is the broadest setting here, and
+            // it is shared with the phone rather than a desktop-only preference.
+            ThemesSection()
+
+            // The desktop's own next: they are what somebody came to this page for on a PC, and they
             // have no equivalent on the phone.
             SectionHeader("desktop")
             Card {
+                // THE SWITCH THAT USED TO BE "LAUNCHER MODE" NOW REPLACES THE SHELL. See
+                // ShellReplacement for what that writes and for the escape hatch that is created
+                // before anything changes. The row is the control and the section below explains
+                // the state it is in, so there is one switch rather than a switch and a button
+                // that do the same thing.
                 ToggleRow(
-                    title = "Launcher mode",
-                    detail = "Use the phone build's navigation model: a horizontal pager over the " +
-                        "page slots you assigned, at full window width, instead of the rail. Tab and " +
-                        "Shift+Tab change page, down opens the switcher, 1-9 jump straight to a slot.",
-                    checked = mobileMode,
-                    onChange = onMobileModeChange,
+                    title = "Prism is the desktop shell",
+                    detail =
+                        if (!shellState.supported) {
+                            com.prism.desktop.ShellReplacement.warning()
+                        } else if (shellState.obstacle.isNotEmpty()) {
+                            shellState.obstacle
+                        } else {
+                            "Start Prism instead of Explorer at sign-in (Windows), or as this " +
+                                "account's X session (Linux). Turning it off restores what was there."
+                        },
+                    checked = shellState.active,
+                    onChange = { wanted ->
+                        scope.launch {
+                            val result = withContext(Dispatchers.IO) {
+                                val outcome = if (wanted) {
+                                    com.prism.desktop.ShellReplacement.enable()
+                                } else {
+                                    com.prism.desktop.ShellReplacement.disable()
+                                }
+                                outcome to com.prism.desktop.ShellReplacement.state()
+                            }
+                            shellNote = result.first.message
+                            shellState = result.second
+                        }
+                    },
                 )
+                if (shellNote.isNotBlank()) {
+                    Hairline()
+                    Row(Modifier.padding(horizontal = 16.dp, vertical = 11.dp)) {
+                        Text(shellNote, fontSize = 12.sp, color = colors.faint, lineHeight = 18.sp)
+                    }
+                }
                 Hairline()
                 InfoRow("Inference threads", PrismSettings.getInferenceThreads().toString())
+                Hairline()
+                // Under the desktop's own settings, and above the phone's groups: it shows what
+                // this machine and its paired devices have copied right now.
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clickableRow { clipboardOpen = true }
+                        .padding(horizontal = 16.dp, vertical = 13.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Clipboard history", fontSize = 15.sp, color = Color(0xFFE6E6EE))
+                        Text(
+                            com.prism.launcher.clipboard.ClipboardHistory.all().size.toString() +
+                                " item(s) · everything copied here and on your trusted devices",
+                            fontSize = 12.sp,
+                            color = colors.faint,
+                        )
+                    }
+                    Text("Open", fontSize = 13.sp, color = colors.accent)
+                }
             }
             SectionFooter(
                 "The slots come from the same prism_slots store the Android build writes, so a page " +
                     "arrangement made on the phone is the arrangement you get here."
             )
 
+            // ── Messaging apps ──────────────────────────────────────────
+            //
+            // The same three services Settings offers on the phone, with the same switches: the
+            // flags live in PrismSettings, so connecting WhatsApp on the laptop shows it connected
+            // on the phone. A desktop cannot read those apps' notifications and does not pretend
+            // to; the rows open their web clients instead.
             Spacer(Modifier.height(18.dp))
-            WindowsShellSection()
-            Spacer(Modifier.height(18.dp))
+            SectionHeader("messaging apps")
+            Card {
+                com.prism.launcher.messaging.MessagingBridges.ALL.forEachIndexed { index, bridge ->
+                    if (index > 0) Hairline()
+                    ToggleRow(
+                        title = bridge.label,
+                        detail = bridge.note,
+                        checked = com.prism.launcher.messaging.MessagingBridges.isEnabled(bridge.id),
+                        onChange = { enabled ->
+                            com.prism.launcher.messaging.MessagingBridges.setEnabled(bridge.id, enabled)
+                            com.prism.launcher.PrismSettings.setMessagingBridgeSetupSeen(true)
+                            revision++
+                        },
+                    )
+                    Row(
+                        Modifier.fillMaxWidth().clickableRow {
+                            runCatching {
+                                java.awt.Desktop.getDesktop().browse(java.net.URI(bridge.webUrl))
+                            }
+                        }.padding(horizontal = 16.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "Open " + bridge.label + " in a browser",
+                            fontSize = 13.sp,
+                            color = colors.accent,
+                        )
+                    }
+                }
+            }
+            SectionFooter(
+                "Prism cannot send as these apps and does not claim to. The connection puts them in " +
+                    "Messages, opens them from here, and — on the phone — includes their " +
+                    "notifications in your message history once notification access is granted."
+            )
+
 
             // Then everything the phone has, in the phone's grouping and order.
             val grouped = sections.groupBy { SettingsCatalog.groupOf(it.title) }
-            val order = SettingsCatalog.GROUPS.map { it.title } + listOf("Other")
+            // The catalog may declare Other itself to place a section there deliberately. Appending
+            // it again would render the same group twice, once empty.
+            val declaredGroups = SettingsCatalog.GROUPS.map { it.title }
+            val order = if ("Other" in declaredGroups) declaredGroups else declaredGroups + "Other"
             order.forEach { groupTitle ->
                 val groupSections = grouped[groupTitle] ?: return@forEach
                 val visible = groupSections
@@ -242,6 +371,10 @@ fun PrismSettingsPage(mobileMode: Boolean, onMobileModeChange: (Boolean) -> Unit
 
             Spacer(Modifier.height(28.dp))
         }
+    }
+
+    if (clipboardOpen) {
+        ClipboardHistoryDialog(onDismiss = { clipboardOpen = false })
     }
 }
 
@@ -471,107 +604,4 @@ private fun NotPorted(title: String, reason: String) {
         lineHeight = 16.sp,
         modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 10.dp)
     )
-}
-
-/**
- * Replacing the Windows shell. PHASE 75.
- *
- * ## Why this is a section and not a toggle
- *
- * A toggle invites a shrug. What this changes is which program Windows starts at sign-in, and getting
- * it wrong leaves somebody looking at a bare desktop with no taskbar, no Start menu and no obvious way
- * to run anything -- which is a genuinely alarming place to be, and is why the plan required a
- * documented escape hatch to exist before the feature did. So the warning is shown before the control,
- * the way back is named on the page rather than in documentation nobody has open at the time, and the
- * button that changes nothing sits next to the one that does.
- *
- * ## Why "Test it" is offered first
- *
- * It sets the value, reads it back, removes it and reads it back again, leaving the machine exactly as
- * it was found. Somebody deciding whether to trust this with their sign-in can watch the mechanism work
- * and reverse itself before betting a logon on it.
- */
-@Composable
-private fun WindowsShellSection() {
-    val scope = rememberCoroutineScope()
-    var state by remember { mutableStateOf(com.prism.desktop.ShellReplacement.state()) }
-    var outcome by remember { mutableStateOf("") }
-
-    if (!state.supported) return
-
-    SectionHeader("WINDOWS SHELL")
-    Card {
-        InfoRow("Prism is the shell", if (state.active) "yes" else "no")
-        Hairline()
-        InfoRow(
-            "Current setting",
-            state.current.ifBlank { "absent -- Windows starts explorer.exe" },
-            mono = true,
-        )
-        if (state.obstacle.isNotEmpty()) {
-            Hairline()
-            InfoRow("Cannot enable", state.obstacle)
-        }
-    }
-
-    Spacer(Modifier.height(10.dp))
-    Row(Modifier.padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
-        OutlinedButton(
-            onClick = {
-                scope.launch {
-                    outcome = withContext(Dispatchers.IO) {
-                        com.prism.desktop.ShellReplacement.roundTrip()
-                    }.message
-                    state = com.prism.desktop.ShellReplacement.state()
-                }
-            },
-        ) { Text("Test it, changing nothing", fontSize = 13.sp) }
-
-        Spacer(Modifier.width(8.dp))
-        if (state.active) {
-            Button(
-                onClick = {
-                    scope.launch {
-                        outcome = withContext(Dispatchers.IO) {
-                            com.prism.desktop.ShellReplacement.disable()
-                        }.message
-                        state = com.prism.desktop.ShellReplacement.state()
-                    }
-                },
-            ) { Text("Put Explorer back") }
-        } else {
-            Button(
-                enabled = state.obstacle.isEmpty(),
-                onClick = {
-                    scope.launch {
-                        outcome = withContext(Dispatchers.IO) {
-                            com.prism.desktop.ShellReplacement.enable()
-                        }.message
-                        state = com.prism.desktop.ShellReplacement.state()
-                    }
-                },
-            ) { Text("Make Prism the shell") }
-        }
-
-        Spacer(Modifier.width(8.dp))
-        OutlinedButton(
-            onClick = {
-                val written = com.prism.desktop.ShellReplacement.escapeScript()
-                outcome = if (written.isEmpty()) {
-                    "The way-back script could not be written anywhere."
-                } else {
-                    "Written to " + written.joinToString(" and ") { it.absolutePath }
-                }
-            },
-        ) { Text("Write the way back", fontSize = 13.sp) }
-    }
-
-    if (outcome.isNotBlank()) {
-        Spacer(Modifier.height(10.dp))
-        Card {
-            Text(outcome, fontSize = 13.sp, lineHeight = 19.sp, modifier = Modifier.padding(16.dp))
-        }
-    }
-
-    SectionFooter(com.prism.desktop.ShellReplacement.warning())
 }

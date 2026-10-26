@@ -1,6 +1,7 @@
 package com.prism.launcher.messaging
 
 import com.prism.core.MeshConnect
+import com.prism.core.MeshCore
 import com.prism.core.PrismPlatform
 import com.prism.launcher.PrismSettings
 import java.io.File
@@ -73,10 +74,32 @@ object MeshAiHost : MeshConnect.DomainHost {
 
     override fun serve(socket: Socket, domain: String, head: String?, input: InputStream) {
         val output = socket.getOutputStream()
+
+        // A BAN THAT ONLY STOPPED DATAGRAMS WAS NOT A BAN. This port is reached by TCP, and the
+        // gossip gate in MeshCore cannot see that connection. Refuse it here by mapping the peer's
+        // address to the node id the ban list is keyed by.
+        val peer = runCatching { socket.inetAddress?.hostAddress }.getOrNull().orEmpty()
+        if (peer.isNotBlank() && MeshCore.isPeerBanned(peer)) {
+            respond(output, 403, "This device is banned from this peer.")
+            runCatching { socket.close() }
+            return
+        }
+
         val requestLine = head.orEmpty().lineSequence().firstOrNull().orEmpty()
 
         when {
             requestLine.startsWith("GET /model/") -> serveModelFile(requestLine, output)
+            // A file the user copied and a trusted device is pasting. The metadata travelled as a
+            // clipboard share; the bytes come here, because they do not fit in a datagram. The
+            // authorisation and the archive live in TrustedFileTransfer, shared with Android's
+            // own host so the two ends speak the same route.
+            requestLine.startsWith("GET " + com.prism.launcher.clipboard.TrustedFileTransfer.PATH) -> {
+                com.prism.launcher.clipboard.TrustedFileTransfer.serve(
+                    runCatching { socket.inetAddress?.hostAddress }.getOrNull().orEmpty(),
+                    requestLine.pathOfRequestLine(),
+                    output,
+                )
+            }
             requestLine.startsWith("POST /generate") -> serveGeneration(head.orEmpty(), input, output)
             // A platform's own route. Checked before the 404 and after the two this host owns, so a
             // registration can never shadow model serving or generation.
@@ -97,7 +120,7 @@ object MeshAiHost : MeshConnect.DomainHost {
     }
 
     /** The path out of a request line: "POST /cloud HTTP/1.1" -> "/cloud". */
-    private fun String.pathOfRequestLine(): String =
+    internal fun String.pathOfRequestLine(): String =
         substringAfter(' ', "").substringBefore(' ').substringBefore('?')
 
     private fun serveExtra(

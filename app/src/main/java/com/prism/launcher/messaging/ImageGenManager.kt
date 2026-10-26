@@ -41,28 +41,60 @@ object ImageGenManager {
         }
     }
 
+    /**
+     * Writes a generated image where the user can find it.
+     *
+     * TWO PATHS, BECAUSE RELATIVE_PATH DOES NOT EXIST BEFORE API 29. The scoped-storage insert was
+     * unconditional, so on Android 8 and 9 `RELATIVE_PATH` was an unknown column: the insert either
+     * failed or produced an entry the write could not target, and the picture the user was told
+     * about never appeared. Pre-29 writes the file itself and records its DATA path, which is how
+     * that API expects a MediaStore image to be created.
+     */
     private fun saveToPublicStore(context: Context, bitmap: Bitmap): Uri? {
         val fileName = "gen_${UUID.randomUUID()}.jpg"
-        val relativePath = "DCIM/Prism/Nebula"
-        
+        return runCatching {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                saveScoped(context, bitmap, fileName)
+            } else {
+                saveLegacy(context, bitmap, fileName)
+            }
+        }.getOrElse {
+            // A generation that succeeded but could not be saved must not crash the chat turn.
+            android.util.Log.w("PrismImage", "Could not save a generated image", it)
+            null
+        }
+    }
+
+    private fun saveScoped(context: Context, bitmap: Bitmap, fileName: String): Uri? {
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
             put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-            put(MediaStore.Images.Media.RELATIVE_PATH, relativePath)
+            put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/Prism/Nebula")
         }
-        
         val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-        return try {
-            uri?.let {
-                context.contentResolver.openOutputStream(it).use { out ->
-                    bitmap.compress(Bitmap.CompressFormat.JPEG, 90, out!!)
-                }
-            }
-            uri
-        } catch (e: Exception) {
-            e.printStackTrace()
-            null
+            ?: return null
+        context.contentResolver.openOutputStream(uri)?.use { out ->
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 90, out)
+        } ?: return null
+        return uri
+    }
+
+    private fun saveLegacy(context: Context, bitmap: Bitmap, fileName: String): Uri? {
+        val directory = File(
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM),
+            "Prism/Nebula",
+        ).apply { mkdirs() }
+        val file = File(directory, fileName)
+        FileOutputStream(file).use { out ->
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 90, out)
         }
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.DATA, file.absolutePath)
+        }
+        return context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            ?: Uri.fromFile(file)
     }
 
     /**

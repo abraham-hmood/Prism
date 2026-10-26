@@ -1,0 +1,3 @@
+F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/CMakeFiles/llama-populate.dir
+F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/CMakeFiles/edit_cache.dir
+F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/CMakeFiles/rebuild_cache.dir

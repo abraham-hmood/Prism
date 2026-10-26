@@ -71,7 +71,7 @@ object SeedVcEngine : CloneEngine {
     private const val TAG = "PrismSpeech"
 
     private const val RELEASE =
-        "https://github.com/ibrahim-hmood/Prism/releases/download/voice-engines-v1"
+        "https://github.com/abraham-hmood/Prism/releases/download/voice-engines-v1"
 
     val CONTENT = VoiceCloningModels.Model(
         id = "seed-content",
@@ -79,6 +79,7 @@ object SeedVcEngine : CloneEngine {
         file = "xlsr_content_int8q.onnx",
         sizeBytes = 203_349_186L,
         url = "$RELEASE/xlsr_content_int8q.onnx",
+        sha256 = "d0b02f1204115ed251bc47c4a813f21b7a575e18ed93d981df10f539bf00816a",
     )
     val STYLE = VoiceCloningModels.Model(
         id = "seed-style",
@@ -86,6 +87,7 @@ object SeedVcEngine : CloneEngine {
         file = "campplus_style_int8q.onnx",
         sizeBytes = 9_553_353L,
         url = "$RELEASE/campplus_style_int8q.onnx",
+        sha256 = "243fe765e0360f8d5b52c4171b8099c8185a53b9581d2edc28b887cb19432b3f",
     )
     val REGULATOR = VoiceCloningModels.Model(
         id = "seed-lenreg",
@@ -93,6 +95,7 @@ object SeedVcEngine : CloneEngine {
         file = "lenreg_int8q.onnx",
         sizeBytes = 2_423_168L,
         url = "$RELEASE/lenreg_int8q.onnx",
+        sha256 = "02b377108ad5ba56a7adbef00ea88f82dbd73e71343c817c895a4725de2f1aea",
     )
     val DIT = VoiceCloningModels.Model(
         id = "seed-dit",
@@ -100,6 +103,7 @@ object SeedVcEngine : CloneEngine {
         file = "dit_step_int8q.onnx",
         sizeBytes = 23_280_117L,
         url = "$RELEASE/dit_step_int8q.onnx",
+        sha256 = "3eb4b99aaea5349218016e500d1df42dcb62302b0e39d307c0c764d3aba8a3b7",
     )
     val VOCODER = VoiceCloningModels.Model(
         id = "seed-hift",
@@ -107,6 +111,7 @@ object SeedVcEngine : CloneEngine {
         file = "hift_vocoder_int8q.onnx",
         sizeBytes = 20_796_087L,
         url = "$RELEASE/hift_vocoder_int8q.onnx",
+        sha256 = "42e4eb8ff3e09de16172c3b0fb649fc045436fc83c1200283e59d421c7e2ac93",
     )
     val MEL = VoiceCloningModels.Model(
         id = "seed-mel",
@@ -114,6 +119,7 @@ object SeedVcEngine : CloneEngine {
         file = "mel_w.onnx",
         sizeBytes = 8_567_808L,
         url = "$RELEASE/mel_w.onnx",
+        sha256 = "e0baa241ff6e9657499ad47b5a064e52a50b902c803e6c31226439c6f9f9e061",
     )
 
     override val models: List<VoiceCloningModels.Model> =

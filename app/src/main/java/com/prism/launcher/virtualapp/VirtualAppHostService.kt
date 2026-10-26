@@ -11,10 +11,13 @@ import android.os.Looper
 import android.os.Message
 import android.os.Messenger
 import android.view.SurfaceControlViewHost
+import android.view.View
 import android.view.ViewGroup
+import android.view.ViewTreeObserver
 import android.view.WindowManager
 import android.widget.FrameLayout
 import com.prism.launcher.PrismLogger
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Runs a virtualized app and hands its rendered window to the launcher to display.
@@ -67,8 +70,17 @@ class VirtualAppHostService : Service() {
         val container: FrameLayout,
         val application: android.app.Application?,
         val hostToken: IBinder?,
+        /** Who asked for this app, so a stall discovered later can still be reported to the page. */
+        val replyTo: Messenger?,
     ) {
         val stack = ArrayDeque<Pair<VirtualAppRunner, android.view.View>>()
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        // Before any app is loaded, because the exception this exists to record can be thrown by
+        // the first instruction of the guest's own code.
+        VirtualAppDiagnostics.installCrashHandler(this)
     }
 
     override fun onBind(intent: Intent?): IBinder = messenger.binder
@@ -148,6 +160,22 @@ class VirtualAppHostService : Service() {
             return
         }
         SystemServiceHook.install(packageName, getPackageName())
+        VirtualAppDiagnostics.clear(this, packageName)
+        VirtualAppDiagnostics.stage(this, packageName, "loading its APKs")
+
+        // A START THAT NEVER FINISHES STILL HAS TO ANSWER.
+        //
+        // Hosting runs the app's own onCreate/onStart/onResume on this process's main thread. If
+        // any of those blocks, the code above never returns, no reply is ever sent, and the page sits
+        // on "Opening app…" with no way to tell a slow app from a wedged one. This answers for it.
+        val answered = AtomicBoolean(false)
+        val deadline = watchdog(WEDGED_AFTER_MS, "virtualapp-deadline-$packageName") {
+            if (!answered.compareAndSet(false, true)) return@watchdog
+            val report = stallReport(packageName, "has not finished starting")
+            PrismLogger.logError(TAG, report)
+            VirtualAppDiagnostics.stage(this, packageName, "wedged while starting; main thread never returned")
+            reply(replyTo, WHAT_HOST, failure(report))
+        }
 
         Thread({
             val runner = VirtualAppRunner(this)
@@ -158,21 +186,35 @@ class VirtualAppHostService : Service() {
                 if (virtual == null) {
                     val reason = loaded.exceptionOrNull()
                     PrismLogger.logError(TAG, "Could not load $packageName", reason)
-                    reply(replyTo, WHAT_HOST, failure(reason?.message ?: "$packageName could not be loaded"))
+                    answered.set(true)
+                    deadline.interrupt()
+                    reply(replyTo, WHAT_HOST, failure("$packageName could not be loaded: " + describe(reason)))
                     return@post
                 }
 
                 val activityName = virtual.launchActivity
                 if (activityName.isNullOrBlank()) {
+                    answered.set(true)
+                    deadline.interrupt()
                     reply(replyTo, WHAT_HOST, failure("${virtual.packageName} declares no launchable activity"))
                     return@post
                 }
 
-                runCatching { embed(virtual, activityName, width, height, hostToken, displayId) }
-                    .onSuccess { reply(replyTo, WHAT_HOST, it) }
+                VirtualAppDiagnostics.stage(this, packageName, "building its Application and hosting $activityName")
+                runCatching { embed(virtual, activityName, width, height, hostToken, displayId, replyTo) }
+                    .onSuccess {
+                        if (answered.compareAndSet(false, true)) {
+                            deadline.interrupt()
+                            reply(replyTo, WHAT_HOST, it)
+                        }
+                    }
                     .onFailure {
                         PrismLogger.logError(TAG, "Could not host $packageName/$activityName", it)
-                        reply(replyTo, WHAT_HOST, failure("${it.javaClass.simpleName}: ${it.message}"))
+                        VirtualAppDiagnostics.stage(this, packageName, "hosting $activityName failed: " + describe(it))
+                        if (answered.compareAndSet(false, true)) {
+                            deadline.interrupt()
+                            reply(replyTo, WHAT_HOST, failure("$packageName could not start: " + describe(it)))
+                        }
                     }
             }
         }, "virtualapp-host-$packageName").apply { isDaemon = true; start() }
@@ -185,6 +227,7 @@ class VirtualAppHostService : Service() {
         height: Int,
         hostToken: IBinder?,
         displayId: Int,
+        replyTo: Messenger?,
     ): Bundle {
         release()
 
@@ -211,12 +254,15 @@ class VirtualAppHostService : Service() {
             container = container,
             application = application,
             hostToken = hostToken,
+            replyTo = replyTo,
         )
 
         // From here on, in-app navigation comes back through this.
         SystemServiceHook.onStartVirtualActivity = { intent -> startInPlace(intent) }
 
-        push(activityName)
+        VirtualAppDiagnostics.guestCode(this, virtual.packageName, "running $activityName, waiting for its first frame")
+        val live = session
+        push(activityName)?.let { decor -> if (live != null) watchFirstFrame(live, decor, activityName) }
 
         PrismLogger.logInfo(TAG, "Embedded ${virtual.packageName}/$activityName at ${width}x$height")
         return Bundle().apply {
@@ -231,8 +277,8 @@ class VirtualAppHostService : Service() {
      *
      * The one below is detached rather than destroyed, so going back does not rebuild it.
      */
-    private fun push(activityName: String) {
-        val live = session ?: return
+    private fun push(activityName: String): View? {
+        val live = session ?: return null
         val runner = VirtualAppRunner(this)
         val decor = runner.createActivity(
             live.virtual,
@@ -250,7 +296,74 @@ class VirtualAppHostService : Service() {
             ),
         )
         live.stack.addLast(runner to decor)
+        return decor
     }
+
+    /**
+     * Notices an app that is on screen but has never painted, which is what a loading screen that
+     * never finishes looks like from the outside.
+     *
+     * Runs on its own thread rather than through [handler]: an app whose main thread is blocked is
+     * exactly the case this exists for, and a `postDelayed` on that same looper would never run. A
+     * thread's stack can be read from another thread, so the report still names where it is stuck.
+     */
+    private fun watchFirstFrame(live: Session, decor: View, activityName: String) {
+        val drawn = AtomicBoolean(false)
+
+        runCatching {
+            decor.viewTreeObserver.addOnPreDrawListener(object : ViewTreeObserver.OnPreDrawListener {
+                override fun onPreDraw(): Boolean {
+                    if (drawn.compareAndSet(false, true)) {
+                        runCatching { decor.viewTreeObserver.removeOnPreDrawListener(this) }
+                        VirtualAppDiagnostics.drawn(this@VirtualAppHostService, live.packageName)
+                    }
+                    return true
+                }
+            })
+        }
+
+        watchdog(FIRST_FRAME_TIMEOUT_MS, "virtualapp-first-frame-${live.packageName}") {
+            if (drawn.get() || session !== live) return@watchdog
+            val report = stallReport(
+                live.packageName,
+                "never drew its first frame -- $activityName is still on its loading screen",
+            )
+            PrismLogger.logError(TAG, report)
+            VirtualAppDiagnostics.stage(this, live.packageName, report)
+            reply(live.replyTo, WHAT_STALL, Bundle().apply { putString(KEY_REASON, report) })
+        }
+    }
+
+    /**
+     * The sentence a user and a developer both need: what did not happen, and where the main thread is.
+     *
+     * The stack is the part that turns "it hangs" into a fix. A guest waiting on a lock or a `join`
+     * shows the frame it is waiting in; one waiting for a message that never arrives shows an idle
+     * looper, which says the problem is upstream of the wait.
+     */
+    private fun stallReport(packageName: String, what: String): String = buildString {
+        append(packageName).append(' ').append(what).append(".\n\n")
+        val frames = runCatching { Looper.getMainLooper().thread.stackTrace }.getOrNull()
+        if (frames.isNullOrEmpty()) {
+            append("Its main thread could not be sampled.")
+        } else {
+            append("Its main thread was in:\n")
+            frames.take(10).forEach { append("  at ").append(it).append('\n') }
+        }
+    }
+
+    /** Runs [action] once after [millis], on a daemon thread that can be cancelled by interrupting it. */
+    private fun watchdog(millis: Long, name: String, action: () -> Unit): Thread =
+        Thread({
+            try {
+                Thread.sleep(millis)
+                action()
+            } catch (_: InterruptedException) {
+                // Cancelled: the launch got past this point.
+            } catch (e: Throwable) {
+                PrismLogger.logWarning(TAG, "Watchdog '$name' failed: ${e.message}")
+            }
+        }, name).apply { isDaemon = true; start() }
 
     /**
      * Goes back one activity. Returns false when there is nothing left to go back to, which is the
@@ -374,6 +487,15 @@ class VirtualAppHostService : Service() {
         const val WHAT_STOP = 3
         const val WHAT_TOUCH = 4
         const val WHAT_BACK = 5
+
+        /** Sent after a successful launch when the app has still not drawn. */
+        const val WHAT_STALL = 6
+
+        /** How long an app may take between the request and its first frame. */
+        private const val FIRST_FRAME_TIMEOUT_MS = 12_000L
+
+        /** How long a launch may take before it is declared wedged and the page is told. */
+        private const val WEDGED_AFTER_MS = 30_000L
 
         const val KEY_PACKAGE = "package"
         const val KEY_WIDTH = "width"

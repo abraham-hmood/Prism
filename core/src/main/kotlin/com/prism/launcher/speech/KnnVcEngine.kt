@@ -48,7 +48,7 @@ object KnnVcEngine : CloneEngine {
     private const val TAG = "PrismSpeech"
 
     private const val RELEASE =
-        "https://github.com/ibrahim-hmood/Prism/releases/download/voice-engines-v1"
+        "https://github.com/abraham-hmood/Prism/releases/download/voice-engines-v1"
 
     val FEATURIZER = VoiceCloningModels.Model(
         id = "knn-wavlm",
@@ -56,6 +56,7 @@ object KnnVcEngine : CloneEngine {
         file = "wavlm_layer6_int8q.onnx",
         sizeBytes = 102_362_972L,
         url = "$RELEASE/wavlm_layer6_int8q.onnx",
+        sha256 = "7ca5a3f44713a98c96621c1a707abd13d9563a7ee54d4a6047a00f5cedc924ae",
     )
     val VOCODER = VoiceCloningModels.Model(
         id = "knn-vocoder",
@@ -63,6 +64,7 @@ object KnnVcEngine : CloneEngine {
         file = "hifigan_knnvc_int8q.onnx",
         sizeBytes = 16_666_507L,
         url = "$RELEASE/hifigan_knnvc_int8q.onnx",
+        sha256 = "60e33119548038b1862df7644f160a2c41af656cead0468c33c26e5cfb0567e0",
     )
 
     override val models: List<VoiceCloningModels.Model> = listOf(FEATURIZER, VOCODER)

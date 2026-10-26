@@ -110,7 +110,9 @@ object AiManager {
         // together with an image attachment in v1 (multimodal + tool-calling in one turn adds a
         // lot of per-backend complexity for a combination that's rarely needed together).
         if (!plainText && PrismSettings.getAgenticToolsEnabled() && imageUri == null) {
-            return@withContext com.prism.launcher.agentic.AgenticEngine.run(userText, onToken, onReasoning)
+            return@withContext com.prism.launcher.agentic.AgenticEngine.run(
+                userText, onToken, onReasoning, history,
+            )
         }
 
         // Image generation, for every AI mode rather than Cloud only.
@@ -143,21 +145,27 @@ object AiManager {
             }
         }
 
-        if (mode == PrismSettings.AI_MODE_CLOUD) {
-            if (!plainText && userText.contains("video", ignoreCase = true)) {
-                return@withContext CloudAiService.generateResponse(userText)
-            }
+        // THE HISTORY IS FOLDED INTO THE PROMPT for the stateless backends. It used to be passed
+        // only to CakeChat, so Cloud Sam answered every message as if the conversation had just
+        // started -- the transcript was on screen, but none of it reached the model. Local GGUF is
+        // deliberately excluded below: llama.cpp keeps its own context for the life of the loaded
+        // model, and sending the turns again would duplicate every one of them.
+        val prompt = foldHistory(userText, history)
 
-            // Priority 2: Real Cloud API call
+        if (mode == PrismSettings.AI_MODE_CLOUD) {
+            // A REAL REQUEST, WHATEVER THE PROMPT SAYS. The old branch sent anything containing
+            // "video" to a hardcoded mock that answered with a sample MP4 from w3schools, presented
+            // as model output. CloudSam now always asks the configured model; if it cannot answer,
+            // the provider's own error comes back and is shown as a failure rather than theatre.
             val cloudModel = PrismSettings.getActiveCloudModel()
                 ?: return@withContext Pair("Error: No cloud model selected. Add one in Settings > AI Engine > Manage Cloud Models.", Pair(null, null))
 
             val base64Image = imageUri?.let { encodeImageToBase64(context, it) }
 
             val textRaw = if (streaming) {
-                CloudAiService.fetchResponseStreaming(cloudModel.baseUrl, cloudModel.apiKey, cloudModel.modelId, userText, base64Image, maxTokens, onToken!!)
+                CloudAiService.fetchResponseStreaming(cloudModel.baseUrl, cloudModel.apiKey, cloudModel.modelId, prompt, base64Image, maxTokens, onToken!!)
             } else {
-                CloudAiService.fetchResponse(cloudModel.baseUrl, cloudModel.apiKey, cloudModel.modelId, userText, base64Image)
+                CloudAiService.fetchResponse(cloudModel.baseUrl, cloudModel.apiKey, cloudModel.modelId, prompt, base64Image)
             }
             return@withContext Pair(textRaw, Pair(null, null))
         } else if (mode == PrismSettings.AI_MODE_LOCAL_CLOUD) {
@@ -165,9 +173,9 @@ object AiManager {
                 ?: return@withContext Pair("No Ollama model selected — scan for servers and pick one in Settings > AI Engine.", Pair(null, null))
 
             val textRaw = if (streaming) {
-                CloudAiService.fetchOllamaChatStreaming(endpoint.host, endpoint.port, endpoint.model, userText, onToken!!)
+                CloudAiService.fetchOllamaChatStreaming(endpoint.host, endpoint.port, endpoint.model, prompt, onToken!!)
             } else {
-                CloudAiService.fetchOllamaChat(endpoint.host, endpoint.port, endpoint.model, userText)
+                CloudAiService.fetchOllamaChat(endpoint.host, endpoint.port, endpoint.model, prompt)
             }
             return@withContext Pair(textRaw, Pair(null, null))
         } else {
@@ -384,6 +392,27 @@ object AiManager {
             if (c == -1) break
             sb.append(c.toChar())
             if (sb.length >= 4 && sb.substring(sb.length - 4) == "\r\n\r\n") break
+        }
+    }
+
+    /**
+     * The recent turns followed by the new message, for a backend that keeps no state.
+     *
+     * Bounded: this is resent on every request, and an unbounded transcript eventually pushes the
+     * system framing out of the model's context window and then the question itself. Twelve turns
+     * is a few screens of chat, which is what a phone conversation actually refers back to.
+     */
+    private fun foldHistory(userText: String, history: List<String>): String {
+        val recent = history.filter { it.isNotBlank() }.takeLast(12)
+        if (recent.isEmpty()) return userText
+        return buildString {
+            append("Conversation so far:\n")
+            recent.forEach { line ->
+                append(line.trim())
+                append('\n')
+            }
+            append("\nNew message:\n")
+            append(userText)
         }
     }
 

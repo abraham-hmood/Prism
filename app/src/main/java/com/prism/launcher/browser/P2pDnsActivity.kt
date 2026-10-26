@@ -149,7 +149,7 @@ class P2pDnsActivity : PrismBaseActivity() {
         override fun onBindViewHolder(holder: DnsVH, position: Int) {
             val (domain, record) = items[position]
             holder.t1.text = domain
-            holder.t1.setTextColor(if (record.isVerified) PrismSettings.getGlowColor() else androidx.core.content.ContextCompat.getColor(this@P2pDnsActivity, R.color.prism_text_primary))
+            holder.t1.setTextColor(if (record.isVerified) com.prism.launcher.nora.IosUi.accent(this@P2pDnsActivity) else com.prism.launcher.nora.IosUi.label(this@P2pDnsActivity))
             holder.t2.text = "${record.ip} • ${if (record.isVerified) "Verified" else "Auto-Seeded"}"
             holder.view.setOnLongClickListener {
                 onDelete(domain)

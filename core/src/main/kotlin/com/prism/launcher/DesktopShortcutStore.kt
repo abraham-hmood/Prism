@@ -153,6 +153,50 @@ class DesktopShortcutStore(private val pageIndex: Int = 1) {
     companion object {
         const val PREFS = "desktop_prefs"
 
+        /** Prefix of the per-page key. Kept here so the shift below cannot drift from [readGrid]. */
+        private const val PAGE_KEY_PREFIX = "cells_page_"
+
+        /**
+         * Moves every saved page grid when a page is inserted at, or removed from, [from].
+         *
+         * THE GRIDS ARE KEYED BY PAGE NUMBER, so inserting a page at the front otherwise hands
+         * every desktop page the icons of the page before it and the last page's icons fall off
+         * the end. That is data loss with no undo -- see [SlotPreferences.addAt], which calls this
+         * for exactly that reason.
+         *
+         * Insertions walk the keys DOWN from the highest page, deletions walk them UP, so a shift
+         * never overwrites a page it has not read yet.
+         *
+         * @param delta +1 to make room at [from], -1 to close the gap left by removing it.
+         */
+        fun shiftPageIndices(from: Int, delta: Int) {
+            if (from < 0 || (delta != 1 && delta != -1)) return
+            val prefs = PrismPlatform.host.prefs(PREFS)
+            val pages = prefs.keys().mapNotNull { key ->
+                if (!key.startsWith(PAGE_KEY_PREFIX)) return@mapNotNull null
+                val page = key.removePrefix(PAGE_KEY_PREFIX).toIntOrNull() ?: return@mapNotNull null
+                key to page
+            }
+
+            if (delta > 0) {
+                pages.sortedByDescending { it.second }.forEach { (key, page) ->
+                    if (page < from) return@forEach
+                    val raw = prefs.getString(key, null) ?: return@forEach
+                    prefs.remove(key)
+                    prefs.putString("$PAGE_KEY_PREFIX${page + 1}", raw)
+                }
+            } else {
+                pages.sortedBy { it.second }.forEach { (key, page) ->
+                    if (page < from) return@forEach
+                    val raw = prefs.getString(key, null)
+                    prefs.remove(key)
+                    if (page > from && raw != null) {
+                        prefs.putString("$PAGE_KEY_PREFIX${page - 1}", raw)
+                    }
+                }
+            }
+        }
+
         /** How many cells a desktop page has. */
         const val GRID_SIZE = 24
 

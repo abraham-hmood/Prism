@@ -826,6 +826,20 @@ class ProteinPanel(context: Context) : LinearLayout(context) {
             return
         }
         val unknown = sequence.count { ProteinChemistry.indexOf(it) == ProteinChemistry.UNKNOWN_INDEX }
+
+        // REFUSE AN UNTRAINED FOLD. The geometry is still real -- bond lengths, peptide planes and
+        // the triangle inequality are built into the structure module -- but the coordinates come
+        // from random weights, and a ribbon of a plausible-looking backbone is exactly the kind of
+        // output that gets screenshotted as if it meant something. The warning used to appear in
+        // the detail text AFTER the fold; by then the structure is already on screen.
+        if (entry.step == 0) {
+            toast(
+                "This model has not been trained yet, so folding would show random geometry. " +
+                    "Train it on the Train tab first — no folding weights ship with Prism.",
+            )
+            return
+        }
+
         if (sequence.length > entry.config.maxLength) {
             // Not refused: the model crops during training but folds whatever it is given, and a
             // sequence longer than the crop folds worse rather than not at all. Saying so is better

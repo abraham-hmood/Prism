@@ -3,6 +3,7 @@ package com.prism.launcher.trusted
 import com.prism.core.MeshConnect
 import com.prism.core.MeshCore
 import com.prism.core.MeshMembership
+import com.prism.core.MeshTransport
 import com.prism.core.MeshUtils
 import com.prism.core.PrismPlatform
 import com.prism.core.json.JSONArray
@@ -59,6 +60,16 @@ object TrustedDevices {
     /** The answer. Carried separately so an acceptance is a deliberate packet, not an inferred state. */
     const val OPCODE_TRUST_REPLY: Byte = 0x2A
 
+    /**
+     * The offering side's final confirmation, after it has checked the proof.
+     *
+     * ONLY THE OFFERING SIDE CAN VERIFY THE CODE, because the code never leaves its screen. Until
+     * this packet arrives the answering device must not write a trust record: it has proved what
+     * it typed, not that the other side accepted it. A wrong code therefore leaves neither side
+     * with a device, rather than the answering side trusting a pairing that failed.
+     */
+    const val OPCODE_TRUST_ACK: Byte = 0x2E
+
     /** A shared payload: history, clipboard, an app, a message batch. */
     const val OPCODE_SHARE: Byte = 0x2B
 
@@ -71,6 +82,23 @@ object TrustedDevices {
      * Putting it on the ordinary opcode would mean a receiver guessing which key to try.
      */
     const val OPCODE_TRUST_WALLET: Byte = 0x2C
+
+    /**
+     * "I am still here, at this address, and this is my fingerprint."
+     *
+     * WITHOUT THIS A PAIRED DEVICE IS REACHABLE ONLY AT THE ADDRESS IT HAD WHEN IT WAS PAIRED.
+     * That is fine until a DHCP lease changes, and then every feature that addresses by `lastIp`
+     * goes quiet in one direction -- most visibly calls, where the phone rings the desktop's
+     * yesterday address and reports nothing wrong, and the desktop never sees an invitation at
+     * all. The identity in this packet is the fingerprint, not the address, so a receiver can move
+     * the record it already trusts to wherever that fingerprint now lives.
+     *
+     * It is a plain announcement and grants nothing: a device that is not already confirmed for
+     * that fingerprint is ignored, so a stranger cannot use it to insert a row.
+     *
+     * 0x35 was free (0x33/0x34 are the science and wallet extras, 0x2F is locations).
+     */
+    const val OPCODE_PRESENCE: Byte = 0x35
 
     /** What may be shared. Each is opt-in per device. */
     enum class Kind(val id: String, val label: String, val detail: String) {
@@ -152,7 +180,20 @@ object TrustedDevices {
         val incoming: Set<Kind>,
         /** True once the far side has answered an offer. */
         val confirmed: Boolean,
+        /**
+         * Values this device used to be known by.
+         *
+         * A fingerprint is derived from the wallet namespace and the device name, and both can move
+         * -- a wallet is imported, a hostname changes with the network. Keeping the old values is
+         * what lets a record written before the move still be found afterwards. An alias only FINDS
+         * a record; the pairing code or a proven pair secret is still what authorises anything.
+         */
+        val aliases: List<String> = emptyList(),
     ) {
+        /** Whether this record is the device that presents [fingerprint], now or at any time before. */
+        fun answersTo(fingerprint: String): Boolean =
+            fingerprint.isNotBlank() && (fingerprint == this.fingerprint || fingerprint in aliases)
+
         val active: Boolean get() = confirmed && (outgoing.isNotEmpty() || incoming.isNotEmpty())
 
         val online: Boolean get() = lastIp.isNotBlank() && peerCheck(lastIp)
@@ -174,22 +215,88 @@ object TrustedDevices {
     /**
      * This device's stable identity on the mesh.
      *
-     * Derived from the wallet namespace plus the machine name, so it survives a changing IP and is the same
-     * value the far side records. NOT the wallet address: an address is a payment identity anybody can look
-     * up on the chain, and using it here would link a user's devices to their balance for every peer that
-     * sees a trust offer go past.
+     * PINNED THE FIRST TIME IT IS ASKED FOR, once the wallet is in a position to answer (see
+     * [isIdentityReady]). That is the fix for a pairing that worked and then stopped: the value was derived from the
+     * wallet namespace every time, and importing a wallet -- which pairing itself can do, when the
+     * answering device has none -- changed it underneath a trust record that had already been
+     * written. The other device kept the old value, the device now claimed a new one, and every
+     * later offer and bridge session was refused as "not trusted" with both lists looking fine.
      *
-     * Falls back to a hash of the machine name when there is no wallet, so the feature can be SET UP before
-     * a wallet exists even though nothing can be decrypted until one does.
+     * A fingerprint is an IDENTITY, not a credential: the pairing code, the stored pair secret and
+     * the mesh transport are what authorise anything. So pinning it loses nothing. It is still not
+     * the wallet address -- an address is a payment identity anybody can look up on the chain, and
+     * using it here would link a user's devices to their balance for every peer that sees a trust
+     * offer go past.
+     *
+     * The derivative below is kept because that is what existing records were written with; it is
+     * what a device that has never been pinned derives once, and what [legacyFingerprintOf] uses to
+     * recognise a device that was paired before its wallet existed.
      */
     fun localFingerprint(): String {
+        pinnedFingerprint()?.let { return it }
         val namespace = runCatching { CloudVault.namespace() }.getOrNull()
         val name = localName()
+        // A LOCKED WALLET IS NOT AN ABSENT ONE. namespace() returns null for both, and pinning the
+        // no-wallet value here would freeze the wrong identity for a device whose wallet is simply
+        // behind the lock screen -- exactly the failure this pinning exists to prevent. Provisional
+        // until it can be derived properly, and [isIdentityReady] is what callers check when a wrong
+        // value would be worse than waiting.
+        if (namespace == null && walletExists()) return deriveFingerprint(null, name)
+        val derived = deriveFingerprint(namespace, name)
+        // A data directory that cannot be written leaves the old behaviour in place rather than
+        // failing: the value is simply derived again next time.
+        persistPinnedFingerprint(derived)
+        return derived
+    }
+
+    /**
+     * Whether [localFingerprint] is the value this device will keep, rather than a guess made while
+     * the wallet was locked.
+     *
+     * A caller that is about to state its identity to another device should check this: announcing
+     * the pre-wallet value to a peer that recorded the wallet-derived one is refused as "not
+     * trusted", and that looks exactly like a broken pairing rather than a locked wallet.
+     */
+    fun isIdentityReady(): Boolean = pinnedFingerprint() != null ||
+        !(walletExists() && runCatching { CloudVault.namespace() }.getOrNull() == null)
+
+    private fun walletExists(): Boolean =
+        runCatching { WalletVault.isInitialized() }.getOrDefault(false)
+
+    /**
+     * The fingerprint a device had before it had a wallet.
+     *
+     * USED ONLY TO FIND AN EXISTING RECORD, never to authorise anything. A device paired while it
+     * had no wallet was stored on this device under this value; if that device has since imported a
+     * wallet it now presents the wallet-derived one, and without this the records could never meet
+     * again -- the pairing would read as "added", and every connection would be refused.
+     *
+     * [name] is the device's own name as it announced it (which is what the old derivation used),
+     * so the bridge hello can work out what IT used to be called and present both values.
+     */
+    fun legacyFingerprintOf(name: String): String = deriveFingerprint(null, name)
+
+    private fun deriveFingerprint(namespace: String?, name: String): String {
         val material = (namespace ?: "no-wallet") + "|" + name
         return java.security.MessageDigest.getInstance("SHA-256")
             .digest(material.toByteArray())
             .take(16)
             .joinToString("") { "%02x".format(it) }
+    }
+
+    private fun pinnedFile(): File? = root?.let { File(it, "device-fingerprint") }
+
+    private fun pinnedFingerprint(): String? = runCatching {
+        pinnedFile()?.takeIf { it.isFile }?.readText()?.trim()?.takeIf { it.isNotEmpty() }
+    }.getOrNull()
+
+    private fun persistPinnedFingerprint(value: String) {
+        runCatching {
+            val file = pinnedFile() ?: return
+            if (file.isFile) return
+            file.parentFile?.mkdirs()
+            file.writeText(value)
+        }
     }
 
     @Volatile
@@ -226,9 +333,27 @@ object TrustedDevices {
     @Volatile
     private var root: File? = null
 
-    /** Called once at startup with the platform's data directory. */
+    /**
+     * Points the store at [directory]. Called once at startup, and idempotently from screens that
+     * may be opened before it.
+     *
+     * A SECOND CALL WITH THE SAME DIRECTORY DOES NOTHING. It used to clear every pairing in
+     * progress, and the trusted-devices screen calls it in onCreate on Android -- so opening the
+     * list while answering an offer threw the offer away, and the offer then looked like it had
+     * been "added but not trusted". Only a genuinely different directory is a fresh start.
+     */
     fun install(directory: File) {
-        root = directory.apply { mkdirs() }
+        val resolved = directory.apply { mkdirs() }
+        val path = runCatching { resolved.canonicalPath }.getOrDefault(resolved.absolutePath)
+        if (root?.let { runCatching { it.canonicalPath }.getOrDefault(it.absolutePath) } == path) return
+        root = resolved
+        // A FRESH START FORGETS PAIRINGS IN PROGRESS. They only ever lived in memory, and half a
+        // pairing belongs to the process that began it -- restoring one across a restart would be
+        // resuming a conversation with a screen nobody is looking at any more.
+        pending.clear()
+        pendingCodes.clear()
+        outgoingPairings.clear()
+        acceptances.clear()
     }
 
     private fun file(): File? = root?.let { File(it, "trusted-devices.json") }
@@ -240,6 +365,7 @@ object TrustedDevices {
             val array = JSONArray(source.readText())
             (0 until array.length()).mapNotNull { index ->
                 val item = array.optJSONObject(index) ?: return@mapNotNull null
+                val aliasArray = item.optJSONArray("alias")
                 Trust(
                     fingerprint = item.optString("fp"),
                     name = item.optString("name"),
@@ -249,20 +375,143 @@ object TrustedDevices {
                     outgoing = kinds(item.optJSONArray("out")),
                     incoming = kinds(item.optJSONArray("in")),
                     confirmed = item.optBoolean("confirmed"),
+                    aliases = aliases(aliasArray),
                 )
-            }.filter { it.fingerprint.isNotBlank() }
+            }.filter { it.fingerprint.isNotBlank() && it.confirmed }
         }.getOrDefault(emptyList())
     }
+
+    /**
+     * The prefix the old build used for the row it wrote when an offer was SENT.
+     *
+     * Kept only to recognise those rows so [all] can ignore them -- they are dropped by the next
+     * save. Nothing may pair from one now: trust is stored under the far side's fingerprint, and
+     * only after it has proved it can see this screen.
+     *
+     * [all] ignores every UNCONFIRMED row for the same reason. Nothing writes one any more (a
+     * pairing in progress lives in memory), so one on disk is a leftover: it can never be completed,
+     * and showing it would put a device that is not trusted -- and that the user cannot verify -- in
+     * the trusted list.
+     */
+    private const val PROVISIONAL_PREFIX = "pending:"
 
     private fun kinds(array: JSONArray?): Set<Kind> {
         if (array == null) return emptySet()
         return (0 until array.length()).mapNotNull { Kind.byId(array.optString(it)) }.toSet()
     }
 
-    fun byFingerprint(fingerprint: String): Trust? = all().firstOrNull { it.fingerprint == fingerprint }
+    /**
+     * The record for the device that presents [fingerprint], including one it used to have.
+     *
+     * ALIAS-AWARE, because a value can move under a record that was already written. Every caller
+     * that used to compare `it.fingerprint == fingerprint` by hand was a place where a renamed or
+     * re-walleted device silently stopped being recognised -- the exact shape of "this device is
+     * not trusted" while both lists show it. Matching an alias authorises nothing on its own: the
+     * pair secret, the pairing code or the mesh transport still has to prove the device.
+     */
+    fun byFingerprint(fingerprint: String): Trust? {
+        val wanted = fingerprint.trim()
+        if (wanted.isEmpty()) return null
+        return all().firstOrNull { it.answersTo(wanted) }
+    }
 
-    fun byIp(ip: String): Trust? = all().firstOrNull { it.lastIp == ip }
+    /**
+     * The record at [ip], compared as an address rather than as a string.
+     *
+     * The same peer reaches this device as `10.8.0.4`, `::ffff:10.8.0.4` or `10.8.0.4%wlan0`
+     * depending on the socket that saw it. An exact string comparison treated those as three
+     * different devices, so inbound messages, calls and locations were dropped as untrusted from a
+     * device that was trusted the whole time.
+     */
+    fun byIp(ip: String): Trust? {
+        val wanted = normaliseAddress(ip)
+        if (wanted.isEmpty()) return null
+        // The most recently seen, not the first on disk: a stale duplicate left by an older build
+        // must not win over the record that is actually current.
+        return all().filter { normaliseAddress(it.lastIp) == wanted }.maxByOrNull { it.lastSeen }
+    }
 
+    /**
+     * The record that presents any of [fingerprints].
+     *
+     * A device announces the value it uses now and, where it can work it out, the one from before
+     * its wallet existed. The record may hold either.
+     */
+    fun matches(fingerprints: Collection<String>): Trust? =
+        all().firstOrNull { device -> fingerprints.any { device.answersTo(it.trim()) } }
+
+    /**
+     * Records that [fingerprint] was seen at [ip].
+     *
+     * Every trust decision that is not made by identity is made by address, so a device that moves
+     * to a new lease and is never re-recorded becomes unreachable for messages, calls, the pointer,
+     * displays and locations -- each of which then reports the peer as unknown rather than offline.
+     * Updated from a session that has already proved itself, never from an unsolicited packet.
+     */
+    fun noteAddress(fingerprint: String, ip: String) = synchronized(writeLock) {
+        // Looked up INSIDE the lock: a revocation that lands between the lookup and the write must
+        // not be undone by re-saving the row it just removed.
+        val device = byFingerprint(fingerprint) ?: return@synchronized
+        val address = normaliseAddress(ip)
+        if (address.isEmpty()) return@synchronized
+        save(
+            all().filterNot { it.answersTo(device.fingerprint) } +
+                device.copy(lastIp = address, lastSeen = System.currentTimeMillis()),
+        )
+    }
+
+    /**
+     * The confirmed record a connecting device most plausibly IS, for a re-verification.
+     *
+     * USED ONLY TO OFFER A PHRASE, never to grant anything. When none of a device's announced
+     * values match a record -- a name that changed, a wallet imported in a build that did not yet
+     * pin its identity, a record written by an older derivation -- the honest answer is not a flat
+     * refusal that the user can do nothing about. A record at the same address, or under the same
+     * name, is offered the same phrase ceremony every pairing uses; a device that cannot see the
+     * target's screen fails it, and one that can is the device the user is holding.
+     */
+    fun candidateFor(ip: String, name: String): Trust? {
+        val wanted = normaliseAddress(ip)
+        val wantedName = name.trim()
+        if (wanted.isEmpty() && wantedName.isEmpty()) return null
+        return all().filter { device ->
+            device.confirmed && (
+                (wanted.isNotEmpty() && normaliseAddress(device.lastIp) == wanted) ||
+                    (wantedName.isNotEmpty() && device.name.equals(wantedName, ignoreCase = true))
+                )
+        }.maxByOrNull { it.lastSeen }
+    }
+
+    /** The comparable form of an address: no IPv6 mapping prefix, no zone, no case. */
+    fun normaliseAddress(raw: String): String = raw.trim().lowercase()
+        .removePrefix("::ffff:")
+        .substringBefore('%')
+
+    private fun aliases(array: JSONArray?): List<String> {
+        if (array == null) return emptyList()
+        return (0 until array.length())
+            .mapNotNull { index -> array.optString(index).trim().takeIf { it.isNotEmpty() } }
+            .distinct()
+    }
+
+    /**
+     * Serialises the read-modify-write cycles that produce this file.
+     *
+     * A session that has just paired, a screen refreshing its list and a revocation arriving on the
+     * mesh can all write at once. Without this, two of them read the same list and the later write
+     * silently drops the other's change -- which looks like a device that was paired and vanished.
+     */
+    private val writeLock = Any()
+
+    /**
+     * Replaces the file atomically.
+     *
+     * EVERY READ RE-PARSES THE FILE, and a plain writeText truncates it first. A reader in another
+     * thread -- the bridge handshake, a share, the list -- between the truncate and the finish sees
+     * an empty file, which parses as "no trusted devices". That is a transient "this device is not
+     * trusted" on a pair that is perfectly fine, and a rename from a sibling file makes it
+     * impossible: a reader sees the old file or the new one, never half of either.
+     */
     private fun save(devices: List<Trust>) {
         val target = file() ?: return
         val array = JSONArray()
@@ -277,18 +526,108 @@ object TrustedDevices {
                     put("out", JSONArray().also { a -> device.outgoing.forEach { a.put(it.id) } })
                     put("in", JSONArray().also { a -> device.incoming.forEach { a.put(it.id) } })
                     put("confirmed", device.confirmed)
+                    put("alias", JSONArray().also { a -> device.aliases.forEach { a.put(it) } })
                 }
             )
         }
-        runCatching {
-            target.parentFile?.mkdirs()
-            target.writeText(array.toString())
-        }.onFailure { PrismPlatform.log.error(TAG, "Could not save the trusted list", it) }
+        synchronized(writeLock) {
+            runCatching {
+                target.parentFile?.mkdirs()
+                val part = File(target.parentFile, target.name + ".part-" + java.util.UUID.randomUUID())
+                part.writeText(array.toString())
+                val targetPath = target.toPath()
+                val partPath = part.toPath()
+                runCatching {
+                    java.nio.file.Files.move(
+                        partPath,
+                        targetPath,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                        java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                    )
+                }.onFailure {
+                    java.nio.file.Files.move(
+                        partPath,
+                        targetPath,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    )
+                }
+            }.onFailure {
+                PrismPlatform.log.error(TAG, "Could not save the trusted list", it)
+            }
+        }
     }
 
     fun upsert(device: Trust) {
-        save(all().filterNot { it.fingerprint == device.fingerprint } + device)
+        // Removes any row that answers to this identity, not only one with the same primary value:
+        // otherwise a record that already holds the value as an alias survives alongside the new
+        // one, and the list shows the same device twice.
+        synchronized(writeLock) {
+            save(all().filterNot { it.answersTo(device.fingerprint) } + device)
+        }
     }
+
+    /**
+     * Moves a record to the fingerprint the device now announces, keeping everything else.
+     *
+     * USED WHEN AN OLD RECORD IS PROVED. A device that paired before it had a wallet is stored
+     * under the value from before; once it proves the pair -- the same phrase ceremony every bridge
+     * uses -- the record can finally be keyed by what it calls itself now. Without this the old
+     * value would have to be aliased forever, and two listings of the same device (the trust list
+     * and the bridge list) could disagree about its name for it.
+     *
+     * THE OLD VALUE IS KEPT AS AN ALIAS, not discarded. A record that moved because a wallet or a
+     * name changed can still be reached by the value the other device remembers, which is what
+     * stops a second round of "not trusted" after the first repair.
+     *
+     * Merges when a record already exists under [newFingerprint]. Refusing there was the worse
+     * outcome: both callers only ever reach this after a device has PROVED itself, and two rows for
+     * one physical device means one of them can never authenticate again. The merged row keeps the
+     * union of what was agreed, because both rows describe the same device.
+     */
+    fun rekey(oldFingerprint: String, newFingerprint: String, name: String = "") =
+        synchronized(writeLock) {
+        val from = oldFingerprint.trim()
+        val to = newFingerprint.trim()
+        if (to.isEmpty() || from == to) return@synchronized
+        val devices = all()
+        val source = devices.firstOrNull { it.answersTo(from) } ?: return@synchronized
+        // The name travels with the identity: a record that moved because the device renamed
+        // itself has to show the name it uses now, or the list keeps a value nothing announces.
+        val shownName = name.trim().ifBlank { source.name }
+        if (source.fingerprint == to) {
+            if (shownName != source.name) upsert(source.copy(name = shownName))
+            return@synchronized
+        }
+        // Alias list: everything the source was ever known by, plus the value being retired. Bounded
+        // so a device that renames itself repeatedly cannot grow the file without limit.
+        val retired = (source.aliases + source.fingerprint + from)
+            .filter { it.isNotBlank() && it != to }
+        val target = devices.firstOrNull { it != source && it.answersTo(to) }
+        if (target == null) {
+            save(
+                devices.filterNot { it == source } +
+                    source.copy(
+                        fingerprint = to,
+                        name = shownName,
+                        lastSeen = System.currentTimeMillis(),
+                        aliases = (source.aliases + retired).distinct().takeLast(MAX_ALIASES),
+                    )
+            )
+            return@synchronized
+        }
+        val merged = target.copy(
+            name = shownName,
+            lastIp = source.lastIp.ifBlank { target.lastIp },
+            lastSeen = maxOf(source.lastSeen, target.lastSeen, System.currentTimeMillis()),
+            outgoing = target.outgoing + source.outgoing,
+            incoming = target.incoming + source.incoming,
+            aliases = (target.aliases + retired).distinct().takeLast(MAX_ALIASES),
+        )
+        save(devices.filterNot { it == source || it == target } + merged)
+    }
+
+    /** How many retired values a record keeps. Enough for a rename and a wallet import, and bounded. */
+    private const val MAX_ALIASES = 8
 
     /**
      * Removes a device and tells it so.
@@ -299,7 +638,11 @@ object TrustedDevices {
      */
     fun revoke(fingerprint: String) {
         val device = byFingerprint(fingerprint)
-        save(all().filterNot { it.fingerprint == fingerprint })
+        // By record, so revoking a device through one of its retired values removes the row it
+        // actually is rather than leaving it behind under the current name.
+        synchronized(writeLock) {
+            save(all().filterNot { it == device || it.fingerprint == fingerprint })
+        }
         if (device != null && device.lastIp.isNotBlank()) {
             runCatching {
                 sender(
@@ -333,12 +676,65 @@ object TrustedDevices {
          * already had.
          */
         val salt: ByteArray = ByteArray(0),
+        /**
+         * Which offer this is, so an answer can only ever answer the question it was asked.
+         *
+         * Empty when the offering device is an older build. Matching on it is skipped then rather
+         * than refusing, because refusing would break pairing with a phone that has not updated.
+         */
+        val id: String = "",
     ) {
         /** Whether this offer will ask for a code. */
         val needsCode: Boolean get() = salt.isNotEmpty()
     }
 
     private val pending = java.util.concurrent.ConcurrentHashMap<String, PendingOffer>()
+
+    /**
+     * An offer this device made, held in memory until the far side proves the code.
+     *
+     * NOT A TRUST RECORD. The old code wrote a provisional row to trusted-devices.json as soon
+     * as an offer was sent, which put the other device in the list before it had confirmed
+     * anything. A pairing in progress is not a pairing: this object is the only place it lives,
+     * and it is discarded on failure, cancellation or restart.
+     */
+    private data class PendingOutgoing(
+        val ip: String,
+        val name: String,
+        val platform: String,
+        val offered: Set<Kind>,
+        val at: Long = System.currentTimeMillis(),
+        /** Names THIS offer, so an answer cannot be mistaken for the answer to a later one. */
+        val id: String = java.util.UUID.randomUUID().toString(),
+    )
+
+    private val outgoingPairings =
+        java.util.concurrent.ConcurrentHashMap<String, PendingOutgoing>()
+
+    /**
+     * An acceptance this device sent and is waiting to have confirmed by the offering side.
+     *
+     * The phrase proves what the answering device typed; only the offering device can say that
+     * the proof was right. This record bridges that gap without writing anything to the trusted
+     * list, so a wrong code leaves no half-pairing behind.
+     */
+    private data class PendingAcceptance(
+        val ip: String,
+        val name: String,
+        val platform: String,
+        val offered: Set<Kind>,
+        val accepted: Set<Kind>,
+        val at: Long = System.currentTimeMillis(),
+        /** The proof of the typed code, kept so the answer can be sent again if it is lost. */
+        val proof: ByteArray? = null,
+        /** Whether a wallet was asked for, so a resend asks for the same thing rather than a new question. */
+        val wantsWallet: Boolean = false,
+        /** The offer this answers, so its confirmation and retries carry the right one. */
+        val offerId: String = "",
+    )
+
+    private val acceptances =
+        java.util.concurrent.ConcurrentHashMap<String, PendingAcceptance>()
 
     /**
      * Offers that have arrived and not been answered.
@@ -366,8 +762,8 @@ object TrustedDevices {
 
         // THE MESHNET, NOT THE WI-FI. Refused here as well as filtered out of the picker, because the
         // picker is one caller and this is the door: a stale list, a remembered address or a second UI
-        // would otherwise walk straight past the policy. See MeshMembership for why the overlay is the
-        // line and what it costs.
+        // would otherwise walk straight past the policy. See MeshMembership for what counts as the
+        // meshnet and why the WireGuard subnet alone was the wrong test.
         if (!MeshMembership.mayPairWith(peerIp)) {
             PrismPlatform.log.warn(TAG, "Refusing to offer trust to " + peerIp + ": " +
                 MeshMembership.explain(peerIp))
@@ -380,6 +776,12 @@ object TrustedDevices {
         val code = PairingCode.generate(PrismSettings.getPairingCodeLength())
         val salt = PairingCode.salt()
         pendingCodes[provisionalFingerprint(peerIp)] = Challenge(code, salt)
+        val pairing = PendingOutgoing(
+            ip = peerIp,
+            name = peerName,
+            platform = peerPlatform,
+            offered = kinds,
+        )
 
         val payload = JSONObject().apply {
             put("fp", localFingerprint())
@@ -387,6 +789,7 @@ object TrustedDevices {
             put("platform", localPlatform)
             put("kinds", JSONArray().also { a -> kinds.forEach { a.put(it.id) } })
             put("salt", java.util.Base64.getEncoder().encodeToString(salt))
+            put("id", pairing.id)
         }.toString()
 
         val sent = runCatching {
@@ -395,27 +798,15 @@ object TrustedDevices {
         }.getOrDefault(false)
         if (!sent) {
             pendingCodes.remove(provisionalFingerprint(peerIp))
+            outgoingPairings.remove(provisionalFingerprint(peerIp))
             return null
         }
 
-        // Stored against the peer's ADDRESS as a provisional key until they answer with their real
-        // fingerprint. A pairing in progress has to be somewhere, and the address is all we know.
-        //
-        // INCOMING IS SET TOO, because a pairing is MUTUAL -- see [Trust]. Offering to share a kind is
-        // also agreeing to receive it, so the kinds are recorded in both directions here and narrowed to
-        // whatever the far side actually accepts when they reply.
-        upsert(
-            Trust(
-                fingerprint = provisionalFingerprint(peerIp),
-                name = peerName,
-                platform = peerPlatform,
-                lastIp = peerIp,
-                lastSeen = System.currentTimeMillis(),
-                outgoing = kinds,
-                incoming = kinds,
-                confirmed = false,
-            )
-        )
+        // HELD IN MEMORY, NOT WRITTEN TO THE TRUSTED LIST. Nothing is added until the far side
+        // answers with a proof this device can open; see onReply. The old provisional row made a
+        // device appear trusted before its user had typed anything, and left it behind when they
+        // never did. The offered kinds are kept here so the reply can only narrow them.
+        outgoingPairings[provisionalFingerprint(peerIp)] = pairing
         // Returned so the caller can SHOW it. Nothing else has it: it is not stored on disk and it is
         // not in the payload.
         return code
@@ -425,6 +816,38 @@ object TrustedDevices {
     private data class Challenge(val code: String, val salt: ByteArray, val at: Long = System.currentTimeMillis())
 
     private val pendingCodes = java.util.concurrent.ConcurrentHashMap<String, Challenge>()
+
+    /**
+     * How long a pairing may stay half-finished.
+     *
+     * Bounded because both ends keep their half in memory: an offer whose user walked away, or an
+     * acceptance whose confirmation never arrived, must expire rather than sit there waiting to be
+     * completed by a packet sent much later. Five minutes is several times longer than anybody needs
+     * to read six words across a desk.
+     */
+    private const val PAIRING_TTL_MILLIS = 5 * 60_000L
+
+    /**
+     * Stops waiting for [peerIp] to answer an offer this device made.
+     *
+     * CALLED WHEN THE USER DISMISSES THE CODE. Without it, pressing Done only hid the code: the
+     * challenge stayed outstanding, so a proof typed on the other device a minute later still
+     * paired it -- adding a device the user had just closed the dialog on. Cancelling here is what
+     * makes dismissing the code mean "not this one".
+     */
+    fun cancelOffer(peerIp: String) {
+        if (peerIp.isBlank()) return
+        val provisional = provisionalFingerprint(peerIp)
+        val wasWaiting = pendingCodes.remove(provisional) != null
+        outgoingPairings.remove(provisional)
+        if (wasWaiting) {
+            PrismPlatform.log.info(TAG, "Stopped waiting for $peerIp to answer the pairing code")
+        }
+    }
+
+    /** Whether this device is showing a code for [peerIp] and waiting to be proved to. */
+    fun isAwaitingCode(peerIp: String): Boolean =
+        peerIp.isNotBlank() && pendingCodes.containsKey(provisionalFingerprint(peerIp))
 
     /**
      * The code currently displayed for a peer, or null.
@@ -440,15 +863,15 @@ object TrustedDevices {
      * Prefixed so it can never collide with a real fingerprint and so a reader can see at a glance that a
      * row is a pairing in progress rather than an established one.
      */
-    private fun provisionalFingerprint(peerIp: String): String = "pending:$peerIp"
+    private fun provisionalFingerprint(peerIp: String): String = PROVISIONAL_PREFIX + peerIp
 
     /** Handles an incoming offer. Registered on [OPCODE_TRUST_OFFER]. */
     fun onOffer(peerIp: String, payload: String): Boolean = runCatching {
         // THE SIDE THAT ACTUALLY MATTERS. An offer is unsolicited: it arrives because somebody else
         // decided to send it. Before this check, any device on the same network could put a consent
-        // prompt on a user's screen, and the pairing code was the only thing standing between that
-        // prompt and a copy of their messages. A code is a reasonable second line of defence and a poor
-        // first one.
+        // prompt on a user's screen. A mesh peer is now the requirement, and the pairing code is still
+        // what stands between that prompt and a copy of their messages -- a reasonable second line of
+        // defence, and not the first one.
         if (!MeshMembership.mayPairWith(peerIp)) {
             PrismPlatform.log.warn(TAG, "Dropped a trust offer from " + peerIp + ": " +
                 MeshMembership.explain(peerIp))
@@ -481,9 +904,9 @@ object TrustedDevices {
         if (existing != null && existing.confirmed && existing.incoming.containsAll(offered)) {
             // Already trusted for these kinds, so no prompt and no code: the user answered this
             // question, and the code exists to authorise a NEW relationship rather than to be re-typed
-            // on every reconnect.
+            // on every reconnect. No reply either: both sides already have the pairing, and a reply
+            // without a proof would be refused by the offering side's outstanding challenge.
             upsert(existing.copy(lastIp = peerIp, lastSeen = System.currentTimeMillis()))
-            sendReply(peerIp, accepted = existing.incoming, proof = null)
             return true
         }
 
@@ -495,6 +918,7 @@ object TrustedDevices {
             kinds = offered,
             arrivedAt = System.currentTimeMillis(),
             salt = salt,
+            id = json.optString("id"),
         )
         PrismPlatform.log.info(TAG, "Trust offered by ${json.optString("name")} ($peerIp)")
         true
@@ -529,33 +953,60 @@ object TrustedDevices {
 
         pending.remove(fingerprint)
 
-        upsert(
-            Trust(
-                fingerprint = fingerprint,
-                name = offer.name,
-                platform = offer.platform,
-                lastIp = offer.ip,
-                lastSeen = System.currentTimeMillis(),
-                // MUTUAL. Accepting a kind from a device is also agreeing to send that kind to it --
-                // see [Trust]. Anything previously agreed to send survives, so a device that was
-                // already sharing more does not lose it by answering an offer.
-                outgoing = byFingerprint(fingerprint)?.outgoing.orEmpty() + accepted,
-                incoming = accepted,
-                confirmed = accepted.isNotEmpty(),
-            )
+        // NOTHING IS ADDED YET. Typing the code proves what this device knows; it does not prove
+        // the offering device accepted the proof, and only that device can check it. The offer is
+        // removed (so "No" or a submitted code is a real answer) and the acceptance waits for the
+        // final acknowledgement. A code that turns out to be wrong therefore leaves no device on
+        // either side.
+        if (accepted.isEmpty()) {
+            acceptances.remove(fingerprint)
+            sendReply(offer.ip, emptySet(), proof = null)
+            return true
+        }
+        val wantsWallet = !WalletVault.isInitialized()
+        acceptances[fingerprint] = PendingAcceptance(
+            ip = offer.ip,
+            name = offer.name,
+            platform = offer.platform,
+            offered = offer.kinds,
+            accepted = accepted,
+            proof = proof,
+            wantsWallet = wantsWallet,
+            offerId = offer.id,
         )
-        sendReply(offer.ip, accepted, proof, wantsWallet = !WalletVault.isInitialized())
-        // The accepting side is paired now too, so it fires the same hook -- otherwise only whoever made
-        // the offer would act on a pairing, and the relationship is two-directional.
-        byFingerprint(fingerprint)?.let { confirmed ->
-            val listener = onConfirmed
-            if (listener != null && accepted.isNotEmpty()) {
-                kotlin.concurrent.thread(name = "trust-confirmed", isDaemon = true) {
-                    runCatching { listener(confirmed) }
-                }
+        sendReply(offer.ip, accepted, proof, wantsWallet = wantsWallet, offerId = offer.id)
+        retryReply(fingerprint)
+        return true
+    }
+
+    /**
+     * Sends the answer again, twice, while the offering device has not confirmed it.
+     *
+     * A PAIRING IS THREE DATAGRAMS AND UDP DOES NOT DELIVER THEM. The final confirmation used to be
+     * sent exactly once; when it was lost the offering side kept a confirmed device while the
+     * answering side kept nothing, which is the state where a device says "trusted" in one list and
+     * "not trusted" on the other. Answering again is harmless -- the offering side recognises a
+     * repeat and answers it with another confirmation (see [onReply]) -- so the retry costs two
+     * packets and turns a coin flip into something that survives a dropped one.
+     */
+    private fun retryReply(fingerprint: String) {
+        val acceptance = acceptances[fingerprint] ?: return
+        kotlin.concurrent.thread(name = "trust-reply-retry", isDaemon = true) {
+            intArrayOf(1_500, 4_000).forEach { wait ->
+                runCatching { Thread.sleep(wait.toLong()) }.onFailure { return@thread }
+                val waiting = acceptances[fingerprint] ?: return@thread
+                // A new attempt for the same device replaced this one: it owns its own retries.
+                if (waiting !== acceptance) return@thread
+                if (System.currentTimeMillis() - waiting.at > PAIRING_TTL_MILLIS) return@thread
+                sendReply(
+                    waiting.ip,
+                    waiting.accepted,
+                    waiting.proof,
+                    waiting.wantsWallet,
+                    waiting.offerId,
+                )
             }
         }
-        return true
     }
 
     private fun sendReply(
@@ -563,6 +1014,7 @@ object TrustedDevices {
         accepted: Set<Kind>,
         proof: ByteArray?,
         wantsWallet: Boolean = false,
+        offerId: String = "",
     ) {
         runCatching {
             sender(
@@ -572,6 +1024,8 @@ object TrustedDevices {
                     put("name", localName())
                     put("platform", localPlatform)
                     put("accepted", JSONArray().also { a -> accepted.forEach { a.put(it.id) } })
+                    // Which offer this answers. Absent when the offer came from an older build.
+                    if (offerId.isNotBlank()) put("replyTo", offerId)
                     if (proof != null) {
                         put("proof", java.util.Base64.getEncoder().encodeToString(proof))
                     }
@@ -590,7 +1044,7 @@ object TrustedDevices {
     fun onReply(peerIp: String, payload: String): Boolean = runCatching {
         // Same gate. A reply is answered against a challenge this device issued, so it is already
         // narrower than an offer -- but an offer made while on the mesh could otherwise be answered
-        // later from off it, and the pairing would complete over the LAN.
+        // later by a device that has left it.
         if (!MeshMembership.mayPairWith(peerIp)) {
             PrismPlatform.log.warn(TAG, "Dropped a trust reply from " + peerIp + ": off the meshnet")
             return false
@@ -601,7 +1055,12 @@ object TrustedDevices {
         if (fingerprint.isBlank()) return false
 
         if (json.optBoolean("revoked")) {
-            save(all().filterNot { it.fingerprint == fingerprint || it.lastIp == peerIp })
+            val revoked = TrustedDevices.normaliseAddress(peerIp)
+            save(
+                all().filterNot {
+                    it.answersTo(fingerprint) || normaliseAddress(it.lastIp) == revoked
+                },
+            )
             PrismPlatform.log.info(TAG, "$peerIp revoked trust")
             return true
         }
@@ -609,65 +1068,251 @@ object TrustedDevices {
         val accepted = kinds(json.optJSONArray("accepted"))
         val provisional = provisionalFingerprint(peerIp)
 
+        // NO OFFER, NO PAIRING. A reply used to be able to create a confirmed device on its own:
+        // an unsolicited packet granted itself the clipboard, the SMS relay and the browser history
+        // with no prompt on this device at all, which made every other check here decorative. A
+        // reply only means something against an offer this device is actually waiting on, and that
+        // offer is in memory rather than in the trusted list.
+        val offered = outgoingPairings[provisional]
+
+        // THE ANSWER HAS TO ANSWER THIS OFFER. Retries are deliberate (see [retryReply]), so a late
+        // one from a pairing that finished a second ago must not be taken as the answer to the code
+        // now on screen -- its proof would not open and would cancel the pairing the user is doing.
+        // Absent on either side means an older build, which is matched on the proof alone as before.
+        val replyTo = json.optString("replyTo")
+        if (offered != null && offered.id.isNotBlank() && replyTo.isNotBlank() && replyTo != offered.id) {
+            PrismPlatform.log.info(TAG, "Ignored an answer to an earlier offer from $peerIp")
+            return false
+        }
+
+        // A REPEAT OF A FINISHED PAIRING IS A LOST CONFIRMATION, NOT AN INTRUSION. The answering side
+        // resends when it hears nothing (see [retryReply]) precisely so a dropped packet cannot
+        // leave it with no record; the answer to that is the confirmation it missed, not a warning.
+        //
+        // ONLY FOR THE PAIRING THAT IS ALREADY DONE. A fresh offer made to the same device after the
+        // old one was confirmed is a new question and must be answered as one, so a reply that
+        // belongs to the earlier offer (`at` no later than the confirmation it produced) is the only
+        // one treated as a repeat. Otherwise a late retry would cancel a new code.
+        val already = byFingerprint(fingerprint)
+        val repeatOfFinishedPairing = already != null && already.confirmed && accepted.isNotEmpty() &&
+            (offered == null || offered.at <= already.lastSeen)
+        if (repeatOfFinishedPairing) {
+            PrismPlatform.log.info(TAG, "Re-confirming trust with ${already?.name} ($peerIp)")
+            sendAck(peerIp, fingerprint, already.outgoing, replyTo)
+            return true
+        }
+        if (offered == null) {
+            PrismPlatform.log.warn(TAG, "Dropped an unsolicited trust reply from $peerIp")
+            return false
+        }
+
+        // Nothing accepted is a decline. It must remove the pending offer without writing a device:
+        // the old code stored an unconfirmed row here, which made "Done" look like a pairing that
+        // had merely not finished.
+        if (accepted.isEmpty()) {
+            pendingCodes.remove(provisional)
+            outgoingPairings.remove(provisional)
+            PrismPlatform.log.info(TAG, "${offered.name} declined the pairing")
+            return false
+        }
+
         // THE CODE IS CHECKED HERE, and this is the only place it can be: the code never left this
         // device, so only this device can tell whether the answer was right. A wrong one ends the
         // pairing rather than downgrading it -- an offer answered by something that could not see this
         // screen is not a weaker pairing, it is a different device.
         val challenge = pendingCodes[provisional]
-        if (challenge != null && accepted.isNotEmpty()) {
-            val proof = runCatching {
-                java.util.Base64.getDecoder().decode(json.optString("proof"))
-            }.getOrDefault(ByteArray(0))
-
-            val key = PairingCode.keyFor(challenge.code, challenge.salt)
-            val ok = proof.isNotEmpty() && key != null &&
-                PairingCode.verify(proof, key, challenge.salt)
-
-            if (!ok) {
-                PrismPlatform.log.warn(
-                    TAG,
-                    "$peerIp answered the pairing code wrongly; the offer is cancelled",
-                )
-                pendingCodes.remove(provisional)
-                save(all().filterNot { it.fingerprint == provisional })
-                onCodeRejected?.invoke(peerIp)
-                return false
-            }
-
-            // Right answer. If they have no wallet and the pairing includes one, hand it over sealed
-            // with the same key -- the only moment at which a phrase can travel, and the reason the code
-            // is an encryption key rather than just a comparison. See PairingCode.
-            if (json.optBoolean("needsWallet") && Kind.WALLET in accepted) {
-                sendWallet(peerIp, key, challenge.salt)
-            }
-            pendingCodes.remove(provisional)
+        if (challenge == null) {
+            // The offer is no longer outstanding -- the process restarted between the offer and the
+            // answer, or the user dismissed the code (see [cancelOffer]). The code is the proof, and
+            // without it there is nothing to verify, so this is refused rather than trusted.
+            PrismPlatform.log.warn(TAG, "Dropped a trust reply from $peerIp with no outstanding offer")
+            outgoingPairings.remove(provisional)
+            return false
+        }
+        if (System.currentTimeMillis() - challenge.at > PAIRING_TTL_MILLIS) {
+            // Answered too late to be about the screen the user was looking at. Refused rather than
+            // accepted, and the stale half-pairing is cleared.
+            PrismPlatform.log.warn(TAG, "Dropped a trust reply from $peerIp: the code had expired")
+            cancelOffer(peerIp)
+            return false
         }
 
-        // The provisional row created by [offer] is replaced by one keyed on their real fingerprint. Both
-        // are removed first so a pairing cannot leave two rows for one device.
-        val previous = byFingerprint(fingerprint) ?: byFingerprint(provisional)
-        save(all().filterNot { it.fingerprint == fingerprint || it.fingerprint == provisional })
+        val proof = runCatching {
+            java.util.Base64.getDecoder().decode(json.optString("proof"))
+        }.getOrDefault(ByteArray(0))
+        val key = PairingCode.keyFor(challenge.code, challenge.salt)
+        val ok = proof.isNotEmpty() && key != null &&
+            PairingCode.verify(proof, key, challenge.salt)
 
+        if (!ok) {
+            PrismPlatform.log.warn(
+                TAG,
+                "$peerIp answered the pairing code wrongly; the offer is cancelled",
+            )
+            pendingCodes.remove(provisional)
+            outgoingPairings.remove(provisional)
+            // NO TRUST ROW IS TOUCHED. In particular, an existing pairing is not revoked because
+            // somebody failed to answer a new offer; that would let a stranger unpair this device
+            // by guessing.
+            onCodeRejected?.invoke(peerIp)
+            return false
+        }
+
+        // Right answer. If they have no wallet and the pairing includes one, hand it over sealed
+        // with the same key -- the only moment at which a phrase can travel, and the reason the code
+        // is an encryption key rather than just a comparison. See PairingCode.
+        if (json.optBoolean("needsWallet") && Kind.WALLET in accepted) {
+            sendWallet(peerIp, key, challenge.salt)
+        }
+        pendingCodes.remove(provisional)
+
+        // A reply can only NARROW what was offered: it cannot grant a kind nobody put on the table.
+        // Both directions are the same set because accepting a kind is also agreeing to send it.
+        val agreed = accepted.intersect(offered.offered)
+        if (agreed.isEmpty()) {
+            outgoingPairings.remove(provisional)
+            return false
+        }
+
+        save(all().filterNot { it.answersTo(fingerprint) || it.fingerprint == provisional })
         upsert(
             Trust(
                 fingerprint = fingerprint,
-                name = json.optString("name").ifBlank { previous?.name ?: peerIp },
-                platform = json.optString("platform").ifBlank { previous?.platform.orEmpty() },
+                name = json.optString("name").ifBlank { offered.name },
+                platform = json.optString("platform").ifBlank { offered.platform },
                 lastIp = peerIp,
                 lastSeen = System.currentTimeMillis(),
-                // They told us what they will RECEIVE, so that is what we may send. A reply can only
-                // ever narrow what was offered: it cannot grant a kind nobody offered.
-                outgoing = accepted.intersect(previous?.outgoing ?: accepted),
-                // And what they accepted is what they will SEND, because the pairing is mutual -- see
-                // [Trust]. Narrowed the same way, so a peer cannot start sending a kind this device
-                // never put on the table.
-                incoming = accepted.intersect(previous?.incoming ?: accepted),
-                confirmed = accepted.isNotEmpty(),
+                outgoing = agreed,
+                incoming = agreed,
+                confirmed = true,
             )
         )
+        outgoingPairings.remove(provisional)
+        // THE LAST HALF OF THE PAIRING. Until this packet arrives the answering device has no row,
+        // by design: it proved what it typed, and this is the only side that can verify it. Sending
+        // it here, after the proof and after the save, is what makes the list mean "confirmed"
+        // rather than "somebody pressed Accept".
+        sendAck(peerIp, fingerprint, agreed, offered.id)
         PrismPlatform.log.info(TAG, "Trust confirmed with ${json.optString("name")} ($peerIp)")
         // On a thread of its own: a listener may start a transfer, and this runs on a mesh receive thread
         // with other packets behind it.
+        byFingerprint(fingerprint)?.let { confirmed ->
+            val listener = onConfirmed
+            if (listener != null) {
+                kotlin.concurrent.thread(name = "trust-confirmed", isDaemon = true) {
+                    runCatching { listener(confirmed) }
+                }
+            }
+        }
+        true
+    }.getOrDefault(false)
+
+    /**
+     * Sends the final confirmation to the device that answered the code. See [OPCODE_TRUST_ACK].
+     *
+     * SENT TWICE. This packet is what gives the answering device its record, and it used to be
+     * sent once over UDP: when it was lost, this side listed a trusted device that the other side
+     * had never heard of. The answering side treats a repeat as a repeat, so the second copy is
+     * free (see [onAck]). Sent from its own thread because the caller is a mesh receive thread and
+     * this function does not block it.
+     */
+    private fun sendAck(
+        peerIp: String,
+        fingerprint: String,
+        accepted: Set<Kind>,
+        offerId: String = "",
+    ) {
+        val payload = JSONObject().apply {
+            put("fp", localFingerprint())
+            put("name", localName())
+            put("platform", localPlatform)
+            put("accepted", JSONArray().also { a -> accepted.forEach { a.put(it.id) } })
+            if (offerId.isNotBlank()) put("ackFor", offerId)
+        }.toString()
+        runCatching { sender(peerIp, OPCODE_TRUST_ACK, payload) }
+        kotlin.concurrent.thread(name = "trust-ack-retry", isDaemon = true) {
+            runCatching { Thread.sleep(1_500L) }.onFailure { return@thread }
+            runCatching { sender(peerIp, OPCODE_TRUST_ACK, payload) }
+        }
+    }
+
+    private fun normalisedIp(raw: String): String =
+        raw.trim().removePrefix("::ffff:").substringBefore('%')
+
+    /**
+     * Handles the offering side's final confirmation. Registered on [OPCODE_TRUST_ACK].
+     *
+     * THIS IS WHERE THE ANSWERING DEVICE ADDS THE PAIR, not when Accept is pressed. Pressing Accept
+     * only proves that this device can derive the code key; the offering side is the one that knows
+     * whether the proof opened. A wrong code, a lost packet or a user who closed the dialog therefore
+     * leaves no trusted device behind.
+     */
+    fun onAck(peerIp: String, payload: String): Boolean = runCatching {
+        if (!MeshMembership.mayPairWith(peerIp)) {
+            PrismPlatform.log.warn(TAG, "Dropped a trust confirmation from $peerIp: off the meshnet")
+            return false
+        }
+        val json = JSONObject(payload)
+        val fingerprint = json.optString("fp")
+        if (fingerprint.isBlank()) return false
+
+        // A CONFIRMATION HAS TO BELONG TO THE ACCEPTANCE IT FINISHES. A repeat of the same one is
+        // fine (the offering side sends it twice); one for a different offer is not, or a late
+        // confirmation could complete a pairing the user answered differently.
+        val ackFor = json.optString("ackFor")
+        val awaiting = acceptances[fingerprint]
+        if (awaiting != null && awaiting.offerId.isNotBlank() &&
+            ackFor.isNotBlank() && ackFor != awaiting.offerId
+        ) {
+            PrismPlatform.log.warn(TAG, "Dropped a confirmation for an earlier pairing from $peerIp")
+            return false
+        }
+
+        // The repeats are answered quietly when the first one already landed.
+        val already = byFingerprint(fingerprint)
+        if (already != null && already.confirmed && awaiting == null) return true
+
+        val pending = awaiting ?: run {
+            PrismPlatform.log.warn(TAG, "Dropped a trust confirmation from $peerIp with no acceptance pending")
+            return false
+        }
+        if (System.currentTimeMillis() - pending.at > PAIRING_TTL_MILLIS) {
+            // The confirmation arrived long after this device answered, which is not something that
+            // happens in a pairing somebody is actually doing. Forgetting it keeps a stale accept
+            // from becoming a trust record when nobody is expecting one.
+            acceptances.remove(fingerprint)
+            PrismPlatform.log.warn(TAG, "Dropped a stale trust confirmation from $peerIp")
+            return false
+        }
+        // The confirmation has to come from the device that received the proof. Matching the address
+        // as well as the fingerprint is what keeps a mesh peer from confirming somebody else's pairing.
+        if (normalisedIp(pending.ip) != normalisedIp(peerIp)) {
+            PrismPlatform.log.warn(TAG, "Dropped a trust confirmation from the wrong address: $peerIp")
+            return false
+        }
+
+        // Only what was offered, and only what this device said it would accept. The offering side
+        // cannot widen the agreement by confirming it.
+        val accepted = kinds(json.optJSONArray("accepted")) 
+            .intersect(pending.offered)
+            .intersect(pending.accepted)
+        acceptances.remove(fingerprint)
+        if (accepted.isEmpty()) return false
+
+        save(all().filterNot { it.answersTo(fingerprint) })
+        upsert(
+            Trust(
+                fingerprint = fingerprint,
+                name = pending.name.ifBlank { json.optString("name") },
+                platform = pending.platform.ifBlank { json.optString("platform") },
+                lastIp = peerIp,
+                lastSeen = System.currentTimeMillis(),
+                outgoing = accepted,
+                incoming = accepted,
+                confirmed = true,
+            )
+        )
+        PrismPlatform.log.info(TAG, "Trust confirmed by ${pending.name} ($peerIp)")
         byFingerprint(fingerprint)?.let { confirmed ->
             val listener = onConfirmed
             if (listener != null) {
@@ -877,10 +1522,19 @@ object TrustedDevices {
      * of them do not exist yet. A kind nobody consumes is dropped after being logged, which is honest —
      * the data arrived and this build has nowhere to put it.
      */
-    private val consumers = java.util.concurrent.ConcurrentHashMap<Kind, (Received) -> Unit>()
+    private val consumers =
+        java.util.concurrent.ConcurrentHashMap<Kind, java.util.concurrent.CopyOnWriteArrayList<(Received) -> Unit>>()
 
+    /**
+     * Adds a consumer for [kind].
+     *
+     * A LIST, not one slot. The portable half of a kind lives in :core and a platform adds its own
+     * on top -- the clipboard records history there and puts the text on the system clipboard here
+     * -- and a map with one value made the second registration silently replace the first, which
+     * meant the desktop received entries and never showed them.
+     */
     fun consume(kind: Kind, consumer: (Received) -> Unit) {
-        consumers[kind] = consumer
+        consumers.getOrPut(kind) { java.util.concurrent.CopyOnWriteArrayList() }.add(consumer)
     }
 
     /** Handles an incoming share. Registered on [OPCODE_SHARE]. */
@@ -905,19 +1559,24 @@ object TrustedDevices {
             return false
         }
 
-        val consumer = consumers[kind]
-        if (consumer == null) {
+        val listeners = consumers[kind]
+        if (listeners.isNullOrEmpty()) {
             PrismPlatform.log.info(TAG, "No consumer for ${kind.id} in this build; dropped")
             return false
         }
-        consumer(
-            Received(
-                kind = kind,
-                fromFingerprint = json.optString("from"),
-                fromName = json.optString("name"),
-                body = json.optJSONObject("body") ?: JSONObject(),
-            )
+        val received = Received(
+            kind = kind,
+            fromFingerprint = json.optString("from"),
+            fromName = json.optString("name"),
+            body = json.optJSONObject("body") ?: JSONObject(),
         )
+        // One failing consumer must not stop the others: storing the history entry and putting the
+        // text on a platform clipboard are independent, and a clipboard that is unavailable is not
+        // a reason to lose the history.
+        listeners.forEach { listener ->
+            runCatching { listener(received) }
+                .onFailure { PrismPlatform.log.warn(TAG, "A ${kind.id} consumer failed: " + it.message) }
+        }
         true
     }.getOrDefault(false)
 
@@ -933,10 +1592,83 @@ object TrustedDevices {
     fun registerWithMesh() {
         MeshCore.register(OPCODE_TRUST_OFFER) { peerIp, payload -> onOffer(peerIp, payload) }
         MeshCore.register(OPCODE_TRUST_REPLY) { peerIp, payload -> onReply(peerIp, payload) }
+        MeshCore.register(OPCODE_TRUST_ACK) { peerIp, payload -> onAck(peerIp, payload) }
         MeshCore.register(OPCODE_SHARE) { peerIp, payload -> onShare(peerIp, payload) }
         MeshCore.register(OPCODE_TRUST_WALLET) { peerIp, payload -> onWallet(peerIp, payload) }
+        MeshCore.register(OPCODE_PRESENCE) { peerIp, payload -> onPresence(peerIp, payload) }
+        startPresenceBeacon()
         PrismPlatform.log.info(TAG, "Trusted-device opcodes registered")
     }
+
+    // ── Presence ───────────────────────────────────────────────────────────
+
+    @Volatile
+    private var presenceStarted = false
+
+    /**
+     * Announces this device's fingerprint and address every [PRESENCE_INTERVAL_MS].
+     *
+     * Once per process: [registerWithMesh] is called from platform startup and can be called
+     * again by a screen, and a second beacon thread would double the traffic for no benefit. The
+     * announcements are unsealed on purpose -- there is no key, no secret and no content in them,
+     * only the identity that the receiver already has a record for.
+     */
+    fun startPresenceBeacon() {
+        if (presenceStarted) return
+        presenceStarted = true
+        Thread({
+            while (true) {
+                runCatching { announcePresence() }
+                    .onFailure { PrismPlatform.log.warn(TAG, "Presence announce failed: " + it.message) }
+                runCatching { Thread.sleep(PRESENCE_INTERVAL_MS) }.onFailure { return@Thread }
+            }
+        }, "trust-presence").apply { isDaemon = true; start() }
+    }
+
+    /** One announcement. Public so a screen can nudge it after the mesh comes up. */
+    fun announcePresence() {
+        val fingerprint = localFingerprint()
+        if (fingerprint.isBlank()) return
+        if (!MeshTransport.isOnMesh()) return
+        MeshTransport.announce(
+            OPCODE_PRESENCE,
+            JSONObject().apply {
+                put("fp", fingerprint)
+                put("name", localName())
+            }.toString(),
+        )
+    }
+
+    /**
+     * A peer told us where it is.
+     *
+     * The record is moved, never created: a packet from a fingerprint this device has not trusted
+     * is dropped before it can touch the store. The name is refreshed only when the peer sends one,
+     * because an alias the user set locally must not be overwritten by the device's own name.
+     */
+    fun onPresence(peerIp: String, payload: String): Boolean {
+        val json = runCatching { JSONObject(payload) }.getOrNull() ?: return false
+        val fingerprint = json.optString("fp")
+        if (fingerprint.isBlank()) return false
+        val device = byFingerprint(fingerprint) ?: return false
+        if (!device.confirmed) return false
+        val address = normaliseAddress(peerIp)
+        if (address.isEmpty()) return false
+        if (normaliseAddress(device.lastIp) == address) return true
+        synchronized(writeLock) {
+            save(
+                all().filterNot { it.answersTo(device.fingerprint) } +
+                    device.copy(lastIp = address, lastSeen = System.currentTimeMillis()),
+            )
+        }
+        PrismPlatform.log.info(
+            TAG,
+            "${device.name} is at $address now; moved its trusted address",
+        )
+        return true
+    }
+
+    private const val PRESENCE_INTERVAL_MS = 20_000L
 
     /** One line for a settings row. */
     fun summary(): String {

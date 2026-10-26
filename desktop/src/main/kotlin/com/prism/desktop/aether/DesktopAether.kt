@@ -83,15 +83,26 @@ object DesktopAether {
         return built
     }
 
-    /** Whether there are trained weights, as opposed to a brain built from nothing. */
-    fun isTrained(): Boolean {
-        brain()
-        return loadedFromDisk
-    }
+    /**
+     * Whether there are trained weights, as opposed to a brain built from nothing.
+     *
+     * NEVER BUILDS THE BRAIN. This is called from the Aether page's composition, on the UI
+     * thread; the old implementation called [brain] first and allocated hundreds of megabytes
+     * just to render a status word -- the page froze and then died. The file is the answer: a
+     * connectome that exists is loaded on the next real use, and one that does not means there
+     * is nothing trained to report.
+     */
+    fun isTrained(): Boolean = weightsFile().isFile
+
+    /** File counts for the page's dataset row -- no reading, no chunking. */
+    fun datasetSummary(): AetherTrainer.Summary = AetherTrainer.summarize(AetherConfig.datasetDir())
 
     fun weightsFile(): File = AetherConfig.weightsFile(AetherConfig.geometry)
 
     fun datasetDir(): File = AetherConfig.datasetDir()
+
+    /** The trainer's full split scan, for callers that want counts per split. */
+    fun datasetSplits() = AetherTrainer.scanDataset(AetherConfig.datasetDir())
 
     /** Forgets everything. Irreversible, which is why nothing calls it without asking first. */
     fun forget() {

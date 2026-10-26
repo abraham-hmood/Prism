@@ -11,9 +11,20 @@ class SocialBotWorker(context: Context, workerParams: WorkerParameters) : Corout
 
     override suspend fun doWork(): Result {
         return try {
-            NebulaSocialManager.generateNewContent(applicationContext, manual = false)
+            val generated = NebulaSocialManager.generateNewContent(applicationContext, manual = false)
+            // A skipped cycle is SUCCESS, not retry: the idle/charging gate deliberately declined
+            // to spend a local model's battery right now, and retrying would fight that decision.
+            // It is logged so "Nebula posted nothing for a day" has an answer in diagnostics.
+            com.prism.launcher.PrismLogger.logInfo(
+                "Nebula",
+                if (generated) "Background cycle generated content"
+                else "Background cycle skipped: device is not idle and charging",
+            )
             Result.success()
         } catch (e: Exception) {
+            com.prism.launcher.PrismLogger.logWarning(
+                "Nebula", "Background cycle failed: ${e.message}",
+            )
             Result.retry()
         }
     }

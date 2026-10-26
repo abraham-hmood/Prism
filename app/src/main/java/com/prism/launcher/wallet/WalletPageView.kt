@@ -313,7 +313,7 @@ class WalletPageView(context: Context) : FrameLayout(context) {
             setTextIsSelectable(true)
         }
 
-        AlertDialog.Builder(context, R.style.Theme_PrismSettings)
+        com.prism.launcher.theme.PrismDialogs.Builder(context, R.style.Theme_PrismSettings)
             .setTitle("Write these ${phrase.size} words down")
             .setMessage(
                 "This phrase IS the wallet. Anyone who reads it can take every coin in it, and " +
@@ -342,7 +342,7 @@ class WalletPageView(context: Context) : FrameLayout(context) {
             toast("Secure storage is not available on this device.")
             return
         }
-        AlertDialog.Builder(context, R.style.Theme_PrismSettings)
+        com.prism.launcher.theme.PrismDialogs.Builder(context, R.style.Theme_PrismSettings)
             .setTitle("Import wallet")
             .setItems(
                 arrayOf(
@@ -459,7 +459,7 @@ class WalletPageView(context: Context) : FrameLayout(context) {
             override fun afterTextChanged(s: android.text.Editable?) {}
         })
 
-        val dialog = AlertDialog.Builder(context, R.style.Theme_PrismSettings)
+        val dialog = com.prism.launcher.theme.PrismDialogs.Builder(context, R.style.Theme_PrismSettings)
             .setTitle("Add a coin")
             .setView(container)
             .setNegativeButton("Cancel", null)
@@ -618,7 +618,7 @@ class WalletPageView(context: Context) : FrameLayout(context) {
 
         val options = peers.map { "$it  (mesh peer)" } + "Enter an address and port myself…"
 
-        AlertDialog.Builder(context, R.style.Theme_PrismSettings)
+        com.prism.launcher.theme.PrismDialogs.Builder(context, R.style.Theme_PrismSettings)
             .setTitle("Where will ${chain.name} run?")
             .setMessage(
                 "${chain.symbol} needs a node on a PC. Pick a computer running Prism Desktop on " +
@@ -737,7 +737,7 @@ class WalletPageView(context: Context) : FrameLayout(context) {
             setTextColor(resolveAttr(R.attr.prismTextPrimary))
         }
 
-        AlertDialog.Builder(context, R.style.Theme_PrismSettings)
+        com.prism.launcher.theme.PrismDialogs.Builder(context, R.style.Theme_PrismSettings)
             .setTitle("Monero wallet")
             .setMessage(
                 "Anyone who reads the seed or the spend key can take every XMR at this address.\n\n" +
@@ -770,7 +770,7 @@ class WalletPageView(context: Context) : FrameLayout(context) {
             setTextColor(resolveAttr(R.attr.prismTextPrimary))
         }
 
-        AlertDialog.Builder(context, R.style.Theme_PrismSettings)
+        com.prism.launcher.theme.PrismDialogs.Builder(context, R.style.Theme_PrismSettings)
             .setTitle("${coin.symbol} private key ($format)")
             .setMessage(
                 "Write this down or store it somewhere you trust. It only covers ${coin.symbol} — " +
@@ -993,7 +993,7 @@ class WalletPageView(context: Context) : FrameLayout(context) {
     // ── Backup and restore ─────────────────────────────────────────────────
 
     private fun showMiningMenu() {
-        AlertDialog.Builder(context, R.style.Theme_PrismSettings)
+        com.prism.launcher.theme.PrismDialogs.Builder(context, R.style.Theme_PrismSettings)
             .setTitle("Wallet")
             .setItems(arrayOf("Backup wallet", "Import wallet")) { _, which ->
                 if (which == 0) startBackup() else startImport()
@@ -1236,7 +1236,7 @@ class WalletPageView(context: Context) : FrameLayout(context) {
             setTextColor(resolveAttr(R.attr.prismTextPrimary))
         }
 
-        AlertDialog.Builder(context, R.style.Theme_PrismSettings)
+        com.prism.launcher.theme.PrismDialogs.Builder(context, R.style.Theme_PrismSettings)
             .setTitle("Receive ${coin.symbol}")
             .setMessage(
                 "Send only ${coin.name} (${coin.symbol}) to this address. Coins from a different " +
@@ -1817,6 +1817,7 @@ class WalletPageView(context: Context) : FrameLayout(context) {
         Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
 
     private fun resolveAttr(attr: Int): Int {
+        com.prism.launcher.theme.ThemeSkin.resolveAttr(context, attr)?.let { return it }
         val value = android.util.TypedValue()
         context.theme.resolveAttribute(attr, value, true)
         return value.data

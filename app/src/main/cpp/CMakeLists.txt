@@ -300,23 +300,9 @@ target_link_libraries(randomx_jni randomx ${log-lib})
 
 # ── Node.js runtime for the editor's extension host ─────────────────────────
 #
-# libnode.so is not built here -- it is a 2-hour cross-compile of Node.js itself, produced by
-# tools/node/build-libnode.sh and dropped into src/main/jniLibs/<abi>/. This only builds the JNI
-# shim that starts it.
-#
-# BUILT ONLY WHEN THE LIBRARY IS PRESENT. A checkout without libnode.so still compiles and the app
-# still runs; NodeRuntime catches the missing library and reports that Node extensions are
-# unavailable, which is the same honest degradation the llama.cpp build above takes for non-arm64
-# devices. Making the whole app un-buildable without a 90 MB binary in the tree would be worse.
-set(PRISM_LIBNODE "${CMAKE_SOURCE_DIR}/../jniLibs/${ANDROID_ABI}/libnode.so")
-if (EXISTS ${PRISM_LIBNODE})
-    message(STATUS "Prism: building the Node.js bridge against ${PRISM_LIBNODE}")
-
-    add_library(libnode SHARED IMPORTED)
-    set_target_properties(libnode PROPERTIES IMPORTED_LOCATION ${PRISM_LIBNODE})
-
-    add_library(prism_node SHARED prism_node.cpp)
-    target_link_libraries(prism_node libnode ${log-lib})
-else()
-    message(STATUS "Prism: no libnode.so for ${ANDROID_ABI}; Node extensions will be unavailable")
-endif()
+# NOT HERE, AND NOT A LIBRARY. The editor's Node host is a real `node` binary inside the PRoot
+# Ubuntu guest installed by NodeInstaller; NodeRuntime launches it as a child process and talks to
+# it over a loopback socket. The old libnode.so/JNI bridge was removed with this change: it was
+# never built in this repository, it could only ever start once per process (node::Start does not
+# return), and it could not exec a bundled tool from app storage -- which is most of what a Node
+# extension host is for. See NodeRuntime's class comment.

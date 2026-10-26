@@ -118,6 +118,42 @@ object ModelPurchaseLedger {
         save(next)
     }
 
+    /**
+     * Cancels held purchases that no scan has decided about for [maxAgeMs].
+     *
+     * WITHOUT THIS THE COINS ARE STUCK FOREVER. A purchase whose listing never got a verdict -- the
+     * buyer offline, both hosts unreachable, a scanner that keeps failing -- sits in HELD, its
+     * amount subtracted from spendable balance by [heldTotal], the refund window closing after three
+     * hours and a re-buy refused because the listing already has a purchase. Nothing was ever sent, so
+     * cancelling loses nothing; leaving it was the only way to be certain the money was never spendable
+     * again.
+     *
+     * @return how many were released.
+     */
+    fun cancelStaleHeld(maxAgeMs: Long = STALE_AFTER_MS): Int {
+        val now = System.currentTimeMillis()
+        var released = 0
+        val next = all().map { purchase ->
+            if (purchase.state == State.HELD && now - purchase.committedAt > maxAgeMs) {
+                released++
+                purchase.copy(state = State.CANCELLED)
+            } else {
+                purchase
+            }
+        }
+        if (released > 0) {
+            save(next)
+            PrismPlatform.log.warn(
+                "ModelShop",
+                "Released $released purchase(s) that were held for more than " +
+                    (maxAgeMs / 3_600_000L) + " h without a verdict; no coins had been sent.",
+            )
+        }
+        return released
+    }
+
+    private const val STALE_AFTER_MS = 24L * 60L * 60L * 1000L
+
     /** Coins committed but not yet sent -- spendable balance minus this is what is really free. */
     fun heldTotal(): BigInteger =
         all().filter { it.state == State.HELD }

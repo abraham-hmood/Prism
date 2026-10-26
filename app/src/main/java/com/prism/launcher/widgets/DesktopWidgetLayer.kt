@@ -285,7 +285,7 @@ class DesktopWidgetLayer(
      * to remove it and drop a new one where it belongs.
      */
     private fun showMenu(index: Int) {
-        androidx.appcompat.app.AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("Widget")
             .setItems(arrayOf("Resize", "Remove")) { _, which ->
                 if (which == 0) beginResize(index) else remove(index)

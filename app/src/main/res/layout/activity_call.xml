@@ -1,0 +1,228 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The in-call screen.
+
+    Dark whatever the theme is, because it is a call screen and every phone OS does that; the
+    buttons are circular and translucent, which is the iOS call layout this imitates.
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#FF0B0B0D">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:gravity="center_horizontal"
+        android:paddingLeft="28dp"
+        android:paddingRight="28dp"
+        android:paddingTop="72dp"
+        android:paddingBottom="40dp">
+
+        <TextView
+            android:id="@+id/callAvatar"
+            android:layout_width="96dp"
+            android:layout_height="96dp"
+            android:gravity="center"
+            android:textSize="38sp"
+            android:textColor="#FFFFFFFF"
+            android:background="@drawable/bg_call_avatar" />
+
+        <TextView
+            android:id="@+id/callName"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="22dp"
+            android:textSize="28sp"
+            android:textStyle="bold"
+            android:textColor="#FFFFFFFF" />
+
+        <TextView
+            android:id="@+id/callStatus"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:textSize="16sp"
+            android:textColor="#99FFFFFF" />
+
+        <TextView
+            android:id="@+id/callSecurity"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:textSize="13sp"
+            android:gravity="center"
+            android:textColor="#B3FFFFFF" />
+
+        <TextView
+            android:id="@+id/callRecording"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="● Recording"
+            android:textColor="#FFFF453A"
+            android:textSize="13sp"
+            android:textStyle="bold"
+            android:visibility="gone" />
+
+        <Space
+            android:layout_width="1dp"
+            android:layout_height="0dp"
+            android:layout_weight="1" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center"
+            android:baselineAligned="false">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical"
+                android:gravity="center">
+
+                <ImageButton
+                    android:id="@+id/callMute"
+                    android:layout_width="64dp"
+                    android:layout_height="64dp"
+                    android:background="@drawable/bg_call_button"
+                    android:contentDescription="Mute"
+                    android:scaleType="centerInside"
+                    android:src="@android:drawable/ic_lock_silent_mode" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="mute"
+                    android:textSize="12sp"
+                    android:textColor="#99FFFFFF" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical"
+                android:gravity="center">
+
+                <ImageButton
+                    android:id="@+id/callSpeaker"
+                    android:layout_width="64dp"
+                    android:layout_height="64dp"
+                    android:background="@drawable/bg_call_button"
+                    android:contentDescription="Speaker"
+                    android:scaleType="centerInside"
+                    android:src="@android:drawable/ic_lock_silent_mode_off" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="speaker"
+                    android:textSize="12sp"
+                    android:textColor="#99FFFFFF" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical"
+                android:gravity="center">
+
+                <ImageButton
+                    android:id="@+id/callRecord"
+                    android:layout_width="64dp"
+                    android:layout_height="64dp"
+                    android:background="@drawable/bg_call_button"
+                    android:contentDescription="Record call"
+                    android:scaleType="centerInside"
+                    android:src="@drawable/ic_call_record_24"
+                    android:tint="#FFFFFFFF"
+                    android:visibility="gone" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="record"
+                    android:textSize="12sp"
+                    android:textColor="#99FFFFFF" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical"
+                android:gravity="center">
+
+                <ImageButton
+                    android:id="@+id/callVoicemail"
+                    android:layout_width="64dp"
+                    android:layout_height="64dp"
+                    android:background="@drawable/bg_call_button"
+                    android:contentDescription="Send to meshvoice"
+                    android:scaleType="centerInside"
+                    android:src="@android:drawable/ic_btn_speak_now" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="meshvoice"
+                    android:textSize="12sp"
+                    android:textColor="#99FFFFFF" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- Answer and end share the row: an incoming call shows both, and a call in progress
+             shows only the end button, centred. -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="34dp"
+            android:orientation="horizontal"
+            android:gravity="center">
+
+            <ImageButton
+                android:id="@+id/callAnswer"
+                android:layout_width="72dp"
+                android:layout_height="72dp"
+                android:layout_marginEnd="36dp"
+                android:background="@drawable/bg_call_answer"
+                android:contentDescription="Answer call"
+                android:padding="21dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/ic_call_phone_24"
+                android:tint="#FFFFFFFF"
+                android:visibility="gone" />
+
+            <ImageButton
+                android:id="@+id/callEnd"
+                android:layout_width="72dp"
+                android:layout_height="72dp"
+                android:background="@drawable/bg_call_end"
+                android:contentDescription="End call"
+                android:padding="21dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/ic_call_hangup_32"
+                android:tint="#FFFFFFFF" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/callHint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="18dp"
+            android:gravity="center"
+            android:textSize="13sp"
+            android:textColor="#66FFFFFF"
+            android:visibility="gone" />
+    </LinearLayout>
+</FrameLayout>

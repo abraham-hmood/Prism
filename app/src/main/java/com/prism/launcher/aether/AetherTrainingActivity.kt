@@ -131,8 +131,9 @@ class AetherTrainingActivity : PrismBaseActivity() {
             IosUi.sectionFooter(
                 ctx,
                 "Drop images into ${AetherConfig.datasetDir().absolutePath} and name each file " +
-                    "after what it shows, or drop in a .txt file to train on its text (read in a " +
-                    "sliding window, a few characters at a time). Training and generation routes " +
+                    "after what it shows, or drop in .txt/.parquet files to train on their text. " +
+                    "Put held-out files in validation/ and testing/ (or name them validation-… and " +
+                    "test-…), and every file in each split is used. Training and generation routes " +
                     "toggle in Prism Settings → Intelligence & Messaging → Aether."
             )
         )
@@ -391,8 +392,11 @@ class AetherTrainingActivity : PrismBaseActivity() {
     // ── Behaviour ───────────────────────────────────────────────────────────
 
     private fun refreshStatus() {
-        val n = AetherStudio.datasetSize()
-        datasetValue.text = "$n image${if (n == 1) "" else "s"}"
+        val summary = AetherStudio.datasetSummary()
+        datasetValue.text = "${summary.totalFiles} file${if (summary.totalFiles == 1) "" else "s"}" +
+            if (summary.validationFiles + summary.testFiles > 0)
+                " · ${summary.validationFiles} val · ${summary.testFiles} test"
+            else ""
         statusValue.text = if (AetherStudio.hasTrainedWeights()) "Trained" else "Untrained"
         modeValue.text = buildString {
             append(if (PrismSettings.getAetherBiotrainEnabled()) "Biological (STDP)" else "Backprop")
@@ -488,7 +492,7 @@ class AetherTrainingActivity : PrismBaseActivity() {
         if (batteryPromptShown) return
         batteryPromptShown = true
 
-        androidx.appcompat.app.AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Let Aether train overnight?")
             .setMessage(
                 "Android throttles long-running work when the screen is off. Exempting Prism " +
@@ -546,7 +550,7 @@ class AetherTrainingActivity : PrismBaseActivity() {
             android.os.Environment.isExternalStorageManager()
 
     private fun requestStorageAccess() {
-        androidx.appcompat.app.AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Storage access needed")
             .setMessage(
                 "Aether reads her dataset from ${AetherConfig.datasetDir().absolutePath} and " +
@@ -572,7 +576,7 @@ class AetherTrainingActivity : PrismBaseActivity() {
     }
 
     private fun confirmForget() {
-        androidx.appcompat.app.AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Erase Aether's connectome?")
             .setMessage(
                 "This deletes every weight and every trace. Training starts from a newborn " +

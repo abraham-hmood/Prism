@@ -1,5 +1,6 @@
 package com.prism.desktop.aether
 
+import com.prism.core.PrismImage
 import java.awt.Color
 import java.awt.Font
 import java.awt.RenderingHints
@@ -103,6 +104,29 @@ object DesktopTextRenderer {
         graphics.dispose()
 
         return planar(image, edge, edge)
+    }
+
+    /**
+     * The same square drawing as [render], as a [PrismImage] for Nora's retina.
+     *
+     * Nora has no text pathway, so a text dataset is presented to her the only way a vision
+     * brain can read: drawn and looked at. Using this rather than a new renderer keeps a glyph
+     * identical in both brains.
+     */
+    fun renderImage(text: String): PrismImage {
+        // The wide reading canvas, matching Aether's, so a line keeps its letter shapes instead
+        // of being shrunk into a square stamp.
+        val width = 384
+        val plane = renderWide(text, width)
+        val area = width * size
+        val pixels = IntArray(area)
+        for (i in 0 until area) {
+            val r = plane[i].toInt().coerceIn(0, 255)
+            val g = plane[area + i].toInt().coerceIn(0, 255)
+            val b = plane[2 * area + i].toInt().coerceIn(0, 255)
+            pixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+        }
+        return PrismImage(width, size, pixels)
     }
 
     /**

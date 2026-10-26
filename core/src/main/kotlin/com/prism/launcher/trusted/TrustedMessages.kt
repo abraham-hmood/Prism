@@ -130,6 +130,12 @@ object TrustedMessages {
      */
     fun sendThrough(deviceFingerprint: String, address: String, body: String): Boolean {
         if (address.isBlank() || body.isBlank()) return false
+        // The lock covers messages on both platforms, and this is the send path behind the desktop
+        // composer. Refusing here rather than only in the UI keeps the promise at the seam.
+        if (!com.prism.launcher.lock.PrismLockScope.permit(
+                com.prism.launcher.lock.PrismLockScope.Gate.MESSAGES
+            )
+        ) return false
 
         val local = SmsRelay.Relayed(
             address = address,

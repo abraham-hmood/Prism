@@ -1,0 +1,54 @@
+10-24 18:06:15.104 26876 15016 D adb.exe : adb_trace.cpp:199 Android Debug Bridge version 1.0.41
+10-24 18:06:15.104 26876 15016 D adb.exe : adb_trace.cpp:199 Version 36.0.0-13206524
+10-24 18:06:15.104 26876 15016 D adb.exe : adb_trace.cpp:199 Installed as C:\Users\bremo\AppData\Local\Android\Sdk\platform-tools\adb.exe
+10-24 18:06:15.104 26876 15016 D adb.exe : adb_trace.cpp:199 Running on Windows 10.0.26200
+10-24 18:06:15.104 26876 15016 D adb.exe : adb_trace.cpp:199 
+10-24 18:06:15.105 26876 15016 D adb.exe : commandline.cpp:1699 Using server socket: tcp:5037
+10-24 18:06:15.105 26876 15016 D adb.exe : adb_client.cpp:400 adb_query: host-serial:127.0.0.1:54537:features
+10-24 18:06:15.105 26876 15016 D adb.exe : adb_client.cpp:358 adb_connect: service: host-serial:127.0.0.1:54537:features
+10-24 18:06:15.106 26876 15016 D adb.exe : adb_client.cpp:160 _adb_connect: host:version
+10-24 18:06:15.107 26876 15016 D adb.exe : sysdeps_win32.cpp:1040 port 5037 type tcp => fd 2048
+10-24 18:06:15.107 26876 15016 D adb.exe : adb_io.cpp:107 writex: fd=2048 len=16 30303063686f73743a76657273696f6e 000chost:version
+10-24 18:06:15.107 26876 15016 D adb.exe : adb_io.cpp:81 readx: fd=2048 wanted=4
+10-24 18:06:15.107 26876 15016 D adb.exe : adb_io.cpp:97 readx: fd=2048 wanted=4 got=4 4f4b4159 OKAY
+10-24 18:06:15.107 26876 15016 D adb.exe : adb_client.cpp:194 _adb_connect: return fd 2048
+10-24 18:06:15.107 26876 15016 D adb.exe : adb_io.cpp:81 readx: fd=2048 wanted=4
+10-24 18:06:15.107 26876 15016 D adb.exe : adb_io.cpp:97 readx: fd=2048 wanted=4 got=4 30303034 0004
+10-24 18:06:15.107 26876 15016 D adb.exe : adb_io.cpp:81 readx: fd=2048 wanted=4
+10-24 18:06:15.107 26876 15016 D adb.exe : adb_io.cpp:97 readx: fd=2048 wanted=4 got=4 30303239 0029
+10-24 18:06:15.107 26876 15016 D adb.exe : sysdeps_win32.cpp:537 adb_close: 2048(lo-client:5037)
+10-24 18:06:15.107 26876 15016 D adb.exe : adb_client.cpp:160 _adb_connect: host-serial:127.0.0.1:54537:features
+10-24 18:06:15.107 26876 15016 D adb.exe : sysdeps_win32.cpp:1040 port 5037 type tcp => fd 2048
+10-24 18:06:15.107 26876 15016 D adb.exe : adb_io.cpp:107 writex: fd=2048 len=40 30303234686f73742d73657269616c3a 0024host-serial: [truncated]
+10-24 18:06:15.109 26876 15016 D adb.exe : adb_io.cpp:81 readx: fd=2048 wanted=4
+10-24 18:06:15.109 26876 15016 D adb.exe : adb_io.cpp:97 readx: fd=2048 wanted=4 got=4 4f4b4159 OKAY
+10-24 18:06:15.109 26876 15016 D adb.exe : adb_client.cpp:194 _adb_connect: return fd 2048
+10-24 18:06:15.109 26876 15016 D adb.exe : adb_client.cpp:376 adb_connect: return fd 2048
+10-24 18:06:15.109 26876 15016 D adb.exe : adb_io.cpp:81 readx: fd=2048 wanted=4
+10-24 18:06:15.109 26876 15016 D adb.exe : adb_io.cpp:97 readx: fd=2048 wanted=4 got=4 30303038 0008
+10-24 18:06:15.109 26876 15016 D adb.exe : adb_io.cpp:81 readx: fd=2048 wanted=8
+10-24 18:06:15.109 26876 15016 D adb.exe : adb_io.cpp:97 readx: fd=2048 wanted=8 got=8 7368656c6c5f7632 shell_v2
+10-24 18:06:15.109 26876 15016 D adb.exe : sysdeps_win32.cpp:537 adb_close: 2048(lo-client:5037)
+10-24 18:06:15.109 26876 15016 D adb.exe : commandline.cpp:772 shell -e 0x7e t=1 use_shell_protocol=true shell_type_arg=raw
+10-24 18:06:15.109 26876 15016 D adb.exe : commandline.cpp:772 
+10-24 18:06:15.109 26876 15016 D adb.exe : adb_client.cpp:358 adb_connect: service: shell,v2,TERM=xterm-256color,raw:echo hi
+10-24 18:06:15.109 26876 15016 D adb.exe : adb_client.cpp:160 _adb_connect: shell,v2,TERM=xterm-256color,raw:echo hi
+10-24 18:06:15.109 26876 15016 D adb.exe : sysdeps_win32.cpp:1040 port 5037 type tcp => fd 2048
+10-24 18:06:15.109 26876 15016 D adb.exe : adb_io.cpp:107 writex: fd=2048 len=37 30303231686f73743a74706f72743a73 0021host:tport:s [truncated]
+10-24 18:06:15.109 26876 15016 D adb.exe : adb_client.cpp:119 Switch transport in progress: host:tport:serial:127.0.0.1:54537
+10-24 18:06:15.109 26876 15016 D adb.exe : adb_io.cpp:81 readx: fd=2048 wanted=4
+10-24 18:06:15.109 26876 15016 D adb.exe : adb_io.cpp:97 readx: fd=2048 wanted=4 got=4 4f4b4159 OKAY
+10-24 18:06:15.109 26876 15016 D adb.exe : adb_io.cpp:81 readx: fd=2048 wanted=8
+10-24 18:06:15.109 26876 15016 D adb.exe : adb_io.cpp:97 readx: fd=2048 wanted=8 got=8 4400000000000000 D.......
+10-24 18:06:15.109 26876 15016 D adb.exe : adb_client.cpp:133 Switch transport success
+10-24 18:06:15.109 26876 15016 D adb.exe : adb_io.cpp:107 writex: fd=2048 len=44 303032387368656c6c2c76322c544552 0028shell,v2,TER [truncated]
+10-24 18:06:15.109 26876 15016 D adb.exe : adb_io.cpp:81 readx: fd=2048 wanted=4
+10-24 18:06:15.109 26876 15016 D adb.exe : adb_io.cpp:97 readx: fd=2048 wanted=4 got=4 4641494c FAIL
+10-24 18:06:15.109 26876 15016 D adb.exe : adb_io.cpp:81 readx: fd=2048 wanted=4
+10-24 18:06:15.109 26876 15016 D adb.exe : adb_io.cpp:97 readx: fd=2048 wanted=4 got=4 30303036 0006
+10-24 18:06:15.109 26876 15016 D adb.exe : adb_io.cpp:81 readx: fd=2048 wanted=6
+10-24 18:06:15.109 26876 15016 D adb.exe : adb_io.cpp:97 readx: fd=2048 wanted=6 got=6 636c6f736564 closed
+10-24 18:06:15.109 26876 15016 D adb.exe : sysdeps_win32.cpp:537 adb_close: 2048(lo-client:5037)
+10-24 18:06:15.110 26876 15016 D adb.exe : adb_client.cpp:372 _adb_connect error: closed
+10-24 18:06:15.110 26876 15016 D adb.exe : adb_client.cpp:376 adb_connect: return fd -1
+error: closed

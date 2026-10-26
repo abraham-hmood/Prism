@@ -63,6 +63,15 @@ class VirtualAppEmbedder(
     private val replies = Messenger(Handler(Looper.getMainLooper()) { message ->
         when (message.what) {
             VirtualAppHostService.WHAT_HOST -> onReply(message.data)
+            // Detected AFTER the app was reported as showing: it is on screen and has never painted.
+            // Reported through onFailure, which replaces the empty surface with the reason -- an
+            // app stuck on its splash screen is not showing anything, so there is nothing to lose by
+            // putting the explanation there instead.
+            VirtualAppHostService.WHAT_STALL -> {
+                current = null
+                onFailure?.invoke(message.data?.getString(VirtualAppHostService.KEY_REASON)
+                    ?: "The app stopped responding while starting")
+            }
             VirtualAppHostService.WHAT_BACK ->
                 if (message.data?.getBoolean(VirtualAppHostService.KEY_OK) != true) {
                     // Nothing left to go back to, so going back means leaving the app.
@@ -87,8 +96,20 @@ class VirtualAppEmbedder(
 
         override fun onServiceDisconnected(name: ComponentName?) {
             service = null
+            val packageName = current
             current = null
-            onFailure?.invoke("The virtualized app's process stopped")
+            // The process that knew why is gone, so the reason is read from what it wrote before it
+            // died: the crash, or the last stage it reached. Without this the only possible report
+            // is "the process stopped", which is the symptom and not the cause.
+            val report = packageName?.let { VirtualAppDiagnostics.read(context, it) }
+            onFailure?.invoke(
+                buildString {
+                    append("The virtualized app's process stopped")
+                    if (packageName != null) append(" while running ").append(packageName)
+                    if (report != null) append(".\n\n").append(report)
+                    else append(".")
+                }
+            )
         }
     }
 

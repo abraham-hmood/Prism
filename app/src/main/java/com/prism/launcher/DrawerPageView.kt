@@ -4,6 +4,7 @@ package com.prism.launcher
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.view.*
@@ -16,6 +17,9 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.GridLayoutManager
 import com.prism.launcher.databinding.PageDrawerRootBinding
 import com.prism.launcher.notifications.NotificationHistory
+import com.prism.launcher.nora.IosUi
+import com.prism.launcher.theme.ThemeSkin
+import com.prism.launcher.search.WebSearch
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collectLatest
 
@@ -33,7 +37,29 @@ class DrawerPageView(
     private val allowDragToDesktop: () -> Boolean,
 ) : FrameLayout(context) {
 
-    private val adapter = DrawerAppsAdapter({ component -> launch(component) }, { allowDragToDesktop() })
+    /** Opens the long-press menu. Null means this drawer has no menu and keeps drag long-press. */
+    var onShowAppMenu: ((DrawerAppEntry, View) -> Unit)? = null
+
+    private val adapter = DrawerAppsAdapter(
+        { component -> launch(component) },
+        { allowDragToDesktop() },
+        onShowMenu = { entry, anchor, _ ->
+            val handler = onShowAppMenu
+            if (handler == null) {
+                false
+            } else {
+                // The icon's own handoff (see MenuDragHandoff) starts the drag; this only has to
+                // put the menu on screen.
+                handler(entry, anchor)
+                true
+            }
+        },
+        onOpenWebResult = { result -> openWebResult(result.url) },
+    )
+
+    /** The inflated hierarchy. A field rather than an init-local because [scrollToLetter] needs it. */
+    private val binding: PageDrawerRootBinding =
+        PageDrawerRootBinding.inflate(LayoutInflater.from(context), this, true)
 
     /**
      * Opens an app, whichever device it lives on.
@@ -70,21 +96,58 @@ class DrawerPageView(
     }
     private var allApps: List<DrawerAppEntry> = emptyList()
     private var filterJob: Job? = null
+    private var webSearchJob: Job? = null
     private var observeJob: Job? = null
     private var isReloading = false
+
+    /** Local matches for the current query, which web results are inserted into when they arrive. */
+    private data class LocalSearchResults(
+        val query: String,
+        val apps: List<DrawerItem>,
+        val widgets: List<DrawerItem.Widget>,
+        val notifications: List<NotificationHistory.Record>,
+    )
+
+    private var localSearch: LocalSearchResults? = null
+    private var webResultsQuery: String = ""
+    private var webResults: List<WebSearch.Result> = emptyList()
+
+    /**
+     * Package changes while this page is attached, handled without going through the database.
+     *
+     * The manifest receiver covers the background case, but it has to write a row and wait for Room
+     * to wake the flow before the drawer hears about a new app. A runtime receiver refreshes the
+     * list straight from the package manager on the spot, so an app installed with the drawer open
+     * appears as it finishes installing. Both paths are kept: this one dies with the page, the
+     * other one survives a closed launcher.
+     */
+    private val packageWatcher = object : android.content.BroadcastReceiver() {
+        override fun onReceive(ctx: Context?, intent: Intent?) {
+            val pkg = intent?.data?.schemeSpecificPart ?: return
+            AppIconCache.invalidate(pkg)
+            val owner = context as? LifecycleOwner ?: return
+            owner.lifecycleScope.launch { refreshAppList() }
+            // The package manager occasionally answers PACKAGE_ADDED a moment before the new
+            // activity is queryable. One follow-up scan costs nothing and means the app appears
+            // as it finishes installing instead of on the next unrelated refresh.
+            postDelayed({
+                if (isAttachedToWindow) owner.lifecycleScope.launch { refreshAppList() }
+            }, 800L)
+        }
+    }
     
-    // Design tokens
-    private val glowColor = PrismSettings.getGlowColor()
+    // Design tokens. Glow resolves from the theme, not from a fixed accent: a theme without
+    // elevation has no glow, and a themed glow takes that theme's accent.
+    private val glowColor = IosUi.accent(context)
 
     private fun resolveAttr(attr: Int): Int {
+        com.prism.launcher.theme.ThemeSkin.resolveAttr(context, attr)?.let { return it }
         val typedValue = android.util.TypedValue()
         context.theme.resolveAttribute(attr, typedValue, true)
         return typedValue.data
     }
 
     init {
-        val binding = PageDrawerRootBinding.inflate(LayoutInflater.from(context), this, true)
-        
         val layoutManager = GridLayoutManager(context, 4)
         layoutManager.spanSizeLookup = object : GridLayoutManager.SpanSizeLookup() {
             override fun getSpanSize(position: Int): Int {
@@ -95,6 +158,7 @@ class DrawerPageView(
                     DrawerAppsAdapter.VIEW_TYPE_GROUP,
                     DrawerAppsAdapter.VIEW_TYPE_SECTION,
                     DrawerAppsAdapter.VIEW_TYPE_NOTIFICATION,
+                    DrawerAppsAdapter.VIEW_TYPE_WEB_RESULT,
                     DrawerAppsAdapter.VIEW_TYPE_WIDGET -> 4
                     else -> 1
                 }
@@ -102,29 +166,35 @@ class DrawerPageView(
         }
         binding.drawerList.layoutManager = layoutManager
         binding.drawerList.adapter = adapter
-        
+
         // Background is now handled by LauncherActivity for system-level blur
         
-        // 1. Search Bar Neon Glow (Multi-layer Halo)
-        binding.searchGlowContainer.background = NeonGlowDrawable(glowColor, 20f * resources.displayMetrics.density)
+        // 1. Search Bar Neon Glow (Multi-layer Halo). Null under a theme without elevation: the
+        // TextInputLayout then keeps its own themed field shape instead of wearing a halo.
+        binding.searchGlowContainer.background = ThemeSkin.glowDrawable(context, 20f)
         binding.searchContainer.setStartIconTintList(ColorStateList.valueOf(glowColor))
-        
+
         // 2. Settings Button Glow
-        binding.settingsBtnWrapper.background = NeonGlowDrawable(glowColor, 32f * resources.displayMetrics.density, 4f)
+        binding.settingsBtnWrapper.background = ThemeSkin.glowDrawable(context, 32f, 4f)
         binding.settingsBtn.imageTintList = ColorStateList.valueOf(glowColor)
-        
+
         // 3. App Title Neon (Tube effect)
-        NeonGlowEngine.applyNeonText(binding.drawerPageHandle, resolveAttr(R.attr.prismTextPrimary), 16f)
-        
+        if (IosUi.mode(context).shape.elevation > 0) {
+            NeonGlowEngine.applyNeonText(binding.drawerPageHandle, glowColor, 16f)
+        } else {
+            NeonGlowEngine.clearNeonText(binding.drawerPageHandle, IosUi.label(context))
+        }
+
         // 4. Staccato Bubble Neon
-        binding.staccatoBubble.background = NeonGlowDrawable(glowColor, 36f * resources.displayMetrics.density, 8f)
+        binding.staccatoBubble.background = ThemeSkin.glowDrawable(context, 36f, 8f)
+        binding.staccatoBubbleText.setTextColor(IosUi.label(context))
         
         binding.settingsBtn.setOnClickListener {
             context.startActivity(Intent(context, SettingsActivity::class.java))
         }
 
         // Reload Button Glow (same treatment as Settings)
-        binding.reloadBtnWrapper.background = NeonGlowDrawable(glowColor, 32f * resources.displayMetrics.density, 4f)
+        binding.reloadBtnWrapper.background = ThemeSkin.glowDrawable(context, 32f, 4f)
         binding.reloadBtn.imageTintList = ColorStateList.valueOf(glowColor)
 
         binding.reloadBtn.setOnClickListener {
@@ -155,8 +225,10 @@ class DrawerPageView(
                 gravity = Gravity.CENTER
                 setTextColor(resolveAttr(R.attr.prismTextPrimary))
                 alpha = 0.6f
-                // Apply a faint base glow for "unlit" state
-                setShadowLayer(4f, 0f, 0f, Color.argb(40, 0, 0, 0))
+                // A faint base glow for the unlit state, if this theme glows at all.
+                if (IosUi.mode(context).shape.elevation > 0) {
+                    setShadowLayer(4f, 0f, 0f, Color.argb(40, 0, 0, 0))
+                }
                 layoutParams = LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
                 )
@@ -199,14 +271,30 @@ class DrawerPageView(
                         .withEndAction { binding.staccatoBubble.visibility = View.GONE }
                         .start()
                     
-                    letterViews.forEach { 
-                        it.alpha = 0.6f
-                        it.setShadowLayer(4f, 0f, 0f, Color.argb(40, 0, 0, 0))
-                        it.setTextColor(resolveAttr(R.attr.prismTextPrimary))
-                    }
+                    letterViews.forEach { applyLetterAppearance(it, false) }
                     true
                 }
                 else -> false
+            }
+        }
+    }
+
+    private fun applyLetterAppearance(tv: TextView, active: Boolean) {
+        val mode = IosUi.mode(context)
+        if (active) {
+            tv.alpha = 1f
+            if (mode.shape.elevation > 0) {
+                NeonGlowEngine.applyNeonText(tv, glowColor, 18f)
+            } else {
+                NeonGlowEngine.clearNeonText(tv, glowColor)
+            }
+        } else {
+            tv.alpha = 0.6f
+            tv.setTextColor(resolveAttr(R.attr.prismTextPrimary))
+            if (mode.shape.elevation > 0) {
+                tv.setShadowLayer(4f, 0f, 0f, Color.argb(40, 0, 0, 0))
+            } else {
+                tv.setShadowLayer(0f, 0f, 0f, 0)
             }
         }
     }
@@ -215,37 +303,45 @@ class DrawerPageView(
         val index = ((touchY / height) * alphabet.size).toInt().coerceIn(0, alphabet.size - 1)
         val char = alphabet[index]
         binding.staccatoBubbleText.text = char.toString()
-        // Text inside bubble glows white
-        NeonGlowEngine.applyNeonText(binding.staccatoBubbleText, Color.WHITE, 24f)
+        if (IosUi.mode(context).shape.elevation > 0) {
+            NeonGlowEngine.applyNeonText(binding.staccatoBubbleText, glowColor, 24f)
+        } else {
+            NeonGlowEngine.clearNeonText(binding.staccatoBubbleText, IosUi.label(context))
+        }
         
         // Follow the finger (centered on the bubble)
         val bubbleHalfHeight = binding.staccatoBubble.height / 2f
         binding.staccatoBubble.translationY = (touchY - bubbleHalfHeight).coerceIn(0f, height.toFloat() - binding.staccatoBubble.height)
         
-        // Highlight logic with Neon Glow
-        letterViews.forEachIndexed { i, tv ->
-            if (i == index) {
-                tv.alpha = 1f
-                NeonGlowEngine.applyNeonText(tv, glowColor, 18f)
-            } else {
-                tv.alpha = 0.6f
-                tv.setShadowLayer(4f, 0f, 0f, Color.argb(40, 0, 0, 0))
-                tv.setTextColor(resolveAttr(R.attr.prismTextPrimary))
-            }
-        }
+        // Highlight logic: accent in the theme's accent, with a glow only if the theme has one.
+        letterViews.forEachIndexed { i, tv -> applyLetterAppearance(tv, i == index) }
         
         scrollToLetter(char)
     }
 
+    /**
+     * Scrolls the drawer to the first row whose app starts with [char].
+     *
+     * THE INDEX HAS TO BE THE ADAPTER'S, not the flat [allApps] one. The adapter shows category and
+     * developer groups as their own full-width rows before the remaining apps, so an index into the
+     * flat, alphabetically sorted app list landed that many rows too early -- which is why the rail
+     * scrolled to the wrong letter.
+     */
     private fun scrollToLetter(char: Char) {
-        val index = allApps.indexOfFirst { 
-            if (char == '#') !it.label.first().isLetter()
-            else it.label.startsWith(char, ignoreCase = true)
+        fun matches(label: String): Boolean =
+            if (char == '#') label.firstOrNull()?.isLetter() == false
+            else label.startsWith(char, ignoreCase = true)
+
+        val index = adapter.currentList.indexOfFirst { item ->
+            when (item) {
+                is DrawerItem.App -> matches(item.entry.label)
+                is DrawerItem.Group -> item.apps.any { matches(it.label) }
+                else -> false
+            }
         }
         if (index != -1) {
-            val binding = PageDrawerRootBinding.bind(this)
-            (binding.drawerList.layoutManager as GridLayoutManager)
-                .scrollToPositionWithOffset(index, 0)
+            (binding.drawerList.layoutManager as? GridLayoutManager)
+                ?.scrollToPositionWithOffset(index, 0)
         }
     }
 
@@ -253,17 +349,50 @@ class DrawerPageView(
         super.onAttachedToWindow()
         if (observeJob?.isActive == true) return
         val lifecycleOwner = context as? LifecycleOwner ?: return
-        // Live-observes the DB (rather than a one-shot fetch) so an app installed/removed
-        // while this page is already attached -- or via AppPackageReceiver in the background --
-        // shows up immediately, without needing to force-stop and relaunch the whole app.
+
+        runCatching {
+            androidx.core.content.ContextCompat.registerReceiver(
+                context,
+                packageWatcher,
+                IntentFilter().apply {
+                    addAction(Intent.ACTION_PACKAGE_ADDED)
+                    addAction(Intent.ACTION_PACKAGE_REPLACED)
+                    addAction(Intent.ACTION_PACKAGE_REMOVED)
+                    addAction(Intent.ACTION_PACKAGE_CHANGED)
+                    addDataScheme("package")
+                },
+                androidx.core.content.ContextCompat.RECEIVER_EXPORTED,
+            )
+        }
+        // TWO SOURCES, IN THIS ORDER: a live PackageManager scan that is shown immediately, then
+        // the installed-apps table purely as a CHANGE NOTIFIER.
+        //
+        // The drawer used to render the rows of that table, which made a minute-old table a
+        // minute-old drawer: an app whose broadcast arrived while the process was not running, or
+        // whose row a scan had dropped, simply was not there until the next full sync. The table is
+        // still written and still useful -- it is what notices a change -- but the package manager
+        // is the authority on what is installed, and asking it costs one query now that labels are
+        // cached and icons are loaded lazily.
         observeJob = lifecycleOwner.lifecycleScope.launch {
-            AppDatabase.get().installedAppDao().observeAll().collectLatest { entities ->
-                allApps = withContext(Dispatchers.IO) {
-                    resolveDrawerEntries(entities) + trustedEntries()
-                }
-                val grouped = groupDrawerApps(allApps)
-                adapter.submitList(grouped)
-            }
+            refreshAppList()
+            AppDatabase.get().installedAppDao().observeAll().collectLatest { refreshAppList() }
+        }
+    }
+
+    /** Re-reads the installed list and shows it, off the main thread. */
+    private suspend fun refreshAppList() {
+        val entries = withContext(Dispatchers.IO) {
+            loadLauncherApps(context.packageManager) + trustedEntries()
+        }
+        if (!isAttachedToWindow) return
+        allApps = entries
+        val query = binding.searchBar.text?.toString().orEmpty()
+        if (query.isBlank()) {
+            adapter.submitList(groupDrawerApps(entries))
+        } else {
+            // Keep whatever the user is searching for applied to the new list, rather than
+            // silently replacing their results with everything.
+            filterApps(query)
         }
     }
 
@@ -297,6 +426,9 @@ class DrawerPageView(
     override fun onDetachedFromWindow() {
         observeJob?.cancel()
         observeJob = null
+        filterJob?.cancel()
+        webSearchJob?.cancel()
+        runCatching { context.unregisterReceiver(packageWatcher) }
         super.onDetachedFromWindow()
     }
 
@@ -313,10 +445,14 @@ class DrawerPageView(
         binding.reloadBtn.animate().rotationBy(360f).setDuration(500).start()
         lifecycleOwner.lifecycleScope.launch {
             withContext(Dispatchers.IO) {
+                // Labels can change with a language switch and icons with a pack, and neither is a
+                // package broadcast, so a deliberate reload throws the cache away.
+                AppIconCache.clear()
                 val dao = AppDatabase.get().installedAppDao()
                 dao.clearAll()
                 dao.insertAll(queryLauncherApps(context))
             }
+            refreshAppList()
             isReloading = false
             android.widget.Toast.makeText(context, "Apps reloaded", android.widget.Toast.LENGTH_SHORT).show()
         }
@@ -325,8 +461,12 @@ class DrawerPageView(
     private fun filterApps(query: String) {
         val lifecycleOwner = context as? LifecycleOwner ?: return
         filterJob?.cancel()
+        webSearchJob?.cancel()
         filterJob = lifecycleOwner.lifecycleScope.launch {
             if (query.isBlank()) {
+                localSearch = null
+                webResultsQuery = ""
+                webResults = emptyList()
                 val grouped = groupDrawerApps(allApps)
                 adapter.submitList(grouped)
                 return@launch
@@ -367,18 +507,78 @@ class DrawerPageView(
                     .take(WIDGET_RESULT_LIMIT)
             }
 
-            val results = buildList {
-                addAll(grouped)
-                if (widgets.isNotEmpty()) {
-                    add(DrawerItem.Section("Widgets"))
-                    widgets.forEach { add(it) }
-                }
-                if (notifications.isNotEmpty()) {
-                    add(DrawerItem.Section("Notifications"))
-                    notifications.forEach { add(DrawerItem.Notification(it)) }
-                }
+            val queryChanged = localSearch?.query != query
+            if (queryChanged) {
+                // The web section belongs to this query; old results for the previous one must
+                // not appear above the new widget matches while the request is in flight.
+                webResultsQuery = ""
+                webResults = emptyList()
             }
-            adapter.submitList(results)
+            localSearch = LocalSearchResults(
+                query = query,
+                apps = grouped,
+                widgets = widgets,
+                notifications = notifications,
+            )
+            submitSearchResults(query)
+            // A package-list refresh can re-run the local filter for the same query; do not make
+            // the user pay for the same network answer twice.
+            if (webResultsQuery != query) startWebSearch(query)
+        }
+    }
+
+    /**
+     * Searches the web alongside the local matches.
+     *
+     * Separate from [filterApps] so the apps, widgets and notifications appear immediately. The
+     * network answer is allowed to arrive a moment later and slot in above the widgets, rather
+     * than making the whole drawer wait for the selected engine.
+     */
+    private fun startWebSearch(query: String) {
+        val lifecycleOwner = context as? LifecycleOwner ?: return
+        webSearchJob?.cancel()
+        webSearchJob = lifecycleOwner.lifecycleScope.launch {
+            delay(WEB_SEARCH_DEBOUNCE_MS)
+            val results = WebSearch.search(query, limit = WEB_RESULT_LIMIT)
+            if (!isAttachedToWindow) return@launch
+            if (binding.searchBar.text?.toString() != query) return@launch
+            if (localSearch?.query != query) return@launch
+            webResultsQuery = query
+            webResults = results
+            submitSearchResults(query)
+        }
+    }
+
+    /** Applies the current local and web results for [query] to the adapter. */
+    private fun submitSearchResults(query: String) {
+        val local = localSearch ?: return
+        if (local.query != query) return
+
+        val results = buildList {
+            addAll(local.apps)
+            if (webResultsQuery == query && webResults.isNotEmpty()) {
+                add(DrawerItem.Section("Web \u00b7 ${WebSearch.engineLabel()}"))
+                webResults.forEach { add(DrawerItem.WebResult(it)) }
+            }
+            if (local.widgets.isNotEmpty()) {
+                add(DrawerItem.Section("Widgets"))
+                addAll(local.widgets)
+            }
+            if (local.notifications.isNotEmpty()) {
+                add(DrawerItem.Section("Notifications"))
+                local.notifications.forEach { add(DrawerItem.Notification(it)) }
+            }
+        }
+        adapter.submitList(results)
+    }
+
+    /** Opens a web result, preferring the browser page over any other desktop page. */
+    private fun openWebResult(url: String) {
+        val activity = context as? LauncherActivity
+        if (activity != null) {
+            activity.openWebResult(url)
+        } else {
+            com.prism.launcher.browser.openInDefaultBrowser(context, url)
         }
     }
 
@@ -394,41 +594,20 @@ class DrawerPageView(
 
         /** Same reasoning as the notification limit: this is a launcher's search box. */
         const val WIDGET_RESULT_LIMIT = 6
+
+        /** Same reasoning again: enough to be useful above the fold, not a results page. */
+        const val WEB_RESULT_LIMIT = 5
+
+        /**
+         * Long enough that typing a word does not send one request per character, short enough
+         * that the results are already there when the user pauses to read the app matches.
+         */
+        const val WEB_SEARCH_DEBOUNCE_MS = 450L
     }
 
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
 
-    /**
-     * Resolves DB rows to [DrawerAppEntry] via PackageManager. Called on every emission of the
-     * live [InstalledAppDao.observeAll] flow in [onAttachedToWindow].
-     *
-     * Falls back to a live PackageManager scan if the DB is still empty
-     * (i.e. [AppSyncWorker] hasn't finished its first run yet).
-     */
-    private fun resolveDrawerEntries(entities: List<InstalledAppEntity>): List<DrawerAppEntry> {
-        val pm = context.packageManager
-
-        if (entities.isEmpty()) {
-            // Fallback: DB not yet populated — do a live scan so the drawer isn't blank.
-            return loadLauncherApps(pm)
-        }
-
-        return entities.mapNotNull { entity ->
-            try {
-                val cn = ComponentName(entity.packageName, entity.activityClass)
-                val ai = pm.getActivityInfo(cn, 0)
-                DrawerAppEntry(
-                    component = cn,
-                    label = ai.loadLabel(pm).toString(),
-                    icon = try { ai.loadIcon(pm) } catch (_: Throwable) { null },
-                )
-            } catch (_: Throwable) {
-                // Package was uninstalled but AppPackageReceiver hasn't fired yet — skip.
-                null
-            }
-        }.sortedBy { it.label.lowercase() }
-    }
 }
 

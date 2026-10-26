@@ -68,6 +68,10 @@ class VirtualAppActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // Installed here as well as in the service: this window is its own entry point, and an app
+        // launched through it must produce the same report when its process dies.
+        VirtualAppDiagnostics.installCrashHandler(this)
+
         container = FrameLayout(this)
         setContentView(container)
 
@@ -118,7 +122,7 @@ class VirtualAppActivity : Activity() {
                 if (virtual == null) {
                     val reason = loaded.exceptionOrNull()
                     PrismLogger.logError(TAG, "Could not load $packageName", reason)
-                    failWith(reason?.message ?: "$packageName could not be loaded")
+                    failWith("$packageName could not be loaded:\n\n${describe(reason)}")
                     return@runOnUiThread
                 }
 
@@ -129,11 +133,19 @@ class VirtualAppActivity : Activity() {
                 }
 
                 container.removeAllViews()
+                VirtualAppDiagnostics.clear(this, packageName)
+                VirtualAppDiagnostics.stage(this, packageName, "loading its APKs")
                 runCatching {
                     // On the main thread, because an app's Application.onCreate expects to be there
                     // -- it registers lifecycle callbacks, builds Handlers and touches the looper it
                     // believes is the main one.
+                    VirtualAppDiagnostics.stage(this, packageName, "building its Application")
                     val application = runner.createApplication(virtual)
+                    VirtualAppDiagnostics.guestCode(
+                        this,
+                        packageName,
+                        "running $activityName, waiting for its first frame",
+                    )
                     val decor = runner.createActivity(
                         virtual,
                         activityName,
@@ -151,7 +163,7 @@ class VirtualAppActivity : Activity() {
                     title = virtual.applicationInfo.loadLabel(packageManager)
                 }.onFailure {
                     PrismLogger.logError(TAG, "Hosting $packageName/$activityName failed", it)
-                    failWith("$packageName could not start:\n\n${it.javaClass.simpleName}: ${it.message}")
+                    failWith("$packageName could not start:\n\n${describe(it)}")
                 }
             }
         }, "virtualapp-start-$packageName").apply { isDaemon = true; start() }

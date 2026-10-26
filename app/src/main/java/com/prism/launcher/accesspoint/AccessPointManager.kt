@@ -162,15 +162,22 @@ class AccessPointManager(private val context: Context) {
     /** Stop an access point and tear down its network group. */
     suspend fun stopAccessPoint(apId: Long): Result<String> = withContext(Dispatchers.IO) {
         try {
+            // THE PERSISTED RECORD IS ENOUGH TO STOP A GROUP. The in-memory map only knows what
+            // this process started, so after a restart "Stop" said "not active" while the WiFi
+            // Direct group kept broadcasting. The group itself belongs to the system, not to this
+            // process, and `removeGroup` reaches it either way -- which is what makes Stop work
+            // across a restart.
             val config = activeAccessPoints[apId]
-                ?: return@withContext Result.failure(Exception("Access point $apId is not active"))
+                ?: AccessPointStore.getAccessPoints().firstOrNull { it.id == apId }
+                ?: return@withContext Result.failure(Exception("No access point with id $apId"))
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 removeP2pGroup(config)
             } else {
                 legacyReservations.remove(apId)?.close()
-                onHotspotStopped(apId)
             }
+            onHotspotStopped(apId)
+            AccessPointStore.saveAccessPoint(config.copy(isActive = false))
 
             PrismLogger.logSuccess(TAG, "Access point ${config.ssidName} stopped")
             Result.success("Access point stopped")
@@ -212,6 +219,73 @@ class AccessPointManager(private val context: Context) {
 
     fun addDevice(device: ConnectedDevice) { connectedDevices[device.macAddress] = device }
     fun removeDevice(mac: String) { connectedDevices.remove(mac) }
+
+    /**
+     * The devices this access point can actually see.
+     *
+     * ## Why the neighbour table
+     *
+     * Android has no public API for "who is connected to my hotspot". `WifiManager`'s station list is
+     * hidden, and a WiFi Direct group does not report members either. The kernel's ARP/neighbour table
+     * is the one source that lists LAN peers by MAC and address, needs no root, and is refreshed by
+     * ordinary traffic. It can include other LAN devices, which is why the scan is best-effort rather
+     * than authoritative -- but an approximate list is what the screen needs, and an empty one was
+     * never true.
+     */
+    fun getConnectedDevices(apId: Long): List<ConnectedDevice> {
+        refreshConnectedDevices(apId)
+        return connectedDevices.values
+            .filter { it.accessPointId == apId }
+            .sortedBy { it.ipAddress }
+    }
+
+    private fun refreshConnectedDevices(apId: Long) {
+        val now = System.currentTimeMillis()
+        val neighbours = readNeighbours()
+        val seen = neighbours.map { it.first }.toSet()
+
+        connectedDevices.values
+            .filter { it.accessPointId == apId && it.macAddress !in seen }
+            .forEach { connectedDevices.remove(it.macAddress) }
+
+        neighbours.forEach { (mac, ip) ->
+            val existing = connectedDevices[mac]?.takeIf { it.accessPointId == apId }
+            connectedDevices[mac] = ConnectedDevice(
+                id = existing?.id ?: 0L,
+                accessPointId = apId,
+                macAddress = mac,
+                deviceName = existing?.deviceName?.takeIf { it != "Unknown Device" }
+                    ?: "Device ${ip.substringAfterLast('.', ip)}",
+                ipAddress = ip,
+                connectedAt = existing?.connectedAt ?: now,
+                lastSeen = now,
+                isBlocked = existing?.isBlocked ?: false,
+            )
+        }
+    }
+
+    /** MAC, IPv4, interface -- from `/proc/net/arp`, which is unreadable on some hardened builds. */
+    private fun readNeighbours(): List<Pair<String, String>> {
+        val table = java.io.File("/proc/net/arp")
+        if (!table.canRead()) {
+            PrismLogger.logInfo(TAG, "The ARP table is not readable on this build; connected devices cannot be listed")
+            return emptyList()
+        }
+        return runCatching {
+            table.readLines().drop(1).mapNotNull { line ->
+                val parts = line.trim().split(Regex("\\s+"))
+                // IP, HW type, flags, HW address, mask, device. Incomplete entries carry a zero MAC
+                // and a flags column of 0x0; they are a pending lookup, not a connected device.
+                if (parts.size < 6) return@mapNotNull null
+                val mac = parts[3]
+                val complete = parts[2] != "0x0"
+                if (!complete || mac == "00:00:00:00:00:00") null else mac to parts[0]
+            }
+        }.getOrElse {
+            PrismLogger.logWarning(TAG, "Could not read the ARP table: " + it.message)
+            emptyList()
+        }
+    }
 
     fun getAccessPointStats(apId: Long): AccessPointStats? = apStats[apId]
     fun getActiveAccessPoints(): List<AccessPointConfig> = activeAccessPoints.values.toList()

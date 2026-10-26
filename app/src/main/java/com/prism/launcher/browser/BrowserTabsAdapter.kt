@@ -68,8 +68,11 @@ data class TabCardUi(
 
 fun captureWebPreview(webView: android.webkit.WebView, maxW: Int, maxH: Int): Bitmap? {
     return try {
-        val w = webView.width.coerceAtLeast(1)
-        val h = webView.height.coerceAtLeast(1)
+        // A GONE or not-yet-laid-out WebView has no size. Clamping that to 1 produced the 1x1
+        // previews; returning null lets the card show its placeholder instead.
+        if (webView.width < 2 || webView.height < 2) return null
+        val w = webView.width
+        val h = webView.height
         val scale = minOf(maxW.toFloat() / w, maxH.toFloat() / h, 1f)
         val tw = (w * scale).toInt().coerceAtLeast(1)
         val th = (h * scale).toInt().coerceAtLeast(1)

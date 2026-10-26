@@ -1,0 +1,21 @@
+# ninja log v7
+7	1947	8146518262969448	llama-populate-prefix/src/llama-populate-stamp/llama-populate-mkdir	ebe3fd5502d4de3d
+7	1947	8146518262969448	F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-mkdir	ebe3fd5502d4de3d
+1948	131000	8146519553143468	llama-populate-prefix/src/llama-populate-stamp/llama-populate-download	46f8c3c647821367
+1948	131000	8146519553143468	F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-download	46f8c3c647821367
+131000	132054	8146519553975019	llama-populate-prefix/src/llama-populate-stamp/llama-populate-update	9b5b717bf956872d
+131000	132054	8146519553975019	F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-update	9b5b717bf956872d
+132546	132948	8146519573128035	llama-populate-prefix/src/llama-populate-stamp/llama-populate-patch	247df5bc3731399f
+132546	132948	8146519573128035	F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-patch	247df5bc3731399f
+132948	133772	8146519580754511	llama-populate-prefix/src/llama-populate-stamp/llama-populate-configure	49b134313813fc45
+132948	133772	8146519580754511	F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-configure	49b134313813fc45
+133772	134205	8146519585720551	llama-populate-prefix/src/llama-populate-stamp/llama-populate-build	46de27c97548a7f9
+133772	134205	8146519585720551	F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-build	46de27c97548a7f9
+134205	134682	8146519590566798	llama-populate-prefix/src/llama-populate-stamp/llama-populate-install	99ed5caa158608f6
+134205	134682	8146519590566798	F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-install	99ed5caa158608f6
+134682	135032	8146519593788320	llama-populate-prefix/src/llama-populate-stamp/llama-populate-test	b22271bfe778fa67
+134682	135032	8146519593788320	F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-test	b22271bfe778fa67
+135032	135716	8146519600502698	CMakeFiles/llama-populate-complete	ee5d5043547906f8
+135032	135716	8146519600502698	llama-populate-prefix/src/llama-populate-stamp/llama-populate-done	ee5d5043547906f8
+135032	135716	8146519600502698	F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/CMakeFiles/llama-populate-complete	ee5d5043547906f8
+135032	135716	8146519600502698	F:/AndroidStudioProjects/Prism/.artifacts/nine-build/_deps/llama-subbuild/llama-populate-prefix/src/llama-populate-stamp/llama-populate-done	ee5d5043547906f8

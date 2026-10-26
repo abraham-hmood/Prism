@@ -121,7 +121,7 @@ class StremioRepositoriesActivity : PrismBaseActivity() {
             })
         }
 
-        androidx.appcompat.app.AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Add a repository")
             .setView(box)
             .setNegativeButton("Cancel", null)
@@ -169,7 +169,7 @@ class StremioRepositoriesActivity : PrismBaseActivity() {
             })
 
             card.setOnLongClickListener {
-                androidx.appcompat.app.AlertDialog.Builder(this)
+                com.prism.launcher.theme.PrismDialogs.Builder(this)
                     .setTitle("Remove ${repository.name}?")
                     .setMessage("Add-ons you already installed from it stay installed.")
                     .setNegativeButton("Cancel", null)

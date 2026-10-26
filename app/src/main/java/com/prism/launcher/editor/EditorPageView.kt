@@ -3,7 +3,9 @@ package com.prism.launcher.editor
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
+import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.GradientDrawable
 import android.view.Gravity
 import android.view.MotionEvent
@@ -16,6 +18,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
@@ -28,6 +31,7 @@ import com.prism.launcher.PrismLogger
 import com.prism.launcher.nora.IosUi
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -59,6 +63,17 @@ class EditorPageView(context: Context) : FrameLayout(context) {
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
     private val rail = LinearLayout(context)
+
+    /**
+     * Extension icons at the foot of the left rail, and the second rail they expand into.
+     *
+     * Up to [INLINE_EXTENSION_LIMIT] extensions are a column of icon buttons in the existing rail,
+     * because that is the least machinery that makes them visible. Past that, the left rail carries
+     * one Extensions button and the icons live in [extensionRail] -- a collapsible list between the
+     * rail and the editor, so the code is pushed right rather than covered.
+     */
+    private val railExtensions = LinearLayout(context)
+    private val extensionRail = LinearLayout(context)
     private val webView = WebView(context)
     private val tree = FileTreePanel(context)
     private val terminal = TerminalPanel(context)
@@ -95,6 +110,67 @@ class EditorPageView(context: Context) : FrameLayout(context) {
 
     private val scratchRoot: File get() = File(context.filesDir, "editor/scratch").apply { mkdirs() }
 
+    // ── Extensions UI state ────────────────────────────────────────────────
+    private var installedExtensions: List<ExtensionStore.Installed> = emptyList()
+    private val extensionDetails = mutableMapOf<String, ExtensionStore.Details>()
+    private val activeExtensions = mutableSetOf<String>()
+    private val liveCommands = mutableSetOf<String>()
+
+    /**
+     * Why an extension failed to activate, by id.
+     *
+     * Kept because the host reports it once and the popup is usually opened later. "Has not
+     * finished activating" is the wrong thing to say about an extension that threw, and the
+     * exception text is the only useful next step for whoever installed it.
+     */
+    private val extensionErrors = mutableMapOf<String, String>()
+    private var extensionLoadJob: Job? = null
+    private var extensionRailShown = false
+
+    /** The floating extension view, if one is open. Only one at a time. */
+    private var extensionPopup: View? = null
+    private var extensionPopupHeader: LinearLayout? = null
+    private var extensionPopupId: String? = null
+
+    /**
+     * The extension's own view, rendered inside the floating popup.
+     *
+     * A VS Code extension draws by assigning `webview.html`. That HTML crosses the bridge and is
+     * loaded in a WebView here, so the popup shows the extension's real interface -- not a summary
+     * of it. The maps hold what has arrived so reopening the popup shows the current view
+     * immediately, and `panelId`/`renderedHtml` keep an idle refresh from reloading the document.
+     */
+    private var extensionPopupContent: FrameLayout? = null
+    private var extensionPopupWebView: WebView? = null
+    private var extensionPopupPanel: String? = null
+    private var extensionPopupRenderedHtml: String? = null
+    private val extensionHtml = mutableMapOf<String, String>()            // panel id -> HTML
+    private val extensionPanelOf = mutableMapOf<String, String>()         // extension id -> panel id
+    private val extensionWebviewState = mutableMapOf<String, String>()    // panel id -> saved state
+
+    /**
+     * The two things an extension popup can show.
+     *
+     * VS Code gives an extension two surfaces: the view it draws, and the commands it contributes.
+     * The popup used to show whichever one happened to exist, which meant an extension with no view
+     * yet showed a command list and never switched, and an extension with a view hid its commands
+     * entirely. They are now tabs, in the order VS Code itself puts them: the view first, because
+     * that is what "open this extension" means.
+     */
+    private enum class ExtensionPopupTab { VIEW, COMMANDS }
+
+    private var extensionPopupTab = ExtensionPopupTab.VIEW
+    private var extensionPopupTabs: com.prism.launcher.nora.IosSegmentedControl? = null
+
+    /** The command list, built lazily and kept so switching tabs does not rebuild it. */
+    private var extensionPopupCommands: View? = null
+
+    /** What the View tab shows when the extension has not drawn anything. */
+    private var extensionPopupPlaceholder: View? = null
+
+    /** Which commands the command tab was built for, so it is rebuilt only when they change. */
+    private var extensionPopupCommandSignature: String = ""
+
     /**
      * The two containers the page is laid out in.
      *
@@ -123,9 +199,11 @@ class EditorPageView(context: Context) : FrameLayout(context) {
         setBackgroundColor(IosUi.groupedBackground(context))
         buildEditorSurface()
         buildRail()
+        buildExtensionRail()
         buildTree()
         buildSetupPanel()
         renderSetup()
+        refreshExtensionButtons()
     }
 
     // ── Layout ─────────────────────────────────────────────────────────────
@@ -247,10 +325,969 @@ class EditorPageView(context: Context) : FrameLayout(context) {
             rail.addView(row, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         }
 
+        // Installed extensions live below the menus, so they are reachable whether the rail is
+        // collapsed to glyphs or expanded to labels.
+        railExtensions.orientation = LinearLayout.VERTICAL
+        railExtensions.setPadding(0, IosUi.dp(context, 4f), 0, IosUi.dp(context, 10f))
+        rail.addView(
+            railExtensions,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ),
+        )
+
         columns.addView(
             rail, 0,
             LinearLayout.LayoutParams(IosUi.dp(context, COLLAPSED_DP), LinearLayout.LayoutParams.MATCH_PARENT)
         )
+    }
+
+    // ── Extension rail and floating views ──────────────────────────────────
+
+    /**
+     * The second rail, hidden until the Extensions button in the left rail asks for it.
+     *
+     * Placed between the rail and the editor rather than on top of either, which is what makes it
+     * push the code right instead of covering it. It starts hidden so a phone layout with four
+     * extensions does not give up 46 dp of code width for a list the user has not opened.
+     */
+    private fun buildExtensionRail() {
+        extensionRail.orientation = LinearLayout.VERTICAL
+        extensionRail.setBackgroundColor(IosUi.cardBackground(context))
+        extensionRail.visibility = View.GONE
+        columns.addView(
+            extensionRail, 1,
+            LinearLayout.LayoutParams(
+                IosUi.dp(context, COLLAPSED_DP), LinearLayout.LayoutParams.MATCH_PARENT,
+            ),
+        )
+    }
+
+    /**
+     * Re-reads the installed extensions and rebuilds both places their icons can appear.
+     *
+     * Called on attach, on window focus (which is how returning from the marketplace is noticed),
+     * and when the rail is opened, because an extension installed in another screen has to show up
+     * without restarting the editor.
+     */
+    private fun refreshExtensionButtons() {
+        extensionLoadJob?.cancel()
+        extensionLoadJob = scope.launch {
+            val installed = withContext(Dispatchers.IO) {
+                runCatching { ExtensionStore.installed() }.getOrDefault(emptyList())
+            }
+            installedExtensions = installed
+            extensionDetails.clear()
+            installed.forEach { extension ->
+                val details = withContext(Dispatchers.IO) {
+                    runCatching { ExtensionStore.details(extension) }.getOrNull()
+                }
+                if (details != null) extensionDetails[extension.id] = details
+            }
+
+            railExtensions.removeAllViews()
+            extensionRail.removeAllViews()
+            if (installed.isEmpty()) {
+                extensionRail.visibility = View.GONE
+                extensionRailShown = false
+                return@launch
+            }
+
+            if (installed.size <= INLINE_EXTENSION_LIMIT) {
+                installed.forEach { extension ->
+                    railExtensions.addView(extensionIconButton(extension, 38f) { openExtensionPopup(extension) })
+                }
+                extensionRail.visibility = View.GONE
+                extensionRailShown = false
+            } else {
+                railExtensions.addView(extensionsToggleButton())
+                renderExtensionRail()
+                if (extensionRailShown) extensionRail.visibility = View.VISIBLE
+            }
+        }
+    }
+
+    /** The single button that opens the second rail when there are more than three extensions. */
+    private fun extensionsToggleButton(): View {
+        val button = TextView(context).apply {
+            text = "\u29C9"      // ⧉ -- two squares, the closest plain glyph to "many panels"
+            textSize = 19f
+            gravity = Gravity.CENTER
+            setTextColor(IosUi.accent(context))
+            contentDescription = "Extensions"
+            isClickable = true
+            setOnClickListener {
+                extensionRailShown = !extensionRailShown
+                if (extensionRailShown) {
+                    renderExtensionRail()
+                    extensionRail.visibility = View.VISIBLE
+                } else {
+                    extensionRail.visibility = View.GONE
+                }
+            }
+        }
+        button.background = GradientDrawable().apply {
+            setColor(IosUi.groupedBackground(context))
+            cornerRadius = IosUi.dp(context, 10f).toFloat()
+        }
+        button.layoutParams = LinearLayout.LayoutParams(IosUi.dp(context, 40f), IosUi.dp(context, 40f)).apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+            topMargin = IosUi.dp(context, 6f)
+        }
+        return button
+    }
+
+    private fun renderExtensionRail() {
+        // The first child is the header; keep it and rebuild only the icons below it.
+        if (extensionRail.childCount == 0) {
+            extensionRail.addView(
+                TextView(context).apply {
+                    text = "EXT"
+                    textSize = 9f
+                    gravity = Gravity.CENTER
+                    letterSpacing = 0.1f
+                    setTextColor(IosUi.secondaryLabel(context))
+                    setPadding(0, IosUi.dp(context, 8f), 0, IosUi.dp(context, 4f))
+                },
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+        }
+        while (extensionRail.childCount > 1) extensionRail.removeViewAt(1)
+        installedExtensions.forEach { extension ->
+            extensionRail.addView(extensionIconButton(extension, 38f) { openExtensionPopup(extension) })
+        }
+    }
+
+    /**
+     * One extension as a square icon button.
+     *
+     * The manifest's `icon` when it has a readable bitmap, and its initial otherwise: plenty of
+     * published extensions ship an SVG or no icon at all, and an invisible button would be worse
+     * than a letter. Disabled extensions are dimmed but still open, because their view is where
+     * somebody finds out why the extension is not doing anything.
+     */
+    private fun extensionIconButton(
+        extension: ExtensionStore.Installed,
+        sizeDp: Float,
+        onClick: () -> Unit,
+    ): View {
+        val size = IosUi.dp(context, sizeDp)
+        val icon = extensionIcon(extension)
+        val view: View = if (icon != null) {
+            ImageView(context).apply {
+                setImageDrawable(icon)
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                val pad = IosUi.dp(context, 7f)
+                setPadding(pad, pad, pad, pad)
+            }
+        } else {
+            TextView(context).apply {
+                text = extension.displayName.firstOrNull()?.uppercase() ?: "E"
+                textSize = 16f
+                gravity = Gravity.CENTER
+                setTextColor(IosUi.label(context))
+                typeface = android.graphics.Typeface.DEFAULT_BOLD
+            }
+        }
+        view.background = GradientDrawable().apply {
+            setColor(IosUi.groupedBackground(context))
+            cornerRadius = IosUi.dp(context, 10f).toFloat()
+            setStroke(1, IosUi.separator(context))
+        }
+        view.alpha = if (extension.enabled) 1f else 0.4f
+        view.contentDescription = extension.displayName
+        view.isClickable = true
+        view.setOnClickListener { onClick() }
+        view.layoutParams = LinearLayout.LayoutParams(size, size).apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+            topMargin = IosUi.dp(context, 6f)
+        }
+        return view
+    }
+
+    private fun extensionIcon(extension: ExtensionStore.Installed): android.graphics.drawable.Drawable? {
+        val file = extensionDetails[extension.id]?.iconFile ?: return null
+        return runCatching {
+            BitmapFactory.decodeFile(file.absolutePath)?.let { BitmapDrawable(resources, it) }
+        }.getOrNull()
+    }
+
+    /**
+     * Opens an extension as a floating, movable view.
+     *
+     * The popup is the extension's own surface: when it has contributed a webview -- a panel, or a
+     * sidebar view resolved on demand -- that HTML is rendered here, and a later `webview.html`
+     * assignment replaces it, so whatever view the extension changes to is the one on screen. Only
+     * an extension that has not drawn anything falls back to the metadata panel (host, state,
+     * description, commands), whose command rows are live and can open the extension's first view.
+     */
+    private fun openExtensionPopup(extension: ExtensionStore.Installed) {
+        closeExtensionPopup()
+        val card = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable().apply {
+                setColor(IosUi.cardBackground(context))
+                cornerRadius = IosUi.dp(context, 16f).toFloat()
+                setStroke(1, IosUi.separator(context))
+            }
+            elevation = IosUi.dp(context, 12f).toFloat()
+            clipToOutline = true
+        }
+
+        val header = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(IosUi.dp(context, 12f), IosUi.dp(context, 10f), IosUi.dp(context, 6f), IosUi.dp(context, 8f))
+            setBackgroundColor(IosUi.groupedBackground(context))
+        }
+        extensionIcon(extension)?.let { drawable ->
+            header.addView(ImageView(context).apply { setImageDrawable(drawable) }, LinearLayout.LayoutParams(
+                IosUi.dp(context, 20f), IosUi.dp(context, 20f),
+            ).apply { marginEnd = IosUi.dp(context, 8f) })
+        }
+        header.addView(
+            TextView(context).apply {
+                text = extension.displayName
+                textSize = 13f
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                setTextColor(IosUi.label(context))
+            },
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
+        )
+        header.addView(
+            TextView(context).apply {
+                text = "\u00D7"
+                textSize = 22f
+                gravity = Gravity.CENTER
+                setTextColor(IosUi.secondaryLabel(context))
+                isClickable = true
+                setPadding(IosUi.dp(context, 10f), 0, IosUi.dp(context, 6f), 0)
+                contentDescription = "Close"
+                setOnClickListener { closeExtensionPopup() }
+            },
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ),
+        )
+
+        // One container for everything the popup can show. The two tabs only toggle visibility,
+        // so switching to Commands and back does not tear down the extension's view -- a WebView
+        // that is destroyed loses whatever the extension was in the middle of doing, including a
+        // sign-in flow.
+        val content = FrameLayout(context)
+
+        val tabs = com.prism.launcher.nora.IosSegmentedControl(context).apply {
+            setSegments(listOf("View", "Commands"), 0)
+        }
+        val tabHolder = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(
+                IosUi.dp(context, 10f), IosUi.dp(context, 4f),
+                IosUi.dp(context, 10f), IosUi.dp(context, 8f),
+            )
+        }
+        tabHolder.addView(tabs, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, IosUi.dp(context, 30f),
+        ))
+
+        card.addView(header)
+        card.addView(tabHolder)
+        card.addView(content, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f,
+        ))
+
+        val params = LayoutParams(IosUi.dp(context, 310f), IosUi.dp(context, 400f)).apply {
+            gravity = Gravity.TOP or Gravity.END
+            topMargin = IosUi.dp(context, 80f)
+            rightMargin = IosUi.dp(context, 12f)
+        }
+        addView(card, params)
+        card.bringToFront()
+
+        extensionPopup = card
+        extensionPopupContent = content
+        extensionPopupHeader = header
+        extensionPopupId = extension.id
+        extensionPopupTabs = tabs
+        extensionPopupTab = ExtensionPopupTab.VIEW
+        extensionPopupCommands = null
+        extensionPopupPlaceholder = null
+        extensionPopupCommandSignature = ""
+
+        tabs.onSelected = { index ->
+            extensionPopupTab = if (index == 0) ExtensionPopupTab.VIEW
+                else ExtensionPopupTab.COMMANDS
+            if (extensionPopupTab == ExtensionPopupTab.VIEW) requestExtensionView(extension.id)
+            renderExtensionPopup(extension)
+        }
+
+        makePopupDraggable(card, header)
+        renderExtensionPopup(extension)
+
+        // A Node-only extension on a device without the runtime cannot activate, and asking it
+        // for a view would only produce the same nothing. Start the host instead: that is what
+        // surfaces the install offer and, once installed, activates the extension properly.
+        if (extension.enabled && extension.nodeEntry != null && !extension.nodeReady) {
+            startNodeHost()
+        }
+
+        // An extension that was never activated has nothing to show and no commands to run, and
+        // that is not a reason to present an empty window: activate it, then ask what it draws.
+        if (extension.enabled && extension.id !in activeExtensions) {
+            activateExtension(extension)
+        } else {
+            requestExtensionView(extension.id)
+        }
+    }
+
+    /** Drags [card] by its [handle], keeping it inside the editor page. */
+    private fun makePopupDraggable(card: View, handle: View) {
+        var downX = 0f
+        var downY = 0f
+        var startX = 0f
+        var startY = 0f
+        handle.isClickable = true
+        handle.setOnTouchListener { _, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = event.rawX
+                    downY = event.rawY
+                    startX = card.translationX
+                    startY = card.translationY
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val maxX = (width - card.left - card.width).toFloat().coerceAtLeast(0f)
+                    val maxY = (height - card.top - card.height).toFloat().coerceAtLeast(0f)
+                    card.translationX = (startX + (event.rawX - downX))
+                        .coerceIn((-card.left).toFloat(), maxX)
+                    card.translationY = (startY + (event.rawY - downY))
+                        .coerceIn((-card.top).toFloat(), maxY)
+                    true
+                }
+                else -> true
+            }
+        }
+    }
+
+    private fun renderExtensionPopup(extension: ExtensionStore.Installed) {
+        val content = extensionPopupContent ?: return
+        extensionPopupTabs?.select(
+            if (extensionPopupTab == ExtensionPopupTab.VIEW) 0 else 1,
+            animate = false,
+            notify = false,
+        )
+        when (extensionPopupTab) {
+            ExtensionPopupTab.VIEW -> renderExtensionViewTab(extension, content)
+            ExtensionPopupTab.COMMANDS -> renderExtensionCommandsTab(extension, content)
+        }
+    }
+
+    /**
+     * The View tab: the extension's own surface, or an explanation of why there isn't one.
+     *
+     * The commands are deliberately NOT folded in here. Showing a command list in place of a view
+     * is what made the popup look like an extension browser rather than the extension itself; a
+     * view that has not been drawn yet gets a sentence and a way to the Commands tab.
+     */
+    private fun renderExtensionViewTab(
+        extension: ExtensionStore.Installed,
+        content: FrameLayout,
+    ) {
+        extensionPopupCommands?.visibility = View.GONE
+        val panelId = extensionPanelOf[extension.id]
+        val html = panelId?.let { extensionHtml[it] }
+        if (panelId != null && !html.isNullOrBlank()) {
+            showExtensionView(extension, content, panelId, html)
+        } else {
+            showExtensionPlaceholder(extension, content)
+        }
+    }
+
+    /**
+     * Loads the extension's HTML into the popup.
+     *
+     * ONLY A CHANGED DOCUMENT IS RELOADED. The popup refreshes on activation and command events
+     * too, and reloading a webview for those would throw away whatever the user had typed into it.
+     * When the extension assigns `webview.html` again -- or switches to a different panel -- the
+     * panel id or HTML differs and the new document replaces the old, which is the behaviour the
+     * user asked for: whatever view the extension changes to is the one on screen.
+     */
+    private fun showExtensionView(
+        extension: ExtensionStore.Installed,
+        content: FrameLayout,
+        panelId: String,
+        html: String,
+    ) {
+        extensionPopupCommands?.visibility = View.GONE
+        extensionPopupPlaceholder?.let { placeholder ->
+            if (placeholder.parent === content) content.removeView(placeholder)
+        }
+        extensionPopupPlaceholder = null
+
+        // A DIFFERENT PANEL MEANS A DIFFERENT DOCUMENT, but the same panel must keep its WebView:
+        // an extension that updates its view by reassigning `webview.html` is re-rendered here,
+        // and reloading into a fresh WebView on every keystroke of a chat view would be unusable.
+        if (extensionPopupWebView == null || extensionPopupPanel != panelId) {
+            extensionPopupWebView?.let { old ->
+                (old.parent as? android.view.ViewGroup)?.removeView(old)
+                old.destroy()
+            }
+            val view = buildExtensionWebview()
+            extensionPopupWebView = view
+            extensionPopupRenderedHtml = null
+            content.addView(
+                view,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                ),
+            )
+        } else {
+            val view = extensionPopupWebView ?: return
+            if (view.parent == null) {
+                content.addView(
+                    view,
+                    FrameLayout.LayoutParams(
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+                    ),
+                )
+            }
+            view.visibility = View.VISIBLE
+        }
+
+        val view = extensionPopupWebView ?: return
+        view.visibility = View.VISIBLE
+        if (extensionPopupPanel == panelId && extensionPopupRenderedHtml == html) return
+
+        extensionPopupPanel = panelId
+        extensionPopupRenderedHtml = html
+
+        // Relative resources in an extension's HTML resolve against its own directory, and its
+        // absolute `file://` references (from `webview.asWebviewUri`) resolve anywhere in app
+        // storage. The trailing slash matters: without it the last path segment is treated as a
+        // file and every relative reference resolves one level too high.
+        val base = "file://" + extension.directory.absolutePath.trimEnd('/') + "/"
+        extensionPopupWebView?.loadDataWithBaseURL(
+            base, prepareExtensionHtml(html, panelId), "text/html", "utf-8", null
+        )
+    }
+
+    /**
+     * What the View tab shows before the extension has drawn anything.
+     *
+     * The point of this tab is to be the extension, so an empty one gets an explanation and a way
+     * to the commands rather than a command list dressed up as a view. Rebuilt only when the state
+     * behind it changes, so a view that arrives a moment later does not flash it away and back.
+     */
+    private fun showExtensionPlaceholder(
+        extension: ExtensionStore.Installed,
+        content: FrameLayout,
+    ) {
+        extensionPopupWebView?.visibility = View.GONE
+        extensionPopupCommands?.visibility = View.GONE
+
+        val details = extensionDetails[extension.id] ?: ExtensionStore.details(extension)
+        // A Node-only extension on a device without the runtime is not "still activating": it
+        // cannot activate at all. That state gets its own explanation and an install button,
+        // instead of a sentence promising a view that will never arrive.
+        val needsNode = extension.nodeEntry != null && !extension.nodeReady
+        val failure = extensionErrors[extension.id]
+        val signature = extension.id + "|" + extension.enabled + "|" +
+            (extension.id in activeExtensions) + "|" + needsNode + "|" + failure + "|" +
+            details.commands.size
+
+        val existing = extensionPopupPlaceholder
+        if (existing != null && existing.tag == signature && existing.parent === content) {
+            existing.visibility = View.VISIBLE
+            return
+        }
+        existing?.let { if (it.parent === content) content.removeView(it) }
+
+        val body = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(
+                IosUi.dp(context, 16f), IosUi.dp(context, 16f),
+                IosUi.dp(context, 16f), IosUi.dp(context, 16f),
+            )
+        }
+        body.addView(TextView(context).apply {
+            text = if (needsNode) "Node.js is needed" else "No view yet"
+            textSize = 15f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            setTextColor(IosUi.label(context))
+        })
+        body.addView(TextView(context).apply {
+            text = when {
+                !extension.enabled ->
+                    "This extension is disabled, so it has not drawn a view."
+                needsNode ->
+                    "${extension.displayName} draws its interface from Node.js code, and the " +
+                        "Node.js runtime is not installed. Install it once and this view appears " +
+                        "here — no restart needed."
+                failure != null ->
+                    "${extension.displayName} could not activate: $failure"
+                extension.id !in activeExtensions ->
+                    "${extension.displayName} has not finished activating, so it has no view to " +
+                        "show yet. This screen will show it as soon as the extension draws one."
+                details.commands.isNotEmpty() ->
+                    "${extension.displayName} has not drawn a view. Commands that open one are on " +
+                        "the Commands tab — a view it creates appears here."
+                else ->
+                    "${extension.displayName} does not draw a view of its own. It contributes " +
+                        "languages, commands or settings instead."
+            }
+            textSize = 12f
+            setTextColor(IosUi.secondaryLabel(context))
+            setLineSpacing(IosUi.dp(context, 2f).toFloat(), 1f)
+            setPadding(0, IosUi.dp(context, 8f), 0, 0)
+        })
+
+        if (needsNode) {
+            // The one button that can turn this placeholder into a view. Installing is slow and
+            // large, so it is offered, never started silently from here.
+            body.addView(IosUi.tintedButton(context, "Install Node.js runtime").apply {
+                setOnClickListener { installNodeRuntime() }
+            }, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = IosUi.dp(context, 14f) })
+            body.addView(TextView(context).apply {
+                text = "About ${NodeInstaller.APPROXIMATE_DOWNLOAD_MB} MB, and it stays on this " +
+                    "device until you remove it."
+                textSize = 11f
+                setTextColor(IosUi.tertiaryLabel(context))
+                setPadding(0, IosUi.dp(context, 6f), 0, 0)
+            })
+        }
+
+        if (details.commands.isNotEmpty()) {
+            body.addView(IosUi.tintedButton(context, "Open Commands").apply {
+                setOnClickListener {
+                    extensionPopupTab = ExtensionPopupTab.COMMANDS
+                    renderExtensionPopup(extension)
+                }
+            }, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = IosUi.dp(context, 14f) })
+        }
+
+        val scroll = ScrollView(context).apply {
+            addView(body)
+            tag = signature
+        }
+        extensionPopupPlaceholder = scroll
+        content.addView(scroll, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT,
+        ))
+    }
+
+    /**
+     * The Commands tab.
+     *
+     * Commands are executable here, which is the whole difference from the old fallback panel:
+     * they used to announce that they had run and leave the popup where it was. Running one now
+     * switches to the View tab and asks the extension for its view afterwards, because a command
+     * that opens a panel has already opened it by the time the host answers.
+     */
+    private fun renderExtensionCommandsTab(
+        extension: ExtensionStore.Installed,
+        content: FrameLayout,
+    ) {
+        extensionPopupWebView?.visibility = View.GONE
+        extensionPopupPlaceholder?.visibility = View.GONE
+
+        val details = extensionDetails[extension.id] ?: ExtensionStore.details(extension)
+        val signature = buildString {
+            append(extension.id).append('|').append(extension.enabled).append('|')
+            append(extension.id in activeExtensions).append('|')
+            append(details.description).append('|')
+            details.commands.forEach { command ->
+                append(command.id).append(':').append(command.id in liveCommands).append(',')
+            }
+        }
+
+        val existing = extensionPopupCommands
+        if (existing != null && existing.tag == signature && existing.parent === content) {
+            existing.visibility = View.VISIBLE
+            return
+        }
+        existing?.let { if (it.parent === content) content.removeView(it) }
+
+        val body = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(
+                IosUi.dp(context, 14f), IosUi.dp(context, 10f),
+                IosUi.dp(context, 14f), IosUi.dp(context, 14f),
+            )
+        }
+        if (details.description.isNotBlank()) {
+            body.addView(TextView(context).apply {
+                text = details.description
+                textSize = 12f
+                setTextColor(IosUi.secondaryLabel(context))
+                setLineSpacing(IosUi.dp(context, 2f).toFloat(), 1f)
+            })
+            body.addView(View(context), LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, IosUi.dp(context, 10f),
+            ))
+        }
+
+        body.addView(popupSectionLabel("STATE"))
+        body.addView(TextView(context).apply {
+            text = when {
+                !extension.enabled -> "Disabled -- not loaded by the editor"
+                extension.id in activeExtensions -> "Active in ${hostName(extension)}"
+                extension.runtime == null -> "Declarative -- contributes through its manifest"
+                else -> "Waiting for ${hostName(extension)} to activate it"
+            }
+            textSize = 12f
+            setTextColor(IosUi.label(context))
+        })
+
+        body.addView(popupSectionLabel("COMMANDS"))
+        if (details.commands.isEmpty()) {
+            body.addView(TextView(context).apply {
+                text = "This extension declares no commands."
+                textSize = 12f
+                setTextColor(IosUi.secondaryLabel(context))
+            })
+        } else {
+            details.commands.forEach { command ->
+                body.addView(commandRow(extension, command))
+            }
+        }
+
+        body.addView(TextView(context).apply {
+            text = if (details.commands.isEmpty()) {
+                "This extension draws no view of its own."
+            } else {
+                "Tap a command to run it. A view it opens appears on the View tab."
+            }
+            textSize = 10f
+            setTextColor(IosUi.secondaryLabel(context))
+            setPadding(0, IosUi.dp(context, 12f), 0, 0)
+        })
+
+        val scroll = ScrollView(context).apply {
+            addView(body)
+            tag = signature
+        }
+        extensionPopupCommands = scroll
+        extensionPopupCommandSignature = signature
+        content.addView(scroll, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT,
+            FrameLayout.LayoutParams.MATCH_PARENT,
+        ))
+    }
+
+    /**
+     * The WebView an extension draws in.
+     *
+     * File access is on because extension resources are unpacked into Prism's own storage and the
+     * HTML refers to them by absolute path; content access stays off because nothing here needs a
+     * `content://` provider. `acquireVsCodeApi` is supplied by [prepareExtensionHtml], not by the
+     * extension, so a view that talks to its extension works with no extra setup.
+     */
+    @Suppress("DEPRECATION")   // the file-URL XHR switch has no replacement and extensions use it
+    private fun buildExtensionWebview(): WebView = WebView(context).apply {
+        setBackgroundColor(IosUi.cardBackground(context))
+        isFocusable = true
+        isFocusableInTouchMode = true
+        settings.javaScriptEnabled = true
+        settings.domStorageEnabled = true
+        settings.allowFileAccess = true
+        // File-to-file XHR, which is how an extension view reads a file next to itself. Universal
+        // access is deliberately NOT granted: it would also let that document reach any origin.
+        settings.allowFileAccessFromFileURLs = true
+        settings.allowContentAccess = false
+        settings.setSupportZoom(false)
+        addJavascriptInterface(WebviewBridge(), "PrismWebview")
+        webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                val url = request?.url ?: return false
+                // A link in an extension view belongs in a browser, not in a 310dp panel.
+                if (url.scheme == "file" || url.scheme == "data" || url.scheme == "about") return false
+                runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, url)) }
+                return true
+            }
+        }
+    }
+
+    /**
+     * The HTML an extension supplies, plus the small shim VS Code's own webviews provide.
+     *
+     * Injected into `<head>` rather than prepended so the document keeps its doctype and therefore
+     * its standards mode -- prepending a script before `<!DOCTYPE html>` puts a page into quirks
+     * mode, where an extension's CSS lays out differently from how its author tested it.
+     */
+    private fun prepareExtensionHtml(html: String, panelId: String): String {
+        val background = hexColour(IosUi.cardBackground(context))
+        val label = hexColour(IosUi.label(context))
+        val state = extensionWebviewState[panelId]
+        val stateLiteral = state
+            ?.let { "JSON.parse(${jsString(it.replace("<", "\\u003c"))})" }
+            ?: "undefined"
+
+        // Extension webviews ship a CSP that allows their own scripts by nonce. The shim below is
+        // inline, so it needs that same nonce; without one -- hashes, or `script-src` naming only
+        // their bundle -- `'unsafe-inline'` is added to `script-src` alone. The rest of the policy
+        // (`default-src 'none'`, `connect-src`, `img-src`) is left exactly as the extension wrote
+        // it, because those are the directives that actually contain a compromised view.
+        val cspTag = Regex(
+            "<meta[^>]+http-equiv\\s*=\\s*[\"']?content-security-policy[\"']?[^>]*>",
+            RegexOption.IGNORE_CASE,
+        ).find(html)
+        var nonce: String? = null
+        var adjusted = html
+        if (cspTag != null) {
+            val contentRegex = Regex(
+                "content\\s*=\\s*([\"'])(.*?)\\1",
+                setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+            )
+            val contentMatch = contentRegex.find(cspTag.value)
+            val content = contentMatch?.groupValues?.get(2)
+            if (content != null) {
+                val scriptSource = Regex("script-src([^;]*)", RegexOption.IGNORE_CASE)
+                    .find(content)?.groupValues?.get(1)
+                nonce = scriptSource?.let {
+                    Regex("'nonce-([^']+)'").find(it)?.groupValues?.get(1)
+                } ?: Regex("'nonce-([^']+)'").find(content)?.groupValues?.get(1)
+                if (nonce == null) {
+                    val directive = Regex("script-src[^;]*", RegexOption.IGNORE_CASE).find(content)
+                    val relaxed = when {
+                        // A hash source makes browsers ignore 'unsafe-inline', so a hashed policy
+                        // is replaced outright instead of extended.
+                        directive != null && Regex("'(sha256|sha384|sha512)-", RegexOption.IGNORE_CASE)
+                            .containsMatchIn(directive.value) ->
+                            content.replace(directive.value, "script-src 'unsafe-inline' file:")
+                        directive != null ->
+                            content.replace(directive.value, directive.value + " 'unsafe-inline'")
+                        else -> "$content; script-src 'unsafe-inline'"
+                    }
+                    adjusted = adjusted.replace(cspTag.value, cspTag.value.replace(content, relaxed))
+                }
+            }
+        }
+        val nonceAttribute = nonce
+            ?.filter { ch -> ch.isLetterOrDigit() || ch in "+/=_- " }
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { " nonce=\"$it\"" }
+            .orEmpty()
+
+        val snippet = """
+            <style$nonceAttribute>
+              html, body { background: $background; color: $label; font-family: -apple-system, Roboto, sans-serif; }
+              ::-webkit-scrollbar { width: 6px; height: 6px; }
+              ::-webkit-scrollbar-thumb { background: rgba(128,128,128,0.45); border-radius: 3px; }
+            </style>
+            <script$nonceAttribute>
+            (function () {
+              window.__prismState = $stateLiteral;
+              window.acquireVsCodeApi = function () {
+                var api = {
+                  postMessage: function (message) {
+                    try { PrismWebview.postMessage(JSON.stringify(message)); } catch (e) {}
+                  },
+                  getState: function () { return window.__prismState; },
+                  setState: function (value) {
+                    window.__prismState = value;
+                    try { PrismWebview.setState(JSON.stringify(value)); } catch (e) {}
+                    return value;
+                  }
+                };
+                window.__prismApi = api;
+                return api;
+              };
+              window.__prismReceive = function (json) {
+                var value;
+                try { value = JSON.parse(json); } catch (e) { value = json; }
+                var event;
+                try { event = new MessageEvent('message', { data: value }); }
+                catch (e) { event = { data: value }; }
+                window.dispatchEvent(event);
+              };
+            })();
+            </script>
+        """.trimIndent()
+
+        val head = Regex("<head[^>]*>", RegexOption.IGNORE_CASE).find(adjusted)
+        if (head != null) {
+            val end = head.range.last + 1
+            return adjusted.substring(0, end) + snippet + adjusted.substring(end)
+        }
+        val root = Regex("<html[^>]*>", RegexOption.IGNORE_CASE).find(adjusted)
+        if (root != null) {
+            val end = root.range.last + 1
+            return "<head>$snippet</head>" + adjusted.substring(0, end) + adjusted.substring(end)
+        }
+        return "<head>$snippet</head>" + adjusted
+    }
+
+    private fun hexColour(color: Int): String =
+        String.format(java.util.Locale.US, "#%06X", 0xFFFFFF and color)
+
+    /**
+     * The bridge from an extension's rendered view back into the extension.
+     *
+     * `acquireVsCodeApi().postMessage(...)` in the popup calls [postMessage]. [setState] keeps the
+     * `getState`/`setState` pair alive across a reload of the view's document, which happens every
+     * time the extension replaces its HTML; without it a view would silently forget its state.
+     */
+    private inner class WebviewBridge {
+        @JavascriptInterface
+        fun postMessage(json: String) {
+            val panelId = extensionPopupPanel ?: return
+            scope.launch {
+                js("PrismEditor.webviewMessage(${jsString(panelId)}, ${jsString(json)})")
+            }
+        }
+
+        @JavascriptInterface
+        fun setState(json: String) {
+            val panelId = extensionPopupPanel ?: return
+            extensionWebviewState[panelId] = json
+        }
+    }
+
+    private fun popupSectionLabel(text: String): TextView = TextView(context).apply {
+        this.text = text
+        textSize = 10f
+        letterSpacing = 0.12f
+        setTextColor(IosUi.secondaryLabel(context))
+        setPadding(0, IosUi.dp(context, 14f), 0, IosUi.dp(context, 5f))
+    }
+
+    private fun commandRow(extension: ExtensionStore.Installed, command: ExtensionStore.Command): View {
+        val row = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            isClickable = true
+            setPadding(0, IosUi.dp(context, 7f), 0, IosUi.dp(context, 7f))
+            setOnClickListener { runExtensionCommand(extension, command) }
+        }
+        row.addView(TextView(context).apply {
+            text = (if (command.id in liveCommands) "\u25CF " else "\u25CB ") + command.title
+            textSize = 12f
+            setTextColor(IosUi.label(context))
+        })
+        row.addView(TextView(context).apply {
+            text = command.id
+            textSize = 9f
+            setTextColor(IosUi.secondaryLabel(context))
+        })
+        return row
+    }
+
+    private fun hostName(extension: ExtensionStore.Installed): String =
+        if (extension.runtime == ExtensionStore.RUNTIME_NODE) "the Node host" else "the web extension host"
+
+    /**
+     * Runs one of an extension's commands, and follows wherever it takes the extension.
+     *
+     * A command is not a button that opens a menu in VS Code: it is code that often creates or
+     * reveals a panel. So the popup switches to View before running it (that is where the result
+     * will be) and asks for the view again a few times afterwards. Three requests rather than one
+     * because the host may still be activating, and a command that awaits its own activation
+     * would otherwise be observed only before it did anything.
+     */
+    private fun runExtensionCommand(
+        extension: ExtensionStore.Installed,
+        command: ExtensionStore.Command,
+    ) {
+        extensionPopupTab = ExtensionPopupTab.VIEW
+        renderExtensionPopup(extension)
+        if (extension.enabled && extension.id !in activeExtensions) activateExtension(extension)
+        js("PrismEditor.runExtensionCommand(${jsString(command.id)})")
+        toast("Running ${command.title}")
+        scheduleViewRequests(extension.id)
+    }
+
+    /** Asks the extension for whatever it is showing, once the editor is still open on it. */
+    private fun requestExtensionView(extensionId: String) {
+        if (extensionId.isBlank()) return
+        js("PrismEditor.openExtensionView(${jsString(extensionId)})")
+    }
+
+    private fun scheduleViewRequests(extensionId: String) {
+        listOf(500L, 1500L, 3000L).forEach { wait ->
+            postDelayed({
+                if (extensionPopupId == extensionId && isAttachedToWindow) {
+                    requestExtensionView(extensionId)
+                }
+            }, wait)
+        }
+    }
+
+    /**
+     * Activates one extension in its host and, if its popup is the one open, asks for its view
+     * when the host has had time to build one.
+     *
+     * Activation is asynchronous in both hosts -- the Node host has to receive a message and run
+     * `activate` -- so asking immediately reliably arrives before a view provider is registered.
+     */
+    private fun activateExtension(extension: ExtensionStore.Installed) {
+        scope.launch {
+            sendActivation(extension)
+            // Activation is not one moment. A Node extension may spend seconds loading, resolving
+            // modules or waiting on its own network calls before it registers a provider. Three
+            // requests cover that; the host also remembers the request and resolves a provider
+            // that arrives later, so a slow extension no longer ends at "No view yet".
+            scheduleViewRequests(extension.id)
+        }
+    }
+
+    private suspend fun sendActivation(extension: ExtensionStore.Installed) {
+        val runtime = extension.runtime ?: return
+        val source = withContext(Dispatchers.IO) { ExtensionStore.entrySource(extension) } ?: return
+        val extra = withContext(Dispatchers.IO) { extensionContextJson(extension) }
+        js(
+            "PrismEditor.activateExtension(" +
+                jsString(extension.id) + ", " +
+                jsString(extension.directory.absolutePath) + ", " +
+                jsString(source) + ", " +
+                jsString(runtime) + ", " +
+                jsString(extra) + ")"
+        )
+    }
+
+    /** Re-draws the open popup after the extension reports a change. No-op when none is open. */
+    private fun refreshExtensionPopup() {
+        val id = extensionPopupId ?: return
+        val extension = installedExtensions.firstOrNull { it.id == id } ?: return
+        renderExtensionPopup(extension)
+        extensionPopupHeader?.let { header ->
+            // The name does not change, but the row is rebuilt so a newly available icon appears.
+            if (header.childCount > 0) header.getChildAt(0).alpha = if (extension.enabled) 1f else 0.4f
+        }
+    }
+
+    private fun closeExtensionPopup() {
+        extensionPopup?.let { popup -> removeView(popup) }
+        // Destroyed, not merely detached: an extension view left alive would keep its timers and
+        // its bridge into a popup nobody can see, once per extension the user ever opened.
+        extensionPopupWebView?.destroy()
+        extensionPopupWebView = null
+        extensionPopupPanel = null
+        extensionPopupRenderedHtml = null
+        extensionPopup = null
+        extensionPopupContent = null
+        extensionPopupHeader = null
+        extensionPopupId = null
+        extensionPopupTabs = null
+        extensionPopupCommands = null
+        extensionPopupPlaceholder = null
+        extensionPopupCommandSignature = ""
+        extensionPopupTab = ExtensionPopupTab.VIEW
     }
 
     private fun expandRail() {
@@ -534,10 +1571,127 @@ class EditorPageView(context: Context) : FrameLayout(context) {
                         applyPendingState()
                         loadExtensions()
                     }
-                    "extension-failed" -> PrismLogger.logWarning(
-                        "PrismEditor",
-                        "Extension ${args.optString("id")} did not activate: ${args.optString("message")}"
-                    )
+                    "extension-failed" -> {
+                        val id = args.optString("id")
+                        val message = args.optString("message").ifBlank { "unknown error" }
+                        if (id.isNotBlank()) extensionErrors[id] = message
+                        PrismLogger.logWarning(
+                            "PrismEditor",
+                            "Extension $id did not activate: $message"
+                        )
+                        refreshExtensionPopup()
+                    }
+                    // The extension host's view of an extension changes as it activates and
+                    // registers commands. The floating popup re-renders from these two events, so
+                    // it shows the extension's current state rather than a snapshot from open time.
+                    "extension-activated" -> {
+                        val id = args.optString("id")
+                        activeExtensions.add(id)
+                        extensionErrors.remove(id)
+                        // The popup may have been opened before the host had this extension's view
+                        // (activation is asynchronous). Asking again here is what makes a view
+                        // that appeared with activation replace the fallback without a reopen.
+                        if (id.isNotBlank() && id == extensionPopupId) {
+                            js("PrismEditor.openExtensionView(${jsString(id)})")
+                        }
+                        refreshExtensionPopup()
+                    }
+                    // The Node host finishing its boot is the moment activations sent before it was
+                    // ready become deliverable. If the popup is waiting on an extension that has
+                    // not activated, this is the second chance.
+                    "host-ready" -> {
+                        val id = extensionPopupId ?: return@launch
+                        val extension = installedExtensions.firstOrNull { it.id == id }
+                        if (extension != null && extension.enabled && id !in activeExtensions) {
+                            activateExtension(extension)
+                        } else if (id in activeExtensions) {
+                            requestExtensionView(id)
+                        }
+                    }
+                    "extension-commands" -> {
+                        liveCommands.clear()
+                        val commands = args.optJSONArray("commands")
+                        if (commands != null) {
+                            for (i in 0 until commands.length()) {
+                                commands.optString(i).takeIf { it.isNotBlank() }?.let(liveCommands::add)
+                            }
+                        }
+                        refreshExtensionPopup()
+                    }
+                    // A command the popup offered does not exist in the host. That used to be
+                    // silent -- the toast said "Running" and nothing happened -- which is the
+                    // most confusing possible answer. Say what happened, and ask the extension
+                    // to activate in case that is the reason its command is missing.
+                    "command-missing" -> {
+                        val id = args.optString("id")
+                        PrismLogger.logWarning(
+                            "PrismEditor", "Command $id was not registered by any running extension"
+                        )
+                        toast("${id.substringAfterLast('.')} is not available — the extension has not registered it")
+                        extensionPopupId?.let { owner ->
+                            installedExtensions.firstOrNull { it.id == owner }?.let { extension ->
+                                if (extension.id !in activeExtensions) {
+                                    activateExtension(extension)
+                                    scheduleViewRequests(extension.id)
+                                }
+                            }
+                        }
+                    }
+                    // The extension ran the command. It may have opened or replaced a view, so
+                    // ask what it is showing now rather than assuming anything happened.
+                    "command-done" -> extensionPopupId?.let { owner -> scheduleViewRequests(owner) }
+                    // An extension's view: its HTML on creation and on every replacement, and
+                    // `none` when it has not contributed one. Stored per panel so the popup can
+                    // open straight into the current view, and re-rendered on every change so a
+                    // view the extension swaps while the popup is open is the one shown.
+                    "extension-webview" -> {
+                        val panelId = args.optString("panelId")
+                        val owner = args.optString("extensionId")
+                        val action = args.optString("action")
+                        // The host is still waiting for a provider. Ask again rather than
+                        // concluding there is no view: this is the window in which a view
+                        // provider registered after an await becomes visible.
+                        if (action == "waiting" && owner.isNotBlank() && owner == extensionPopupId &&
+                            owner in activeExtensions
+                        ) {
+                            scheduleViewRequests(owner)
+                        }
+                        when (action) {
+                            // A panel that exists but has not drawn anything yet must not become
+                            // "the view this extension is showing": doing that replaced a view
+                            // that DID have content with an empty one, which is exactly how the
+                            // popup ended up falling back to the command list. The mapping moves
+                            // only when there is HTML to show.
+                            "open", "html", "title" -> if (panelId.isNotBlank()) {
+                                val html = args.optString("html")
+                                if (html.isNotBlank()) {
+                                    extensionHtml[panelId] = html
+                                    if (owner.isNotBlank()) extensionPanelOf[owner] = panelId
+                                }
+                            }
+                            "dispose" -> if (panelId.isNotBlank()) {
+                                extensionHtml.remove(panelId)
+                                extensionWebviewState.remove(panelId)
+                                if (owner.isNotBlank() && extensionPanelOf[owner] == panelId) {
+                                    extensionPanelOf.remove(owner)
+                                }
+                            }
+                        }
+                        refreshExtensionPopup()
+                    }
+                    // A message the extension sent into its own view (`webview.postMessage`). It
+                    // is delivered as a `message` event, which is the event VS Code's webviews
+                    // fire and the one extension views listen for.
+                    "extension-webview-message" -> {
+                        val panelId = args.optString("panelId")
+                        if (panelId.isNotBlank() && panelId == extensionPopupPanel) {
+                            extensionPopupWebView?.evaluateJavascript(
+                                "window.__prismReceive && window.__prismReceive(" +
+                                    jsString(args.optString("payload")) + ")",
+                                null,
+                            )
+                        }
+                    }
                     "extension-message" -> toast(args.optString("message"))
                     "extension-state" -> withContext(Dispatchers.IO) {
                         saveExtensionState(args.optString("scope"), args.optString("state"))
@@ -756,26 +1910,22 @@ class EditorPageView(context: Context) : FrameLayout(context) {
             // Node takes a second or so to boot, and it has to be up before the page tries to
             // activate anything into it -- so it is started here, before the first activation, and
             // not lazily on the first message.
-            if (installed.any { it.runtime == ExtensionStore.RUNTIME_NODE }) {
+            //
+            // ANY extension declaring `main` counts, not just ones already classified as Node.
+            // Classification depends on the runtime being installed, so the old check was false on
+            // exactly the device that needed the offer: every Node-only extension looked
+            // declarative, nothing started the host, and the install dialog never appeared. The
+            // extension then sat there with "has not finished activating" forever.
+            if (installed.any { it.nodeEntry != null }) {
                 startNodeHost()
-                installMissingDependencies(installed)
+                installMissingDependencies(installed.filter { it.runtime == ExtensionStore.RUNTIME_NODE })
             }
 
             js("PrismEditor.startExtensionHost()")
             var activated = 0
             installed.forEach { extension ->
-                val runtime = extension.runtime ?: return@forEach
-                val source = withContext(Dispatchers.IO) { ExtensionStore.entrySource(extension) }
-                    ?: return@forEach
-                val extra = withContext(Dispatchers.IO) { extensionContextJson(extension) }
-                js(
-                    "PrismEditor.activateExtension(" +
-                        jsString(extension.id) + ", " +
-                        jsString(extension.directory.absolutePath) + ", " +
-                        jsString(source) + ", " +
-                        jsString(runtime) + ", " +
-                        jsString(extra) + ")"
-                )
+                if (extension.runtime == null) return@forEach
+                sendActivation(extension)
                 activated++
             }
             if (activated > 0) {
@@ -921,7 +2071,7 @@ class EditorPageView(context: Context) : FrameLayout(context) {
     private fun offerNodeInstall(reason: String) {
         if (offeredNode) return
         offeredNode = true
-        androidx.appcompat.app.AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("Install the Node.js runtime?")
             .setMessage(
                 reason + "\n\nIt installs a small Linux guest with Node.js and npm inside it, " +
@@ -958,7 +2108,7 @@ class EditorPageView(context: Context) : FrameLayout(context) {
             addView(progress)
             addView(label)
         }
-        val dialog = androidx.appcompat.app.AlertDialog.Builder(context)
+        val dialog = com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("Installing Node.js")
             .setView(body)
             .setCancelable(false)
@@ -976,7 +2126,7 @@ class EditorPageView(context: Context) : FrameLayout(context) {
             }
             runCatching { dialog.dismiss() }
             if (failure != null) {
-                androidx.appcompat.app.AlertDialog.Builder(context)
+                com.prism.launcher.theme.PrismDialogs.Builder(context)
                     .setTitle("Node.js did not install")
                     .setMessage(failure)
                     .setPositiveButton("Close", null)
@@ -987,6 +2137,10 @@ class EditorPageView(context: Context) : FrameLayout(context) {
             // reloaded rather than only the ones that failed: an extension that was running in the
             // Worker may now belong in Node.
             toast("Node.js is ready")
+            // Re-scan so `nodeReady` is true for the extensions that were waiting on it, then
+            // activate the ones that are now Node extensions. Without the rescan the popup still
+            // believed every Node-only extension was declarative.
+            refreshExtensionButtons()
             loadExtensions()
         }
     }
@@ -1001,7 +2155,7 @@ class EditorPageView(context: Context) : FrameLayout(context) {
             val version = withContext(Dispatchers.IO) { NodeInstaller.installedVersion(context) }
             val bytes = withContext(Dispatchers.IO) { NodeInstaller.installedBytes(context) }
 
-            val builder = androidx.appcompat.app.AlertDialog.Builder(context)
+            val builder = com.prism.launcher.theme.PrismDialogs.Builder(context)
                 .setTitle("Node.js runtime")
 
             when {
@@ -1180,7 +2334,7 @@ class EditorPageView(context: Context) : FrameLayout(context) {
 
     private fun chooseNewFileType() {
         val labels = EditorMenus.NEW_FILE_TYPES.map { "${it.first}  (.${it.second})" }.toTypedArray()
-        androidx.appcompat.app.AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("New file")
             .setItems(labels) { _, which ->
                 val (_, extension, starter) = EditorMenus.NEW_FILE_TYPES[which]
@@ -1258,7 +2412,7 @@ class EditorPageView(context: Context) : FrameLayout(context) {
                 setText(File(path).name)
                 setSingleLine()
             }
-            androidx.appcompat.app.AlertDialog.Builder(context)
+            com.prism.launcher.theme.PrismDialogs.Builder(context)
                 .setTitle("Save as")
                 .setMessage(folder.absolutePath)
                 .setView(nameField)
@@ -1346,7 +2500,7 @@ class EditorPageView(context: Context) : FrameLayout(context) {
         val replaceField = EditText(context).apply { hint = "Replace with"; setSingleLine() }
         if (replace) root.addView(replaceField)
 
-        val builder = androidx.appcompat.app.AlertDialog.Builder(context)
+        val builder = com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle(
                 when {
                     replace && inFiles -> "Replace in Files"
@@ -1417,7 +2571,7 @@ class EditorPageView(context: Context) : FrameLayout(context) {
             }
 
             val labels = hits.map { "${it.first.name}  (${it.second})" }.toTypedArray()
-            androidx.appcompat.app.AlertDialog.Builder(context)
+            com.prism.launcher.theme.PrismDialogs.Builder(context)
                 .setTitle("${hits.size} file(s) matched")
                 .setItems(labels) { _, which -> openFile(hits[which].first) }
                 .setNegativeButton("Close", null)
@@ -1475,7 +2629,7 @@ class EditorPageView(context: Context) : FrameLayout(context) {
                 val o = list.getJSONObject(it)
                 "${o.optString("name")}   ${o.optString("kind")}  :${o.optInt("line")}"
             }.toTypedArray()
-            androidx.appcompat.app.AlertDialog.Builder(context)
+            com.prism.launcher.theme.PrismDialogs.Builder(context)
                 .setTitle("Symbols")
                 .setItems(labels) { _, which ->
                     js("PrismEditor.revealPosition(${list.getJSONObject(which).optInt("line")}, 1)")
@@ -1491,7 +2645,7 @@ class EditorPageView(context: Context) : FrameLayout(context) {
             inputType = android.text.InputType.TYPE_CLASS_TEXT
             setSingleLine()
         }
-        androidx.appcompat.app.AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("Go to Line/Column")
             .setView(field)
             .setPositiveButton("Go") { _, _ ->
@@ -1530,7 +2684,7 @@ class EditorPageView(context: Context) : FrameLayout(context) {
                 val o = list.getJSONObject(it)
                 "line ${o.optInt("line")}: ${o.optString("message")}"
             }.toTypedArray()
-            androidx.appcompat.app.AlertDialog.Builder(context)
+            com.prism.launcher.theme.PrismDialogs.Builder(context)
                 .setTitle("Problems")
                 .setItems(labels) { _, which ->
                     js("PrismEditor.revealPosition(${list.getJSONObject(which).optInt("line")}, 1)")
@@ -1546,7 +2700,7 @@ class EditorPageView(context: Context) : FrameLayout(context) {
             if (IosUi.isDark(context)) "prism-ios-dark" else "prism-ios-light",
             "prism-ios-dark", "prism-ios-light", "hc-black",
         )
-        androidx.appcompat.app.AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("Appearance")
             .setItems(themes) { _, which -> js("PrismEditor.setTheme('${ids[which]}')") }
             .setNeutralButton("Font size…") { _, _ -> showFontSize() }
@@ -1556,14 +2710,14 @@ class EditorPageView(context: Context) : FrameLayout(context) {
 
     private fun showFontSize() {
         val sizes = (9..22).map { it.toString() }.toTypedArray()
-        androidx.appcompat.app.AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("Font size")
             .setItems(sizes) { _, which -> js("PrismEditor.setFontSize(${sizes[which]})") }
             .show()
     }
 
     private fun showEditorLayout() {
-        androidx.appcompat.app.AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("Editor Layout")
             .setItems(arrayOf(
                 if (treeVisible) "Hide file tree" else "Show file tree",
@@ -1585,7 +2739,7 @@ class EditorPageView(context: Context) : FrameLayout(context) {
 
     private fun showViewList() {
         val names = arrayOf("Explorer", "Search", "Extensions", "Problems", "Terminal", "Source Control")
-        androidx.appcompat.app.AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("Open View")
             .setItems(names) { _, which ->
                 when (which) {
@@ -1609,7 +2763,7 @@ class EditorPageView(context: Context) : FrameLayout(context) {
      */
     private fun showSourceControl() {
         if (openFolder == null) { toast("Open a folder first"); return }
-        androidx.appcompat.app.AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("Source Control")
             .setItems(arrayOf("git status", "git diff", "git log --oneline -20", "git add -A", "git commit")) { _, which ->
                 showTerminal()
@@ -1627,7 +2781,7 @@ class EditorPageView(context: Context) : FrameLayout(context) {
 
     private fun promptCommit() {
         val field = EditText(context).apply { hint = "Commit message"; setSingleLine() }
-        androidx.appcompat.app.AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("git commit")
             .setView(field)
             .setPositiveButton("Commit") { _, _ ->
@@ -1639,7 +2793,7 @@ class EditorPageView(context: Context) : FrameLayout(context) {
     }
 
     private fun showRunView() {
-        androidx.appcompat.app.AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("Run")
             .setItems(arrayOf("Run active file", "Run selected text", "Breakpoints (${breakpointCount()})")) { _, which ->
                 when (which) {
@@ -1751,6 +2905,7 @@ class EditorPageView(context: Context) : FrameLayout(context) {
 
     /** Back closes what is open, innermost first, before the launcher sees it. */
     fun handleBack(): Boolean {
+        if (extensionPopup != null) { closeExtensionPopup(); return true }
         if (railExpanded) { collapseRail(); return true }
         if (terminal.visibility == View.VISIBLE) { terminal.visibility = View.GONE; return true }
         if (treeVisible) { toggleTree(); return true }
@@ -1763,7 +2918,19 @@ class EditorPageView(context: Context) : FrameLayout(context) {
         // models page loop, and this page has nothing that needs refreshing on a swipe.
     }
 
+    /**
+     * Returning from the marketplace is a window-focus change, not an activity result -- the editor
+     * is a page view inside the launcher. Re-reading here is what makes a just-installed extension
+     * appear in the rail without leaving and re-entering the page.
+     */
+    override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
+        super.onWindowFocusChanged(hasWindowFocus)
+        if (hasWindowFocus) refreshExtensionButtons()
+    }
+
     override fun onDetachedFromWindow() {
+        closeExtensionPopup()
+        extensionLoadJob?.cancel()
         scope.cancel()
         terminal.stop()
         super.onDetachedFromWindow()
@@ -1775,6 +2942,9 @@ class EditorPageView(context: Context) : FrameLayout(context) {
 
         /** Menu panel width. Fits beside the collapsed rail on a phone; a 290dp panel did not. */
         const val MENU_WIDTH_DP = 270f
+
+        /** At most this many extensions get an inline icon; more than this get their own rail. */
+        const val INLINE_EXTENSION_LIMIT = 3
         const val MAX_OPEN_BYTES = 8L * 1024 * 1024
     }
 }

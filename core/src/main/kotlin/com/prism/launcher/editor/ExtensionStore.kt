@@ -328,6 +328,57 @@ object ExtensionStore {
         }.sortedBy { it.displayName.lowercase() }
     }
 
+    /** One command an extension contributes, as its manifest declares it. */
+    data class Command(val id: String, val title: String)
+
+    /**
+     * The parts of an installed extension the editor UI needs to draw it.
+     *
+     * Read from the extension's own `package.json` rather than kept in [Installed], because only
+     * the editor's extension rail and its floating view want any of this -- the marketplace list
+     * and the store itself would be carrying an icon path and a command array they never read.
+     */
+    data class Details(
+        val description: String,
+        /** The `icon` file, if the manifest names one that exists. */
+        val iconFile: File?,
+        val commands: List<Command>,
+    )
+
+    /**
+     * What the UI needs to draw [installed], tolerating a damaged manifest.
+     *
+     * The icon path is canonicalised and required to stay inside the extension's directory: a
+     * manifest is untrusted content from a downloaded package, and `icon: "../../.."` would
+     * otherwise let it point the decoder at any file on the device.
+     */
+    fun details(installed: Installed): Details {
+        val manifest = File(installed.directory, "package.json")
+        val json = runCatching { JSONObject(manifest.readText()) }.getOrNull()
+            ?: return Details("", null, emptyList())
+
+        val icon = json.optString("icon").takeIf { it.isNotBlank() }?.let { relative ->
+            runCatching {
+                val file = File(installed.directory, relative.removePrefix("./")).canonicalFile
+                val root = installed.directory.canonicalFile
+                file.takeIf {
+                    it.isFile && (it.path == root.path || it.path.startsWith(root.path + File.separator))
+                }
+            }.getOrNull()
+        }
+
+        val commands = runCatching {
+            val array = json.optJSONObject("contributes")?.optJSONArray("commands") ?: JSONArray()
+            (0 until array.length()).mapNotNull { index ->
+                val item = array.optJSONObject(index) ?: return@mapNotNull null
+                val id = item.optString("command").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                Command(id, item.optString("title").ifBlank { id })
+            }
+        }.getOrDefault(emptyList())
+
+        return Details(json.optString("description"), icon, commands)
+    }
+
     fun isInstalled(id: String): Boolean =
         File(root(), "$id/package.json").isFile
 
@@ -394,6 +445,18 @@ object ExtensionStore {
                 } else {
                     destination.parentFile?.mkdirs()
                     destination.outputStream().use { out -> zip.copyTo(out, 64 * 1024) }
+                    // EXECUTABLE BITS ARE NOT IN A ZIP'S DATA STREAM. VSIX uses the Unix mode in
+                    // the external attributes, which java.util.zip does not expose, so an
+                    // extension that ships a language server or its own native binary gets it back
+                    // mode 0600 and the spawn fails with EACCES. The paths below are where every
+                    // extension puts runnable files; `.bin` scripts are covered by the third
+                    // clause, and a false positive only means a text file is marked executable.
+                    val runnable = relative.startsWith("resources/native-binary/") ||
+                        relative.startsWith("bin/") ||
+                        relative.contains("/bin/") ||
+                        relative.startsWith("node_modules/.bin/") ||
+                        destination.extension.lowercase() in setOf("", "sh", "exe")
+                    if (runnable) runCatching { destination.setExecutable(true, false) }
                     count++
                 }
                 zip.closeEntry()

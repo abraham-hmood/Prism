@@ -391,6 +391,7 @@ class AgenticToolsPageView @JvmOverloads constructor(
     // ── Shared UI helpers ────────────────────────────────────────────────────
 
     private fun resolveAttr(attr: Int): Int {
+        com.prism.launcher.theme.ThemeSkin.resolveAttr(context, attr)?.let { return it }
         val typedValue = android.util.TypedValue()
         context.theme.resolveAttribute(attr, typedValue, true)
         return typedValue.data
@@ -551,20 +552,28 @@ class AgenticToolsAdapter(
 
         val lineActive = com.prism.core.PrismPlatform.host.hasActiveCellularLine()
         val imageGenLoaded = com.prism.launcher.PrismSettings.hasImageGenerator()
+        val contextOffloadOn = com.prism.launcher.PrismSettings.getContextOffloadEnabled()
         val missingLine = def.requiresActiveLine && !lineActive
         val missingImageGen = def.requiresImageGenerator && !imageGenLoaded
-        val disabled = missingLine || missingImageGen
+        val missingContext = def.requiresContextOffload && !contextOffloadOn
+        val disabled = missingLine || missingImageGen || missingContext
 
         if (disabled) {
-            b.toolBuiltinBadge.text = if (missingImageGen) "NEEDS IMAGE MODEL" else "NEEDS SIM"
+            b.toolBuiltinBadge.text = when {
+                missingImageGen -> "NEEDS IMAGE MODEL"
+                missingLine -> "NEEDS SIM"
+                else -> "NEEDS CONTEXT SETTING"
+            }
             b.toolBuiltinBadge.setTextColor(ContextCompat.getColor(ctx, R.color.tool_disabled_fg))
             b.toolBuiltinBadge.backgroundTintList =
                 ColorStateList.valueOf(ContextCompat.getColor(ctx, R.color.tool_disabled_bg))
             b.toolName.setTextColor(ContextCompat.getColor(ctx, R.color.tool_disabled_fg))
-            b.toolSubtitle.text = if (missingImageGen) {
-                "${def.description} (needs an image generation model — import one in Settings > AI Engine)"
-            } else {
-                "${def.description} (needs an active SIM or eSIM)"
+            b.toolSubtitle.text = when {
+                missingImageGen ->
+                    "${def.description} (needs an image generation model — import one in Settings > AI Engine)"
+                missingLine -> "${def.description} (needs an active SIM or eSIM)"
+                else -> "${def.description} (turn on On-device context offload in Settings > " +
+                    "Intelligence & Messaging)"
             }
             b.toolRoot.alpha = 0.5f
             b.toolRoot.isEnabled = false
@@ -574,7 +583,7 @@ class AgenticToolsAdapter(
             b.toolBuiltinBadge.setTextColor(ContextCompat.getColor(ctx, R.color.model_tag_text_fg))
             b.toolBuiltinBadge.backgroundTintList =
                 ColorStateList.valueOf(ContextCompat.getColor(ctx, R.color.model_tag_text_bg))
-            b.toolName.setTextColor(ContextCompat.getColor(ctx, R.color.prism_text_primary))
+            b.toolName.setTextColor(com.prism.launcher.nora.IosUi.label(ctx))
             b.toolRoot.alpha = 1.0f
             b.toolRoot.isEnabled = true
             b.toolRoot.setOnClickListener { onBuiltinToolClick(def) }

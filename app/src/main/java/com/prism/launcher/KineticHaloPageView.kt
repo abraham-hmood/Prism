@@ -3,14 +3,13 @@ package com.prism.launcher
 import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.content.Context
-import android.graphics.*
-import android.graphics.drawable.Drawable
-import android.os.VibrationEffect
-import android.os.Vibrator
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.PointF
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
-import android.view.ViewGroup
 import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -18,14 +17,29 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.flow.collectLatest
-import kotlin.math.*
+import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.min
+import kotlin.math.sin
 
 /**
- * Kinetic Halo Page: A circular, physics-based app drawer.
- * Interaction: Touch and hold to summon the ring, slide in circles to rotate apps.
+ * Kinetic Halo: a circular, physics-ish app picker.
+ *
+ * ## Geometry is in dp and measured from the view, never fixed pixels
+ *
+ * The first version placed 120-pixel icons on a 300-pixel ring. On a 3x phone that is a ring a
+ * third of the width with icons that look like specks; on a tablet the ring does not fit at all.
+ * Everything here is derived from the view's own size and [resources.displayMetrics]: the ring is
+ * a fraction of the shorter side, the icons are a fixed dp size, and the centre is the view's
+ * centre rather than wherever the finger happened to land. That last part matters on a phone --
+ * summoning the halo near an edge used to push most of it off screen.
+ *
+ * Touch still decides the ANGLE the ring starts at, so the gesture feels directly manipulated,
+ * but not the centre.
  */
 class KineticHaloPageView(
     context: Context,
@@ -35,25 +49,28 @@ class KineticHaloPageView(
     private var allApps: List<DrawerAppEntry> = emptyList()
     private var observeJob: Job? = null
     private val activeIcons = mutableListOf<AppIconView>()
-    
+
     // Interaction state
-    private var isSummoned = false
-    private var centerPoint = PointF(0f, 0f)
-    private var currentRotation = 0f // In degrees
+    private var currentRotation = 0f // degrees
     private var lastTouchAngle = 0f
-    
-    // Visuals
+    private var summonProgress = 0f // 0..1
+    private var velocity = 0f // angular velocity, degrees per frame
+    private var lastHapticRotation = 0f
+    private var inertia: ValueAnimator? = null
+    private var summon: ValueAnimator? = null
+
+    private val density = resources.displayMetrics.density
+    private val iconSizePx = (56f * density).toInt()
+    private val ringRadiusFraction = 0.33f
+
     private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
         style = Paint.Style.STROKE
-        strokeWidth = 4f
-        alpha = 100
-        maskFilter = BlurMaskFilter(20f, BlurMaskFilter.Blur.NORMAL)
+        strokeWidth = 1.5f * density
+        alpha = 110
     }
-    
-    private var summonProgress = 0f // 0 to 1
-    private var velocity = 0f // Angular velocity
-    private var lastHapticAngle = 0f
+
+    private val centerPoint = PointF(0f, 0f)
 
     init {
         setWillNotDraw(false)
@@ -64,8 +81,6 @@ class KineticHaloPageView(
         super.onAttachedToWindow()
         if (observeJob?.isActive == true) return
         val lifecycleOwner = context as? LifecycleOwner ?: return
-        // Live-observes the DB so a newly installed/removed app is reflected immediately,
-        // matching the same fix applied to DrawerPageView (was previously a one-shot load).
         observeJob = lifecycleOwner.lifecycleScope.launch {
             AppDatabase.get().installedAppDao().observeAll().collectLatest { entities ->
                 allApps = withContext(Dispatchers.IO) { resolveDrawerEntries(entities) }
@@ -77,50 +92,62 @@ class KineticHaloPageView(
     override fun onDetachedFromWindow() {
         observeJob?.cancel()
         observeJob = null
+        summon?.cancel()
+        inertia?.cancel()
         super.onDetachedFromWindow()
     }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        centerPoint.set(w / 2f, h / 2f)
+        layoutIcons()
+    }
+
+    /** Radius the ring reaches at full summon, in pixels. */
+    private fun ringRadius(): Float =
+        min(width, height).coerceAtLeast(1) * ringRadiusFraction
 
     private fun setupIcons() {
         removeAllViews()
         activeIcons.clear()
-        // We only show a subset or all depending on layers.
-        // For the V1, let's map the top 24 apps.
-        allApps.take(32).forEach { entry ->
+
+        allApps.take(MAX_APPS).forEach { entry ->
             val iconView = AppIconView(context, entry)
             iconView.setOnClickListener { onLaunch(entry.component) }
-            addView(iconView, LayoutParams(120, 120))
+            addView(iconView, LayoutParams(iconSizePx, iconSizePx))
             activeIcons.add(iconView)
             iconView.alpha = 0f
             iconView.scaleX = 0f
             iconView.scaleY = 0f
         }
+        layoutIcons()
     }
 
     override fun onDraw(canvas: Canvas) {
-        if (summonProgress > 0) {
-            val radius = 300f * summonProgress
-            ringPaint.alpha = (100 * summonProgress).toInt()
-            canvas.drawCircle(centerPoint.x, centerPoint.y, radius, ringPaint)
-        }
+        super.onDraw(canvas)
+        if (summonProgress <= 0f) return
+        ringPaint.alpha = (110 * summonProgress).toInt().coerceIn(0, 255)
+        canvas.drawCircle(centerPoint.x, centerPoint.y, ringRadius() * summonProgress, ringPaint)
     }
 
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                centerPoint.set(event.x, event.y)
+                centerPoint.set(width / 2f, height / 2f)
                 animateSummon(true)
                 lastTouchAngle = calculateAngle(event.x, event.y)
                 velocity = 0f
+                inertia?.cancel()
             }
             MotionEvent.ACTION_MOVE -> {
                 val currentAngle = calculateAngle(event.x, event.y)
                 val delta = normalizeAngle(currentAngle - lastTouchAngle)
                 currentRotation += delta
-                velocity = delta // Simple velocity tracking
+                velocity = delta
                 lastTouchAngle = currentAngle
-                
-                checkHapticFeedback(currentRotation)
+
+                checkHapticFeedback()
                 layoutIcons()
                 invalidate()
             }
@@ -132,9 +159,9 @@ class KineticHaloPageView(
         return true
     }
 
-    private fun animateSummon(summon: Boolean) {
-        isSummoned = summon
-        ValueAnimator.ofFloat(summonProgress, if (summon) 1f else 0f).apply {
+    private fun animateSummon(show: Boolean) {
+        summon?.cancel()
+        summon = ValueAnimator.ofFloat(summonProgress, if (show) 1f else 0f).apply {
             duration = 300
             interpolator = DecelerateInterpolator()
             addUpdateListener {
@@ -147,50 +174,50 @@ class KineticHaloPageView(
     }
 
     private fun layoutIcons() {
-        val radius = 300f * summonProgress
+        val radius = ringRadius() * summonProgress
         val iconCount = activeIcons.size
         if (iconCount == 0) return
 
+        val step = 360f / iconCount
         activeIcons.forEachIndexed { index, view ->
-            val angleDeg = (currentRotation + (index * (360f / iconCount)))
-            val angleRad = Math.toRadians(angleDeg.toDouble())
-            
-            val x = centerPoint.x + radius * cos(angleRad).toFloat() - view.width / 2
-            val y = centerPoint.y + radius * sin(angleRad).toFloat() - view.height / 2
-            
+            val angleRad = Math.toRadians((currentRotation + (index * step)).toDouble())
+            val x = centerPoint.x + radius * cos(angleRad).toFloat() - iconSizePx / 2f
+            val y = centerPoint.y + radius * sin(angleRad).toFloat() - iconSizePx / 2f
             view.x = x
             view.y = y
-            
-            // Visual polish: fade in/scale as they expand
             view.alpha = summonProgress * 0.9f
             view.scaleX = summonProgress
             view.scaleY = summonProgress
-            
-            // Adjust depth based on "speed" (velocity) if needed in future V2
         }
     }
 
     private fun applyInertia() {
         if (abs(velocity) < 0.5f) return
-        
-        ValueAnimator.ofFloat(velocity, 0f).apply {
+        inertia?.cancel()
+        inertia = ValueAnimator.ofFloat(velocity, 0f).apply {
             duration = (abs(velocity) * 100).toLong().coerceIn(200, 1000)
             interpolator = DecelerateInterpolator()
             addUpdateListener {
-                val v = it.animatedValue as Float
-                currentRotation += v
-                checkHapticFeedback(currentRotation)
+                currentRotation += it.animatedValue as Float
+                checkHapticFeedback()
                 layoutIcons()
             }
             start()
         }
     }
 
-    private fun checkHapticFeedback(angle: Float) {
+    /**
+     * One tick per icon that passes the finger.
+     *
+     * Tracked on accumulated rotation rather than the raw angle: the angle wraps at +/-180, so the
+     * old comparison fired once per revolution more or less by accident and not at all in some
+     * directions.
+     */
+    private fun checkHapticFeedback() {
         val step = 360f / activeIcons.size.coerceAtLeast(1)
-        if (abs(angle - lastHapticAngle) >= step) {
+        if (abs(currentRotation - lastHapticRotation) >= step) {
+            lastHapticRotation = currentRotation
             performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
-            lastHapticAngle = angle
         }
     }
 
@@ -224,14 +251,19 @@ class KineticHaloPageView(
 
     private class AppIconView(context: Context, entry: DrawerAppEntry) : FrameLayout(context) {
         init {
+            contentDescription = entry.label
             val iv = ImageView(context)
             iv.setImageDrawable(entry.icon)
             iv.scaleType = ImageView.ScaleType.FIT_CENTER
             addView(iv, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
-            
-            val bg = View(context)
-            bg.background = BlurMaskFilter(10f, BlurMaskFilter.Blur.NORMAL).let { null } // Placeholder logic
-            // Add a subtle bloom effect?
         }
+    }
+
+    private companion object {
+        /**
+         * More than this on one ring and the icons overlap at any radius a phone can hold. The
+         * drawer is where the full list lives; the halo is a quick picker.
+         */
+        const val MAX_APPS = 24
     }
 }

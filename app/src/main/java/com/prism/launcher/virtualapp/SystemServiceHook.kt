@@ -96,6 +96,10 @@ object SystemServiceHook {
         virtualPackages.add(virtualPackage)
         this.hostPackage = hostPackage
 
+        // The app's own idea of which process it is running in, which the system-facing rewrite
+        // above does not touch and many apps gate their initialisation on.
+        ProcessIdentity.adopt(virtualPackage)
+
         if (installed) return
         installed = true
 
@@ -153,9 +157,40 @@ object SystemServiceHook {
                         }
                     }
 
+                    // COMPONENT NAME ARGUMENTS, not just strings.
+                    //
+                    // An app toggling one of its own components -- Amazon does it for its MAP
+                    // account storage on a background thread -- passes a ComponentName, so the
+                    // string rewrite below never touched it. The system then refused with
+                    // "Attempt to change component state; pid=..., uid=...", and because that
+                    // throw happened on a pool thread it was uncaught and took the whole process
+                    // down. That is the "process dies" failure: not the virtualization crashing,
+                    // the app being told its own component is not its own.
+                    //
+                    // Toggling is answered here rather than forwarded. There is no installed
+                    // component to enable: the app's components live in Prism's process, and the
+                    // system has never heard of them. A call that would have changed whether a
+                    // receiver runs is meaningless under virtualization, and reporting success is
+                    // more honest than forwarding a request that cannot be honoured.
+                    var componentArgument = args?.filterIsInstance<android.content.ComponentName>()
+                        ?.firstOrNull { it.packageName in virtualPackages }
+
+                    if (componentArgument != null && method.name == "setComponentEnabledSetting") {
+                        PrismLogger.logInfo(TAG, "Ignored a component state change for $componentArgument")
+                        return@InvocationHandler null
+                    }
+                    if (componentArgument != null && method.name == "getComponentEnabledSetting") {
+                        return@InvocationHandler android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+                    }
+
                     val rewritten = args?.map { argument ->
-                        if (argument is String && argument in virtualPackages) hostPackage
-                        else argument
+                        when {
+                            argument is String && argument in virtualPackages -> hostPackage
+                            argument is android.content.ComponentName &&
+                                argument.packageName in virtualPackages ->
+                                android.content.ComponentName(hostPackage, argument.className)
+                            else -> argument
+                        }
                     }?.toTypedArray()
 
                     try {

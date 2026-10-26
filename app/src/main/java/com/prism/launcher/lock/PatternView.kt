@@ -51,7 +51,27 @@ class PatternView(context: Context) : View(context) {
         strokeJoin = Paint.Join.ROUND
     }
 
-    private fun accent(): Int = if (errorState) 0xFFFF453A.toInt() else 0xFF0A84FF.toInt()
+    /**
+     * The theme's accent, or red for a rejected attempt.
+     *
+     * The lock screen is themed by the activity around it; a pattern grid that stayed iOS blue in
+     * every theme was the one control that ignored it.
+     */
+    private fun accent(): Int = if (errorState) {
+        com.prism.launcher.theme.PrismThemes.modeFor(isDarkTheme()).palette.destructive.toInt()
+    } else {
+        com.prism.launcher.theme.PrismThemes.modeFor(isDarkTheme()).palette.accent.toInt()
+    }
+
+    private fun isDarkTheme(): Boolean =
+        (resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+            android.content.res.Configuration.UI_MODE_NIGHT_YES
+
+    /** The theme's text colour at low alpha, for the untouched dots. */
+    private fun idleDot(): Int {
+        val text = com.prism.launcher.theme.PrismThemes.modeFor(isDarkTheme()).palette.text.toInt()
+        return (0x66 shl 24) or (text and 0x00FFFFFF)
+    }
 
     private fun cellSize(): Float = minOf(width, height) / 3f
 
@@ -84,7 +104,7 @@ class PatternView(context: Context) : View(context) {
         for (index in 0 until 9) {
             val (x, y) = centreOf(index)
             val touched = index in chosen
-            dotPaint.color = if (touched) accent() else 0x66FFFFFF
+            dotPaint.color = if (touched) accent() else idleDot()
             dotPaint.style = Paint.Style.FILL
             canvas.drawCircle(x, y, if (touched) radius * 1.5f else radius, dotPaint)
 
@@ -111,10 +131,19 @@ class PatternView(context: Context) : View(context) {
                 capture(event.x, event.y)
                 invalidate()
             }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+            MotionEvent.ACTION_UP -> {
                 tracking = false
                 invalidate()
                 if (chosen.isNotEmpty()) onPattern?.invoke(chosen.joinToString(""))
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                // A cancelled gesture is not an attempt. Submitting here counted a notification
+                // shade pull or a system gesture as a wrong pattern and, after five of them,
+                // started the 30-second lockout.
+                tracking = false
+                chosen.clear()
+                errorState = false
+                invalidate()
             }
             else -> return false
         }

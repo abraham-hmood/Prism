@@ -91,6 +91,17 @@ object AppSync {
         }
     }
 
+    /**
+     * The apps launched most often, most-used first.
+     *
+     * READ-ONLY and best-effort: a launcher decoration that needs to know which icons are the
+     * user's favourites must never fail because the statistics table is unavailable, so an empty
+     * list (no sparks) is the fallback rather than an exception.
+     */
+    suspend fun topLaunched(limit: Int = 32): List<String> = runCatching {
+        AppDatabase.get().appLaunchStatDao().getTopOverall(limit)
+    }.getOrDefault(emptyList())
+
     /** Registers the periodic reconcile. Safe to call unconditionally; it replaces by name. */
     fun schedule(catalog: AppCatalog) {
         PrismPlatform.scheduler.schedule(

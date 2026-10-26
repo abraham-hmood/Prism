@@ -18,6 +18,10 @@
         android:minSdkVersion="33" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Screen mirroring. Android 14 refuses a mediaProjection foreground service without this,
+         and a projection without that service is invalidated as soon as the app leaves the
+         foreground. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <!-- Required on Android 14+ for the dataSync foreground type CakeChat training runs under. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -41,6 +45,15 @@
     <!-- Agentic read_text/send_text/make_call tools (AgenticMessagingTools) -->
     <uses-permission android:name="android.permission.CALL_PHONE" />
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+    <!-- The number shown as "calling from", for the dialer header. Optional on many carriers. -->
+    <uses-permission android:name="android.permission.READ_PHONE_NUMBERS" />
+    <!-- Ending a carrier call Prism placed. Android 9+ requires this, and without it the call
+         screen has to hand the user to the system notification to hang up. -->
+    <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS" />
+    <!-- Muting a carrier call, which is an audio-manager setting on that path. -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- The incoming mesh-call screen when Prism is in the background. -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <!-- Dictation in Messages and Nebula. Requested at the moment the mic is first tapped. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
@@ -51,8 +64,16 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />
+    <!-- The debug bridge can receive an APK from a trusted device. Android still shows its own
+         confirmation, and the user must allow Prism to install unknown apps. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- `adb shell pm list packages` must see the same catalogue the launcher shows. -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackagesPermission" />
     <uses-permission android:name="android.permission.DOWNLOAD_WITHOUT_NOTIFICATION" />
-    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" tools:ignore="ProtectedPermissions" />
+    <!-- PACKAGE_USAGE_STATS was only ever used by AppUsageMonitor, which paused the whole VPN when
+         a bypass-listed app came to the foreground. Per-app bypass is addDisallowedApplication on
+         the VpnService and needs no usage access, so the permission (which the user had to grant
+         by hand in a system settings screen) is gone. -->
     <uses-permission android:name="android.permission.MANAGE_VIRTUAL_MACHINE"
         tools:ignore="ProtectedPermissions" />
 
@@ -65,6 +86,25 @@
             <action android:name="com.prism.launcher.action.DESKTOP_PAGE" />
         </intent>
         <!--
+            Icon packs. IconPackEngine asks for these four intents, but from Android 11 an app
+            cannot see another package unless the manifest declares what it is looking for, so
+            every one of them returned nothing and the picker offered "Default" on its own, no
+            matter how many packs were installed.
+        -->
+        <intent>
+            <action android:name="org.adw.launcher.THEMES" />
+        </intent>
+        <intent>
+            <action android:name="com.novalauncher.THEME" />
+        </intent>
+        <intent>
+            <action android:name="com.dlto.atom.launcher.THEME" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="com.anddoes.launcher.THEME" />
+        </intent>
+        <!--
             Required for dictation. From Android 11 the speech recognition service is invisible
             to us without this, so SpeechRecognizer.isRecognitionAvailable() returns false and
             createSpeechRecognizer() has nothing to bind to — the mic would simply never work.
@@ -72,11 +112,23 @@
         <intent>
             <action android:name="android.speech.RecognitionService" />
         </intent>
+        <!--
+            Text-to-speech engines. SystemTtsEngine asks the package manager which engines are
+            installed when no default is selected, and from Android 11 that question returns an
+            empty list unless the manifest declares the intent it is looking for. Without this
+            the fallback concluded "No speech engine is installed" on devices that had one,
+            which made every speech feature look broken whenever Kokoro was not downloaded.
+        -->
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
     </queries>
 
     <application
         android:name=".PrismApp"
         android:allowBackup="true"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:usesCleartextTraffic="true"
         android:icon="@drawable/ic_launcher"
         android:label="@string/app_name"
@@ -126,6 +178,144 @@
             android:screenOrientation="fullUser"
             android:exported="false"
             android:theme="@style/Theme.PrismSettings" />
+        <!-- Themes: the gallery and the creator. The creator is a peer of the gallery rather
+             than a dialog because it needs the whole window for two nested tab pairs, a file
+             drawer and a movable preview. -->
+        <activity
+            android:name=".theme.ThemesActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
+        <activity
+            android:name=".theme.ThemeEditorActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.PrismSettings" />
+        <!-- PRISM DEBUG BRIDGE. Three windows: the list, the words a target shows, and the
+             terminal. None is exported; they are opened only from Settings or by the bridge's
+             own phrase callback. -->
+        <activity
+            android:name=".pdb.PdbActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
+        <activity
+            android:name=".pdb.PdbPhraseActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:launchMode="singleTop"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
+        <activity
+            android:name=".pdb.PdbTerminalActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
+        <activity
+            android:name=".PagePickerSwipeActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
+
+        <!-- Wireless displays: the picker, and the screen that receives a mirror. The receiver is
+             a single-full-screen activity: a second stream replaces the first rather than
+             stacking. -->
+        <activity
+            android:name=".display.WirelessDisplaysActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
+        <activity
+            android:name=".display.DisplayReceiverActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:launchMode="singleTop"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
+
+        <!-- THE REVERSE CASE: a desktop asked this phone to show its screen. Android only hands
+             out a projection through a consent dialog owned by an activity, so this invisible
+             window asks for it and then finishes. -->
+        <activity
+            android:name=".display.CapturePermissionActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:theme="@style/Theme.Prism.Transparent" />
+
+        <!-- A NON-PRISM SCREEN (a TV or monitor the OS already knows about). The presentation
+             window lives on the far display; this activity is the phone-side control that keeps
+             it alive when the user goes Home. -->
+        <activity
+            android:name=".display.SystemDisplayActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
+
+        <!-- SCREEN MIRRORING TO A PRISM DISPLAY. The capture is a mediaProjection foreground
+             service because Android 14 invalidates a projection held by a background app. A
+             non-Prism TV is reached through the system's own cast screen; there is no browser
+             receiver and no activity to type an address into. -->
+        <service
+            android:name=".display.mirror.ScreenMirrorService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+
+        <!-- The two Mouse page editors. They are ordinary settings screens with text fields, so
+             they declare adjustResize: the script editor is tall enough that a keyboard covering
+             half of it without resizing makes the cursor unreachable. -->
+        <activity
+            android:name=".mouse.MouseColorStyleActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.PrismSettings" />
+        <activity
+            android:name=".mouse.MouseFlowScriptActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.PrismSettings" />
+
+        <!-- The cloud-gaming session screen. It was launched by CloudPageView but never declared
+             here, so starting a session threw ActivityNotFoundException and the feature was
+             unreachable on every device. landscape/fullscreen because it is a game. -->
+        <activity
+            android:name=".cloud.CloudGamingActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:theme="@style/Theme.PrismSettings" />
+
+        <activity
+            android:name=".clipboard.ClipboardHistoryActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
+
+        <!-- Live clipboard sharing. A foreground service only because that is what keeps the
+             process alive so ClipboardCapture's listener can be called while Prism is in the
+             background. Android lets the default IME's package read the clipboard from any
+             process, so once Prism Writer is the keyboard there is nothing to poll. See
+             ClipboardWatchService and ClipboardWatchPolicy. -->
+        <service
+            android:name=".clipboard.ClipboardWatchService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps the user's clipboard sharing to their own paired devices immediate; shown continuously in a notification the user turns on and can stop at any time." />
+        </service>
         <activity
             android:name=".ModelStoreActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
@@ -208,6 +398,14 @@
 
         <activity
             android:name=".DiagnosticsActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
+
+        <!-- The Health & Repair cockpit. Opened from Settings → System Health. -->
+        <activity
+            android:name=".health.SystemHealthActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
             android:screenOrientation="fullUser"
             android:exported="false"
@@ -349,8 +547,33 @@
             android:exported="false"
             android:label="Dictionary" />
 
+        <!-- One photo, full screen, from the Photos page. Its chrome is drawn by the activity
+             itself so it can follow the selected theme. -->
+        <activity
+            android:name=".photos.PhotoViewerActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:theme="@style/Theme.PrismSettings" />
+
+        <!-- PhotoPix, the layer-based editor the viewer's pencil and the desktop page open. -->
+        <activity
+            android:name=".photopix.PhotoPixActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:theme="@style/Theme.PrismSettings" />
+
         <activity
             android:name=".writer.WriterPermissionActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- The runtime-permission host for agentic tools (make_call). Transparent and
+             noHistory: it exists for the length of one system prompt. -->
+        <activity
+            android:name=".agentic.AgentPermissionActivity"
             android:exported="false"
             android:excludeFromRecents="true"
             android:noHistory="true"
@@ -465,6 +688,13 @@
             android:theme="@style/Theme.PrismSettings"
             android:windowSoftInputMode="adjustResize" />
 
+        <activity
+            android:name=".messaging.MessagingBridgesActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings"
+            android:windowSoftInputMode="adjustResize" />
+
         <!--
             Opens Windows executables. android:enabled="false" is load-bearing: the component is
             switched on only when the user turns Windows mode on, so Prism does not appear in the
@@ -555,6 +785,18 @@
             android:exported="false"
             android:process=":virtualapp" />
 
+        <!--
+            The compatibility check: runs an installed app in a throwaway surface to find out
+            whether it virtualizes. It lives in the guest's own process for the same reason the
+            host does, because the app's code is executed, and it is not exported, because it runs
+            whatever it is told to. Debug builds additionally declare a receiver that can ask it
+            to; see src/debug/AndroidManifest.xml.
+        -->
+        <service
+            android:name=".virtualapp.VirtualAppCheckService"
+            android:exported="false"
+            android:process=":virtualapp" />
+
         <activity
             android:name=".virtualapp.VirtualAppActivity"
             android:exported="false"
@@ -641,6 +883,76 @@
 
         <activity
             android:name=".lock.ContactDetailActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- Prism's own dialer and mesh call screen. Its own task so a call is not buried under
+             the launcher, and singleTop so an incoming-call notification focuses the call already
+             on screen instead of stacking a second one. -->
+        <activity
+            android:name=".calls.CallActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:excludeFromRecents="false"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:showWhenLocked="true"
+            android:theme="@style/Theme.PrismLauncher"
+            android:turnScreenOn="true"
+            android:windowSoftInputMode="adjustResize" />
+
+        <activity
+            android:name=".calls.DialerActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.PrismSettings"
+            android:windowSoftInputMode="adjustResize">
+            <!-- Required for the default-dialer role. The role qualifier looks for an activity
+                 that handles ACTION_DIAL with NO data restriction; a filter that only accepts
+                 tel: URIs does not match, which is why Prism was not offered as a phone app even
+                 though it could dial a number. Prism prefills whatever number arrives and still
+                 waits for an explicit call press; it never dials straight from this intent. -->
+            <intent-filter>
+                <action android:name="android.intent.action.DIAL" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.DIAL" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="tel" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="tel" />
+            </intent-filter>
+        </activity>
+
+        <!-- The other half of the default-dialer role: Telecom binds this service for every carrier
+             call, and Prism's own CallActivity becomes the call surface. -->
+        <service
+            android:name=".calls.PrismInCallService"
+            android:exported="true"
+            android:permission="android.permission.BIND_INCALL_SERVICE">
+            <meta-data
+                android:name="android.telecom.IN_CALL_SERVICE_UI"
+                android:value="true" />
+            <intent-filter>
+                <action android:name="android.telecom.InCallService" />
+            </intent-filter>
+        </service>
+
+        <activity
+            android:name=".calls.CallRecordingsActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
+
+        <activity
+            android:name=".calls.MeshvoiceActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
             android:exported="false"
             android:theme="@style/Theme.PrismSettings"
@@ -751,12 +1063,19 @@
             android:theme="@style/Theme.PrismSettings" />
 
         <!-- DNS Proxy Service for Access Points: listens on 0.0.0.0:53 -->
+        <!-- Enabled: PrismApp and Settings both start this when the toggle is on. It used to be
+             android:enabled="false", so startService() had no component to start and the feature
+             was unreachable no matter what the setting said. -->
         <service
             android:name=".browser.DnsProxyService"
             android:exported="false"
-            android:enabled="false"
+            android:enabled="true"
             android:description="@string/dns_proxy_service_description">
         </service>
+        <!-- Android's package-installer result for APKs received by the Prism Debug Bridge. -->
+        <receiver
+            android:name=".pdb.PdbInstallReceiver"
+            android:exported="false" />
     </application>
 </manifest>
 

@@ -327,15 +327,28 @@ object KokoroMeshShare {
         text: String,
         voiceId: String?,
         speed: Float,
+        /**
+         * The clone's reference recording, when [voiceId] is a clone.
+         *
+         * A clone lives on the device that saved it. Sending the id alone made the peer look up
+         * a voice it does not have and answer in the clone's published base voice -- a different
+         * person, with only a log line to say so. Sending the recording lets the peer run the
+         * same conversion locally. Null for an ordinary voice.
+         */
+        reference: FloatArray? = null,
+        pitchHz: Float = 0f,
         timeoutMs: Int = 180_000,
     ): SpeechMeshWire.Clip? {
         if (text.isBlank()) return SpeechMeshWire.Clip(FloatArray(0), 24_000)
-        val body = JSONObject()
+        val payload = JSONObject()
             .put("text", text)
             .put("voice", voiceId ?: com.prism.launcher.PrismSettings.KOKORO_DEFAULT_VOICE)
             .put("speed", speed.toDouble())
-            .toString()
-            .toByteArray()
+        if (reference != null && reference.isNotEmpty()) {
+            payload.put("reference", SpeechMeshWire.encode64(SpeechMeshWire.floats(reference)))
+            payload.put("pitch", pitchHz.toDouble())
+        }
+        val body = payload.toString().toByteArray()
         val response = request(peerIp, "/synthesize", body, timeoutMs) ?: return null
         if (response.status != 200) {
             PrismPlatform.log.warn(TAG, "Synthesis on $peerIp failed (${response.status}): ${response.errorText()}")

@@ -369,7 +369,7 @@ class SocialSearchPanel(context: Context) : LinearLayout(context) {
     /** A series has to become one episode before it can become a stream. */
     private fun chooseEpisode(meta: StremioStore.Meta) {
         val labels = meta.episodes.map { it.label }.toTypedArray()
-        androidx.appcompat.app.AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle(meta.name)
             .setNegativeButton("Cancel", null)
             .setItems(labels) { _, which ->
@@ -429,7 +429,7 @@ class SocialSearchPanel(context: Context) : LinearLayout(context) {
             }
         }.toTypedArray()
 
-        androidx.appcompat.app.AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle(title.take(60))
             .setNegativeButton("Cancel", null)
             .setItems(labels) { _, which ->

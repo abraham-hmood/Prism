@@ -1,5 +1,7 @@
 package com.prism.launcher
 
+import com.prism.launcher.mouse.MouseGlow
+
 /**
  * Every Prism setting, declared once, in the order the phone shows them.
  *
@@ -159,7 +161,8 @@ object SettingsCatalog {
         OPEN_IMAGE_MODELS, OPEN_NORA, OPEN_AETHER, OPEN_CAKECHAT, AUTO_CAPTION_FOLDER,
         OPEN_PRISM_SWAP, OPEN_DATASETS, OPEN_WALLET, OPEN_MINING, OPEN_WRITER, WRITER_DICTIONARY,
         SELECT_CUSTOM_FONT, SUMMARY_STATUS, SELECT_ISO, OPEN_TOUR, OPEN_LOCK_SCREEN,
-        EMERGENCY_CONTACTS, STREMIO_REPOSITORIES, STREMIO_ADDONS,
+        EMERGENCY_CONTACTS, STREMIO_REPOSITORIES, STREMIO_ADDONS, WIRELESS_DISPLAYS,
+        OPEN_MOUSE_COLOR_STYLE_EDITOR, OPEN_MOUSE_FLOW_EDITOR, OPEN_PDB,
     }
 
     data class Section(val title: String, val items: List<Item>)
@@ -204,8 +207,20 @@ object SettingsCatalog {
         Group("Wallet & Mining", "Mining, selling models and node hosting", listOf("Wallet Mining", "Selling Models")),
         Group("Virtualization", "Run a guest OS inside Prism", listOf("OS Virtualization")),
         Group("Keyboard", "Prism Writer", listOf("Prism Writer (Keyboard)")),
+        // A group of its own rather than a row in Launcher Aesthetic: the Mouse page is a control
+        // surface, not a launcher pattern, and its colour editor and script editor are full screens.
+        Group("Mouse", "RGB glow styles, flows and custom effects", listOf("Mouse")),
         Group("Personal", "Lock screen, medical card and getting started", listOf("Medical", "Getting started")),
         Group("Media", "Stremio", listOf("Stremio")),
+        // AN EXPLICIT "Other" RATHER THAN LEAVING IT TO THE FALLBACK. A section named in no group
+        // lands there anyway, but then nothing can SAY that it belongs there on purpose -- and a
+        // display is a local-network feature that is neither a launcher preference nor a privacy
+        // switch, so "Other" is the honest place for it rather than a group that half fits.
+        Group("Other", "Displays and anything that does not fit the other groups", listOf("Display")),
+        // A group of its own rather than another row under Trusted devices: the bridge needs
+        // trust first, but it is a shell and not a sharing permission. Keeping it separate is
+        // also what makes it discoverable when something has gone wrong.
+        Group("Developer options", "Prism Debug Bridge and developer tooling", listOf("Developer options")),
     )
 
     fun groupOf(section: String): String =
@@ -226,7 +241,7 @@ object SettingsCatalog {
         privacyAndHistory(), accessPoints(), wireGuard(), intelligence(), speech(), llmModels(),
         diffusion(), nora(), aether(), responseBehavior(), trustedDevices(), blocklist(),
         nameSystem(), typography(), writer(), mining(), sellingModels(), virtualization(),
-        gettingStarted(), medical(), stremio(),
+        gettingStarted(), medical(), stremio(), display(), mouse(), developer(),
     )
 
     /** Every item, flattened, for a search box. */
@@ -251,6 +266,95 @@ object SettingsCatalog {
                 values = listOf("0", "1", "2"),
                 get = { PrismSettings.getDefaultPage().toString() },
                 set = { PrismSettings.setDefaultPage(it.toIntOrNull() ?: 1) },
+            ),
+        ),
+    )
+
+    /**
+     * The Mouse page's light and the editors for it.
+     *
+     * THE CHOICES ARE DERIVED, NOT HARD-CODED. A custom style or flow the user creates appears
+     * here as soon as the list is next built, without a second registration step. `selectedStyle()`
+     * falls back to a shipped entry if the stored id was deleted, so this row can never render with
+     * nothing highlighted.
+     */
+    private fun mouse(): Section {
+        val styles = MouseGlow.styles()
+        val flows = MouseGlow.flows()
+        return Section(
+            "Mouse",
+            listOf(
+                Switch(
+                    "Touchpad view",
+                    "Use a glowing touchpad instead of the mouse body",
+                    get = { PrismSettings.getMouseTouchpad() },
+                    set = { PrismSettings.setMouseTouchpad(it) },
+                ),
+                Choice(
+                    "Color style",
+                    "The palette of light that flows around the mouse, its buttons and its wheel",
+                    labels = styles.map { it.name },
+                    values = styles.map { it.id },
+                    get = { MouseGlow.selectedStyle().id },
+                    set = { PrismSettings.setMouseColorStyle(it) },
+                    reach = Reach.PHONE_ACTS,
+                ),
+                Choice(
+                    "Color flow",
+                    "How the palette moves: liquid, pop, lava-lamp bubbles or a flow you scripted",
+                    labels = flows.map { it.name },
+                    values = flows.map { it.id },
+                    get = { MouseGlow.selectedFlow().id },
+                    set = { PrismSettings.setMouseColorFlow(it) },
+                    reach = Reach.PHONE_ACTS,
+                ),
+                Action(
+                    "Create a color style",
+                    "Choose any number of colours and name the palette",
+                    Target.OPEN_MOUSE_COLOR_STYLE_EDITOR,
+                    reach = Reach.PHONE_ACTS,
+                ),
+                Action(
+                    "Create a color flow",
+                    "Write a Prism flow script to move the light your own way",
+                    Target.OPEN_MOUSE_FLOW_EDITOR,
+                    reach = Reach.PHONE_ACTS,
+                ),
+            ),
+        )
+    }
+
+    /** Named by no group, so it lands under Other -- the same place the phone puts it. */
+    private fun display() = Section(
+        "Display",
+        listOf(
+            // The Other section's one interface-wide choice. It is a display question before it
+            // is a launcher question -- how much of the screen a page is allowed to use -- and it
+            // is the same switch on both builds.
+            Switch(
+                "Windowed pages",
+                "Draw each page as a titled window with the desktop around it, on both the phone " +
+                    "and the desktop",
+                get = { PrismSettings.getWindowedPages() },
+                set = { PrismSettings.setWindowedPages(it) },
+            ),
+            // THE PHOTO BACKUP SWITCH. Under Other because it is neither a launcher preference
+            // nor a network one: it copies the camera roll, encrypted with the wallet's photo key,
+            // to this device's vault and to every trusted device on the mesh. Off by default --
+            // nothing about this should happen because an app was installed.
+            Switch(
+                "Back up photos & videos",
+                "Keep a compressed, encrypted copy of every photo and video on this device, and " +
+                    "send it to every trusted device on your meshnet. Sealed with your wallet's " +
+                    "photo key, so only your devices can open it.",
+                get = { PrismSettings.getPhotoBackup() },
+                set = { PrismSettings.setPhotoBackup(it) },
+            ),
+            Action(
+                "Wireless displays",
+                "Mirror this screen to another Prism device, or to a TV or monitor this system " +
+                    "can present to",
+                Target.WIRELESS_DISPLAYS,
             ),
         ),
     )
@@ -647,6 +751,24 @@ object SettingsCatalog {
                 values = listOf("1", "2", "4", "6", "12", "24"),
                 get = { PrismSettings.getNebulaGenerationIntervalHours().toString() },
                 set = { PrismSettings.setNebulaGenerationIntervalHours(it.toIntOrNull() ?: 2) },
+            ),
+        ),
+    )
+
+    /**
+     * Developer options.
+     *
+     * The bridge is the first thing here, and deliberately the only thing for now: a screen full
+     * of switches somebody has to trust before it has a working terminal is worse than one honest
+     * action that opens the device list.
+     */
+    private fun developer() = Section(
+        "Developer options",
+        listOf(
+            Action(
+                "Prism Debug Bridge",
+                "Run a shell on a trusted device over the mesh. No USB or wireless debugging needed.",
+                Target.OPEN_PDB,
             ),
         ),
     )

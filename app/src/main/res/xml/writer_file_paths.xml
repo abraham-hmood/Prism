@@ -8,4 +8,10 @@
     <cache-path name="writer_gifs" path="writer-gifs/" />
     <!-- Where the camera writes a Lyke recording before it is imported. -->
     <cache-path name="lyke_capture" path="lyke-capture/" />
+    <!-- Downloads opened from the browser's own list. DownloadManager's content URI is preferred;
+         this is the fallback when the row has aged out of its database. -->
+    <external-path name="downloads" path="Download/" />
+    <!-- Packages received by the Prism Debug Bridge. Only this directory is exposed so Android's
+         installer can read one file, never the app's private data. -->
+    <files-path name="pdb_incoming" path="pdb/incoming/" />
 </paths>

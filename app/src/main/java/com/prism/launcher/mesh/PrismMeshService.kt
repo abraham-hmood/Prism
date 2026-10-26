@@ -14,6 +14,11 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.util.concurrent.ConcurrentHashMap
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.util.Base64
+import java.util.zip.GZIPInputStream
+import java.util.zip.GZIPOutputStream
 
 /**
  * The Control Plane for the Prism Mesh.
@@ -23,6 +28,8 @@ object PrismMeshService {
     private const val TAG = "PrismMesh"
     private const val DEFAULT_MESH_PORT = 8081
     private const val PROTOCOL_HEADER = "PRISM"
+    /** UDP payload budget under the 16 KB receive buffer, with room for the 6-byte header. */
+    private const val MAX_DNS_PAYLOAD = 15_000
 
     // Without a handler, an unhandled failure inside a SupervisorJob scope can be dropped
     // without ever reaching the global uncaught-exception handler -- so a mesh service that
@@ -65,18 +72,57 @@ object PrismMeshService {
      * nothing about mesh membership.
      */
     fun isOnMesh(): Boolean =
-        PrismSettings.getMeshEnabled() && (listenerJob?.isActive == true || gossipJob?.isActive == true)
+        PrismSettings.getMeshEnabled() &&
+            !controlPlaneBroken &&
+            socket?.isClosed == false &&
+            (listenerJob?.isActive == true || gossipJob?.isActive == true)
+
+    /**
+     * True when the control-plane socket is not usable, even though the jobs are still alive.
+     *
+     * THE SILENT FAILURE THIS REPLACES: under the VPN, an unprotected UDP socket has its packets
+     * routed into the TUN interface and dropped. The listener and gossip coroutines stay active,
+     * `isOnMesh()` answered true, and every feature built on the mesh behaved as if the network
+     * were simply quiet. A state that says "running" while nothing can leave is worse than an
+     * error, so this flag is consulted by [isOnMesh] and reported by [listenerHealth].
+     */
+    @Volatile
+    var controlPlaneBroken: Boolean = false
+        private set
 
     /** Mesh IPs of peers currently considered alive. */
-    fun activePeerIps(): List<String> = activePeers.keys.toList()
+    fun activePeerIps(): List<String> {
+        val cutoff = System.currentTimeMillis() - com.prism.core.MeshCore.PEER_LEASE_MS
+        return activePeers.filterValues { it.lastSeen > cutoff }.keys.toList()
+    }
 
     /** Last unexpected listener failure, or null if the listener has never failed. */
     @Volatile
     var lastListenerError: String? = null
         private set
 
+    /**
+     * Datagrams that could not be sent, and why.
+     *
+     * A SILENT catch here is worse than a crash for this feature: "the mesh is up but nothing
+     * arrives" has a dozen causes, and a send that fails because the address family is wrong, the
+     * socket was closed, or the interface has no route to the peer looks exactly like a peer that
+     * chose not to answer. The counter is what Diagnostics shows.
+     */
+    @Volatile
+    var sendFailureCount: Long = 0L
+        private set
+
+    /** The last send failure, or null if none has happened since the process started. */
+    @Volatile
+    var lastSendError: String? = null
+        private set
+
     /** Human-readable listener health, for diagnostics. */
     fun listenerHealth(): String = when {
+        controlPlaneBroken ->
+            "DEGRADED: the socket could not be excluded from the VPN, so packets are being routed " +
+                "into the tunnel and dropped. Turn the VPN off, or fix the protect() failure, then restart the mesh."
         listenerJob?.isActive == true -> "listening on ${PrismSettings.getMeshBootstrapPort()}"
         lastListenerError != null -> "stopped after error: $lastListenerError"
         PrismSettings.getMeshEnabled() -> "not running (start() never ran, or the port was taken)"
@@ -99,13 +145,32 @@ object PrismMeshService {
                     reuseAddress = true
                     broadcast = true
                 }
-                
-                // Try to bypass VPN for the mesh control plane
-                try {
-                    val vpnServiceClass = Class.forName("com.prism.launcher.browser.PrivateDnsVpnService")
-                    val protectMethod = vpnServiceClass.getMethod("protectSocket", DatagramSocket::class.java)
-                    protectMethod.invoke(null, socket)
-                } catch (e: Exception) {}
+
+                // Bypass the VPN for the mesh control plane. THIS RESULT IS NOT IGNORED any more:
+                // `protect` returns false whenever it cannot exclude the socket, and under an
+                // active tunnel that means every mesh packet is swallowed. The old empty catch
+                // made that indistinguishable from a quiet network.
+                val vpnRunning = runCatching {
+                    com.prism.launcher.browser.PrivateDnsVpnService.isServiceRunning()
+                }.getOrDefault(false)
+                val protected = runCatching {
+                    com.prism.launcher.browser.PrivateDnsVpnService.protectSocket(socket!!)
+                }.getOrElse { error ->
+                    PrismLogger.logWarning(TAG, "protect() threw: ${error.message}")
+                    false
+                }
+                if (!protected && vpnRunning) {
+                    controlPlaneBroken = true
+                    lastListenerError =
+                        "protect() refused the mesh socket while the VPN is up; mesh traffic will be dropped"
+                    PrismLogger.logError(
+                        TAG,
+                        "Mesh control plane cannot bypass the VPN: protect() returned false",
+                        null,
+                    )
+                } else {
+                    controlPlaneBroken = false
+                }
                 
                 PrismLogger.logSuccess(TAG, "Decentralized Mesh active on port $meshPort")
                 
@@ -144,8 +209,13 @@ object PrismMeshService {
                 }
 
                 val now = System.currentTimeMillis()
-                // Evict stale peers
-                activePeers.entries.removeIf { it.value.lastSeen < now - 300000L } 
+                // Evict stale peers. The lease is the same one MeshCore uses, so a phone and a
+                // desktop agree on when a device has gone: this used to be five minutes here and
+                // ninety seconds there, and the phone's five is why a closed Prism still read as
+                // online in the trusted list.
+                activePeers.entries.removeIf {
+                    it.value.lastSeen < now - com.prism.core.MeshCore.PEER_LEASE_MS
+                }
                 
                 if (activePeers.isNotEmpty()) {
                     val randomPeerIp = activePeers.keys.random()
@@ -223,6 +293,15 @@ object PrismMeshService {
 
     fun kickNode(nodeId: String): Boolean = evictNode(nodeId, permanent = false)
 
+    /**
+     * Whether the peer at [ip] is banned. See MeshCore.isPeerBanned for why the gossip gate alone
+     * did not stop a banned device from reaching the model/AI hosts over TCP.
+     */
+    fun isPeerBanned(ip: String): Boolean {
+        val nodeId = activePeers[ip]?.nodeId?.takeIf { it.isNotBlank() } ?: return false
+        return nodeId in PrismSettings.getBannedPrismNodeIds()
+    }
+
     fun banNode(nodeId: String): Boolean {
         if (nodeId.isBlank()) return false
         PrismSettings.setBannedPrismNodeIds(PrismSettings.getBannedPrismNodeIds() + nodeId)
@@ -246,6 +325,29 @@ object PrismMeshService {
 
     /** Stops the listener/gossip loops and releases the socket, so toggling the setting off takes effect immediately rather than only on next process start. */
     fun stop() {
+        // Say goodbye while the socket is still usable. A clean shutdown removing itself at once
+        // is what makes closing Prism look like closing Prism rather than like a device that
+        // silently went offline five minutes ago.
+        //
+        // SENT SYNCHRONOUSLY, not through sendPacket: that queues onto the scope, and the socket
+        // is closed a few lines later -- so the goodbye could reach the top of the queue after
+        // the socket was gone. This is the one message whose whole point is being early.
+        runCatching {
+            val sock = socket
+            if (sock != null && !sock.isClosed) {
+                val myPort = PrismSettings.getMeshBootstrapPort().toIntOrNull() ?: DEFAULT_MESH_PORT
+                val payload = localAnnouncement(myPort).toByteArray()
+                val data = ByteArray(6 + payload.size)
+                PROTOCOL_HEADER.toByteArray().copyInto(data)
+                data[5] = 0x07.toByte()
+                payload.copyInto(data, 6)
+                activePeers.forEach { (ip, info) ->
+                    runCatching {
+                        sock.send(DatagramPacket(data, data.size, InetAddress.getByName(ip), info.port))
+                    }
+                }
+            }
+        }
         listenerJob?.cancel()
         gossipJob?.cancel()
         listenerJob = null
@@ -253,6 +355,7 @@ object PrismMeshService {
         try { socket?.close() } catch (e: Exception) {}
         socket = null
         activePeers.clear()
+        probedAt.clear()
         pendingRequests.clear()
         // The speech HTTP port is part of what the mesh exposes. Leaving it listening after the
         // mesh is switched off would keep offering this machine's models over the plain LAN,
@@ -280,7 +383,7 @@ object PrismMeshService {
         val header = String(data, 0, 5)
         if (header != PROTOCOL_HEADER) return
         
-        if (MeshUtils.getAllLocalIps().contains(peerIp)) return
+        if (localIps().contains(peerIp)) return
 
         val now = System.currentTimeMillis()
         val command = data[5]
@@ -333,6 +436,7 @@ object PrismMeshService {
             0x02.toByte() -> handlePeerListReq(peerIp, info.port)
             0x03.toByte() -> handlePeerListResp(payload)
             0x05.toByte() -> handleDnsWrite(payload, peerIp)
+            0x07.toByte() -> handleLeave(peerIp)
             0x08.toByte() -> handleDnsSyncReq(peerIp, info.port, payload)
             0x09.toByte() -> handleDnsSyncResp(peerIp, payload)
             0x0A.toByte() -> handleDiscoveryReq(peerIp, payload)
@@ -430,7 +534,21 @@ object PrismMeshService {
                 }, "trust-wallet").start()
             }
 
+            // A trusted peer saying where it is now. Cheap and frequent, so it runs inline: this
+            // only rewrites an existing record's address, and doing it on a thread per packet
+            // would cost more than the work.
+            com.prism.launcher.trusted.TrustedDevices.OPCODE_PRESENCE -> {
+                com.prism.launcher.trusted.TrustedDevices.onPresence(peerIp, payload)
+            }
+
             com.prism.launcher.messaging.SmsRelay.OPCODE_SMS -> {
+                // THE RECEIVE SIDE OF THE SETTING. The preference existed and was read by the
+                // sender's receiver, but nothing wrote it and nothing checked it here, so a
+                // relayed text was ingested whether or not the user had asked for relaying.
+                if (!PrismSettings.getSmsRelayEnabled()) {
+                    PrismLogger.logInfo("PrismSmsRelay", "Ignored a relayed text: relaying is off")
+                    return
+                }
                 val ctx = com.prism.launcher.PrismApp.instance
                 Thread({
                     val sealed = com.prism.launcher.messaging.SmsRelay.fromPayloadString(payload)
@@ -520,6 +638,40 @@ object PrismMeshService {
             com.prism.launcher.social.SocialMeshSync.OPCODE_DELIVER ->
                 com.prism.launcher.social.SocialMeshSync.onDeliver(peerIp, payload)
 
+            // MESH CALLS AND MESHNET VOICEMAIL. Signals are rare and parse JSON, so they go
+            // off the dispatch thread; audio is one frame every 20 ms and must not queue behind a
+            // thread that is starting a call, so it is handled inline. The engine's own receive
+            // functions are shared with the desktop's MeshCore path, which is what keeps one set of
+            // encryption checks on both platforms.
+            com.prism.launcher.calls.MeshCalls.OPCODE_SIGNAL -> {
+                Thread({
+                    com.prism.launcher.calls.MeshCalls.receiveSignal(peerIp, payload)
+                }, "mesh-call-signal").start()
+            }
+
+            com.prism.launcher.calls.MeshCalls.OPCODE_AUDIO ->
+                com.prism.launcher.calls.MeshCalls.receiveAudio(peerIp, payload)
+
+            com.prism.launcher.calls.MeshCalls.OPCODE_VOICE -> {
+                Thread({
+                    com.prism.launcher.calls.MeshCalls.MeshVoice.accept(peerIp, payload)
+                }, "meshvoice-ingest").start()
+            }
+
+            // Trusted-device positions and find requests. Both decrypt a sealed payload and write a
+            // file, so both are off the dispatch thread for the same reason.
+            com.prism.launcher.trusted.TrustedLocations.OPCODE_LOCATION -> {
+                Thread({
+                    com.prism.launcher.trusted.TrustedLocations.receiveLocation(peerIp, payload)
+                }, "location-receive").start()
+            }
+
+            com.prism.launcher.trusted.TrustedLocations.OPCODE_FIND -> {
+                Thread({
+                    com.prism.launcher.trusted.TrustedLocations.receiveFind(peerIp, payload)
+                }, "location-find").start()
+            }
+
             // PrismCoin blocks and transactions. The node itself decides whether this device
             // participates -- having the Wallet page on a desktop slot is the opt-in -- so a peer
             // that has not opted in simply drops these rather than relaying them.
@@ -555,6 +707,17 @@ object PrismMeshService {
     private fun handleHeartbeat(peerIp: String, port: Int) {
         val myPort = try { PrismSettings.getMeshBootstrapPort().toInt() } catch(e: Exception) { DEFAULT_MESH_PORT }
         sendPacket(peerIp, port, 0x0B.toByte(), localAnnouncement(myPort))
+    }
+
+    /**
+     * A peer said goodbye.
+     *
+     * The lease would have removed it in a minute or so; this makes a deliberate shutdown immediate.
+     * It matters most on the trusted-devices screen, where "online" is the thing being read.
+     */
+    private fun handleLeave(peerIp: String) {
+        activePeers.remove(peerIp)
+        pendingRequests.keys.removeIf { it.startsWith("$peerIp:") }
     }
     
     private fun handleHeartbeatResp(peerIp: String, payload: String) {
@@ -607,19 +770,28 @@ object PrismMeshService {
 
     private fun handlePeerListResp(payload: String) {
         val myIps = MeshUtils.getAllLocalIps()
+        val now = System.currentTimeMillis()
         payload.split(",").filter { it.isNotBlank() }.forEach { entry ->
             try {
                 val parts = entry.split(":")
                 val ip = parts[0]
                 val port = parts.getOrNull(1)?.toInt() ?: DEFAULT_MESH_PORT
-                if (!myIps.contains(ip) && !activePeers.containsKey(ip)) {
-                    activePeers[ip] = PeerInfo(System.currentTimeMillis(), port = port)
-                    sendPacket(ip, port, 0x01.toByte(), "{}")
-                    requestSync(ip)
-                }
+                // HEARSAY IS NOT PRESENCE. This used to insert every listed address into the peer
+                // table with a fresh timestamp, which is what kept a device whose Prism was closed
+                // showing as online as long as any third device still mentioned it. A listed
+                // address is only a hint to probe; it becomes a peer when it answers itself.
+                if (myIps.contains(ip) || isPeer(ip)) return@forEach
+                val lastProbe = probedAt[ip] ?: 0L
+                if (now - lastProbe < PROBE_INTERVAL_MS) return@forEach
+                probedAt[ip] = now
+                sendPacket(ip, port, 0x01.toByte(), "{}")
             } catch (e: Exception) {}
         }
     }
+
+    /** The last time an address heard through a peer list was probed, to cap the traffic. */
+    private val probedAt = ConcurrentHashMap<String, Long>()
+    private const val PROBE_INTERVAL_MS = 30_000L
 
     private fun handleModelAnnounce(payload: String, peerIp: String) {
         try {
@@ -634,15 +806,35 @@ object PrismMeshService {
             val json = JSONObject(payload)
             val domain = json.getString("domain")
             val ip = json.getString("ip")
-            P2pDnsManager.updateRecord(PrismApp.instance, domain, ip, isVerified = true, fromMesh = true)
-            broadcastToOthers(0x05.toByte(), payload, sourceIp)
+            // THE SIGNATURE IS THE AUTHORITY when there is one; the sender's address is the
+            // fallback for builds that cannot sign. updateRecord checks both, including that a
+            // name already bound to an identity cannot be moved by a different one.
+            val altArray = json.optJSONArray("alts")
+            val alts = mutableSetOf<String>()
+            if (altArray != null) {
+                for (i in 0 until altArray.length()) alts.add(altArray.getString(i))
+            }
+            val accepted = P2pDnsManager.updateRecord(
+                PrismApp.instance,
+                domain,
+                ip,
+                isVerified = true,
+                fromMesh = true,
+                sourceIp = sourceIp,
+                timestamp = json.optLong("ts", System.currentTimeMillis()),
+                alternates = alts,
+                publicKey = json.optString("pub"),
+                signature = json.optString("sig"),
+            )
+            if (accepted) broadcastToOthers(0x05.toByte(), payload, sourceIp)
+            else PrismLogger.logWarning(TAG, "Ignored unauthorized DNS write from $sourceIp for $domain")
         } catch (e: Exception) {}
     }
 
     private fun handleDnsSyncReq(peerIp: String, port: Int, payload: String) {
         PrismLogger.logDebug(TAG, "Sync requested by $peerIp")
         try {
-            val json = JSONObject(payload)
+            val json = JSONObject(decodeDnsPayload(payload))
             if (json.has("dns")) {
                 ingestDnsJson(json.getJSONObject("dns"))
             }
@@ -652,16 +844,52 @@ object PrismMeshService {
             put("dns", getLocalDnsJson())
             put("peers", getPeerListString())
         }
-        sendPacket(peerIp, port, 0x09.toByte(), response.toString())
+        sendPacket(peerIp, port, 0x09.toByte(), encodeDnsPayload(response.toString()))
     }
 
     private fun handleDnsSyncResp(peerIp: String, payload: String) {
         try {
-            val json = JSONObject(payload)
+            val json = JSONObject(decodeDnsPayload(payload))
             if (json.has("dns")) ingestDnsJson(json.getJSONObject("dns"))
             if (json.has("peers")) handlePeerListResp(json.getString("peers"))
             PrismLogger.logDebug(TAG, "Sync received from $peerIp")
         } catch (e: Exception) {}
+    }
+
+    /**
+     * Compresses a DNS sync body before it goes into one UDP datagram.
+     *
+     * The receive buffer is 16 KB, and an uncompressed ledger of a few hundred domains reaches
+     * that easily -- at which point the datagram is silently truncated by the transport and the
+     * receiver parses a fragment. Gzip + Base64 typically cuts a JSON ledger by an order of
+     * magnitude; if the result still does not fit, the ledger is trimmed to the most recent
+     * records and the loss is logged rather than being presented as a successful sync.
+     */
+    private fun encodeDnsPayload(json: String): String {
+        val raw = json.toByteArray()
+        if (raw.size < 2048) return json
+        val compressed = try {
+            val out = ByteArrayOutputStream()
+            GZIPOutputStream(out).use { it.write(raw) }
+            out.toByteArray()
+        } catch (_: Exception) {
+            return json
+        }
+        if (compressed.size + 8 > MAX_DNS_PAYLOAD) {
+            PrismLogger.logWarning(
+                TAG,
+                "DNS sync is ${compressed.size} bytes compressed; dropping it rather than " +
+                    "sending a datagram the peer cannot receive whole",
+            )
+            return JSONObject().put("dns", JSONObject()).toString()
+        }
+        return "GZ:" + Base64.getEncoder().encodeToString(compressed)
+    }
+
+    private fun decodeDnsPayload(payload: String): String {
+        if (!payload.startsWith("GZ:")) return payload
+        val bytes = Base64.getDecoder().decode(payload.removePrefix("GZ:"))
+        return GZIPInputStream(ByteArrayInputStream(bytes)).use { it.readBytes().toString(Charsets.UTF_8) }
     }
 
     private fun ingestDnsJson(dnsObj: JSONObject) {
@@ -683,7 +911,9 @@ object PrismMeshService {
                     alts,
                     obj.getLong("ts"),
                     obj.optBoolean("v", false),
-                    source
+                    source,
+                    obj.optString("pub"),
+                    obj.optString("sig"),
                 )
             } catch (e: Exception) {}
         }
@@ -703,6 +933,8 @@ object PrismMeshService {
             put("ts", record.timestamp)
             val publicAlts = record.alternates.filter { it != "127.0.0.1" }
             if (publicAlts.isNotEmpty()) put("alts", com.prism.core.json.JSONArray(publicAlts))
+            if (record.publicKey.isNotBlank()) put("pub", record.publicKey)
+            if (record.signature.isNotBlank()) put("sig", record.signature)
         }.toString()
         
         broadcastToOthers(0x05.toByte(), payload)
@@ -718,7 +950,9 @@ object PrismMeshService {
                 put("ts", record.timestamp)
                 put("v", record.isVerified)
                 put("src", record.source.name)
-                
+                if (record.publicKey.isNotBlank()) put("pub", record.publicKey)
+                if (record.signature.isNotBlank()) put("sig", record.signature)
+
                 val publicAlts = record.alternates.filter { it != "127.0.0.1" }.toMutableSet()
                 if (record.ip == "127.0.0.1" && broadcastIp != record.ip) {
                    // no-op, already primary
@@ -752,7 +986,7 @@ object PrismMeshService {
     fun requestSync(targetIp: String) {
         val info = activePeers[targetIp] ?: return
         val payload = JSONObject().apply { put("dns", getLocalDnsJson()) }
-        sendPacket(targetIp, info.port, 0x08.toByte(), payload.toString())
+        sendPacket(targetIp, info.port, 0x08.toByte(), encodeDnsPayload(payload.toString()))
     }
 
     /**
@@ -785,8 +1019,28 @@ object PrismMeshService {
                 }
                 
                 val packet = DatagramPacket(data, data.size, InetAddress.getByName(targetIp), targetPort)
-                socket?.send(packet)
-            } catch (e: Exception) {}
+                val target = socket
+                if (target == null) {
+                    noteSendFailure("socket is not open (mesh stopped or never started)")
+                    return@launch
+                }
+                target.send(packet)
+            } catch (e: Exception) {
+                noteSendFailure(e.message ?: e.javaClass.simpleName)
+            }
+        }
+    }
+
+    private fun noteSendFailure(reason: String) {
+        sendFailureCount += 1
+        // Log the first failure and then every fiftieth: a peer that is gone produces one failure
+        // per gossip round forever, and logging all of them would bury everything else.
+        if (sendFailureCount == 1L || sendFailureCount % 50L == 0L) {
+            lastSendError = reason
+            PrismLogger.logWarning(
+                TAG,
+                "UDP send failed ($sendFailureCount so far): $reason",
+            )
         }
     }
 
@@ -806,11 +1060,34 @@ object PrismMeshService {
         return healthyPeers.minByOrNull { it.value.latency }?.key
     }
     
-    fun getPeerCount(): Int = activePeers.size
+    fun getPeerCount(): Int {
+        val cutoff = System.currentTimeMillis() - com.prism.core.MeshCore.PEER_LEASE_MS
+        return activePeers.count { it.value.lastSeen > cutoff }
+    }
     
+    /**
+     * This device's own addresses, refreshed at most every 1.5 seconds.
+     *
+     * The listener used to enumerate every network interface for every incoming packet. At
+     * pointer rates -- a hundred small datagrams a second -- that work sits directly between the
+     * finger and the cursor on the far side.
+     */
+    @Volatile private var localIpsAt = 0L
+    @Volatile private var localIpsCache: Set<String> = emptySet()
+
+    private fun localIps(): Set<String> {
+        val now = System.currentTimeMillis()
+        if (now - localIpsAt < 1_500L) return localIpsCache
+        val fresh = runCatching { MeshUtils.getAllLocalIps() }.getOrDefault(emptySet())
+        localIpsCache = fresh
+        localIpsAt = now
+        return fresh
+    }
+
     fun isPeer(ip: String): Boolean {
         val cleanIp = if (ip.startsWith("::ffff:")) ip.substring(7) else ip
-        return activePeers.containsKey(cleanIp)
+        val info = activePeers[cleanIp] ?: return false
+        return System.currentTimeMillis() - info.lastSeen <= com.prism.core.MeshCore.PEER_LEASE_MS
     }
 
     /**

@@ -87,13 +87,16 @@ fun LockPage() {
     var contacts by remember(revision) { mutableStateOf(EmergencyContacts.all()) }
     var contactName by remember { mutableStateOf("") }
     var contactNumber by remember { mutableStateOf("") }
+    // Required: the alert says who needs help, using the name this contact knows the user by.
+    var contactKnownAs by remember { mutableStateOf("") }
+    var knownAsError by remember { mutableStateOf("") }
 
     PageScaffold("Lock", "A credential for Prism, a medical card and emergency contacts") {
         Column(Modifier.verticalScroll(rememberScrollState())) {
 
             if (note.isNotBlank()) {
                 Surface(
-                    color = Color(0xFF1E1E26),
+                    color = colors.surfaceRaised,
                     shape = RoundedCornerShape(8.dp),
                     modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp),
                 ) {
@@ -117,7 +120,7 @@ fun LockPage() {
                             "would be walked past by alt-tab, a second monitor, or the task manager. " +
                             "What this locks is Prism.",
                         fontSize = 12.sp,
-                        color = Color(0xFFE0C060),
+                        color = colors.accent,
                         lineHeight = 18.sp,
                     )
                     Spacer(Modifier.height(10.dp))
@@ -395,6 +398,12 @@ fun LockPage() {
                             Column(Modifier.weight(1f)) {
                                 Text(contact.name.ifBlank { contact.number }, fontSize = 13.sp)
                                 Text(
+                                    if (contact.knownAs.isBlank()) "no name set — alert would be anonymous"
+                                    else "they know you as " + contact.knownAs,
+                                    fontSize = 10.sp,
+                                    color = if (contact.knownAs.isBlank()) Color(0xFFE0A080) else colors.faint,
+                                )
+                                Text(
                                     contact.number,
                                     fontSize = 10.sp,
                                     fontFamily = FontFamily.Monospace,
@@ -425,30 +434,62 @@ fun LockPage() {
                         )
                     }
                     Hairline()
-                    Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.padding(12.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            OutlinedTextField(
+                                value = contactName,
+                                onValueChange = { contactName = it },
+                                placeholder = { Text("Their name", fontSize = 12.sp) },
+                                singleLine = true,
+                                modifier = Modifier.width(140.dp),
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            OutlinedTextField(
+                                value = contactNumber,
+                                onValueChange = { contactNumber = it },
+                                placeholder = { Text("Number", fontSize = 12.sp) },
+                                singleLine = true,
+                                modifier = Modifier.width(150.dp),
+                            )
+                        }
+                        Spacer(Modifier.height(6.dp))
                         OutlinedTextField(
-                            value = contactName,
-                            onValueChange = { contactName = it },
-                            placeholder = { Text("Name", fontSize = 12.sp) },
+                            value = contactKnownAs,
+                            onValueChange = { contactKnownAs = it; knownAsError = "" },
+                            placeholder = { Text("Your name they know (required)", fontSize = 12.sp) },
                             singleLine = true,
-                            modifier = Modifier.width(150.dp),
+                            isError = knownAsError.isNotBlank(),
+                            modifier = Modifier.width(300.dp),
                         )
-                        Spacer(Modifier.width(6.dp))
-                        OutlinedTextField(
-                            value = contactNumber,
-                            onValueChange = { contactNumber = it },
-                            placeholder = { Text("Number", fontSize = 12.sp) },
-                            singleLine = true,
-                            modifier = Modifier.width(170.dp),
+                        if (knownAsError.isNotBlank()) {
+                            Text(knownAsError, fontSize = 11.sp, color = Color(0xFFE08080))
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "The alert uses this name, and is sent with your current location.",
+                            fontSize = 10.sp,
+                            color = colors.faint,
                         )
-                        Spacer(Modifier.width(6.dp))
+                        Spacer(Modifier.height(6.dp))
                         Button(
                             enabled = contactNumber.isNotBlank(),
                             onClick = {
-                                EmergencyContacts.add(contactName.trim(), contactNumber.trim())
-                                contactName = ""
-                                contactNumber = ""
-                                revision++
+                                if (contactKnownAs.isBlank()) {
+                                    knownAsError = "Enter the name this person knows you by."
+                                } else {
+                                    val added = EmergencyContacts.add(
+                                        contactName.trim(), contactNumber.trim(), contactKnownAs.trim(),
+                                    )
+                                    if (!added) {
+                                        knownAsError = "Could not add that contact. Is the number already listed?"
+                                    } else {
+                                        contactName = ""
+                                        contactNumber = ""
+                                        contactKnownAs = ""
+                                        knownAsError = ""
+                                        revision++
+                                    }
+                                }
                             },
                         ) { Text("Add", fontSize = 12.sp) }
                     }
@@ -489,7 +530,7 @@ private fun Toggle(label: String, on: Boolean, onChange: (Boolean) -> Unit) {
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Surface(
-            color = if (on) colors.accent else Color(0xFF2A2A31),
+            color = if (on) colors.accent else colors.surfaceRaised,
             shape = CircleShape,
             modifier = Modifier.size(9.dp),
         ) {}
@@ -523,7 +564,7 @@ private fun PatternGrid(label: String, onDrawn: (String) -> Unit) {
         Canvas(
             Modifier
                 .size(150.dp)
-                .background(Color(0xFF14141A), RoundedCornerShape(8.dp))
+                .background(colors.surface, RoundedCornerShape(8.dp))
                 .pointerInput(Unit) {
                     awaitPointerEventScope {
                         while (true) {
@@ -562,7 +603,7 @@ private fun PatternGrid(label: String, onDrawn: (String) -> Unit) {
             }
             for (i in 1..9) {
                 drawCircle(
-                    color = if (i in touched) colors.accent else Color(0xFF32323C),
+                    color = if (i in touched) colors.accent else colors.surfaceRaised,
                     radius = cell * 0.13f,
                     center = centre(i),
                 )
@@ -622,7 +663,21 @@ fun LockOverlay() {
         }
     }
 
-    Box(Modifier.fillMaxSize().background(Color(0xFF07070A))) {
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(colors.background)
+            // OPAQUE AND INPUT-CONSUMING. An opaque background hides the page behind it but does
+            // not stop a click from reaching it: Compose hit-tests positions, not pixels. Draining
+            // every pointer event here is what makes the lock a lock instead of a screensaver.
+            .pointerInput(Unit) {
+                awaitPointerEventScope {
+                    while (true) {
+                        awaitPointerEvent().changes.forEach { it.consume() }
+                    }
+                }
+            }
+    ) {
         Column(
             Modifier.fillMaxSize().padding(40.dp),
             verticalArrangement = Arrangement.Top,
@@ -664,7 +719,7 @@ fun LockOverlay() {
                 Text(
                     "That is not right. " + wrong + " attempt(s).",
                     fontSize = 11.sp,
-                    color = Color(0xFFFFB4B4),
+                    color = colors.destructive,
                 )
             }
 
@@ -684,7 +739,7 @@ fun LockOverlay() {
             if (showCard) {
                 Spacer(Modifier.height(8.dp))
                 Surface(
-                    color = Color(0xFF16161A),
+                    color = colors.card,
                     shape = RoundedCornerShape(10.dp),
                     modifier = Modifier.width(420.dp),
                 ) {
@@ -715,7 +770,7 @@ fun LockOverlay() {
                             )
                         }
                         if (record.organDonor) {
-                            Text("Organ donor", fontSize = 12.sp, color = Color(0xFF9BE8B4))
+                            Text("Organ donor", fontSize = 12.sp, color = colors.accent)
                         }
                         if (contacts.isNotEmpty()) {
                             Spacer(Modifier.height(8.dp))

@@ -13,6 +13,12 @@ import com.prism.launcher.messaging.LocalAi
  * translate to/from the canonical [ToolDefinition]/[ToolCall]/[ModelTurn] types up front; this
  * loop never needs to know which backend it's talking to.
  *
+ * EVERY BACKEND IS TOLD ABOUT EVERY TOOL IT CAN CALL: name, description and argument schema.
+ * Cloud and Ollama get them in the request's `tools` field; a local model has no such field and
+ * gets the same three things in its prompt through [AgenticBuiltinSyntax.DEFAULT] when the user has
+ * not imported a profile of their own. There is no path where tools are enabled and the model is
+ * left to guess that they exist.
+ *
  * Entry point is [AiManager.getResponse], which delegates here when agentic tools are enabled
  * and no image is attached (multimodal + tool-calling in the same turn isn't supported in v1).
  */
@@ -20,10 +26,19 @@ object AgenticEngine {
 
     private const val MAX_ITERATIONS = 5
 
+    private const val CONTEXT_INSTRUCTION =
+        "Long-term context: this device has an on-device context store, and you are expected to " +
+            "use it. Before the conversation or a document grows larger than you can hold, call " +
+            "context_offload with the material worth keeping and keep the returned id. When you " +
+            "need something you offloaded, call access_context_part with that id and a query or a " +
+            "line range -- never assume you still have the whole thing in mind. Nothing in the " +
+            "store is sent anywhere; it is a file on this device."
+
     suspend fun run(
         userText: String,
         onToken: ((String) -> Unit)?,
-        onReasoning: ((String) -> Unit)?
+        onReasoning: ((String) -> Unit)?,
+        history: List<String> = emptyList(),
     ): Pair<String, Pair<String?, String?>> {
         val dao = AppDatabase.get().agenticDao()
         // Capability-gated tools are never even offered to the model when their capability is
@@ -33,26 +48,36 @@ object AgenticEngine {
         val tools = (dao.getEnabledTools().map { it.toDefinition() } + AgenticBuiltinTools.ALL)
             .filter { !it.requiresActiveLine || com.prism.core.PrismPlatform.host.hasActiveCellularLine() }
             .filter { !it.requiresImageGenerator || PrismSettings.hasImageGenerator() }
+            .filter { !it.requiresContextOffload || PrismSettings.getContextOffloadEnabled() }
 
+        // Which prompt-injection profile applies, if any. "None" means the backend's native
+        // `tools` field (Cloud and Ollama); the built-in profile is selectable by id and has no
+        // database row, so it is resolved here rather than looked up.
         val syntaxId = PrismSettings.getActiveAgenticSyntaxId()
-        val syntax = syntaxId?.let { dao.getSyntax(it) }
+        val syntax = when (syntaxId) {
+            null -> null
+            AgenticBuiltinSyntax.ID -> AgenticBuiltinSyntax.DEFAULT
+            else -> dao.getSyntax(syntaxId)
+        }
 
         // Discards anything a previous turn left behind before this turn can pick it up.
         AgenticBuiltinTools.consumeGeneratedImageUri()
 
+        // The tool loop starts every turn with fresh messages, so it has no memory of its own.
+        // Folding the transcript in here is what stops an agentic Sam from reintroducing itself
+        // every message; the local path gets it too because its transcript is rebuilt per turn.
+        val prompt = foldHistory(userText, history)
+
         val mode = PrismSettings.getAiMode()
         val answer = when (mode) {
-            PrismSettings.AI_MODE_CLOUD -> runCloud(userText, tools, syntax, onToken, onReasoning)
-            PrismSettings.AI_MODE_LOCAL_CLOUD -> runOllama(userText, tools, syntax, onToken, onReasoning)
-            else -> {
-                // No local model has a native tool-calling API -- without a syntax profile there's
-                // nothing to inject/parse, so just fall back to a single plain generation.
-                if (syntax == null) {
-                    plainLocal(userText, onToken, onReasoning)
-                } else {
-                    runLocal(userText, tools, syntax, onToken, onReasoning)
-                }
-            }
+            PrismSettings.AI_MODE_CLOUD -> runCloud(prompt, tools, syntax, onToken, onReasoning)
+            PrismSettings.AI_MODE_LOCAL_CLOUD -> runOllama(prompt, tools, syntax, onToken, onReasoning)
+            // NO LOCAL BACKEND HAS NATIVE TOOL CALLING, so a local run always needs a profile.
+            // The built-in one is the fallback rather than a special case: a local model with
+            // agentic tools on must still be TOLD what the tools are, how to call them and what
+            // they do -- otherwise the switch does nothing and the model answers as if Prism had
+            // no tools at all. An imported profile still wins.
+            else -> runLocal(prompt, tools, syntax ?: AgenticBuiltinSyntax.DEFAULT, onToken, onReasoning)
         }
         return answer.withGeneratedMedia()
     }
@@ -82,7 +107,11 @@ object AgenticEngine {
 
         val toolsJson = if (syntax == null) NativeToolFormat.buildToolsJsonArray(tools) else null
         val messages = mutableListOf<AgenticMessage>()
-        if (syntax != null) messages.add(AgenticMessage("system", SyntaxToolFormat.renderSystemPrompt(syntax, tools)))
+        if (syntax != null) {
+            messages.add(AgenticMessage("system", SyntaxToolFormat.renderSystemPrompt(syntax, tools) + contextInstruction()))
+        } else if (PrismSettings.getContextOffloadEnabled()) {
+            messages.add(AgenticMessage("system", CONTEXT_INSTRUCTION))
+        }
         messages.add(AgenticMessage("user", userText))
 
         repeat(MAX_ITERATIONS) {
@@ -121,7 +150,11 @@ object AgenticEngine {
 
         val toolsJson = if (syntax == null) NativeToolFormat.buildToolsJsonArray(tools) else null
         val messages = mutableListOf<AgenticMessage>()
-        if (syntax != null) messages.add(AgenticMessage("system", SyntaxToolFormat.renderSystemPrompt(syntax, tools)))
+        if (syntax != null) {
+            messages.add(AgenticMessage("system", SyntaxToolFormat.renderSystemPrompt(syntax, tools) + contextInstruction()))
+        } else if (PrismSettings.getContextOffloadEnabled()) {
+            messages.add(AgenticMessage("system", CONTEXT_INSTRUCTION))
+        }
         messages.add(AgenticMessage("user", userText))
 
         repeat(MAX_ITERATIONS) {
@@ -161,6 +194,7 @@ object AgenticEngine {
         // Local models have no message-history API -- the running exchange is kept as a single
         // growing plain-text transcript instead, re-sent as the whole "prompt" each round.
         val transcript = StringBuilder(SyntaxToolFormat.renderSystemPrompt(syntax, tools))
+            .append(contextInstruction())
             .append("\n\nUser: ").append(userText).append("\n")
 
         repeat(MAX_ITERATIONS) {
@@ -185,21 +219,6 @@ object AgenticEngine {
         return Pair(fallback, Pair(null, null))
     }
 
-    private suspend fun plainLocal(
-        userText: String,
-        onToken: ((String) -> Unit)?,
-        onReasoning: ((String) -> Unit)?
-    ): Pair<String, Pair<String?, String?>> {
-        val modelPath = PrismSettings.getLocalAiModelPath()
-        if (modelPath.isBlank()) return Pair("Error: No local model loaded. Import one in Settings.", Pair(null, null))
-        val text = if (onToken != null && PrismSettings.getStreamingEnabled()) {
-            LocalAi.generator.generateStreaming(modelPath, userText, PrismSettings.getMaxTokens(), onToken, onReasoning)
-        } else {
-            LocalAi.generator.generate(modelPath, userText)
-        }
-        return Pair(text, Pair(null, null))
-    }
-
     /** Native backends (no syntax) interpret [messageJson] directly; backends with a syntax
      * assigned always parse tool calls out of the raw text via regex instead, even for Cloud/Ollama
      * (covers non-standard "OpenAI-compatible" endpoints that don't actually support `tools`). */
@@ -220,4 +239,30 @@ object AgenticEngine {
 
     private fun describeCalls(calls: List<ToolCall>): String =
         "Calling ${calls.joinToString(", ") { it.name }}..."
+
+    /**
+     * The standing instruction that makes offloading a behaviour rather than an option.
+     *
+     * Appended only when the user has enabled it. Without this a model is merely ABLE to call the
+     * tools, and most will never think to until its context is already full -- which is exactly
+     * the point at which the material it needed to save has been truncated away.
+     */
+    private fun contextInstruction(): String =
+        if (!PrismSettings.getContextOffloadEnabled()) ""
+        else "\n\n" + CONTEXT_INSTRUCTION
+
+    /** The same bounded fold the plain backends use; see `AiManager.foldHistory`. */
+    private fun foldHistory(userText: String, history: List<String>): String {
+        val recent = history.filter { it.isNotBlank() }.takeLast(12)
+        if (recent.isEmpty()) return userText
+        return buildString {
+            append("Conversation so far:\n")
+            recent.forEach { line ->
+                append(line.trim())
+                append('\n')
+            }
+            append("\nNew message:\n")
+            append(userText)
+        }
+    }
 }

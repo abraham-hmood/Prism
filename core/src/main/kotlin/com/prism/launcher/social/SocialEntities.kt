@@ -112,6 +112,23 @@ interface SocialDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertInteraction(interaction: SocialInteractionEntity)
 
+    /** Whether this actor already reacted to this post, so a tap can toggle rather than stack. */
+    @Query("SELECT * FROM social_interactions WHERE postId = :postId AND actorId = :actorId AND type = :type LIMIT 1")
+    suspend fun findInteraction(postId: String, actorId: String, type: String): SocialInteractionEntity?
+
+    @Query("DELETE FROM social_interactions WHERE id = :id")
+    suspend fun deleteInteraction(id: Long)
+
+    // MAX(0, ...) rather than a plain addition: a stale interaction row (from a mesh import, or
+    // an unlike after the count was already zeroed) must never drive the displayed number below
+    // zero. The counts are denormalised onto the post for the feed, so they are maintained here
+    // rather than recomputed on every bind.
+    @Query("UPDATE social_posts SET likesCount = MAX(0, likesCount + :delta) WHERE postId = :postId")
+    suspend fun adjustLikes(postId: String, delta: Int)
+
+    @Query("UPDATE social_posts SET repostCount = MAX(0, repostCount + :delta) WHERE postId = :postId")
+    suspend fun adjustReposts(postId: String, delta: Int)
+
     // Messages
     @Query("SELECT * FROM social_messages WHERE chatId = :chatId ORDER BY timestamp ASC")
     suspend fun getMessagesForChat(chatId: String): List<SocialMessageEntity>

@@ -41,7 +41,7 @@ object SettingsActions {
     var navigate: ((PageId) -> Unit)? = null
 
     /** Dialogs a settings row can ask the page to show. */
-    enum class Dialog { PRISM_SERVERS, PRISM_NODES, SPEECH_MODEL }
+    enum class Dialog { PRISM_SERVERS, PRISM_NODES, SPEECH_MODEL, WIRELESS_DISPLAYS, PDB }
 
     /** Installed by the settings page, which is what can host a dialog. */
     var openDialog: ((Dialog) -> Unit)? = null
@@ -58,6 +58,10 @@ object SettingsActions {
             go(PageId.TUNNEL, "Opened Tunnel, which has the adapter, the whitelist and WireGuard.")
 
         Target.OPEN_TRUSTED_DEVICES -> go(PageId.TRUSTED, "Opened trusted devices.")
+        Target.OPEN_PDB -> {
+            openDialog?.invoke(Dialog.PDB)
+            "Opened the Prism Debug Bridge."
+        }
         Target.OPEN_ACCESS_POINT -> go(PageId.ACCESS_POINT, "Opened the access point.")
         Target.MANAGE_DNS_RECORDS, Target.MANAGE_WEB_HOSTING ->
             go(PageId.MESH, "Opened Mesh, which lists the names this device answers for.")
@@ -239,6 +243,24 @@ object SettingsActions {
         // splitting them into two pages would separate a list from the thing that fills it.
         Target.STREMIO_REPOSITORIES, Target.STREMIO_ADDONS ->
             go(PageId.STREMIO, "Opened Stremio.")
+
+        // A DIALOG, because the list changes while it is open and the connect action needs a
+        // radio group beside it. A sentence on the row could not show either.
+        Target.WIRELESS_DISPLAYS -> {
+            openDialog?.invoke(Dialog.WIRELESS_DISPLAYS)
+            ""
+        }
+
+        // The style list itself IS in this section -- a style created on the phone appears in the
+        // dropdown and can be picked here. Only the editor, which is a full Android screen, has no
+        // desktop counterpart.
+        Target.OPEN_MOUSE_COLOR_STYLE_EDITOR ->
+            "The colour-style editor is on the phone's Settings > Mouse. Styles created there " +
+                "appear in the dropdown above, and the Mouse page draws with whichever is chosen."
+
+        Target.OPEN_MOUSE_FLOW_EDITOR ->
+            "The flow script editor is on the phone's Settings > Mouse. Flows created there " +
+                "appear in this section and run on the Mouse page."
     }
 
     // ── Plumbing ───────────────────────────────────────────────────────────

@@ -2,6 +2,7 @@ package com.prism.launcher
 
 import android.content.ClipData
 import android.content.ComponentName
+import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.drawable.Drawable
 import android.view.LayoutInflater
@@ -12,7 +13,7 @@ import androidx.recyclerview.widget.RecyclerView
 import com.prism.launcher.databinding.ItemDesktopCellBinding
 
 class DesktopGridAdapter(
-    private val packageManager: PackageManager,
+    private val context: Context,
     private val store: DesktopShortcutStore,
     private val cellCount: Int,
     private val onDataChanged: () -> Unit,
@@ -21,7 +22,11 @@ class DesktopGridAdapter(
     private val onLaunchFolder: (DesktopItem) -> Unit,
     private val onDragStarted: () -> Unit = {},
     private val onDragEnded: () -> Unit = {},
+    /** Opens the same app menu as the drawer. The third argument is the old long-press drag. */
+    private val onShowMenu: ((DrawerAppEntry, View, () -> Boolean) -> Boolean)? = null,
 ) : RecyclerView.Adapter<DesktopGridAdapter.VH>() {
+
+    private val packageManager: PackageManager = context.packageManager
 
     var cells: Array<DesktopItem?> = store.readGrid(cellCount).toTypedArray()
     @Suppress("UNUSED_PARAMETER") // Keep signature same for now if needed, but unused
@@ -44,11 +49,27 @@ class DesktopGridAdapter(
         }
     }
 
+    /**
+     * Swaps two cells.
+     *
+     * REFUSES any swap involving a widget or a cell the widget covers. A widget is not one cell:
+     * its [DesktopItem.Occupied] neighbours point back at its top-left index, and swapping it with
+     * an icon left that index pointing at the wrong cell -- so the widget's own occupancy now said
+     * some other icon was a widget, and the grid disagreed with itself. Better a move that does
+     * nothing than a grid that lies about which cells are taken.
+     */
     fun move(from: Int, to: Int) {
         if (from == to) return
+        if (from !in cells.indices || to !in cells.indices) return
+        val a = cells[from] ?: return
+        val b = cells[to]
+        if (a.ownsCells() || b.ownsCells()) return
         val tmp = cells[from]; cells[from] = cells[to]; cells[to] = tmp
         persist(); notifyItemMoved(from, to)
     }
+
+    private fun DesktopItem?.ownsCells(): Boolean =
+        this is DesktopItem.Widget || this is DesktopItem.PluginWidget || this is DesktopItem.Occupied
 
     fun placeAt(index: Int, item: DesktopItem?) {
         if (index !in cells.indices) return
@@ -142,29 +163,33 @@ class DesktopGridAdapter(
             }
             holder.itemView.setTag(R.id.tag_prism_launcher_app_target, true)
 
-            // Long-press: start drag. Store the source position so the drop handler
-            // knows which cell to clear (preventing the "copy" bug).
+            val startDrag = { startItemDrag(holder, item) }
+            // The menu hands the gesture back through this listener, on the cell itself: with a
+            // menu open the grid is told not to intercept, so a listener on the list never sees
+            // the move that should become the drag. See [MenuDragHandoff].
+            val handoff = (context as? android.app.Activity)?.let { activity ->
+                MenuDragHandoff(activity, startDrag).also { holder.handoff = it }
+            }
+            holder.itemView.setOnTouchListener(handoff)
             holder.itemView.setOnLongClickListener {
-                dragSourceIndex = holder.bindingAdapterPosition
-                onDragStarted()
-                val clip = ClipData.newPlainText("prism_desktop_item", item.serialize())
-                val shadow = View.DragShadowBuilder(holder.binding.icon)
-                val started = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
-                    holder.itemView.startDragAndDrop(clip, shadow, dragSourceIndex, View.DRAG_FLAG_GLOBAL)
-                } else {
-                    @Suppress("DEPRECATION")
-                    holder.itemView.startDrag(clip, shadow, dragSourceIndex, 0)
-                }
-                if (started) {
-                    holder.itemView.setOnDragListener { _, ev ->
-                        if (ev.action == android.view.DragEvent.ACTION_DRAG_ENDED) {
-                            dragSourceIndex = -1
-                            onDragEnded()
-                        }
-                        false
+                if (item is DesktopItem.App && onShowMenu != null) {
+                    // The menu appears on hold. Moving the finger dismisses it and starts the
+                    // same drag this cell has always used, which is what keeps the desktop's
+                    // reorder, folder and delete-zone mechanics intact.
+                    val entry = DrawerAppEntry(
+                        component = item.component,
+                        label = resolveLabel(item.component),
+                        icon = resolveIcon(item.component),
+                    )
+                    if (onShowMenu.invoke(entry, holder.itemView, startDrag)) {
+                        handoff?.arm()
+                        holder.itemView.parent?.requestDisallowInterceptTouchEvent(true)
+                        return@setOnLongClickListener true
                     }
+                    startDrag()
+                } else {
+                    startDrag()
                 }
-                started
             }
         } else {
             holder.binding.icon.setImageDrawable(null)
@@ -173,6 +198,35 @@ class DesktopGridAdapter(
             holder.itemView.setOnLongClickListener(null)
             holder.itemView.setTag(R.id.tag_prism_launcher_app_target, null)
         }
+    }
+
+    /**
+     * Starts the desktop's long-press drag for one cell.
+     *
+     * Kept as one method because the menu handoff and the menu-less path (folders, files, and a
+     * desktop without a menu) must produce exactly the same clip, shadow and source marker.
+     */
+    private fun startItemDrag(holder: VH, item: DesktopItem): Boolean {
+        dragSourceIndex = holder.bindingAdapterPosition
+        onDragStarted()
+        val clip = ClipData.newPlainText("prism_desktop_item", item.serialize())
+        val shadow = View.DragShadowBuilder(holder.binding.icon)
+        val started = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+            holder.itemView.startDragAndDrop(clip, shadow, dragSourceIndex, View.DRAG_FLAG_GLOBAL)
+        } else {
+            @Suppress("DEPRECATION")
+            holder.itemView.startDrag(clip, shadow, dragSourceIndex, 0)
+        }
+        if (started) {
+            holder.itemView.setOnDragListener { _, ev ->
+                if (ev.action == android.view.DragEvent.ACTION_DRAG_ENDED) {
+                    dragSourceIndex = -1
+                    onDragEnded()
+                }
+                false
+            }
+        }
+        return started
     }
 
     // ── Folder icon preview ──────────────────────────────────────────────
@@ -238,15 +292,31 @@ class DesktopGridAdapter(
         packageManager.getActivityInfo(cn, 0).loadLabel(packageManager).toString()
     } catch (_: Throwable) { cn.packageName.split(".").last() }
 
-    private fun resolveIcon(cn: ComponentName): Drawable? =
-        synchronized(iconCache) {
-            iconCache.getOrPut(cn) {
-                try { packageManager.getActivityIcon(cn) }
-                catch (_: Throwable) { try { packageManager.getApplicationIcon(cn.packageName) } catch (_: Throwable) { null } }
+    /**
+     * An app's icon, through the user's icon pack when one is active.
+     *
+     * The pack is part of the cache key, not just the component: switching packs in Settings used
+     * to leave every cached icon in place, so the desktop and hotseat kept the old artwork until
+     * the process restarted.
+     */
+    private fun resolveIcon(cn: ComponentName): Drawable? {
+        val pack = PrismSettings.getIconPackPackage()
+        val key = "$pack|${cn.flattenToString()}"
+        return synchronized(iconCache) {
+            iconCache.getOrPut(key) {
+                (if (pack.isNotEmpty()) IconPackEngine.getIconPackDrawable(context, cn, pack) else null)
+                    ?: try { packageManager.getActivityIcon(cn) }
+                    catch (_: Throwable) {
+                        try { packageManager.getApplicationIcon(cn.packageName) } catch (_: Throwable) { null }
+                    }
             }
         }
+    }
 
-    class VH(val binding: ItemDesktopCellBinding) : RecyclerView.ViewHolder(binding.root)
+    class VH(val binding: ItemDesktopCellBinding) : RecyclerView.ViewHolder(binding.root) {
+        /** Turns an open menu's held cell into a drag; see [MenuDragHandoff]. */
+        var handoff: MenuDragHandoff? = null
+    }
 
     companion object {
         /**
@@ -265,8 +335,8 @@ class DesktopGridAdapter(
          * 96 covers several screens of a grid, which is all a cache in front of a PackageManager
          * lookup needs to do.
          */
-        private val iconCache = object : LinkedHashMap<ComponentName, Drawable?>(128, 0.75f, true) {
-            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<ComponentName, Drawable?>?) =
+        private val iconCache = object : LinkedHashMap<String, Drawable?>(128, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Drawable?>?) =
                 size > 96
         }
 

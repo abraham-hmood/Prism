@@ -5,15 +5,27 @@ import java.io.File
 import java.util.concurrent.TimeUnit
 
 /**
- * Making Prism the Windows shell, and getting back out again. PHASE 75.
+ * Making Prism the desktop's shell, and getting back out again. PHASE 75.
  *
  * ## What this actually changes
  *
- * One registry value: `Shell` under `HKCU\Software\Microsoft\Windows NT\CurrentVersion\Winlogon`. When
- * it is absent -- which is the default on every Windows installation -- Windows falls back to the
- * machine-wide value, which is `explorer.exe`. When it is present, the program it names is started at
- * logon INSTEAD of Explorer: no taskbar, no Start menu, no desktop icons, no Alt-Tab window list,
- * because all of those are Explorer rather than Windows.
+ * On Windows, one registry value: `Shell` under
+ * `HKCU\Software\Microsoft\Windows NT\CurrentVersion\Winlogon`. When it is absent -- which is the
+ * default on every Windows installation -- Windows falls back to the machine-wide value, which is
+ * `explorer.exe`. When it is present, the program it names is started at logon INSTEAD of Explorer:
+ * no taskbar, no Start menu, no desktop icons, no Alt-Tab window list, because all of those are
+ * Explorer rather than Windows.
+ *
+ * On Linux it is a session rather than a registry key. Prism writes a per-user `~/.xsession` (the
+ * file an X display manager runs for this account, and what `startx` reads) whose first non-comment
+ * line execs Prism, plus a session entry under `~/.local/share/xsessions` for display managers that
+ * scan the user's own directory. Both are per-user and need no root, which is the same guarantee
+ * the Windows path gives: nothing here can affect another account on the machine.
+ *
+ * IT DOES NOT CLAIM TO BE A WINDOW MANAGER. Prism draws a taskbar of the session's windows and can
+ * raise them; it does not tile, decorate, or provide a compositor. On a Linux machine the X session
+ * still needs a window manager for that, which is why the session file can name one -- see
+ * [linuxSessionScript].
  *
  * THIS IS A SUPPORTED MECHANISM, not a trick. It is what Windows kiosk and assigned-access
  * configurations use, it is per-user rather than machine-wide, and it needs no administrator rights
@@ -50,7 +62,11 @@ object ShellReplacement {
     private const val KEY = "HKCU\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon"
     private const val VALUE = "Shell"
 
+    /** The first line of the marker a session file written by Prism starts with. */
+    private const val LINUX_MARKER = "# Prism desktop session, written by Prism"
+
     private val windows = System.getProperty("os.name").orEmpty().lowercase().contains("win")
+    private val linux = System.getProperty("os.name").orEmpty().lowercase().contains("nux")
 
     data class State(
         /** Whether this platform can do it at all. */
@@ -68,14 +84,14 @@ object ShellReplacement {
     // ── Reading ────────────────────────────────────────────────────────────
 
     fun state(): State {
+        if (linux) return linuxState()
         if (!windows) {
             return State(
                 supported = false,
                 active = false,
                 current = "",
-                obstacle = "Linux and macOS have no equivalent of this. Replacing a Linux desktop " +
-                    "means writing a compositor and a session file, which the plan puts out of scope; " +
-                    "macOS does not allow it at all.",
+                obstacle = "macOS does not let a program replace the login session, and Prism will " +
+                    "not pretend it does.",
             )
         }
 
@@ -125,12 +141,147 @@ object ShellReplacement {
      */
     fun executable(): File? {
         val home = System.getProperty("java.home") ?: return null
-        // jpackage lays out app/Prism.exe beside runtime/, so the executable is two levels up.
+        // jpackage lays out app/Prism beside runtime/, so the executable is two levels up. Windows
+        // appends .exe; Linux's jpackage launcher has no extension.
+        val name = if (windows) "Prism.exe" else "Prism"
         val candidates = listOf(
-            File(File(home).parentFile, "Prism.exe"),
-            File(File(home).parentFile?.parentFile, "Prism.exe"),
+            File(File(home).parentFile, name),
+            File(File(home).parentFile?.parentFile, name),
         )
         return candidates.firstOrNull { it.isFile }
+    }
+
+    // ── Linux: a session file, not a registry value ────────────────────────
+
+    private fun xsessionFile(): File = File(System.getProperty("user.home"), ".xsession")
+
+    private fun xsessionBackup(): File = File(System.getProperty("user.home"), ".xsession.prism-backup")
+
+    private fun sessionEntry(): File = File(
+        File(System.getProperty("user.home"), ".local/share/xsessions"),
+        "prism.desktop",
+    )
+
+    private fun linuxState(): State {
+        val session = xsessionFile()
+        val text = runCatching { if (session.isFile) session.readText() else "" }.getOrDefault("")
+        val active = text.contains(LINUX_MARKER)
+        val command = text.lines().firstOrNull { it.trimStart().startsWith("exec ") }
+            ?.trim()
+            ?.removePrefix("exec ")
+            ?.trim()
+            ?.trim('"')
+            ?.ifBlank { null }
+        val executable = executable()
+        return State(
+            supported = true,
+            active = active,
+            current = if (active) command.orEmpty() else "the desktop's own session",
+            obstacle = when {
+                executable == null && !active ->
+                    "Prism is running from a development build, not an installed one. A session has " +
+                        "to name a program the display manager can start on its own; a Gradle run is " +
+                        "not one."
+                session.isFile && text.isNotBlank() && !active ->
+                    "This account already has a hand-written ~/.xsession. Prism will not replace it; " +
+                        "move it aside first if it is stale."
+                else -> ""
+            },
+        )
+    }
+
+    /**
+     * The session Prism starts instead of the desktop's own.
+     *
+     * A WINDOW MANAGER IS STILL NEEDED, and Prism is not one: something has to place and decorate
+     * the programs Prism launches. So the script starts the first window manager it can find as a
+     * child, then execs Prism over the session. A machine with none still gets Prism, and
+     * [enableLinux] says that its windows will not be placed.
+     */
+    private fun linuxSessionScript(prism: File): String = buildString {
+        appendLine("#!/bin/sh")
+        appendLine(LINUX_MARKER)
+        appendLine("#")
+        appendLine("# This account's X session runs Prism instead of the desktop environment.")
+        appendLine("# The way back is 'Restore desktop shell.sh', written before this file was")
+        appendLine("# changed, or delete this file. Neither needs root.")
+        appendLine()
+        appendLine("# A window manager still has to place and decorate other programs' windows.")
+        appendLine("for wm in openbox xfwm4 metacity mutter kwin_x11 i3; do")
+        appendLine("  if command -v \"\$wm\" >/dev/null 2>&1; then \"\$wm\" & break; fi")
+        appendLine("done")
+        appendLine()
+        appendLine("exec \"" + prism.absolutePath + "\"")
+    }
+
+    private fun enableLinux(): Result {
+        val state = linuxState()
+        if (state.obstacle.isNotEmpty()) return Result(false, state.obstacle)
+        if (state.active) return Result(true, "Prism is already this account's desktop session.")
+
+        val executable = executable()
+            ?: return Result(false, "No installed Prism executable to start the session with.")
+
+        val escapes = escapeScript()
+        if (escapes.isEmpty()) {
+            return Result(
+                false,
+                "Refused: the way back could not be written, and a session with no way back is a " +
+                    "trap rather than a feature.",
+            )
+        }
+
+        val session = xsessionFile()
+        // Only the FIRST enable backs the file up: a second one must not overwrite the backup
+        // with Prism's own session file, which would make the backup useless.
+        if (session.isFile && !session.readText().orEmpty().contains(LINUX_MARKER)) {
+            runCatching { session.copyTo(xsessionBackup(), overwrite = false) }
+        }
+        runCatching { session.writeText(linuxSessionScript(executable)) }
+        session.setExecutable(true, false)
+
+        val entry = sessionEntry()
+        runCatching {
+            entry.parentFile?.mkdirs()
+            entry.writeText(
+                "[Desktop Entry]\n" +
+                    "Type=Application\n" +
+                    "Name=Prism\n" +
+                    "Comment=Prism's own desktop session\n" +
+                    "Exec=\"" + executable.absolutePath + "\"\n" +
+                    "DesktopNames=Prism\n",
+            )
+        }
+
+        val readBack = runCatching { session.readText() }.getOrDefault("")
+        if (!readBack.contains(LINUX_MARKER)) {
+            return Result(false, "The session file could not be written: " + session.absolutePath)
+        }
+
+        PrismPlatform.log.info(TAG, "Prism is now this account's X session: " + session.absolutePath)
+        return Result(
+            true,
+            "Prism runs as this account's desktop session from the next sign-in. The way back is " +
+                escapes.joinToString(" and ") { it.absolutePath } +
+                ". A window manager is still needed to place other programs' windows; Prism draws " +
+                "their taskbar buttons but does not tile or decorate them.",
+        )
+    }
+
+    private fun disableLinux(): Result {
+        val session = xsessionFile()
+        val text = runCatching { if (session.isFile) session.readText() else "" }.getOrDefault("")
+        if (!text.contains(LINUX_MARKER)) {
+            return Result(true, "Nothing to undo: this account's session is not Prism's.")
+        }
+        runCatching { session.delete() }
+        val backup = xsessionBackup()
+        if (backup.isFile) runCatching { backup.copyTo(session, overwrite = true); backup.delete() }
+        runCatching { sessionEntry().delete() }
+        return Result(
+            true,
+            "The desktop's own session is restored. Sign out and in again to use it.",
+        )
     }
 
     // ── The way back, written first ────────────────────────────────────────
@@ -144,6 +295,36 @@ object ShellReplacement {
      * who does not know it is there -- which is why [enable] prints both.
      */
     fun escapeScript(): List<File> {
+        if (linux) {
+            val session = xsessionFile().absolutePath
+            val backup = xsessionBackup().absolutePath
+            val entry = sessionEntry().absolutePath
+            val body = buildString {
+                appendLine("#!/bin/sh")
+                appendLine("# Puts this account's normal desktop session back.")
+                appendLine("#")
+                appendLine("# Prism wrote this before making itself the X session for this account.")
+                appendLine("# Running it removes Prism's session file and restores the one Prism found.")
+                appendLine("# Nothing here needs root -- every path is inside the home directory.")
+                appendLine()
+                appendLine("set -e")
+                appendLine("rm -f \"" + session + "\"")
+                appendLine("if [ -f \"" + backup + "\" ]; then mv \"" + backup + "\" \"" + session + "\"; fi")
+                appendLine("rm -f \"" + entry + "\"")
+                appendLine("echo \"The desktop session has been restored. Sign out and in again.\"")
+            }
+            val targets = listOfNotNull(
+                File(System.getProperty("user.home"), "Restore desktop shell.sh"),
+                File(PrismPlatform.host.dataDir(), "Restore desktop shell.sh"),
+            )
+            val written = targets.filter { target ->
+                runCatching { target.writeText(body); target.setExecutable(true, false) }
+                    .map { target.isFile && target.length() > 0 }
+                    .getOrDefault(false)
+            }
+            return written
+        }
+
         val body = buildString {
             appendLine("@echo off")
             appendLine("rem  Puts the normal Windows shell back.")
@@ -185,6 +366,7 @@ object ShellReplacement {
      * at their next logon.
      */
     fun enable(): Result {
+        if (linux) return enableLinux()
         val state = state()
         if (!state.supported) return Result(false, state.obstacle)
         if (state.obstacle.isNotEmpty()) return Result(false, state.obstacle)
@@ -232,6 +414,7 @@ object ShellReplacement {
      * explorer.exe back would leave a per-user override that quietly wins over any future policy.
      */
     fun disable(): Result {
+        if (linux) return disableLinux()
         if (!windows) return Result(false, "Not a Windows machine.")
 
         val before = read()
@@ -268,6 +451,16 @@ object ShellReplacement {
      * whether their next logon will have a taskbar.
      */
     fun roundTrip(): Result {
+        if (linux) {
+            val on = enableLinux()
+            if (!on.ok) return on
+            val off = disableLinux()
+            return Result(
+                off.ok,
+                "Wrote this account's session file, read it back, then restored the previous " +
+                    "session. " + off.message,
+            )
+        }
         if (!windows) return Result(false, "Not a Windows machine.")
 
         val before = read()
@@ -313,12 +506,24 @@ object ShellReplacement {
     }
 
     /** What somebody needs to know before turning this on. */
-    fun warning(): String =
+    fun warning(): String = if (!windows && !linux) {
+        "macOS does not let an application replace the login session, so Prism cannot be the shell " +
+            "here. The desktop build still runs as an ordinary application on this machine."
+    } else if (linux) {
+        "Replacing the session means your desktop environment does not start at your next sign-in: " +
+            "Prism becomes the program the display manager runs, draws a taskbar of your open windows " +
+            "and can raise them. It is not a window manager, so the session starts the first one it " +
+            "finds (openbox, xfwm4, metacity, mutter, kwin or i3) alongside Prism. This is per-user " +
+            "and needs no root, so it cannot affect anybody else on this machine. The way back is " +
+            "written to your home directory before anything changes."
+    } else {
         "Replacing the shell means Explorer does not start at your next sign-in: no taskbar, no Start " +
-            "menu, no desktop icons, no Alt-Tab window list. Prism's own desktop and taskbar take over. " +
+            "menu, no desktop icons, no Alt-Tab window list. Prism's own desktop and taskbar take over, " +
+            "including a list of the programs you have open. " +
             "This is per-user and needs no administrator rights, so it cannot affect anybody else on " +
             "this machine. The way back is written to your Desktop before anything changes, and " +
             "Ctrl+Shift+Esc opens Task Manager even with no shell running at all."
+    }
 
     private fun run(command: List<String>): String? = runCatching {
         val process = ProcessBuilder(command).redirectErrorStream(true).start()

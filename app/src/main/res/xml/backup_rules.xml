@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The current CA and lock credentials live in noBackupFilesDir, which Android excludes by default.
+  These entries cover the legacy locations so an upgrade cannot upload a plaintext CA key before
+  the migration runs.
+-->
+<full-backup-content>
+    <exclude domain="file" path="prism_ca_key.der" />
+    <exclude domain="file" path="prism_ca_cert.der" />
+    <exclude domain="file" path="lock/credentials.json" />
+</full-backup-content>

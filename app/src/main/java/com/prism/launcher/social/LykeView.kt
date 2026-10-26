@@ -263,7 +263,7 @@ class LykeView(context: Context) : FrameLayout(context) {
 
     /** The + tab: record with the camera, or pick something already on the device. */
     private fun showCreateSheet() {
-        androidx.appcompat.app.AlertDialog.Builder(context)
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
             .setTitle("New video")
             .setItems(arrayOf("Record", "Upload from device")) { _, which ->
                 if (which == 0) onRecordRequested?.invoke() else onUploadRequested?.invoke()
@@ -503,12 +503,25 @@ class LykeView(context: Context) : FrameLayout(context) {
                 val ok = if (target.isFile) {
                     LykeStore.attachLocalFile(item.id, target.absolutePath); true
                 } else {
-                    NebulaMeshSync.fetchLykeVideo(item.id, target)
+                    // A FETCHED FILE HAS TO BECOME THE STORE'S LOCAL COPY. The download used to
+                    // stop at "the bytes are on disk": the registry still had an empty localPath,
+                    // so play() refused, the view was never recorded as watched, and Mirror said
+                    // the video was not on this device -- all while the file sat right there.
+                    val fetched = NebulaMeshSync.fetchLykeVideo(item.id, target)
+                    if (fetched && target.isFile) {
+                        LykeStore.attachLocalFile(item.id, target.absolutePath)
+                        true
+                    } else {
+                        false
+                    }
                 }
 
                 post {
                     if (video?.id != item.id) return@post
                     if (ok && target.isFile) {
+                        // The holder's snapshot of the video predates the download; refresh the
+                        // path so play() and the rail's mirror action see the file too.
+                        video = item.copy(localPath = target.absolutePath)
                         empty.visibility = View.GONE
                         player.setVideoURI(Uri.fromFile(target))
                         player.setOnPreparedListener { it.isLooping = true }

@@ -88,6 +88,10 @@ class VirtualAppRunner(private val hostContext: Context) {
         // getApplicationContext() and casts it to itself.
         virtual.application = app
 
+        // The framework creates content providers BEFORE Application.onCreate, and apps depend on
+        // that: a provider is where they bootstrap libraries that Application then assumes exist.
+        installProviders(virtual)
+
         runCatching { app.onCreate() }.onFailure {
             PrismLogger.logWarning(TAG, "${virtual.packageName}'s Application.onCreate threw: $it")
         }
@@ -99,7 +103,107 @@ class VirtualAppRunner(private val hostContext: Context) {
         // own initialisers failed.
         val cause = (it as? InvocationTargetException)?.targetException ?: it
         PrismLogger.logError(TAG, "Could not build an Application for ${virtual.packageName}", cause)
-        null
+
+        // A PLAIN APPLICATION IS BETTER THAN NONE.
+        //
+        // `Activity.getApplication()` returning null is not a survivable state: androidx's
+        // ViewModelStore dereferences it ("Your activity is not yet attached to the Application
+        // instance"), and so do ContextCompat, process-lifecycle helpers and anything that asks for
+        // the application context early. The app's OWN Application could not be constructed, but a
+        // bare one attached to the virtual context is exactly what the base class provides, and it
+        // turns a crash in a support library into an app that starts and reports its own error
+        // where it can.
+        runCatching {
+            val fallback = android.app.Application()
+            android.app.Application::class.java
+                .getDeclaredMethod("attach", Context::class.java)
+                .apply { isAccessible = true }
+                .invoke(fallback, VirtualContext(hostContext, virtual))
+            virtual.application = fallback
+            fallback
+        }.getOrElse {
+            PrismLogger.logError(TAG, "Could not build even a plain Application for ${virtual.packageName}", it)
+            null
+        }
+    }
+
+    /**
+     * Creates the app's content providers, which is where most apps bootstrap their libraries.
+     *
+     * ## Why this is not optional
+     *
+     * `androidx.startup`, Firebase, WorkManager, every app that builds its DI graph in a provider --
+     * all of it lives in a `<provider>` that the framework instantiates between `Application.attach`
+     * and `Application.onCreate`. Prism used to skip that step entirely, so those initialisers never
+     * ran and the app failed later with a message about something else. Amazon is the clearest case:
+     * it throws "Service registry not initialized yet" from its own ShopKit DI, which is exactly the
+     * registry its init provider was supposed to fill.
+     *
+     * The preferred route is the framework's own `ActivityThread.installContentProviders`, because
+     * that does more than call `onCreate`: it registers each provider in the process's provider map,
+     * so the app's own `ContentResolver` lookups resolve to them instead of failing with "Unknown
+     * authority". It is private API, reached the same way the rest of this file reaches into the
+     * framework, and it takes the class loader from the Context it is given -- [VirtualContext]
+     * answers with the guest's, so the providers come from the guest's APK.
+     *
+     * If that call is refused on a given platform, the providers are still created directly. An app
+     * whose initialisers ran but whose own resolver lookups do not resolve is better off than one
+     * whose initialisers never ran at all.
+     */
+    private fun installProviders(virtual: VirtualPackage) {
+        val infos = virtual.providers
+        if (infos.isEmpty()) return
+
+        val context = VirtualContext(hostContext, virtual)
+
+        // The system checks that a published provider belongs to the caller, and Prism is the
+        // caller: every guest runs under Prism's uid. Saying so is what makes publication legal
+        // rather than a lie -- the process genuinely is the one serving these providers.
+        val uid = android.os.Process.myUid()
+        infos.forEach { it.applicationInfo?.uid = uid }
+
+        val throughFramework = runCatching {
+            val thread = Class.forName("android.app.ActivityThread")
+                .getDeclaredMethod("currentActivityThread")
+                .apply { isAccessible = true }
+                .invoke(null) ?: throw IllegalStateException("No ActivityThread")
+
+            thread.javaClass
+                .getDeclaredMethod("installContentProviders", Context::class.java, List::class.java)
+                .apply { isAccessible = true }
+                .invoke(thread, context, infos)
+        }
+
+        if (throughFramework.isSuccess) {
+            // Named individually, because the useful question when an app reports an uninitialised
+            // library is "did ITS provider run", not "did nineteen providers run".
+            infos.forEach {
+                PrismLogger.logInfo(
+                    TAG,
+                    "Provider ${it.authority} -> ${it.name} (process ${it.processName})",
+                )
+            }
+            PrismLogger.logInfo(TAG, "Installed ${infos.size} provider(s) for ${virtual.packageName}")
+            return
+        }
+
+        PrismLogger.logWarning(
+            TAG,
+            "Framework provider installation failed for ${virtual.packageName} " +
+                "(${describe(throughFramework.exceptionOrNull())}); creating them directly",
+        )
+
+        infos.forEach { info ->
+            runCatching {
+                val provider = virtual.classLoader.loadClass(info.name)
+                    .getDeclaredConstructor()
+                    .newInstance() as android.content.ContentProvider
+                provider.attachInfo(context, info)
+                provider.onCreate()
+            }.onFailure {
+                PrismLogger.logWarning(TAG, "${info.name} could not be created: ${describe(it)}")
+            }
+        }
     }
 
     /**
@@ -123,11 +227,26 @@ class VirtualAppRunner(private val hostContext: Context) {
             PrismLogger.logInfo(TAG, "$activityName is an alias for $className")
         }
 
-        val instance = virtual.classLoader.loadClass(className)
-            .getDeclaredConstructor()
-            .newInstance() as Activity
+        val instance = instantiate(virtual, className)
 
         val themeRes = virtual.themeFor(activityName)
+
+        // THE ActivityInfo MUST NEVER BE NULL.
+        //
+        // `Activity.onCreate` reads `mActivityInfo.parentActivityName` unconditionally, so a null
+        // there is a NullPointerException thrown from inside the framework's own onCreate -- before
+        // a single line of the app's code runs -- and reported only as
+        // "InvocationTargetException: null" because reflection wraps it and the wrapper's message
+        // is always null. That is exactly the failure Firefox hit: its launcher entry is the
+        // `<activity-alias>` org.mozilla.firefox.AppCool, and PackageManager lists the alias's
+        // TARGET, so looking the alias up came back empty.
+        //
+        // Two lookups, then a synthesized entry: the alias name is often the only name the archive
+        // knows, and the implementation class is often the only one PackageManager knows.
+        val info = virtual.activityInfo(activityName)
+            ?: virtual.activityInfo(className)
+            ?: virtual.synthesizedActivityInfo(className, themeRes)
+                .also { PrismLogger.logInfo(TAG, "Synthesized ActivityInfo for $className") }
         val virtualContext = VirtualContext(hostContext, virtual).apply {
             if (themeRes != 0) setTheme(themeRes)
         }
@@ -158,7 +277,7 @@ class VirtualAppRunner(private val hostContext: Context) {
             context = virtualContext,
             window = window,
             application = application,
-            activityInfo = virtual.activityInfo(activityName),
+            activityInfo = info,
             themeRes = themeRes,
             component = component,
             intent = intent,
@@ -171,14 +290,53 @@ class VirtualAppRunner(private val hostContext: Context) {
 
         ActivityAccess.callOnCreate(instance, null)
 
+        // A REAL LIFECYCLE, NOT JUST onCreate.
+        //
+        // Every app that shows a splash and moves on in onStart or onResume -- which is most apps
+        // written in the last decade, and was the reason apps like Reklaim sat on their loading
+        // screen forever -- never gets past the splash without these. The system calls them after
+        // onCreate; nothing else here does, so nothing else did.
+        //
+        // Failures here are logged rather than fatal: the view from onCreate is already built and
+        // worth showing, and an exception in onResume is more useful as a report than as a blank
+        // page. onCreate itself is NOT tolerated that way -- an activity that failed to create has
+        // nothing to show.
+        for (lifecycle in listOf("onStart", "onResume", "onPostResume")) {
+            runCatching { ActivityAccess.callLifecycle(instance, lifecycle) }.onFailure {
+                PrismLogger.logError(TAG, "${virtual.packageName}/$activityName threw in $lifecycle", it)
+                virtual.startupTrouble = "$lifecycle threw " + describe(it)
+            }
+        }
+
         PrismLogger.logInfo(TAG, "Hosting ${virtual.packageName}/$activityName")
         return window.decorView
     }
 
     /** Runs the hosted activity's `onDestroy`, best effort. */
     fun destroy() {
-        hosted?.let { runCatching { ActivityAccess.callOnDestroy(it) } }
+        hosted?.let { activity ->
+            // Paused before destroyed, in the order the framework uses: an app that saves state in
+            // onPause never gets the chance otherwise, and one that unregisters listeners in
+            // onStop leaves them registered in a process that is about to load the next app.
+            runCatching { ActivityAccess.callLifecycle(activity, "onPause") }
+            runCatching { ActivityAccess.callLifecycle(activity, "onStop") }
+            runCatching { ActivityAccess.callOnDestroy(activity) }
+        }
         hosted = null
+    }
+
+    /**
+     * Builds the app's Activity object, reporting the app's own exception rather than the wrapper.
+     *
+     * `Constructor.newInstance` wraps anything the constructor threw in an
+     * `InvocationTargetException` whose `message` is always null, so a constructor that throws
+     * `IllegalStateException("Play Services missing")` was being reported as
+     * `InvocationTargetException: null`. Unwrapping here is what turns that back into a sentence.
+     */
+    private fun instantiate(virtual: VirtualPackage, className: String): Activity = try {
+        virtual.classLoader.loadClass(className).getDeclaredConstructor().newInstance() as Activity
+    } catch (e: InvocationTargetException) {
+        throw e.targetException ?: e
     }
 
     companion object {
@@ -328,13 +486,42 @@ internal object ActivityAccess {
     fun callOnCreate(target: Activity, state: Bundle?) {
         val method = Activity::class.java.getDeclaredMethod("onCreate", Bundle::class.java)
         method.isAccessible = true
-        method.invoke(target, state)
+        invokeUnwrapped(method, target, state)
     }
 
     fun callOnDestroy(target: Activity) {
         val method = Activity::class.java.getDeclaredMethod("onDestroy")
         method.isAccessible = true
-        method.invoke(target)
+        invokeUnwrapped(method, target)
+    }
+
+    /**
+     * Calls one of the argument-less lifecycle methods -- onStart, onResume, onPause, onStop.
+     *
+     * Looked up on `android.app.Activity` by name, then invoked with the SAME unwrapping as the
+     * others: these are the calls an app's own code runs inside, so they are exactly where a real
+     * exception is most likely to be replaced by a message-less reflection wrapper.
+     */
+    fun callLifecycle(target: Activity, name: String) {
+        val method = Activity::class.java.getDeclaredMethod(name)
+        method.isAccessible = true
+        invokeUnwrapped(method, target)
+    }
+
+    /**
+     * `Method.invoke`, with the reflection wrapper removed.
+     *
+     * An `InvocationTargetException` carries the app's exception in [InvocationTargetException.getTargetException]
+     * and nothing at all in its own message -- which is why every virtualization failure used to be
+     * reported as "InvocationTargetException: null". Rethrowing the target makes the caller's report
+     * name the exception the app actually threw, with its own stack.
+     */
+    private fun invokeUnwrapped(method: java.lang.reflect.Method, target: Any, vararg args: Any?) {
+        try {
+            method.invoke(target, *args)
+        } catch (e: InvocationTargetException) {
+            throw e.targetException ?: e
+        }
     }
 
     /** The process's ActivityThread, which is where a host activity's framework objects came from. */

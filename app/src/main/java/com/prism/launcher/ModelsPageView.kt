@@ -164,33 +164,20 @@ class ModelsPageView @JvmOverloads constructor(
         }
     }
 
-    /** Scans filesDir/models and reconciles it against PrismSettings' registry (handles models imported before this registry existed). */
+    /**
+     * The models list, reconciled by the shared registry.
+     *
+     * THIS USED TO SCAN ONE DIRECTORY AND PRUNE EVERYTHING ELSE. It listed `filesDir/models` and then
+     * dropped every registry entry whose path was not in that folder. A quantised model is written
+     * BESIDE its source (see QuantizationService), which is usually the user's own folder rather than
+     * the app's, so the result appeared once and had vanished by the next visit to this page. The
+     * portable [com.prism.launcher.messaging.ModelRegistry] already knows both model directories and
+     * removes an entry only when its file is really gone; this is now that.
+     */
     private fun loadModels(): List<PrismSettings.ImportedModel> {
-        val modelsDir = File(context.filesDir, "models")
-        val files = modelsDir.listFiles()?.filter { it.isFile } ?: emptyList()
-        val existingPaths = files.map { it.absolutePath }.toSet()
-
-        val registry = PrismSettings.getImportedModels().toMutableList()
-        val registeredPaths = registry.map { it.path }.toSet()
-        val activeImage = PrismSettings.getLocalImageModelPath()
-
-        var changed = false
-        files.forEach { file ->
-            if (file.absolutePath !in registeredPaths) {
-                val type = when (file.absolutePath) {
-                    activeImage -> PrismSettings.MODEL_TYPE_IMAGE
-                    else -> PrismSettings.MODEL_TYPE_TEXT
-                }
-                registry.add(PrismSettings.ImportedModel(file.absolutePath, file.name, type, file.lastModified()))
-                changed = true
-            }
-        }
-
-        val reconciled = registry.filter { it.path in existingPaths }
-        if (reconciled.size != registry.size) changed = true
-        if (changed) PrismSettings.setImportedModels(reconciled)
-
-        return reconciled.sortedByDescending { it.importedAt }
+        runCatching { com.prism.launcher.messaging.ModelRegistry.reconcile() }
+            .onFailure { com.prism.launcher.PrismLogger.logWarning("Models", "Reconcile failed: " + it.message) }
+        return PrismSettings.getImportedModels().sortedByDescending { it.importedAt }
     }
 
     private fun refreshList() {

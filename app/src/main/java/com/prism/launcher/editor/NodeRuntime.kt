@@ -112,6 +112,12 @@ object NodeRuntime {
      */
     fun start(context: Context): Boolean {
         if (isRunning) return true
+        // A process that has started but whose channel is not up yet counts as started. Without
+        // this, two callers in the same second each spawned their own PRoot guest: the editor page
+        // starts the host when it sees a Node extension, and opening that extension's popup starts
+        // it again. Both wrote to different ports, both logged "Node starting", and whichever one
+        // lost the race left a dead process behind -- which is exactly what the log showed.
+        if (process != null || starting.get()) return true
         if (!isInstalled(context)) {
             lastError = null
             return false
@@ -122,7 +128,12 @@ object NodeRuntime {
             val appContext = context.applicationContext
             val assets = stageAssets(appContext)
 
-            val server = ServerSocket(0, 1, InetAddress.getLoopbackAddress())
+            // IPv4 EXPLICITLY. `getLoopbackAddress()` answers `::1` on a device with IPv6
+            // preferred, while the Node host connects to `127.0.0.1` (the literal a guest can
+            // always resolve). The listener then accepted nothing, Node's connect failed, and the
+            // host exited with code 1 before it ever sent a line -- a silent failure that looked
+            // like a broken PRoot. Both sides must name the same family, so this one names v4.
+            val server = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
             val token = newToken()
 
             val command = buildCommand(

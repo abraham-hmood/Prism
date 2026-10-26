@@ -47,6 +47,7 @@ class ModelStoreView @JvmOverloads constructor(
     private var searchJob: kotlinx.coroutines.Job? = null
 
     private fun resolveAttr(attr: Int): Int {
+        com.prism.launcher.theme.ThemeSkin.resolveAttr(context, attr)?.let { return it }
         val typedValue = android.util.TypedValue()
         context.theme.resolveAttribute(attr, typedValue, true)
         return typedValue.data
@@ -56,10 +57,10 @@ class ModelStoreView @JvmOverloads constructor(
         binding.modelStoreBackBtn.setOnClickListener { onBackRequested?.invoke() }
         binding.modelStoreBackBtn.visibility = View.GONE
 
-        binding.modelStoreSearchGlowContainer.background = NeonGlowDrawable(
-            color = PrismSettings.getGlowColor(),
-            cornerRadius = 24f * resources.displayMetrics.density,
-            strokeWidth = 3f * resources.displayMetrics.density
+        binding.modelStoreSearchGlowContainer.background = com.prism.launcher.theme.ThemeSkin.glowDrawable(
+            context,
+            com.prism.launcher.nora.IosUi.mode(context).shape.field.toFloat(),
+            3f,
         )
 
         binding.modelStoreList.layoutManager = LinearLayoutManager(context)
@@ -89,12 +90,13 @@ class ModelStoreView @JvmOverloads constructor(
                 text = label
                 textSize = 13f
                 setPadding(dp(18), dp(8), dp(18), dp(8))
-                setTextColor(if (category == currentCategory) resolveAttr(R.attr.prismBackground) else resolveAttr(R.attr.prismTextPrimary))
+                val theme = com.prism.launcher.nora.IosUi.mode(context)
+                setTextColor(if (category == currentCategory) theme.palette.onAccent.toInt() else theme.palette.text.toInt())
                 background = if (category == currentCategory) {
                     android.graphics.drawable.GradientDrawable().apply {
                         shape = android.graphics.drawable.GradientDrawable.RECTANGLE
-                        cornerRadius = dp(20).toFloat()
-                        setColor(PrismSettings.getGlowColor())
+                        cornerRadius = dp(if (theme.shape.pill) 999 else 20).toFloat()
+                        setColor(theme.palette.accent.toInt())
                     }
                 } else {
                     ContextCompat.getDrawable(context, R.drawable.tab_badge_bg)
@@ -156,10 +158,14 @@ class ModelStoreView @JvmOverloads constructor(
     }
 
     private fun download(model: ModelDiscoveryService.DiscoveredModel) {
+        // VISION IS NOT IMAGE GENERATION. The Vision category holds MediaPipe detectors and
+        // classifiers -- face landmarker, object detector, image classifier -- and every one of
+        // them was installed as the image GENERATOR, so choosing one replaced the generator with a
+        // file that cannot make an image and left vision itself with nothing.
         val isImageModel = when (currentCategory) {
-            "text" -> false
-            "generative", "enhancement", "vision" -> true
-            else -> model.category in listOf("generative", "enhancement", "vision") ||
+            "text", "vision" -> false
+            "generative", "enhancement" -> true
+            else -> model.category in listOf("generative", "enhancement") ||
                 model.name.contains("diffusion", ignoreCase = true)
         }
         ModelDownloadManager.download(context, model.name, model.downloadUrl, isImageModel)

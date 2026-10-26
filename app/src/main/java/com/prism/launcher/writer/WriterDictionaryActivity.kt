@@ -130,7 +130,7 @@ class WriterDictionaryActivity : PrismBaseActivity() {
 
     private fun promptForDictionary() {
         val input = EditText(this).apply { hint = "Dictionary name" }
-        androidx.appcompat.app.AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("New dictionary")
             .setView(input)
             .setPositiveButton("Create") { _, _ ->
@@ -143,7 +143,7 @@ class WriterDictionaryActivity : PrismBaseActivity() {
 
     private fun promptForWord(dictionary: String) {
         val input = EditText(this).apply { hint = "Word" }
-        androidx.appcompat.app.AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Add to $dictionary")
             .setView(input)
             .setPositiveButton("Add") { _, _ ->
@@ -164,7 +164,7 @@ class WriterDictionaryActivity : PrismBaseActivity() {
             addView(from)
             addView(to)
         }
-        androidx.appcompat.app.AlertDialog.Builder(this)
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
             .setTitle("Redefine a word")
             .setView(box)
             .setPositiveButton("Save") { _, _ ->

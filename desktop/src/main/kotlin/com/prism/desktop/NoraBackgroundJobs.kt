@@ -103,7 +103,10 @@ object NoraBackgroundJobs {
                 // runBlocking on THIS thread, not the UI one. NoraTrainer.train is suspending, and this
                 // thread exists precisely to be blocked by it.
                 runBlocking {
-                    NoraTrainer(brain).train(epochs = epochs, focus = focus) { progress ->
+                    NoraTrainer(
+                        brain,
+                        textRenderer = com.prism.desktop.aether.DesktopTextRenderer::renderImage,
+                    ).train(epochs = epochs, focus = focus) { progress ->
                         if (cancelRequested) return@train
                         if (progress.epoch != lastEpoch) {
                             lastEpoch = progress.epoch

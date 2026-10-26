@@ -10,46 +10,43 @@ import java.net.URL
 
 /**
  * Executes network requests to OpenAI-compatible cloud LLM endpoints.
- * Also includes mock logic for image/video generation demonstration.
+ *
+ * ## The mock that used to be here
+ *
+ * This object used to carry `generateResponse(prompt)`, which answered ANY prompt containing
+ * "video" with a canned sentence plus a link to w3schools' sample MP4, and answered everything
+ * else with invented prose about "our cloud neural engine". Sam's cloud mode called it directly
+ * for video prompts, so a request for a video produced a stranger's demo file presented as model
+ * output. It is deleted rather than kept for demos: every path that wants an answer now goes to a
+ * real endpoint, and a fake one cannot be reached by accident.
  */
 object CloudAiService {
 
     /**
-     * Top-level entry point for AI generation.
-     * Returns Pair(ResponseText, Pair(AttachmentUri, AttachmentType))
+     * Builds an endpoint URL from a base that may or may not end in a slash.
+     *
+     * The image path used `baseUrl + "images/generations"`, so a base without its trailing slash
+     * produced `https://host/v1images/generations` -- a 404 that looked like the provider refusing
+     * the request.
      */
-    suspend fun generateResponse(prompt: String): Pair<String, Pair<String?, String?>> {
-        // In a real implementation, this would call your Cloud LLM API (OpenAI/Gemini/etc)
-        // and parse the response for tool calls (like image generators).
-        
-        val responseText: String
-        var attachmentUri: String? = null
-        var attachmentType: String? = null
+    private fun endpoint(baseUrl: String, path: String): String =
+        baseUrl.trimEnd('/') + "/" + path.trimStart('/')
 
-        if (prompt.contains("image", ignoreCase = true)) {
-            responseText = "I've generated a high-fidelity vision of your request using our cloud neural engine."
-            attachmentUri = "https://picsum.photos/1200/800" // Mock image
-            attachmentType = "image"
-        } else if (prompt.contains("video", ignoreCase = true)) {
-            responseText = "Here is an AI-synthesized motion sequence based on your prompt."
-            attachmentUri = "https://www.w3schools.com/html/mov_bbb.mp4" // Mock video
-            attachmentType = "video"
-        } else if (prompt.contains("who are you", ignoreCase = true)) {
-            responseText = "I am Sam, your advanced AI companion powered by the Prism Cloud Engine."
-        } else {
-            responseText = "Sam (Cloud): I processed your request. Our cloud infrastructure provides higher accuracy and multi-modal support compared to local inference."
+    /** Timeouts on every cloud call, so a provider that accepts the connection and stalls cannot
+     * hold a chat turn open forever. Read is generous because a long generation is not a stall. */
+    private fun open(url: java.net.URL): HttpURLConnection =
+        (url.openConnection() as HttpURLConnection).apply {
+            connectTimeout = 15_000
+            readTimeout = 120_000
         }
-
-        return Pair(responseText, Pair(attachmentUri, attachmentType))
-    }
 
     /**
      * Legacy/Internal helper for real API calls.
      */
     fun fetchResponse(baseUrl: String, apiKey: String, model: String, userText: String, base64Image: String? = null): String {
         return try {
-            val url = com.prism.core.Urls.of(baseUrl + "/chat/completions")
-            val conn = url.openConnection() as HttpURLConnection
+            val url = com.prism.core.Urls.of(endpoint(baseUrl, "chat/completions"))
+            val conn = open(url)
             conn.requestMethod = "POST"
             conn.setRequestProperty("Authorization", "Bearer $apiKey")
             conn.setRequestProperty("Content-Type", "application/json")
@@ -113,8 +110,8 @@ object CloudAiService {
      */
     fun fetchResponseStreaming(baseUrl: String, apiKey: String, model: String, userText: String, base64Image: String? = null, maxTokens: Int = -1, onToken: (String) -> Unit): String {
         return try {
-            val url = com.prism.core.Urls.of(baseUrl + "/chat/completions")
-            val conn = url.openConnection() as HttpURLConnection
+            val url = com.prism.core.Urls.of(endpoint(baseUrl, "chat/completions"))
+            val conn = open(url)
             conn.requestMethod = "POST"
             conn.setRequestProperty("Authorization", "Bearer $apiKey")
             conn.setRequestProperty("Content-Type", "application/json")
@@ -277,8 +274,8 @@ object CloudAiService {
      */
     fun fetchChatWithTools(baseUrl: String, apiKey: String, model: String, messages: JSONArray, tools: JSONArray?): JSONObject {
         return try {
-            val url = com.prism.core.Urls.of(baseUrl + "/chat/completions")
-            val conn = url.openConnection() as HttpURLConnection
+            val url = com.prism.core.Urls.of(endpoint(baseUrl, "chat/completions"))
+            val conn = open(url)
             conn.requestMethod = "POST"
             conn.setRequestProperty("Authorization", "Bearer $apiKey")
             conn.setRequestProperty("Content-Type", "application/json")
@@ -361,8 +358,8 @@ object CloudAiService {
      */
     fun fetchImage(baseUrl: String, apiKey: String, prompt: String): PrismImage? {
         return try {
-            val url = com.prism.core.Urls.of(baseUrl + "images/generations")
-            val conn = url.openConnection() as HttpURLConnection
+            val url = com.prism.core.Urls.of(endpoint(baseUrl, "images/generations"))
+            val conn = open(url)
             conn.requestMethod = "POST"
             conn.setRequestProperty("Authorization", "Bearer $apiKey")
             conn.setRequestProperty("Content-Type", "application/json")
