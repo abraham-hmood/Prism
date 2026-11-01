@@ -30,9 +30,15 @@ import com.prism.launcher.LauncherActivity
 import com.prism.launcher.DesktopShortcutStore
 import com.prism.launcher.DesktopItem
 import com.prism.launcher.FileOps
+import com.prism.launcher.PrismLogger
 import com.prism.launcher.PrismSettings
 import com.prism.launcher.clipboard.ClipboardHistory
 import com.prism.launcher.clipboard.TrustedFileTransfer
+import com.prism.launcher.storage.BridgedStorage
+import com.prism.launcher.storage.BridgedStorageStore
+import com.prism.launcher.storage.HostedStorage
+import com.prism.launcher.storage.HostedStorageStore
+import com.prism.launcher.trusted.TrustedStorageBridge
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -49,16 +55,33 @@ sealed class ExplorerPath {
 sealed class FileEntry {
     data class Local(val file: File) : FileEntry()
     data class Network(val storage: PrismSettings.NetworkStorage) : FileEntry()
+    /** A folder this device is hosting as networked storage. */
+    data class Hosted(val storage: HostedStorage) : FileEntry()
+    /** A folder offered by a trusted device, not bridged yet. */
+    data class TrustedRemote(val share: TrustedStorageBridge.RemoteShare) : FileEntry()
+    /** A trusted device's folder that this device has been granted. */
+    data class Bridged(val storage: BridgedStorage) : FileEntry()
     data object InternalStorageLink : FileEntry()
     data object AppStorageLink : FileEntry()
-    data class ExternalStorageLink(val label: String, val root: File) : FileEntry()
+
+    /**
+     * An SD card or USB drive, as Android describes it rather than as a bare directory.
+     *
+     * The volume -- not just its mount point -- is what the Format, Burn and Unmount actions need,
+     * and a volume Android has ejected has no mount point at all, so the row cannot be built from a
+     * `File` alone.
+     */
+    data class VolumeLink(val volume: RemovableVolume) : FileEntry()
 
     val name: String get() = when(this) {
         is Local -> file.name
         is Network -> storage.name
+        is Hosted -> storage.name
+        is TrustedRemote -> share.share.name
+        is Bridged -> storage.name
         is InternalStorageLink -> "Internal Storage"
         is AppStorageLink -> "App Storage"
-        is ExternalStorageLink -> label
+        is VolumeLink -> volume.displayName
     }
 }
 
@@ -77,15 +100,49 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
         viewScope.coroutineContext.cancelChildren()
+        if (volumeReceiverRegistered) {
+            runCatching { context.unregisterReceiver(volumeReceiver) }
+            volumeReceiverRegistered = false
+        }
+        TrustedStorageBridge.removeListener(storageListener)
     }
 
+    /**
+     * Refreshes the root list when a card or stick is inserted or removed.
+     *
+     * Without this a USB drive only appeared after navigating away and back, which reads as "Prism
+     * did not notice the drive". Only the root list is rebuilt, so a refresh cannot interrupt
+     * somebody browsing a folder.
+     */
+    private val volumeReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(receiverContext: Context?, intent: Intent?) {
+            if (currentPath == ExplorerPath.Root) navigateTo(ExplorerPath.Root)
+        }
+    }
+    private var volumeReceiverRegistered = false
+
     private var currentPath: ExplorerPath = ExplorerPath.Root
+
+    /**
+     * A trusted device can announce or bridge a folder while this page is open.
+     *
+     * The listener always posts: announcements arrive on a mesh thread, and rebuilding a list from
+     * there would touch views off the main thread. It only refreshes the root, so a folder being
+     * browsed is not interrupted.
+     */
+    private val storageListener: () -> Unit = {
+        post {
+            if (currentPath == ExplorerPath.Root) navigateTo(ExplorerPath.Root)
+        }
+    }
+
     private val adapter: FileExplorerAdapter
     private val pathText: TextView
     private val searchBar: android.widget.EditText
     private var allEntries: List<FileEntry> = emptyList()
-    private var externalVolumeRoots: List<FileEntry.ExternalStorageLink> = emptyList()
+    private var volumes: List<RemovableVolume> = emptyList()
     private lateinit var pasteButton: ImageButton
+    private lateinit var addConnectionButton: ImageButton
 
     internal fun resolveAttr(context: Context, attr: Int): Int {
         com.prism.launcher.theme.ThemeSkin.resolveAttr(context, attr)?.let { return it }
@@ -103,6 +160,15 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
         searchBar = root.findViewById(R.id.fileSearchBar)
         pasteButton = root.findViewById(R.id.fileExplorerPasteBtn)
         pasteButton.setOnClickListener { performPaste() }
+        addConnectionButton = root.findViewById(R.id.fileExplorerAddBtn)
+        // Tinted from the active theme rather than baked white, so the button stays visible on a
+        // light theme instead of disappearing into the header.
+        addConnectionButton.imageTintList = android.content.res.ColorStateList.valueOf(
+            com.prism.launcher.nora.IosUi.label(context),
+        )
+        addConnectionButton.setOnClickListener { showNetworkConnectDialog() }
+        TrustedStorageBridge.install()
+        TrustedStorageBridge.addListener(storageListener)
 
         adapter = FileExplorerAdapter(
             onEntryClick = { entry ->
@@ -111,10 +177,28 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
                         if (entry.file.isDirectory) navigateTo(ExplorerPath.Local(entry.file))
                         else openFile(entry.file)
                     }
-                    is FileEntry.Network -> navigateTo(ExplorerPath.Network(entry.storage))
+                    // A saved connection opens its details rather than a listing: what it holds
+                    // is real, and a folder of files that were never fetched is not.
+                    is FileEntry.Network -> showNetworkDetails(entry.storage)
+                    is FileEntry.Hosted -> HostedStorageSheet.showDetails(context, entry.storage) {
+                        navigateTo(ExplorerPath.Root)
+                    }
+                    is FileEntry.TrustedRemote -> HostedStorageSheet.showRemoteShare(context, entry.share)
+                    is FileEntry.Bridged -> HostedStorageSheet.showBridgedDetails(
+                        context,
+                        entry.storage.ownerFingerprint,
+                        entry.storage.ownerName,
+                        entry.storage.host,
+                        entry.storage.share,
+                    ) { navigateTo(ExplorerPath.Root) }
                     is FileEntry.InternalStorageLink -> navigateTo(ExplorerPath.Local(Environment.getExternalStorageDirectory()))
                     is FileEntry.AppStorageLink -> navigateTo(ExplorerPath.Local(context.filesDir))
-                    is FileEntry.ExternalStorageLink -> navigateTo(ExplorerPath.Local(entry.root))
+                    is FileEntry.VolumeLink -> {
+                        val root = entry.volume.root
+                        // A mounted volume opens; an ejected one can only offer its actions.
+                        if (root != null && entry.volume.isMounted) navigateTo(ExplorerPath.Local(root))
+                        else showVolumeMenu(entry.volume)
+                    }
                 }
             },
             onDragStarted = {
@@ -147,6 +231,28 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
         })
 
         (context as? com.prism.launcher.LauncherActivity)?.attachFileExplorerPage(this)
+
+        val mediaFilter = android.content.IntentFilter().apply {
+            addAction(Intent.ACTION_MEDIA_MOUNTED)
+            addAction(Intent.ACTION_MEDIA_UNMOUNTED)
+            addAction(Intent.ACTION_MEDIA_EJECT)
+            addAction(Intent.ACTION_MEDIA_REMOVED)
+            addAction(Intent.ACTION_MEDIA_BAD_REMOVAL)
+            addDataScheme("file")
+        }
+        volumeReceiverRegistered = runCatching {
+            androidx.core.content.ContextCompat.registerReceiver(
+                context, volumeReceiver, mediaFilter,
+                androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED,
+            )
+            true
+        }.getOrElse {
+            com.prism.launcher.PrismLogger.logWarning(
+                "Storage",
+                "Could not watch for volume changes: ${it.message}",
+            )
+            false
+        }
 
         // 4-column balanced grid
         recycler.layoutManager = androidx.recyclerview.widget.GridLayoutManager(context, 4)
@@ -313,51 +419,28 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
         }
     }
 
+    /**
+     * The "+" and the long-press menu both land here.
+     *
+     * A saved connection is also put on a desktop page, which is what the old dialog did and what
+     * makes a network share reachable without opening Files first.
+     */
     private fun showNetworkConnectDialog() {
-        val layout = android.widget.LinearLayout(context).apply {
-            orientation = android.widget.LinearLayout.VERTICAL
-            val pad = (16 * resources.displayMetrics.density).toInt()
-            setPadding(pad, pad, pad, pad)
+        NetworkStorageSheet.showCreate(context) { storage ->
+            val targetPage = (context as? LauncherActivity)?.findDesktopPosition() ?: 1
+            DesktopShortcutStore.add(
+                DesktopItem.NetworkedFolder(storage.host, storage.name, storage.protocol),
+                targetPage,
+            )
+            navigateTo(ExplorerPath.Root)
         }
-        
-        val nameIn = android.widget.EditText(context).apply { hint = "Storage Name (e.g. My PC)" }
-        val protIn = android.widget.EditText(context).apply { hint = "Protocol (ftp, p2p, webdav)" }
-        val hostIn = android.widget.EditText(context).apply { hint = "Host / IP / Node ID" }
-        val portIn = android.widget.EditText(context).apply { hint = "Port (e.g. 21)" }
-        val userIn = android.widget.EditText(context).apply { hint = "Username (optional)" }
-        val passIn = android.widget.EditText(context).apply { hint = "Password (optional)"; inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD }
+    }
 
-        layout.addView(nameIn)
-        layout.addView(protIn)
-        layout.addView(hostIn)
-        layout.addView(portIn)
-        layout.addView(userIn)
-        layout.addView(passIn)
-
-        PrismDialogFactory.show(
-            context,
-            "Connect to Network",
-            "Enter connection details:",
-            onPositive = {
-                val storage = com.prism.launcher.PrismSettings.NetworkStorage(
-                    name = nameIn.text.toString().trim().ifEmpty { "Network Storage" },
-                    protocol = protIn.text.toString().trim().lowercase().ifEmpty { "ftp" },
-                    host = hostIn.text.toString().trim(),
-                    port = portIn.text.toString().toIntOrNull() ?: 21,
-                    username = userIn.text.toString(),
-                    password = passIn.text.toString()
-                )
-                com.prism.launcher.PrismSettings.addNetworkStorage(storage)
-                
-                // Add to random desktop page as requested
-                val targetPage = (context as? LauncherActivity)?.findDesktopPosition() ?: 1
-                DesktopShortcutStore.add(DesktopItem.NetworkedFolder(storage.host, storage.name, storage.protocol), targetPage)
-                
-                Toast.makeText(context, "Connected and added to Desktop", Toast.LENGTH_SHORT).show()
-                navigateTo(currentPath) // Refresh view
-            },
-            customView = layout
-        )
+    private fun showNetworkDetails(storage: com.prism.launcher.PrismSettings.NetworkStorage) {
+        NetworkStorageSheet.showDetails(context, storage) {
+            Toast.makeText(context, "Connection removed", Toast.LENGTH_SHORT).show()
+            navigateTo(ExplorerPath.Root)
+        }
     }
 
     private fun filterEntries(query: String?) {
@@ -433,15 +516,27 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
                 val roots = mutableListOf<FileEntry>()
                 roots.add(FileEntry.InternalStorageLink)
                 roots.add(FileEntry.AppStorageLink)
-                externalVolumeRoots = discoverExternalVolumes(context)
-                roots.addAll(externalVolumeRoots)
+                // SD cards and USB-OTG drives sit on the same shelf as internal storage.
+                volumes = StorageVolumes.list(context)
+                roots.addAll(volumes.map { FileEntry.VolumeLink(it) })
                 com.prism.launcher.PrismSettings.getNetworkStorages().forEach {
                     roots.add(FileEntry.Network(it))
                 }
+                HostedStorageStore.all().forEach { roots.add(FileEntry.Hosted(it)) }
+                BridgedStorageStore.all().forEach { roots.add(FileEntry.Bridged(it)) }
+                // Unbridged offers from trusted devices are visible as their own rows. Tapping
+                // one starts the phrase-verified bridge instead of pretending it can be browsed.
+                TrustedStorageBridge.unbridgedShares().forEach {
+                    roots.add(FileEntry.TrustedRemote(it))
+                }
+                TrustedStorageBridge.requestDiscovery()
+                TrustedStorageBridge.announceHosted()
                 allEntries = roots
                 filterEntries(searchBar.text.toString())
+                addConnectionButton.visibility = View.VISIBLE
             }
             is ExplorerPath.Local -> {
+                addConnectionButton.visibility = View.GONE
                 val dir = path.dir
                 if (!dir.canRead()) {
                     Toast.makeText(context, "Access Denied: ${dir.name}", Toast.LENGTH_SHORT).show()
@@ -466,54 +561,33 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
                 }
             }
             is ExplorerPath.Network -> {
-                pathText.text = "${path.storage.protocol.uppercase()} // ${path.storage.name}"
-                // Simulate network listing
-                val mockFiles = listOf(
-                    FileEntry.Local(File("/mock/shared_data.pdf")),
-                    FileEntry.Local(File("/mock/mesh_backup.task")),
-                    FileEntry.Local(File("/mock/photos_p2p/"))
-                )
-                allEntries = mockFiles
-                filterEntries(searchBar.text.toString())
+                // Connections are opened as a details sheet now. This branch only exists so the
+                // path stays exhaustive (and for a back-stack entry made before that change); it
+                // returns home instead of inventing a listing.
+                navigateTo(ExplorerPath.Root)
             }
         }
-    }
-
-    /**
-     * Every non-primary storage volume (SD card, USB-OTG drive) exposed to this app, with a
-     * human-readable label. `getExternalFilesDirs()` only ever gives back an app-specific
-     * subdirectory per volume (index 0 is always the primary/internal volume, already handled
-     * separately) — the real volume root is derived by stripping the fixed
-     * `/Android/data/<pkg>/files` suffix, the standard technique for reaching a removable
-     * volume's true root pre-API-30. Readable once "All Files Access" is granted, same as
-     * Internal Storage.
-     */
-    private fun discoverExternalVolumes(context: Context): List<FileEntry.ExternalStorageLink> {
-        val appFilesDirs = context.getExternalFilesDirs(null)
-        if (appFilesDirs.size <= 1) return emptyList()
-
-        val descriptions = try {
-            val sm = context.getSystemService(Context.STORAGE_SERVICE) as android.os.storage.StorageManager
-            sm.storageVolumes
-        } catch (e: Exception) {
-            emptyList()
-        }
-
-        val result = mutableListOf<FileEntry.ExternalStorageLink>()
-        for (i in 1 until appFilesDirs.size) {
-            val appDir = appFilesDirs[i] ?: continue
-            val root = appDir.parentFile?.parentFile?.parentFile?.parentFile ?: continue
-            if (!root.exists() || !root.canRead()) continue
-            val label = descriptions.getOrNull(i)?.getDescription(context) ?: "External Storage $i"
-            result.add(FileEntry.ExternalStorageLink(label, root))
-        }
-        return result
     }
 
     private fun isTopLevelRoot(dir: File): Boolean {
         if (dir.absolutePath == Environment.getExternalStorageDirectory().absolutePath) return true
         if (dir.absolutePath == context.filesDir.absolutePath) return true
-        return externalVolumeRoots.any { it.root.absolutePath == dir.absolutePath }
+        return volumes.any { it.root?.absolutePath == dir.absolutePath }
+    }
+
+    /** The long-press menu for an SD card or USB drive. */
+    private fun showVolumeMenu(volume: RemovableVolume, onDismiss: () -> Unit = {}) {
+        PrismLogger.logInfo(
+            "Storage",
+            "Menu for '${volume.displayName}' (${volume.kind.title}, ${volume.state})",
+        )
+        StorageSheets.showVolumeMenu(
+            context = context,
+            volume = volume,
+            onOpen = { volume.root?.let { navigateTo(ExplorerPath.Local(it)) } },
+            onChanged = { navigateTo(ExplorerPath.Root) },
+            onDismiss = onDismiss,
+        )
     }
 
     private fun openFile(file: File) {
@@ -550,10 +624,23 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
     }
 
     private fun showOptions(entry: FileEntry, onDismiss: () -> Unit = {}) {
-        val options = mutableListOf("Open", "Add to Desktop")
+        // A removable volume has its own menu: Format, Burn and Unmount are the actions that matter
+        // for a card, and they are meaningless for an ordinary folder.
+        if (entry is FileEntry.VolumeLink) {
+            showVolumeMenu(entry.volume, onDismiss)
+            return
+        }
+        val options = mutableListOf("Open")
+        if (entry !is FileEntry.Hosted && entry !is FileEntry.TrustedRemote && entry !is FileEntry.Bridged) {
+            options.add("Add to Desktop")
+        }
         if (entry is FileEntry.Local) {
             options.addAll(listOf("Move to Trash", "Cut", "Copy", "Rename", "Host as Website"))
+            if (entry.file.isDirectory) options.add("Host as Networked Storage")
         }
+        if (entry is FileEntry.Hosted) options.add("Stop hosting")
+        if (entry is FileEntry.TrustedRemote) options.add("Request bridge")
+        if (entry is FileEntry.Bridged) options.add("Remove bridge")
 
         val dialog = PrismDialogFactory.show(
             context,
@@ -578,10 +665,21 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
                         "Open" -> {
                             when (entry) {
                                 is FileEntry.Local -> if (entry.file.isDirectory) navigateTo(ExplorerPath.Local(entry.file)) else openFile(entry.file)
-                                is FileEntry.Network -> navigateTo(ExplorerPath.Network(entry.storage))
+                                is FileEntry.Network -> showNetworkDetails(entry.storage)
+                                is FileEntry.Hosted -> HostedStorageSheet.showDetails(context, entry.storage) {
+                                    navigateTo(ExplorerPath.Root)
+                                }
+                                is FileEntry.TrustedRemote -> HostedStorageSheet.showRemoteShare(context, entry.share)
+                                is FileEntry.Bridged -> HostedStorageSheet.showBridgedDetails(
+                                    context,
+                                    entry.storage.ownerFingerprint,
+                                    entry.storage.ownerName,
+                                    entry.storage.host,
+                                    entry.storage.share,
+                                ) { navigateTo(ExplorerPath.Root) }
                                 is FileEntry.InternalStorageLink -> navigateTo(ExplorerPath.Local(Environment.getExternalStorageDirectory()))
                                 is FileEntry.AppStorageLink -> navigateTo(ExplorerPath.Local(context.filesDir))
-                                is FileEntry.ExternalStorageLink -> navigateTo(ExplorerPath.Local(entry.root))
+                                is FileEntry.VolumeLink -> entry.volume.root?.let { navigateTo(ExplorerPath.Local(it)) }
                             }
                         }
                         "Move to Trash" -> if (entry is FileEntry.Local) moveToTrash(entry.file)
@@ -612,6 +710,28 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
                             intent.putExtra("PREFILL_PATH", entry.file.absolutePath)
                             context.startActivity(intent)
                         }
+                        "Host as Networked Storage" -> if (entry is FileEntry.Local && entry.file.isDirectory) {
+                            HostedStorageSheet.showCreate(context, entry.file) {
+                                navigateTo(ExplorerPath.Root)
+                            }
+                        }
+                        "Stop hosting" -> if (entry is FileEntry.Hosted) {
+                            HostedStorageSheet.showDetails(context, entry.storage) {
+                                navigateTo(ExplorerPath.Root)
+                            }
+                        }
+                        "Request bridge" -> if (entry is FileEntry.TrustedRemote) {
+                            HostedStorageSheet.showRemoteShare(context, entry.share)
+                        }
+                        "Remove bridge" -> if (entry is FileEntry.Bridged) {
+                            HostedStorageSheet.showBridgedDetails(
+                                context,
+                                entry.storage.ownerFingerprint,
+                                entry.storage.ownerName,
+                                entry.storage.host,
+                                entry.storage.share,
+                            ) { navigateTo(ExplorerPath.Root) }
+                        }
                     }
                 }
             }
@@ -641,9 +761,14 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
                 val s = entry.storage
                 DesktopItem.NetworkedFolder(s.host, s.name, s.protocol)
             }
+            // A hosted or bridged row has an owner rather than a stable local address; putting it
+            // on a desktop page without that address would create a shortcut to nothing.
+            is FileEntry.Hosted, is FileEntry.TrustedRemote, is FileEntry.Bridged -> return
             is FileEntry.InternalStorageLink -> DesktopItem.DirectoryRef(Environment.getExternalStorageDirectory().absolutePath, "Internal Storage")
             is FileEntry.AppStorageLink -> DesktopItem.DirectoryRef(context.filesDir.absolutePath, "App Storage")
-            is FileEntry.ExternalStorageLink -> DesktopItem.DirectoryRef(entry.root.absolutePath, entry.label)
+            is FileEntry.VolumeLink -> entry.volume.root?.let {
+                DesktopItem.DirectoryRef(it.absolutePath, entry.volume.displayName)
+            } ?: return
         }
         (context as? LauncherActivity)?.addToDesktop(item)
     }
@@ -673,10 +798,14 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
 private object FileEntryDiff : DiffUtil.ItemCallback<FileEntry>() {
     fun key(e: FileEntry): String = when (e) {
         is FileEntry.Local -> "local:${e.file.absolutePath}"
-        is FileEntry.Network -> "network:${e.storage.name}"
+        // Keyed by id: two connections may legitimately share a display name.
+        is FileEntry.Network -> "network:${e.storage.id}"
+        is FileEntry.Hosted -> "hosted:${e.storage.id}"
+        is FileEntry.TrustedRemote -> "trusted:${e.share.ownerFingerprint}:${e.share.share.id}"
+        is FileEntry.Bridged -> "bridged:${e.storage.ownerFingerprint}:${e.storage.id}"
         is FileEntry.InternalStorageLink -> "internal"
         is FileEntry.AppStorageLink -> "appstorage"
-        is FileEntry.ExternalStorageLink -> "external:${e.root.absolutePath}"
+        is FileEntry.VolumeLink -> "volume:${e.volume.id}"
     }
 
     override fun areItemsTheSame(old: FileEntry, new: FileEntry) = key(old) == key(new)
@@ -718,24 +847,59 @@ class FileExplorerAdapter(
 
         // Reset state
         holder.fileIcon.colorFilter = null
+        holder.fileSubtitle.visibility = View.GONE
         
         val typeColor: Int
         when (entry) {
             is FileEntry.InternalStorageLink -> {
-                holder.fileIcon.setImageResource(android.R.drawable.ic_dialog_email)
+                holder.fileIcon.setImageResource(android.R.drawable.ic_menu_save)
                 typeColor = android.graphics.Color.parseColor("#FFD700")
             }
             is FileEntry.AppStorageLink -> {
-                holder.fileIcon.setImageResource(android.R.drawable.ic_dialog_email)
+                holder.fileIcon.setImageResource(android.R.drawable.ic_menu_manage)
                 typeColor = android.graphics.Color.parseColor("#7C9EFF")
             }
-            is FileEntry.ExternalStorageLink -> {
-                holder.fileIcon.setImageResource(android.R.drawable.ic_dialog_email)
-                typeColor = android.graphics.Color.parseColor("#00BA7C")
+            is FileEntry.VolumeLink -> {
+                // The capacity under the name is what makes an SD card and a USB stick
+                // distinguishable at a glance, and what tells a user which one is nearly full.
+                holder.fileIcon.setImageResource(
+                    if (entry.volume.kind == VolumeKind.USB) android.R.drawable.stat_sys_download_done
+                    else android.R.drawable.ic_menu_gallery,
+                )
+                typeColor = if (entry.volume.isMounted) {
+                    android.graphics.Color.parseColor("#00BA7C")
+                } else {
+                    android.graphics.Color.parseColor("#9B9BA1")
+                }
+                holder.fileSubtitle.text = entry.volume.subtitle()
+                holder.fileSubtitle.visibility = View.VISIBLE
             }
             is FileEntry.Network -> {
                 holder.fileIcon.setImageResource(android.R.drawable.stat_sys_download_done)
                 typeColor = android.graphics.Color.parseColor("#00BA7C")
+                // The transport and address, because "Home NAS" alone does not say whether it is
+                // the SMB share or the SFTP box with the same name.
+                holder.fileSubtitle.text = com.prism.launcher.storage.NetworkStorageTypes
+                    .titleFor(entry.storage.protocol) + " · " + entry.storage.host
+                holder.fileSubtitle.visibility = View.VISIBLE
+            }
+            is FileEntry.Hosted -> {
+                holder.fileIcon.setImageResource(android.R.drawable.ic_menu_share)
+                typeColor = android.graphics.Color.parseColor("#5E5CE6")
+                holder.fileSubtitle.text = "Hosted · ${entry.storage.subtitle}"
+                holder.fileSubtitle.visibility = View.VISIBLE
+            }
+            is FileEntry.TrustedRemote -> {
+                holder.fileIcon.setImageResource(android.R.drawable.stat_sys_download_done)
+                typeColor = android.graphics.Color.parseColor("#00BA7C")
+                holder.fileSubtitle.text = "${entry.share.ownerName} · tap to bridge"
+                holder.fileSubtitle.visibility = View.VISIBLE
+            }
+            is FileEntry.Bridged -> {
+                holder.fileIcon.setImageResource(android.R.drawable.stat_sys_download_done)
+                typeColor = android.graphics.Color.parseColor("#30D158")
+                holder.fileSubtitle.text = entry.storage.subtitle
+                holder.fileSubtitle.visibility = View.VISIBLE
             }
             is FileEntry.Local -> {
                 val file = entry.file
@@ -853,6 +1017,7 @@ class FileExplorerAdapter(
     class VH(view: View) : RecyclerView.ViewHolder(view) {
         val fileIcon: ImageView = view.findViewById(R.id.fileIcon)
         val fileName: TextView = view.findViewById(R.id.fileName)
+        val fileSubtitle: TextView = view.findViewById(R.id.fileSubtitle)
         val glassView: View = view.findViewById(R.id.glassBackground)
         /** Reused across rebinds of this holder instead of allocated fresh every bind. */
         var glowDrawable: com.prism.launcher.NeonGlowDrawable? = null

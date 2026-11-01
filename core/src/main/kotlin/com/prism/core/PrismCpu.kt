@@ -64,24 +64,60 @@ object PrismCpu {
         } == cores
     }
 
-    private fun detectPerformanceCores(): Int {
+    /**
+     * Each CPU's hardware clock ceiling, index = CPU number; empty when sysfs is unreadable.
+     *
+     * cpuinfo_max_freq is the hardware ceiling. scaling_max_freq would be wrong: it moves with
+     * thermal and governor policy, so a throttled phone would look like it had fewer fast cores and
+     * the pool would shrink and never grow back.
+     */
+    private fun maxFrequencies(): List<Long> {
         val cores = coreCount()
         val frequencies = (0 until cores).mapNotNull { cpu ->
-            // cpuinfo_max_freq is the hardware ceiling. scaling_max_freq would be wrong: it moves
-            // with thermal and governor policy, so a throttled phone would look like it had fewer
-            // fast cores and the pool would shrink and never grow back.
             val file = File("/sys/devices/system/cpu/cpu$cpu/cpufreq/cpuinfo_max_freq")
             runCatching { file.takeIf { it.canRead() }?.readText()?.trim()?.toLongOrNull() }.getOrNull()
         }
+        return if (frequencies.size < cores) emptyList() else frequencies
+    }
+
+    private fun detectPerformanceCores(): Int {
+        val cores = coreCount()
+        val frequencies = maxFrequencies()
 
         // Not readable here: desktops mostly, and any Android that restricts sysfs. Every core is
         // then assumed equal, which for a uniform machine is simply true.
-        if (frequencies.size < cores) return cores
+        if (frequencies.isEmpty()) return cores
 
         val peak = frequencies.max()
         if (peak <= 0) return cores
         val fast = frequencies.count { it * 100 >= peak * 70 }
         return fast.coerceIn(1, cores)
+    }
+
+    /**
+     * The CPU indices that run at or near peak clock, as a bitmask; 0 when the layout is unknown.
+     *
+     * THIS IS WHAT MAKES THE THREAD COUNT MEAN ANYTHING. Counting performance cores and then asking
+     * ggml for that many threads does not put those threads ON the performance cores: Linux is free
+     * to schedule any of them anywhere, and it does -- a decoding thread that lands on a 1.8 GHz
+     * Cortex-A510 stops every other thread at the next graph barrier. Measured on a Galaxy S22 with
+     * SmolLM2-135M, 64 tokens: 1 thread 42.1 tok/s, 4 threads 31.9, 6 threads 12.3 -- more threads
+     * made it slower because of exactly that. The mask is handed to ggml's threadpool so the little
+     * cores are excluded at the source.
+     *
+     * Bit i is CPU i. 0 means "could not read the layout", which the native side treats as "leave
+     * affinity alone" rather than guessing.
+     */
+    val performanceCoreMask: Long by lazy {
+        val frequencies = maxFrequencies()
+        if (frequencies.isEmpty()) return@lazy 0L
+        val peak = frequencies.max()
+        if (peak <= 0) return@lazy 0L
+        var mask = 0L
+        frequencies.forEachIndexed { cpu, frequency ->
+            if (cpu < java.lang.Long.SIZE && frequency * 100 >= peak * 70) mask = mask or (1L shl cpu)
+        }
+        mask
     }
 
     /**

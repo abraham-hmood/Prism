@@ -35,6 +35,22 @@ class PrismTunnelEngine(private val context: Context) {
     private var routingActive: Boolean = false
     private var currentMode: String? = null
     private var currentRole: String? = null
+
+    /**
+     * Whether a client's saved fleet actually answered during this run.
+     *
+     * A LIST IN SETTINGS IS NOT A CONNECTION. [startP2pClientMode] used to leave only
+     * `routingActive = true` behind, so a device with one saved server that was switched off still
+     * reported itself on the meshnet. Email then addressed mesh mail and every mesh feature
+     * prepared for peers that did not exist. This is set by a real handshake, on a background
+     * thread, because [com.prism.launcher.vpn.PrismServerClient.probe] can block for six seconds.
+     */
+    @Volatile
+    private var clientServerReachable: Boolean = false
+
+    /** Invalidates an in-flight probe when the tunnel is torn down or reconfigured. */
+    @Volatile
+    private var clientProbeGeneration: Int = 0
     
     private var proxyServer: PrismProxyServer? = null
     private var hostingServer: PrismProxyServer? = null
@@ -247,6 +263,8 @@ class PrismTunnelEngine(private val context: Context) {
 
     fun stop() {
         routingActive = false
+        clientProbeGeneration++
+        clientServerReachable = false
         hostingServer?.stop()
         hostingServer = null
         proxyServer?.stop()
@@ -259,6 +277,8 @@ class PrismTunnelEngine(private val context: Context) {
 
     fun pauseTunnel() {
         routingActive = false
+        clientProbeGeneration++
+        clientServerReachable = false
         hostingServer?.stop()
         hostingServer = null
         proxyServer?.stop()
@@ -290,34 +310,35 @@ class PrismTunnelEngine(private val context: Context) {
     /**
      * Whether the Prism P2P VPN is actually carrying traffic right now.
      *
-     * ROLE-AGNOSTIC BY CONSTRUCTION: [start] sets [routingActive] for both branches of the
-     * server/client split, so a device serving the tunnel and a device connected to somebody
-     * else's both answer true. Anything gated on "is the user on the Prism VPN" wants exactly that
-     * and should not have to ask which end it is.
+     * ROLE-AWARE, BECAUSE THE TWO ENDS HAVE DIFFERENT PROOF. A server is live when a listener is
+     * actually bound ([isPrismServerRunning]); a client is live when the VPN service has established
+     * its TUN interface and it has a server to reach. [routingActive] is deliberately not enough:
+     * it only means [start] ran with the current settings, which is also true for a client whose
+     * saved fleet is unreachable.
      *
      * MODE AND ROLE ARE READ FROM SETTINGS, NOT FROM THIS ENGINE'S FIELDS. They are the user's
      * configuration and are always current, whereas [currentMode] is only as fresh as the last
      * [start] -- and this question gets asked from the settings screen, which is exactly where the
      * user is in the middle of changing them.
-     *
-     * Liveness is either the VPN service running or this engine routing, because both are real and
-     * neither covers the other: a private-browsing tunnel or a persistent server brings the service
-     * up, while a server node whose listeners were started at boot is serving peers whether or not
-     * the VpnService itself was ever established.
      */
     fun isPrismVpnActive(): Boolean {
         if (!PrismSettings.getVpnTunnelingEnabled()) return false
         if (PrismSettings.getVpnMode() != PrismSettings.VPN_MODE_PRISM) return false
 
-        val live = routingActive ||
-            runCatching { PrivateDnsVpnService.isRunning() }.getOrDefault(false)
-        if (!live) return false
+        // A BOUND LISTENER IS NOT A CONNECTION. `routingActive` only says this engine was started
+        // with the current settings; a client with a saved fleet that it cannot reach sets it too.
+        // Treating that as membership made email choose mesh ports and advertise the mesh domain on
+        // a device that was connected to nothing.
+        val role = PrismSettings.getPrismVpnRole()
+        if (role == PrismSettings.PRISM_ROLE_SERVER) return isPrismServerRunning()
 
-        // A server IS the VPN once its listeners are up; a client is only on one if it has a server
-        // to reach. Without that check a client that has never been given an address would report
-        // itself connected, because PrismProxyClient.start() returns quietly when the list is empty.
-        return PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_SERVER ||
-            PrismSettings.getPrismServers().isNotEmpty()
+        val live = runCatching { PrivateDnsVpnService.isRunning() }.getOrDefault(false)
+        if (!live) return false
+        // AND THE FLEET MUST HAVE ANSWERED. An entry in the server list is a wish, not a link:
+        // [startP2pClientMode] probes every saved server once and only a successful CONNECT
+        // handshake turns this true. A client whose server is off therefore reports off the mesh,
+        // which is what "I am not connected to one" has to mean.
+        return clientServerReachable
     }
 
     /** True only while a Prism server listener or VPN server socket is actually bound. */
@@ -414,6 +435,45 @@ class PrismTunnelEngine(private val context: Context) {
 
     private fun startP2pClientMode() {
         PrismProxyClient.start(context)
+        // A bridge's job starts where the tunnel does: ask every selected server for its names and
+        // listings. Off the main thread, because a fleet can contain a server that is simply down.
+        if (PrismSettings.isPrismBridgeRole()) {
+            com.prism.launcher.vpn.FleetBridge.refreshAsync()
+        }
+
+        // PROVE THE CLIENT BEFORE CALLING THIS DEVICE A MEMBER. Probe every saved server, not just
+        // the active one: [PrismProxyClient] installs fallbacks, so a reachable second server is a
+        // working tunnel even when the first is down. The probe is off the main thread and guarded
+        // by a generation so a reply from an old configuration cannot turn the new one green.
+        clientServerReachable = false
+        val generation = ++clientProbeGeneration
+        val servers = PrismSettings.getPrismServers()
+        if (servers.isEmpty()) {
+            com.prism.launcher.PrismLogger.logWarning(
+                "PrismTunnel",
+                "Prism client mode has no server in the fleet; the device is not on a meshnet.",
+            )
+            return
+        }
+        Thread({
+            val reachable = servers.any { server ->
+                com.prism.launcher.vpn.PrismServerClient.probe(server) is
+                    com.prism.launcher.vpn.PrismServerClient.Result.Connected
+            }
+            if (generation != clientProbeGeneration) return@Thread
+            clientServerReachable = reachable
+            if (reachable) {
+                com.prism.launcher.PrismLogger.logInfo(
+                    "PrismTunnel",
+                    "A Prism server answered; this device is a mesh client.",
+                )
+            } else {
+                com.prism.launcher.PrismLogger.logWarning(
+                    "PrismTunnel",
+                    "None of the saved Prism servers answered. The device is not on a meshnet.",
+                )
+            }
+        }, "prism-client-probe").apply { isDaemon = true; start() }
     }
 
     private fun startExternalVpnTunnel() {

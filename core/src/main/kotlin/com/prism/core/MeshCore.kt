@@ -72,6 +72,16 @@ object MeshCore {
     private const val OP_HEARTBEAT_RESP: Byte = 0x0B
 
     /**
+     * One packet for somebody this device can reach but the sender cannot.
+     *
+     * Used by the Relay VPN role: a relay has a route into a part of the mesh (or another fleet
+     * server's mesh) that a client does not. The payload is `{"to","op","data","ttl"}` and the
+     * relay forwards the inner opcode unchanged, so the final receiver needs no new protocol. TTL
+     * stops two relays from bouncing the same packet forever.
+     */
+    const val OP_RELAY: Byte = 0x0D
+
+    /**
      * "I am going away."
      *
      * Sent once from [stop]. Without it a device that is shut down cleanly still lingers for the
@@ -214,7 +224,23 @@ object MeshCore {
 
     // ── State ──────────────────────────────────────────────────────────────
 
-    fun isOnMesh(): Boolean = running && socket?.isClosed == false
+    /**
+     * Whether this device is a member of a mesh right now, not merely listening for one.
+     *
+     * `running` only says the discovery socket is bound, which every install does at startup. It is
+     * the control plane being READY, not a connection to anything. Answering true from that alone made
+     * email choose mesh ports and a mesh domain on a machine that was on no meshnet at all.
+     *
+     * Membership is a live peer, or this machine serving the mesh. The serving check is the same hook
+     * the node announcement uses, so a desktop whose Prism proxy is bound counts even before a client
+     * connects, and a client with an empty fleet does not.
+     */
+    fun isOnMesh(): Boolean {
+        if (!running || socket?.isClosed != false) return false
+        val cutoff = System.currentTimeMillis() - PEER_LEASE_MS
+        if (activePeers.values.any { it.lastSeen > cutoff }) return true
+        return runCatching { serverEndpoint() != null }.getOrDefault(false)
+    }
 
     fun activePeerIps(): List<String> = activePeers.keys.toList()
 
@@ -548,6 +574,34 @@ object MeshCore {
                 if (json.isNotBlank()) dnsConsumer?.invoke(peerIp, json)
             }
 
+            OP_RELAY -> runCatching {
+                // Only a device whose role is Relay forwards. Otherwise every phone in the mesh
+                // would amplify every relayed packet, which is how a small mesh becomes a storm.
+                if (!com.prism.launcher.PrismSettings.isPrismRelayRole()) return@runCatching
+                val body = JSONObject(payload)
+                val target = body.optString("to")
+                val inner = body.optInt("op", -1)
+                val data = body.optString("data")
+                val ttl = body.optInt("ttl", 3)
+                if (target.isBlank() || inner !in 0..255 || ttl <= 0) return@runCatching
+                val hop = activePeers[normalise(target)] ?: return@runCatching
+                // Only forward when the next hop is not the peer that sent it: echoing straight
+                // back is the smallest possible loop.
+                if (normalise(target) == normalise(peerIp)) return@runCatching
+                val forwarded = JSONObject()
+                    .put("to", target)
+                    .put("op", inner)
+                    .put("data", data)
+                    .put("ttl", ttl - 1)
+                    .toString()
+                sendPacket(target, hop.port, inner.toByte(), data)
+                if (ttl > 1) {
+                    // Also offer it to the rest of the mesh; a client that could not reach the
+                    // target directly may be one hop away from a relay that can.
+                    broadcastToOthers(OP_RELAY, forwarded, peerIp)
+                }
+            }
+
             else -> {
                 val handler = handlers[command]
                 if (handler == null) {
@@ -629,6 +683,27 @@ object MeshCore {
      * to it. Callers of this are advisory rather than load-bearing — anything that must arrive uses the
      * TCP path in Phase 50.
      */
+    /**
+     * Sends one packet through the best peer, asking it to forward to [targetIp].
+     *
+     * The relay role is what makes this usable: a relay has a route to a part of the mesh this
+     * device cannot reach directly. Returns false when there is no peer to hand the packet to, so a
+     * caller can fall back to sending it itself rather than assuming delivery.
+     */
+    fun relayToPeer(targetIp: String, command: Byte, payload: String, ttl: Int = 3): Boolean {
+        if (targetIp.isBlank() || ttl <= 0) return false
+        val hop = bestPeer() ?: return false
+        val port = activePeers[hop]?.port ?: return false
+        val body = JSONObject()
+            .put("to", targetIp)
+            .put("op", command.toInt() and 0xff)
+            .put("data", payload)
+            .put("ttl", ttl)
+            .toString()
+        sendPacket(hop, port, OP_RELAY, body)
+        return true
+    }
+
     fun sendToPeer(targetIp: String, command: Byte, payload: String) {
         val info = activePeers[normalise(targetIp)] ?: return
         sendPacket(targetIp, info.port, command, payload)

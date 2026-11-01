@@ -49,6 +49,56 @@ sealed class SlotAssignment {
     /** The layer-based PhotoPix editor as a page of its own. Never in the default layout. */
     data object PhotoPix : SlotAssignment()
 
+    /** Prompt-to-film generation, with a library of rendered and resumable projects. */
+    data object VideoCraft : SlotAssignment()
+
+    /** A sentence in, a picture out: the image page, using the active text and image models. */
+    data object ImageCraft : SlotAssignment()
+
+    /** Text or a document in, an audio file out: the library and its player. */
+    data object AudioCraft : SlotAssignment()
+
+    /** The user's own models: five kinds, their datasets and their training recipes. */
+    data object ModelCraft : SlotAssignment()
+
+    /** The datasets those models train on, built and kept as one CSV plus their files. */
+    data object DatasetCraft : SlotAssignment()
+
+    /** The game asset viewport: an active game model and an active text model, then a prompt. */
+    data object AssetCraft : SlotAssignment()
+
+    /**
+     * The game library and maker: saved games, a prompt, and the three models that can shape one.
+     *
+     * Separate from [AssetCraft] on purpose. AssetCraft is a single mesh viewport for inspecting a
+     * model's output; GameCraft owns persisted games, code and textures, and is a place a user
+     * returns to rather than a preview they pass through.
+     */
+    data object GameCraft : SlotAssignment()
+
+    /** The mail server's dashboard: listening services, delivery log, DNS and settings. */
+    data object EmailServer : SlotAssignment()
+
+    /** The mail client: folder tabs, grouped messages, compose and accounts. */
+    data object EmailClient : SlotAssignment()
+
+    /**
+     * Snapshots of this device's own state, taken by the device: Prism's data plus installed apps.
+     *
+     * A page rather than a settings row because a backup is something a user returns to, checks the
+     * age of and restores from -- not a switch they flip once.
+     */
+    data object TimeMachine : SlotAssignment()
+
+    /** Diary entries and the recipes kept beside them. */
+    data object Journal : SlotAssignment()
+
+    /** The mesh-gated app catalogue and the publisher upload flow. */
+    data object AppStore : SlotAssignment()
+
+    /** Running processes and the files they hold open, as a page of its own. */
+    data object TaskManager : SlotAssignment()
+
     fun serialize(): String = when (this) {
         is Default -> "default"
         is Browser -> "browser"
@@ -74,6 +124,19 @@ sealed class SlotAssignment {
         is Mouse -> "mouse"
         is Photos -> "photos"
         is PhotoPix -> "photopix"
+        is VideoCraft -> "videocraft"
+        is ImageCraft -> "imagecraft"
+        is AudioCraft -> "audiocraft"
+        is ModelCraft -> "modelcraft"
+        is DatasetCraft -> "datasetcraft"
+        is AssetCraft -> "assetcraft"
+        is GameCraft -> "gamecraft"
+        is EmailServer -> "email_server"
+        is EmailClient -> "email_client"
+        is TimeMachine -> "time_machine"
+        is Journal -> "journal"
+        is AppStore -> "app_store"
+        is TaskManager -> "task_manager"
         is Custom -> "custom|$packageName|$viewClassName"
     }
 
@@ -103,6 +166,19 @@ sealed class SlotAssignment {
             if (raw == "mouse") return Mouse
             if (raw == "photos") return Photos
             if (raw == "photopix") return PhotoPix
+            if (raw == "videocraft") return VideoCraft
+            if (raw == "imagecraft") return ImageCraft
+            if (raw == "audiocraft") return AudioCraft
+            if (raw == "modelcraft") return ModelCraft
+            if (raw == "datasetcraft") return DatasetCraft
+            if (raw == "assetcraft") return AssetCraft
+            if (raw == "gamecraft") return GameCraft
+            if (raw == "email_server") return EmailServer
+            if (raw == "email_client") return EmailClient
+            if (raw == "time_machine") return TimeMachine
+            if (raw == "journal") return Journal
+            if (raw == "app_store") return AppStore
+            if (raw == "task_manager") return TaskManager
             val parts = raw.split("|")
             if (parts.size == 3 && parts[0] == "custom") {
                 return Custom(parts[1], parts[2])

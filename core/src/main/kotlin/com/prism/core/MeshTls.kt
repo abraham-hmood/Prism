@@ -94,6 +94,9 @@ object MeshTls {
     private val contexts = ConcurrentHashMap<String, SSLContext>()
     private val leaves = ConcurrentHashMap<String, Leaf>()
 
+    /** Self-signed contexts, used only when a device CA could not be created. */
+    private val fallbackContexts = ConcurrentHashMap<String, SSLContext>()
+
     /**
      * A minted leaf, with the CA that signed it.
      *
@@ -112,6 +115,18 @@ object MeshTls {
     val ready: Boolean get() = caKey != null && caCert != null
 
     /**
+     * Why the last [install] failed, in enough detail to act on.
+     *
+     * [install] deliberately swallows its own exceptions -- TLS is a reduced service, not a fatal
+     * one -- but swallowing the MESSAGE left callers with "install returned false" and no way to
+     * tell a read-only directory from a provider that would not register. That is the difference
+     * between a fixable problem and a support ticket, so the reason is kept here.
+     */
+    @Volatile
+    var lastError: String = ""
+        private set
+
+    /**
      * Loads the device's CA, generating one the first time.
      *
      * Called at startup. Cheap when the CA exists — two file reads — and a few milliseconds when it does
@@ -123,6 +138,7 @@ object MeshTls {
         // A newly installed CA invalidates every leaf signed by the one it replaced.
         leaves.clear()
         contexts.clear()
+        fallbackContexts.clear()
         val keyFile = File(directory, CA_KEY_FILE)
         val certFile = File(directory, CA_CERT_FILE)
 
@@ -134,6 +150,7 @@ object MeshTls {
                     .generateCertificate(certFile.inputStream()) as X509Certificate
             }.isSuccess
             if (loaded) {
+                lastError = ""
                 PrismPlatform.log.info(TAG, "Root CA loaded")
                 return true
             }
@@ -166,9 +183,11 @@ object MeshTls {
             certFile.writeBytes(cert.encoded)
             caKey = pair.private
             caCert = cert
+            lastError = ""
             PrismPlatform.log.info(TAG, "Generated a root CA for this device")
             true
         }.getOrElse {
+            lastError = "${it.javaClass.simpleName}: ${it.message}"
             PrismPlatform.log.error(TAG, "Could not create a root CA", it)
             false
         }
@@ -237,6 +256,59 @@ object MeshTls {
     }
 
     /**
+     * A context presenting a SELF-SIGNED certificate for [domain], when no device CA exists.
+     *
+     * ## Why this is needed rather than "refuse TLS"
+     *
+     * The mail server's IMAP listener is TLS-only -- a plaintext IMAP port would put a password on
+     * the wire -- so a device whose CA could not be created had no IMAP at all: the app said "TLS
+     * is unavailable" and the mailbox was unreachable even on loopback. That turns a cosmetic
+     * certificate problem into total loss of mail.
+     *
+     * A self-signed leaf is a real certificate with a real key. Prism's own mail client trusts the
+     * mesh explicitly ([MeshTrust]), so it connects either way; an outside client on the same LAN
+     * shows the usual untrusted-certificate warning, which is the honest thing for a device that
+     * could not establish its identity. The alternative -- no listener -- is strictly worse.
+     *
+     * Cached separately from [contextFor] so a later successful [install] supersedes it cleanly.
+     */
+    fun fallbackContextFor(domain: String): SSLContext? {
+        val key = domain.lowercase().trim().ifBlank { return null }
+        fallbackContexts[key]?.let { return it }
+
+        return runCatching {
+            val pair = generateKeyPair()
+            val from = Date(System.currentTimeMillis() - CLOCK_SKEW_MS)
+            val to = Date(from.time + LEAF_DAYS * DAY_MS)
+            val name = X500Name("CN=$key, O=Prism Mail")
+            val builder = JcaX509v3CertificateBuilder(
+                name, BigInteger.valueOf(System.currentTimeMillis()), from, to, name, pair.public,
+            )
+            builder.addExtension(
+                Extension.subjectAlternativeName, false,
+                GeneralNames(sanFor(key)),
+            )
+            builder.addExtension(Extension.basicConstraints, true, BasicConstraints(false))
+            // Signed by its own key: there is no authority to sign it, which is the whole point.
+            val signer = JcaContentSignerBuilder("SHA256withECDSA").setProvider("BC").build(pair.private)
+            val certificate = JcaX509CertificateConverter().setProvider("BC")
+                .getCertificate(builder.build(signer))
+
+            val store = KeyStore.getInstance("PKCS12").apply {
+                load(null, null)
+                setKeyEntry("prism", pair.private, STORE_PASSWORD, arrayOf(certificate))
+            }
+            val managers = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
+                .apply { init(store, STORE_PASSWORD) }
+            SSLContext.getInstance("TLS").apply {
+                init(managers.keyManagers, arrayOf(MeshTrust), SecureRandom())
+            }.also { fallbackContexts[key] = it }
+        }.onFailure {
+            PrismPlatform.log.error(TAG, "Could not mint a self-signed certificate for $key", it)
+        }.getOrNull()
+    }
+
+    /**
      * Mints (or returns) the leaf for [domain].
      *
      * Cached, and the cache is cleared whenever a CA is installed, because a leaf signed by the
@@ -268,7 +340,7 @@ object MeshTls {
             // the subject alternative name. A leaf without one is rejected before the user sees anything.
             builder.addExtension(
                 Extension.subjectAlternativeName, false,
-                GeneralNames(arrayOf(GeneralName(GeneralName.dNSName, key))),
+                GeneralNames(sanFor(key)),
             )
             builder.addExtension(Extension.basicConstraints, true, BasicConstraints(false))
 
@@ -280,6 +352,26 @@ object MeshTls {
         }.getOrElse {
             PrismPlatform.log.error(TAG, "Could not mint a certificate for $key", it)
             null
+        }
+    }
+
+    /**
+     * The subject alternative names a leaf needs for [key].
+     *
+     * An IP LITERAL IS AN iPAddress SAN, NOT A dNSName. Public-internet mail is addressed to this
+     * device's public address, because a home connection has no name to point at it, so the mail
+     * server presents a leaf for an address literal. A client checking that leaf looks for an
+     * iPAddress entry and will reject a dNSName holding the same digits -- which is exactly the
+     * "certificate name does not match" warning that made IMAP unusable in internet mode.
+     */
+    private fun sanFor(key: String): Array<GeneralName> {
+        val literal = key.removeSurrounding("[", "]")
+        val isIp = runCatching { java.net.InetAddress.getByName(literal) }.isSuccess &&
+            (literal.count { it == ':' } >= 2 || literal.matches(Regex("\\d{1,3}(\\.\\d{1,3}){3}")))
+        return if (isIp) {
+            arrayOf(GeneralName(GeneralName.iPAddress, literal))
+        } else {
+            arrayOf(GeneralName(GeneralName.dNSName, key))
         }
     }
 

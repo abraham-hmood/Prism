@@ -145,6 +145,9 @@ fun main(args: Array<String>) {
         audio = DesktopAudioSink(),
         main = AwtMainThread,
     )
+    // MP3 (and anything else a Java Sound SPI can open) now reaches the same decoder the speech
+    // pipeline uses for WAV. Installed here so ModelCraft, voice cloning and transcription all see it.
+    DesktopAudioDecoding.install()
 
     // ONE COPY PER MACHINE, checked before any listener is opened. A second copy cannot bind the
     // mesh, search, debug-bridge, PRISM_CONNECT, display or speech ports, and its mesh socket joins
@@ -189,6 +192,17 @@ fun main(args: Array<String>) {
     // minimal Linux install has no system speech engine at all, and claiming otherwise would make a
     // machine that cannot speak until Kokoro downloads look like a machine whose voice is broken.
     com.prism.launcher.speech.PrismSpeaker.systemEngineFactory = { DesktopSystemTts.openOrNull() }
+
+    // The receive half of the message APIs. A webhook that only runs while a page is open is not a
+    // webhook; it is a poll with extra steps, and it loses whatever arrives while the window is
+    // closed. Off until the user enables it in Settings.
+    runCatching { com.prism.launcher.messaging.MessagingWebhook.startIfEnabled() }
+        .onFailure {
+            com.prism.core.PrismPlatform.log.warn(
+                "Messages",
+                "Could not start the message webhook: ${it.message}",
+            )
+        }
 
     // WHAT KIND OF MACHINE THIS IS (PHASE 99). Until this, the compute registry announced
     // PLATFORM_ANDROID from :core with a comment saying it only ever ran on Android -- so a desktop
@@ -250,6 +264,31 @@ fun main(args: Array<String>) {
         com.prism.desktop.wallet.DesktopWalletCipher(com.prism.core.PrismPlatform.host.dataDir())
     )
 
+    // The mail server, after the wallet cipher and not before: mail is sealed with a key derived
+    // from the recovery phrase, so a server started first would refuse every delivery until the
+    // dashboard was opened. The settings switch is authoritative on both builds.
+    runCatching {
+        var mail = com.prism.launcher.email.EmailSettings.load()
+        if (!mail.onMesh && mail.publicAddress.isBlank()) {
+            val ip = com.prism.launcher.email.EmailDns.publicIp()
+            if (ip.isNotBlank()) {
+                mail = mail.copy(publicAddress = ip)
+                mail.save()
+            }
+        }
+        if (mail.enabled) {
+            com.prism.launcher.email.EmailMaintenance.start()
+            Thread {
+                val error = com.prism.launcher.email.EmailServer.start(mail)
+                if (error.isNotBlank()) {
+                    com.prism.core.PrismPlatform.log.warn("PrismMail", error)
+                }
+            }.apply { isDaemon = true; name = "prism-mail-start" }.start()
+        }
+    }.onFailure {
+        com.prism.core.PrismPlatform.log.warn("PrismMail", "Could not start mail: ${it.message}")
+    }
+
     // The inference thread count, if the user has set one. Left at the detected default otherwise --
     // which on a desktop is half the logical processors, for the reason measured in PrismCpu.
     com.prism.core.PrismCpu.applySettings(com.prism.launcher.PrismSettings.getInferenceThreads())
@@ -280,9 +319,47 @@ fun main(args: Array<String>) {
     com.prism.launcher.messaging.ImageGeneration.register(
         com.prism.launcher.messaging.NoraImageGenerator()
     )
+    // A real diffusion checkpoint, through the vendored stable-diffusion.cpp. Same engine id the
+    // old "not built" placeholder used, so an existing selection keeps working and now means
+    // something.
     com.prism.launcher.messaging.ImageGeneration.register(
-        com.prism.launcher.messaging.StableDiffusionCppGenerator()
+        com.prism.launcher.diffusion.LocalDiffusionGenerator()
     )
+    // ModelCraft's own image models. Same artifact pair the trainer writes, same folder the Models
+    // page activates; selecting it is what makes a model trained here usable by GameCraft.
+    com.prism.launcher.messaging.ImageGeneration.register(
+        com.prism.launcher.modelcraft.ModelCraftImageGenerator()
+    )
+
+    // WHERE AN IMAGECRAFT PICTURE GOES, and how the user hears about one that finished while they
+    // were on another page. Pictures/Prism/ImageCraft rather than the app's own directory, because a
+    // picture the user cannot find is not a picture. The completion notice goes through the tray
+    // balloon -- see DesktopNotifier for why a balloon cannot be replaced and why progress therefore
+    // lives on the page instead of in it.
+    com.prism.launcher.messaging.ImageCraft.sink = com.prism.launcher.messaging.ImageCraft.PlatformSink { image ->
+        val dir = java.io.File(
+            java.io.File(System.getProperty("user.home") ?: ".", "Pictures/Prism"),
+            "ImageCraft",
+        )
+        com.prism.launcher.messaging.ImageGeneration.save(image, dir, "imagecraft")
+            ?.absolutePath.orEmpty()
+    }
+    com.prism.launcher.messaging.ImageCraft.onFinished = { state ->
+        val body = when {
+            state.complete && state.savedTo.isNotBlank() -> "Saved to ${state.savedTo}"
+            state.complete -> "Ready${if (state.note.isBlank()) "" else " — ${state.note}"}"
+            state.error != null -> state.error.orEmpty()
+            else -> "Stopped"
+        }
+        runCatching {
+            com.prism.core.PrismPlatform.notifier.notify(
+                channel = "imagecraft",
+                id = 7413,
+                title = if (state.complete) "Image ready" else "ImageCraft",
+                body = body,
+            )
+        }
+    }
 
     // Vision (PHASE 35) and dictation (PHASE 36), same shape and same fallback rule.
     com.prism.launcher.messaging.Vision.register(com.prism.launcher.messaging.CloudVisionEngine())
@@ -472,6 +549,9 @@ fun main(args: Array<String>) {
             .map { node -> if (node.contains(':')) node else "$node:$port" }
     }
     com.prism.core.MeshCore.start()
+    // The same RCS opcode the Android dispatcher handles, registered with the portable mesh. A
+    // desktop that is on the same mesh and holds the same wallet receives into MessagingStore.
+    runCatching { com.prism.launcher.messaging.RcsChat.install() }
     com.prism.core.MeshConnect.startServer()
 
     // RE-ANNOUNCE THE LOCAL NAMES. The registry announces as each name is added, and the search and
@@ -518,6 +598,12 @@ fun main(args: Array<String>) {
     }.onFailure {
         com.prism.core.PrismPlatform.log.warn("PrismCalls", "Incoming call banner did not install: " + it.message)
     }
+    // Tags placed on a phone arrive here as one small packet. The desktop has no camera placement
+    // screen, but it can still show a neighbour's wall on its Map, so it registers to receive.
+    runCatching { com.prism.launcher.minigames.GeoTagNet.install() }
+        .onFailure {
+            com.prism.core.PrismPlatform.log.warn("PrismGeoTag", "Tag receiver did not install: " + it.message)
+        }
     runCatching { com.prism.launcher.trusted.TrustedLocations.install() }
         .onFailure {
             com.prism.core.PrismPlatform.log.warn("PrismLocations", "Locations did not install: " + it.message)
@@ -621,6 +707,15 @@ fun main(args: Array<String>) {
     com.prism.launcher.messaging.Dictation.register(
         com.prism.launcher.messaging.CloudTranscriptionEngine()
     )
+    // Speech datasets get their per-clip language by transcribing the clip; the engine is whatever
+    // dictation has, which on this platform is whisper.cpp when a model is chosen.
+    com.prism.launcher.speech.LanguageId.installFromDictation()
+    // Every kind's trainer, each on its own data: the acoustic model, the byte-level text model,
+    // merged CSV. Every other kind is described by a recipe and trained elsewhere.
+    com.prism.launcher.modelcraft.ModelCraft.installDefaultTrainer()
+    // And the frames the interpolator and video datasets are built from: JCodec reads the clip and
+    // every frame up to the cap is written beside it as a PNG, which is what those trainers read.
+    com.prism.desktop.ModelCraftFrames.install()
 
     // THE CONSOLE GATE. The lock's promise is that private data refuses while it is engaged, and
     // this harness reads the same files the UI does -- so a locked Prism answered `prism wallet`,
@@ -639,6 +734,28 @@ fun main(args: Array<String>) {
         println("  Unlock Prism in its window, then run it again.")
         println()
         return
+    }
+
+    // A FILM THAT WAS RENDERING WHEN PRISM LAST EXITED KEEPS GOING. The process cannot run anything on
+    // its way out, so the work is recorded instead: a render leaves a job marker while it runs, and a
+    // marker still on disk here means the last exit was not a clean one. Restarting the render
+    // continues from the last completed clip -- and, since the keyframes are cached on disk, from the
+    // last keyframe inside the clip that was in progress.
+    if (guiRun) {
+        runCatching {
+            val interrupted = com.prism.desktop.videocraft.DesktopVideoCraftRuns.resumeInterrupted()
+            if (interrupted != null) {
+                com.prism.core.PrismPlatform.log.info(
+                    "VideoCraft",
+                    "Resuming the render Prism was in the middle of: ${interrupted.prompt.take(60)}",
+                )
+                com.prism.desktop.videocraft.DesktopVideoCraftRuns.start(interrupted)
+            }
+        }.onFailure {
+            com.prism.core.PrismPlatform.log.warn(
+                "VideoCraft", "Could not resume the interrupted render: ${it.message}",
+            )
+        }
     }
 
     when (args.firstOrNull()?.lowercase() ?: "gui") {
@@ -1965,20 +2082,19 @@ private fun printNode(node: com.prism.launcher.plugins.PluginNode, indent: Int) 
 private fun quantize(args: List<String>) {
     rule("Model quantization")
 
-    row("native quantiser", if (com.prism.launcher.quant.PrismQuantizer.isAvailable()) "available" else "NOT available")
-    if (!com.prism.launcher.quant.PrismQuantizer.isAvailable()) {
-        println()
-        println("  gguf_bridge did not load, so there is nothing to quantise with. See `prism diagnose`.")
-        println()
-        return
-    }
+    row(
+        "GGUF quantiser",
+        if (com.prism.launcher.quant.PrismQuantizer.isAvailable()) "available" else "NOT available",
+    )
+    // Built in rather than native, so it has no library to be missing -- see SafetensorQuantizer.
+    row("safetensors quantiser", "available (built in)")
 
     val source = args.firstOrNull()
     val levelName = args.getOrNull(1)
 
     if (source == null) {
         println()
-        println("  Levels, smallest first:")
+        println("  GGUF levels, smallest first:")
         com.prism.launcher.quant.PrismQuantizer.Level.entries.forEach { level ->
             row(
                 "  " + level.name,
@@ -1987,7 +2103,16 @@ private fun quantize(args: List<String>) {
             )
         }
         println()
-        println("  quantize <model.gguf> <LEVEL>   convert a model on disk")
+        println("  Safetensors levels, smallest first:")
+        com.prism.launcher.quant.SafetensorQuantizer.Level.entries.forEach { level ->
+            row(
+                "  " + level.fileSuffix,
+                String.format("%.2f", level.bitsPerWeight) + " bits/weight" +
+                    (if (level.note.isBlank()) "" else "  -- " + level.note),
+            )
+        }
+        println()
+        println("  quantize <model.gguf|model.safetensors> <LEVEL>   convert a model on disk")
         println()
         return
     }
@@ -2000,38 +2125,52 @@ private fun quantize(args: List<String>) {
         return
     }
 
-    val level = com.prism.launcher.quant.PrismQuantizer.Level.entries
-        .firstOrNull { it.name.equals(levelName, ignoreCase = true) }
+    // The level list comes from the FILE's container, so one command covers both formats and an
+    // unknown level is reported with the ones that do apply.
+    val targets = com.prism.launcher.quant.QuantTarget.forSource(file)
+    if (targets.isEmpty()) {
+        println()
+        println("  " + file.name + " is neither a GGUF nor a safetensors checkpoint.")
+        println()
+        return
+    }
+    val level = targets.firstOrNull { it.fileSuffix.equals(levelName, ignoreCase = true) }
     if (level == null) {
         println()
-        println("  Unknown level '" + levelName + "'. Run `prism quantize` for the list.")
+        println("  Unknown level '" + levelName + "'. For this file: " + targets.joinToString(", ") { it.fileSuffix })
+        println()
+        return
+    }
+    if (!level.available) {
+        row("FAILED", level.unavailableReason)
         println()
         return
     }
 
     // Named after the level, which is the convention every GGUF store relies on -- including Prism's own
-    // size estimator, which reads the SOURCE's bits per weight off its filename.
+    // size estimator, which reads the SOURCE's bits per weight off its filename. The extension follows the
+    // container: a quantised safetensors is still a safetensors file.
     val destination = java.io.File(
         file.parentFile,
         // A raw string, so the regex is read as a regex: a plain literal needs the backslash doubled
         // and a single one is a Kotlin escape error rather than a pattern.
-        file.nameWithoutExtension.replace(Regex("""(?i)[.-](Q[0-9][_A-Z0-9]*|F16|F32|BF16)"""), "") +
-            "." + level.name + ".gguf",
+        file.nameWithoutExtension.replace(Regex("""(?i)[.-](Q[0-9][_A-Z0-9]*|F16|F32|BF16|I8|I4)"""), "") +
+            "." + level.fileSuffix + "." + level.extension,
     )
 
     row("source", file.name + "  (" + (file.length() / (1024 * 1024)) + " MB)")
     row("target", destination.name)
-    row("estimate", (com.prism.launcher.quant.PrismQuantizer.estimateOutputBytes(file, level) / (1024 * 1024)).toString() + " MB")
+    row("level", level.label)
+    row("estimate", (level.estimateOutputBytes(file) / (1024 * 1024)).toString() + " MB")
     row("threads", com.prism.core.PrismCpu.inferenceThreads().toString())
     println()
     println("  Working. This takes minutes, not seconds.")
     println()
 
     val started = System.currentTimeMillis()
-    val problem = com.prism.launcher.quant.PrismQuantizer.quantize(
+    val problem = level.quantize(
         source = file,
         destination = destination,
-        level = level,
         threads = com.prism.core.PrismCpu.inferenceThreads(),
     )
     val seconds = (System.currentTimeMillis() - started) / 1000
@@ -2043,8 +2182,14 @@ private fun quantize(args: List<String>) {
         row("result", destination.absolutePath)
         row("size", (destination.length() / (1024 * 1024)).toString() + " MB")
         println()
-        println("  The file is an ordinary GGUF and loads on the phone as well -- that is the point of")
-        println("  doing this here rather than there.")
+        if (level.extension == "gguf") {
+            println("  The file is an ordinary GGUF and loads on the phone as well -- that is the point of")
+            println("  doing this here rather than there.")
+        } else {
+            println("  The file is a Prism-quantised safetensors checkpoint: weights are blocked in 32s")
+            println("  with one fp32 scale per block in a '<tensor>.scale' tensor, and the header records")
+            println("  the scheme.")
+        }
     }
     println()
 }
@@ -5447,9 +5592,13 @@ private fun imageGen(prompt: String) {
     }
     row("using", chosen.label)
 
-    val result = com.prism.launcher.messaging.ImageGeneration.generate(prompt) { stage ->
-        row("stage", stage)
-    }
+    // NAMED, because "size" is now the last parameter and a trailing lambda would bind to it --
+    // which the compiler caught here, and would have looked like a type error in a place with
+    // nothing to do with progress.
+    val result = com.prism.launcher.messaging.ImageGeneration.generate(
+        prompt,
+        onStage = { stage -> row("stage", stage) },
+    )
 
     if (result.image == null) {
         row("result", "FAILED -- ${result.error}")

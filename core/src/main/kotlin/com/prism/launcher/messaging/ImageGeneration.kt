@@ -61,7 +61,26 @@ interface ImageGenerator {
      * MediaPipe's create-and-generate is one opaque native call, so inventing percentages for it
      * would be inventing them.
      */
-    fun generate(prompt: String, onStage: ((String) -> Unit)? = null): PrismImage?
+    fun generate(
+        prompt: String,
+        onStage: ((String) -> Unit)? = null,
+        /** Real sampling progress, 0..1, where the engine can measure it. Engines that cannot
+         *  measure it never call this, which is how a UI knows to show an indeterminate bar. */
+        onProgress: ((Float) -> Unit)? = null,
+        /** The size the caller wants. Null means "use your own judgement". */
+        size: ImageSize? = null,
+    ): PrismImage?
+
+    /**
+     * Asks a render in flight to stop.
+     *
+     * Not every engine can: a cloud endpoint's request is already gone and cannot be recalled, and
+     * MediaPipe's create-and-generate is one native call with no interruption point. Those inherit
+     * this no-op and the caller's own state says the run was stopped, which is the truth from the
+     * user's side. A local diffusion render does stop, because stable-diffusion.cpp has a real
+     * cancel flag.
+     */
+    fun cancel() {}
 
     sealed class Availability {
         data object Ready : Availability()
@@ -145,6 +164,8 @@ object ImageGeneration {
         prompt: String,
         engineId: String? = null,
         onStage: ((String) -> Unit)? = null,
+        onProgress: ((Float) -> Unit)? = null,
+        size: ImageSize? = null,
     ): Result {
         val started = System.currentTimeMillis()
         val engine = engineId?.let { engines[it] } ?: preferred()
@@ -158,7 +179,7 @@ object ImageGeneration {
         if (prompt.isBlank()) return Result(null, engine.label, "Nothing to draw.", 0)
 
         return runCatching {
-            val image = engine.generate(prompt, onStage)
+            val image = engine.generate(prompt, onStage, onProgress, size)
             Result(
                 image = image,
                 engine = engine.label,
@@ -169,6 +190,17 @@ object ImageGeneration {
             PrismPlatform.log.error(TAG, "${engine.label} failed", it)
             Result(null, engine.label, it.message ?: it::class.simpleName.orEmpty(), 0)
         }
+    }
+
+    /**
+     * Stops whatever [preferred] would have started.
+     *
+     * Routed through the registry rather than the caller holding an engine, because the caller is a
+     * page that does not know which engine was chosen -- and the one that can stop is the one that is
+     * running.
+     */
+    fun cancelCurrent() {
+        runCatching { preferred()?.cancel() }
     }
 
     /**
@@ -191,6 +223,55 @@ object ImageGeneration {
  * gets image generation with no extra step — provided the endpoint offers it, which is checked by
  * trying rather than by asking, because there is no discovery call for it.
  */
+/**
+ * A render size, in pixels.
+ *
+ * Portable and deliberately dumb: it carries two numbers and how to say them, because the size has
+ * to travel from a settings screen through the registry into a model that was compiled for a fixed
+ * range of shapes. What each engine does with a size it cannot honour is that engine's business, and
+ * each one says so rather than silently rendering something else.
+ */
+data class ImageSize(val width: Int, val height: Int) {
+
+    val label: String get() = "$width \u00d7 $height"
+
+    /** The stored form: `512x768`, which survives a settings round trip without a parser. */
+    val stored: String get() = "${width}x$height"
+
+    companion object {
+        val DEFAULT = ImageSize(512, 512)
+
+        /**
+         * What a Settings row offers.
+         *
+         * Square sizes first because most checkpoints are trained square, then one portrait and one
+         * landscape for the shapes people actually ask for. Nothing above 1024: a phone rendering
+         * 1024x1024 with SDXL takes minutes, and offering 2048 would be offering a number rather
+         * than a feature.
+         */
+        val CHOICES = listOf(
+            ImageSize(256, 256),
+            ImageSize(384, 384),
+            ImageSize(512, 512),
+            ImageSize(512, 768),
+            ImageSize(640, 640),
+            ImageSize(768, 512),
+            ImageSize(768, 768),
+            ImageSize(1024, 1024),
+        )
+
+        fun parse(raw: String?): ImageSize {
+            val parts = raw.orEmpty().lowercase().split("x", "\u00d7", " ")
+                .map { it.trim() }.filter { it.isNotEmpty() }
+            if (parts.size < 2) return DEFAULT
+            val width = parts[0].toIntOrNull() ?: return DEFAULT
+            val height = parts[1].toIntOrNull() ?: return DEFAULT
+            if (width < 64 || height < 64 || width > 4096 || height > 4096) return DEFAULT
+            return ImageSize(width, height)
+        }
+    }
+}
+
 class CloudImageGenerator : ImageGenerator {
 
     override val id = "cloud"
@@ -200,9 +281,10 @@ class CloudImageGenerator : ImageGenerator {
             "the prompt leaves this device."
 
     override fun availability(): ImageGenerator.Availability {
-        val model = PrismSettings.getActiveCloudModel()
+        val model = PrismSettings.getActiveCloudModel(PrismSettings.KIND_IMAGE)
             ?: return ImageGenerator.Availability.Unavailable(
-                "No cloud model is configured. Set one up on the Cloud AI page."
+                "No cloud IMAGE model is active. Add one on the Cloud AI page with its kind set " +
+                    "to Image."
             )
         if (model.apiKey.isBlank()) {
             return ImageGenerator.Availability.Unavailable("That cloud model has no API key.")
@@ -210,9 +292,25 @@ class CloudImageGenerator : ImageGenerator {
         return ImageGenerator.Availability.Ready
     }
 
-    override fun generate(prompt: String, onStage: ((String) -> Unit)?): PrismImage? {
-        val model = PrismSettings.getActiveCloudModel() ?: return null
+    override fun generate(
+        prompt: String,
+        onStage: ((String) -> Unit)?,
+        onProgress: ((Float) -> Unit)?,
+        size: ImageSize?,
+    ): PrismImage? {
+        val model = PrismSettings.getActiveCloudModel(PrismSettings.KIND_IMAGE) ?: return null
         onStage?.invoke("Asking ${model.modelId}…")
-        return CloudAiService.fetchImage(model.baseUrl, model.apiKey, prompt)
+        // THE SIZE AND THE MODEL ID GO TOGETHER, AND BY NAME. `size` sits after `modelId` and the
+        // timeout in the signature, so passing it positionally would have handed a "512x768" string
+        // to the model-id parameter -- a request for a model that does not exist, which every
+        // endpoint answers with a 404 that looks like the key being wrong.
+        // Progress is not reported: a remote render has no steps to observe from here.
+        return CloudAiService.fetchImage(
+            baseUrl = model.baseUrl,
+            apiKey = model.apiKey,
+            prompt = prompt,
+            modelId = model.modelId,
+            size = size,
+        )
     }
 }

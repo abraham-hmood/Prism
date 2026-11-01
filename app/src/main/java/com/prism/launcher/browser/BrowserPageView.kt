@@ -165,12 +165,43 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
             if (onMesh) "Served over the Prism mesh" else "Served over the internet"
     }
 
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        post { syncTabTimers() }
+    }
+
+    override fun onWindowVisibilityChanged(visibility: Int) {
+        super.onWindowVisibilityChanged(visibility)
+        // A page one swipe away is still an attached tree with a live WebView in it. Pausing its
+        // timers is what stops an off-screen site from animating and running scripts for nobody.
+        syncTabTimers()
+    }
+
     override fun onDetachedFromWindow() {
         host?.attachBrowserPage(null)
         // A biometric unlock lasts for this visit to private tabs, not for the process.
         privateAuthenticated = false
         privateAuthExpiresAt = 0L
+        syncTabTimers()
         super.onDetachedFromWindow()
+    }
+
+    /**
+     * Runs timers for the tab on screen, and only for that tab.
+     *
+     * Every background tab used to keep its JavaScript, CSS animations and media alive. That is
+     * correct for a desktop browser with a tab strip; on a launcher page that is merely the
+     * neighbour of the one being looked at, it is a continuous CPU cost. Selecting a tab resumes
+     * it, and a hidden tab is resumed the next time it is shown.
+     */
+    private fun syncTabTimers() {
+        val visible = isShown
+        for (tab in tabs) {
+            runCatching {
+                if (visible && tab.id == activeTabId) tab.webView.onResume()
+                else tab.webView.onPause()
+            }
+        }
     }
 
     private fun hasPrivateAuth(): Boolean =
@@ -337,6 +368,7 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
             }
         }
         applyVpnForTab(tabToSelect)
+        syncTabTimers()
         closeTabsOverlay()
     }
 

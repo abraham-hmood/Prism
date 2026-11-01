@@ -45,12 +45,14 @@ class PocketParityTest {
                 File(models, m.file).writeBytes(from.readBytes())
             }
             PocketTtsEngine.temperatureForTest = 0f
+            PocketTtsEngine.polishForTest = false
         }
 
         @AfterClass
         @JvmStatic
         fun close() {
             PocketTtsEngine.temperatureForTest = -1f
+            PocketTtsEngine.polishForTest = true
             CloneEngines.ALL.forEach { runCatching { it.close() } }
         }
 

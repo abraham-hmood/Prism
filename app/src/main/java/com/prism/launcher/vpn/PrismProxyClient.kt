@@ -90,8 +90,14 @@ object PrismProxyClient {
                 builder.addProxyRule("http://${active.address}:${active.port}")
             }
 
-            // 2. Add others as fallbacks
-            servers.filter { it != active }.forEach {
+            // 2. Bridged servers come next: in Bridge mode their meshes are part of what this
+            // device is browsing, so they are tried before ordinary fallbacks.
+            servers.filter { it != active && it.isBridged }.forEach {
+                builder.addProxyRule("http://${it.address}:${it.port}")
+            }
+
+            // 3. Add the rest as fallbacks.
+            servers.filter { it != active && !it.isBridged }.forEach {
                 builder.addProxyRule("http://${it.address}:${it.port}")
             }
 

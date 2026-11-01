@@ -90,9 +90,44 @@ object DisplayPageFactory {
             SlotAssignment.Mouse -> MousePageView(context)
             SlotAssignment.Photos -> com.prism.launcher.photos.PhotosPageView(context)
             SlotAssignment.PhotoPix -> com.prism.launcher.photopix.PhotoPixPageView(context)
+            SlotAssignment.VideoCraft -> com.prism.launcher.videocraft.VideoCraftPageView(context)
+            // The ImageCraft page takes a plain Context, so it can be drawn on a television too: the
+            // generation itself happens in a service, and "which app is on screen" is not part of
+            // what it draws. Starting a render from a display still renders on this phone, which the
+            // page's own progress line says.
+            SlotAssignment.ImageCraft -> com.prism.launcher.imagecraft.ImageCraftPageView(context)
+            // AudioCraft takes a plain Context too: a television can browse the library and play a
+            // file, and the reading itself is done by whichever device started it.
+            SlotAssignment.AudioCraft -> com.prism.launcher.audiocraft.AudioCraftPageView(context)
+            SlotAssignment.ModelCraft -> com.prism.launcher.modelcraft.ModelCraftPageView(context)
+            // DatasetCraft takes a plain Context: a television can build a dataset as well as a phone
+            // can, and the files are copied on the device the page is drawn on.
+            SlotAssignment.DatasetCraft -> com.prism.launcher.datasetcraft.DatasetCraftPageView(context)
+            // AssetCraft takes a plain Context: a television can orbit the same scene and press
+            // Generate; the work is done by the model on this device either way.
+            SlotAssignment.AssetCraft -> com.prism.launcher.assetcraft.AssetCraftPageView(context)
+            // GameCraft takes a plain Context: a display can browse saved games and run the maker
+            // on this phone, with its model gates evaluated on this device.
+            SlotAssignment.GameCraft -> com.prism.launcher.gamecraft.GameCraftPageView(context)
             SlotAssignment.ModelStore -> com.prism.launcher.ModelStorePageView(context)
             SlotAssignment.AgenticTools -> com.prism.launcher.agentic.AgenticToolsPageView(context)
             SlotAssignment.Wallet -> WalletPageView(context)
+
+            // Mail on a television is read-only in practice: the server page reports state, and the
+            // client can browse. Both take a plain Context, so a display gets the same view.
+            SlotAssignment.EmailServer -> com.prism.launcher.email.EmailServerPageView(context)
+            SlotAssignment.EmailClient -> com.prism.launcher.email.EmailClientPageView(context)
+
+            // Both take a plain Context: a television can read the journal and list snapshots, and
+            // a snapshot started from the television is still taken by this phone.
+            SlotAssignment.TimeMachine -> com.prism.launcher.timemachine.TimeMachinePageView(context)
+            SlotAssignment.Journal -> com.prism.launcher.journal.JournalPageView(context)
+            // The store can be browsed from a television; publishing needs a file picker and is
+            // therefore a phone or desktop action, which the page gates on its own.
+            SlotAssignment.AppStore -> com.prism.launcher.appstore.AppStorePageView(context)
+            // A television can inspect the same process table and files as the phone; the kill
+            // result is reported on the page either way.
+            SlotAssignment.TaskManager -> com.prism.launcher.taskmanager.TaskManagerPageView(context)
 
             // The social surface is the one page whose constructor requires the launcher itself.
             SlotAssignment.NebulaSocial ->

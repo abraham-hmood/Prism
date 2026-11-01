@@ -174,6 +174,7 @@ class ElectricEdgeDrawable(
     private val body = Paint(Paint.ANTI_ALIAS_FLAG)
     private val rect = RectF()
     private var phase = 0f
+    private var lastFrame = 0L
 
     private val animator = ValueAnimator.ofFloat(0f, 1f).apply {
         duration = 2400L
@@ -187,6 +188,13 @@ class ElectricEdgeDrawable(
                 cancel()
                 return@addUpdateListener
             }
+            // A LIVE BORDER DOES NOT NEED SIXTY FRAMES A SECOND. Spark puts one of these on every
+            // bordered control, so full-rate animators meant dozens of blurred edge redraws per
+            // frame for as long as the theme was active. Fourteen updates a second still reads as
+            // current, and throttling here works on every API level.
+            val now = android.os.SystemClock.uptimeMillis()
+            if (now - lastFrame < 66L) return@addUpdateListener
+            lastFrame = now
             phase = it.animatedValue as Float
             invalidateSelf()
         }

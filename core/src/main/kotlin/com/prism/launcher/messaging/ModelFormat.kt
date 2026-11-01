@@ -32,6 +32,16 @@ object ModelFormat {
         /** llama.cpp weights. Only valid at offset 0. */
         GGUF,
 
+        /**
+         * Hugging Face's tensor container, which stable-diffusion.cpp reads directly.
+         *
+         * An eight-byte little-endian header length followed by that many bytes of JSON, so unlike
+         * every other format here the magic is a number rather than a string. Detected structurally
+         * for that reason: "{` first" would be a guess, "a sane length then a JSON object" is the
+         * format.
+         */
+        SAFETENSORS,
+
         /** A MediaPipe `.task` bundle, which is a ZIP. A small prefix is survivable. */
         TASK_ZIP,
 
@@ -59,7 +69,8 @@ object ModelFormat {
         val leadingZeroes: Long,
         val headerHex: String,
     ) {
-        val isUsable: Boolean get() = kind == Kind.GGUF || kind == Kind.TASK_ZIP
+        val isUsable: Boolean
+            get() = kind == Kind.GGUF || kind == Kind.TASK_ZIP || kind == Kind.SAFETENSORS
 
         /** What to tell the user, phrased as the thing they can act on. */
         fun explain(file: File): String = when (kind) {
@@ -82,9 +93,14 @@ object ModelFormat {
                 "${file.name} is a bare TFLite model. MediaPipe's LLM API needs a `.task` bundle, " +
                     "which packages the TFLite model together with its tokenizer and metadata."
 
+            Kind.SAFETENSORS ->
+                "${file.name} is a safetensors checkpoint. Image generation reads it directly; " +
+                    "the text engine needs the same weights converted to GGUF."
+
             Kind.UNKNOWN ->
                 "${file.name} is not a format Prism can run (header $headerHex). Prism reads GGUF " +
-                    "for llama.cpp and `.task` bundles for MediaPipe."
+                    "for llama.cpp, safetensors for stable-diffusion.cpp and `.task` bundles for " +
+                    "MediaPipe."
 
             else -> ""
         }
@@ -93,6 +109,86 @@ object ModelFormat {
     private val GGUF = byteArrayOf(0x47, 0x47, 0x55, 0x46)          // "GGUF"
     private val ZIP = byteArrayOf(0x50, 0x4B, 0x03, 0x04)           // "PK\3\4"
     private val TFLITE = byteArrayOf(0x54, 0x46, 0x4C, 0x33)        // "TFL3"
+
+    /**
+     * What family of model a GGUF holds.
+     *
+     * ## Why a GGUF is not automatically a text model
+     *
+     * It used to be: `install` filed every GGUF as TEXT unless something said otherwise. But
+     * stable-diffusion.cpp reads GGUF too, and a diffusion checkpoint is not a language model --
+     * SD-Turbo downloaded from the store's Image tab landed in the Text list and could draw
+     * nothing there, while the image slot it was meant for stayed empty. hf.co hosts both shapes
+     * under one extension, so the extension cannot decide.
+     *
+     * ## How the family is decided
+     *
+     * By the names inside the file, which are the tensor names for a converted checkpoint and the
+     * metadata keys for a llama.cpp model:
+     *
+     *  - llama.cpp writes `general.architecture`, and every text family has it.
+     *  - stable-diffusion.cpp's converted checkpoints have no metadata at all and name their
+     *    tensors `conditioner.*`, `model.diffusion_model.*`, `first_stage_model.*`, or the Flux
+     *    `double_blocks.*` / `single_blocks.*`. SDXL and SD 1.5 both look like that.
+     *
+     * A GGUF with neither is UNKNOWN and the caller keeps its old answer, rather than this
+     * guessing at a file it does not recognise.
+     */
+    enum class GgufFamily { DIFFUSION, TEXT, UNKNOWN }
+
+    /** Tensor-name prefixes that only a diffusion checkpoint has. */
+    private val DIFFUSION_MARKERS = listOf(
+        "conditioner.",
+        "model.diffusion_model.",
+        "first_stage_model.",
+        "cond_stage_model.",
+        "alphas_cumprod",
+        "double_blocks.",
+        "single_blocks.",
+        "vae.decoder",
+    )
+
+    /** How much of a GGUF is scanned for those names. They sit in the first table. */
+    private val FAMILY_SCAN_BYTES = 256 * 1024
+
+    fun ggufFamily(file: File): GgufFamily {
+        if (!file.isFile || file.length() <= 0L) return GgufFamily.UNKNOWN
+        return runCatching {
+            RandomAccessFile(file, "r").use { raf ->
+                val size = minOf(FAMILY_SCAN_BYTES.toLong(), file.length()).toInt()
+                val bytes = ByteArray(size)
+                raf.readFully(bytes)
+                if (!startsWith(bytes, GGUF, 0)) return@use GgufFamily.UNKNOWN
+                // Latin-1 because the body is binary: this asks whether a name is present, and
+                // any byte-per-char decoding answers that without failing on invalid UTF-8.
+                val text = String(bytes, Charsets.ISO_8859_1)
+                val diffusion = text.contains("stable-diffusion") ||
+                    DIFFUSION_MARKERS.any { text.contains(it) }
+                when {
+                    diffusion -> GgufFamily.DIFFUSION
+                    text.contains("general.architecture") -> GgufFamily.TEXT
+                    else -> GgufFamily.UNKNOWN
+                }
+            }
+        }.getOrDefault(GgufFamily.UNKNOWN)
+    }
+
+    /**
+     * Whether the window is a safetensors header: a plausible length, then a JSON object.
+     *
+     * The length has to describe the JSON that follows it, which is what separates a real header
+     * from a file that happens to begin with small numbers. A header larger than the file is not
+     * a header; neither is one longer than the spec's own practical limit for a model of this size.
+     */
+    private fun isSafetensors(window: ByteArray, fileLength: Long): Boolean {
+        if (window.size < 10) return false
+        var headerLength = 0L
+        for (i in 0 until 8) {
+            headerLength = headerLength or ((window[i].toLong() and 0xFF) shl (8 * i))
+        }
+        if (headerLength < 2 || headerLength > fileLength - 8) return false
+        return window[8] == '{'.code.toByte()
+    }
 
     /**
      * How far in to look for a ZIP's magic.
@@ -134,6 +230,9 @@ object ModelFormat {
                 }
                 if (startsWith(window, TFLITE, 0)) {
                     return@use Detection(Kind.TFLITE, 0, blank, hex)
+                }
+                if (isSafetensors(window, file.length())) {
+                    return@use Detection(Kind.SAFETENSORS, 0, blank, hex)
                 }
 
                 val zipAt = indexOf(window, ZIP)

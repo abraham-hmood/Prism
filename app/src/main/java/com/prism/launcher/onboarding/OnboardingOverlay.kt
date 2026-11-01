@@ -226,6 +226,8 @@ class OnboardingOverlay(context: Context) : LinearLayout(context) {
                     if (!PrismSettings.hasCustomPagePickerSwipe()) return
                 OnboardingContent.Step.Special.WALLET_SETUP ->
                     if (!com.prism.launcher.wallet.WalletVault.isInitialized()) return
+                OnboardingContent.Step.Special.LYKE_ACCOUNT ->
+                    if (!hasLykeAccount()) return
                 else -> Unit
             }
         }
@@ -250,8 +252,9 @@ class OnboardingOverlay(context: Context) : LinearLayout(context) {
 
         val interactive = step.special == OnboardingContent.Step.Special.SWIPE_TRIGGER
         val walletStep = step.special == OnboardingContent.Step.Special.WALLET_SETUP
+        val accountStep = step.special == OnboardingContent.Step.Special.LYKE_ACCOUNT
         val bridgesStep = step.special == OnboardingContent.Step.Special.MESSAGING_BRIDGES
-        glyph.visibility = if (interactive || walletStep || bridgesStep) View.GONE else View.VISIBLE
+        glyph.visibility = if (interactive || walletStep || accountStep || bridgesStep) View.GONE else View.VISIBLE
         // The explanatory paragraph stays: the pad needs the context that explains why the
         // three swipes must agree and why horizontal ones are edge-only, and the wallet needs
         // to say why it is being asked for before it asks.
@@ -264,6 +267,12 @@ class OnboardingOverlay(context: Context) : LinearLayout(context) {
                 // The wallet exists now, so this step is passable and the tour is escapable.
                 applyGateState()
             }
+            specialHost.addView(setup)
+        }
+
+        if (accountStep) {
+            val setup = LykeAccountSetupView(context)
+            setup.onAccountReady = { applyGateState() }
             specialHost.addView(setup)
         }
 
@@ -315,15 +324,21 @@ class OnboardingOverlay(context: Context) : LinearLayout(context) {
             !PrismSettings.hasCustomPagePickerSwipe()
         val requiresWallet = step.special == OnboardingContent.Step.Special.WALLET_SETUP &&
             !com.prism.launcher.wallet.WalletVault.isInitialized()
-        val locked = requiresTrigger || requiresWallet
+        val requiresAccount = step.special == OnboardingContent.Step.Special.LYKE_ACCOUNT &&
+            !hasLykeAccount()
+        val locked = requiresTrigger || requiresWallet || requiresAccount
 
         val ready = PrismSettings.hasCustomPagePickerSwipe() &&
-            com.prism.launcher.wallet.WalletVault.isInitialized()
+            com.prism.launcher.wallet.WalletVault.isInitialized() && hasLykeAccount()
         skip.visibility = if (ready) View.VISIBLE else View.GONE
         jumpLink.visibility = if (ready) View.VISIBLE else View.GONE
         next.isEnabled = !locked
         next.alpha = if (locked) 0.45f else 1f
     }
+
+    /** Both halves of the mail login, which is what make the forced step passable. */
+    private fun hasLykeAccount(): Boolean =
+        PrismSettings.getLykeProfileConfirmed() && PrismSettings.hasLykePassword()
 
     private fun showSectionPicker() {
         val names = OnboardingContent.SECTIONS.map { it.name }.toTypedArray()

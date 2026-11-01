@@ -2,9 +2,11 @@ package com.prism.launcher.minigames
 
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
+import android.graphics.Shader
 
 /**
  * The look: ruled paper, and everything on it drawn in pencil.
@@ -62,6 +64,23 @@ object PencilStyle {
     const val BLUE_PENCIL = 0xFF3F6FA8.toInt()
     const val GREEN_PENCIL = 0xFF4E8A57.toInt()
 
+    /**
+     * The xOS colouring pencils.
+     *
+     * Paper Empire is the only game that is allowed to be paper, but on xOS it is paper under a
+     * blacklight: the page stays a page, the graphite becomes electric, and the ruling runs cyan to
+     * magenta. These are deliberately a small set -- a neon palette with ten colours stops reading
+     * as neon and starts reading as a paint box.
+     */
+    const val NEON_CYAN = 0xFF00F0FF.toInt()
+    const val NEON_BLUE = 0xFF3B9DFF.toInt()
+    const val NEON_MAGENTA = 0xFFFF3CF2.toInt()
+    const val NEON_GREEN = 0xFF66FFB2.toInt()
+    const val NEON_VIOLET = 0xFFA76BFF.toInt()
+
+    /** The page under the blacklight. Still paper, just after dark. */
+    fun neonPaper(dark: Boolean): Int = if (dark) 0xFF0B0A1A.toInt() else 0xFFF3FBFF.toInt()
+
     const val LINE_SPACING_DP = 26f
 
     fun paper(dark: Boolean): Int = if (dark) PAPER_DARK else PAPER
@@ -95,21 +114,54 @@ object PencilStyle {
      * [scrollY] lets a scrolling surface keep the ruling fixed to the CONTENT rather than to the
      * screen, which is the difference between a page that moves and a screen with lines on it.
      */
-    fun drawPaper(canvas: Canvas, width: Int, height: Int, dark: Boolean, density: Float, scrollY: Float = 0f) {
-        canvas.drawColor(paper(dark))
+    fun drawPaper(
+        canvas: Canvas,
+        width: Int,
+        height: Int,
+        dark: Boolean,
+        density: Float,
+        scrollY: Float = 0f,
+        neon: Boolean = false,
+    ) {
+        canvas.drawColor(if (neon) neonPaper(dark) else paper(dark))
 
         val spacing = LINE_SPACING_DP * density
-        val rulePaint = pencil(1f * density, rule(dark), alpha = 190)
+        val ruleColour = if (neon) NEON_BLUE else rule(dark)
+        val marginColour = if (neon) NEON_MAGENTA else margin(dark)
+
+        // A low wash of cyan-to-magenta over the page. The ruling alone reads as coloured ink;
+        // the wash is what makes the sheet look lit from underneath rather than merely tinted.
+        if (neon) {
+            val wash = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                shader = LinearGradient(
+                    0f, 0f, width.toFloat(), height.toFloat(),
+                    0x2200F0FF, 0x18FF3CF2, Shader.TileMode.CLAMP,
+                )
+            }
+            canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), wash)
+        }
+
+        val rulePaint = pencil(1f * density, ruleColour, alpha = if (neon) 220 else 190)
+        val ruleGlow = if (neon) pencil(3.2f * density, NEON_CYAN, alpha = 45) else null
         var y = -(scrollY % spacing)
         while (y < height) {
-            if (y >= 0) canvas.drawLine(0f, y, width.toFloat(), y, rulePaint)
+            if (y >= 0) {
+                ruleGlow?.let { canvas.drawLine(0f, y, width.toFloat(), y, it) }
+                canvas.drawLine(0f, y, width.toFloat(), y, rulePaint)
+            }
             y += spacing
         }
 
         val marginX = 46f * density
-        canvas.drawLine(marginX, 0f, marginX, height.toFloat(), pencil(1.4f * density, margin(dark), alpha = 170))
+        if (neon) {
+            canvas.drawLine(
+                marginX, 0f, marginX, height.toFloat(),
+                pencil(4f * density, NEON_MAGENTA, alpha = 35),
+            )
+        }
+        canvas.drawLine(marginX, 0f, marginX, height.toFloat(), pencil(1.4f * density, marginColour, alpha = 170))
         // The punch holes, which is the detail that makes people say "that's my school book".
-        val holePaint = shading(rule(dark), alpha = 90)
+        val holePaint = shading(if (neon) NEON_MAGENTA else rule(dark), alpha = 90)
         listOf(0.22f, 0.5f, 0.78f).forEach { at ->
             canvas.drawCircle(marginX / 2.2f, height * at, 5.5f * density, holePaint)
         }

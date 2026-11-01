@@ -86,9 +86,9 @@ object WirelessDisplay {
     const val MODE_MIMIC = "mimic"
     const val MODE_EXTEND = "extend"
 
-    /** Ten seconds: three missed beacons at the three-second interval. */
-    private const val DISPLAY_LEASE_MS = 10_000L
-    private const val BEACON_INTERVAL_MS = 3_000L
+    /** Three missed beacons at the ten-second interval, plus margin. */
+    private const val DISPLAY_LEASE_MS = 35_000L
+    private const val BEACON_INTERVAL_MS = 10_000L
 
     /**
      * How long a verified control link may be silent before it is treated as dead.
@@ -100,8 +100,8 @@ object WirelessDisplay {
      * nothing. Three missed heartbeats is long enough to ride out a pause and short enough that a
      * user who reconnects after a lost network is not locked out.
      */
-    private const val LINK_SILENCE_LIMIT_MS = 18_000L
-    private const val HEARTBEAT_INTERVAL_MS = 5_000L
+    private const val LINK_SILENCE_LIMIT_MS = 35_000L
+    private const val HEARTBEAT_INTERVAL_MS = 10_000L
 
     /** How long a connected peer may leave a fresh handshake unanswered. */
     private const val HANDSHAKE_TIMEOUT_MS = 20_000L
@@ -164,6 +164,20 @@ object WirelessDisplay {
     /** What this build calls itself in a beacon. Set at startup by each platform. */
     @Volatile
     var deviceName: () -> String = { "Prism device" }
+
+    /**
+     * Whether this device's screen is on.
+     *
+     * Discovery is for a person choosing a display, so a phone asleep in a pocket has no reason to
+     * transmit a beacon every few seconds. Android reports the screen state from `PrismApp`; a
+     * connected link ignores this flag, because a live mirror needs its heartbeats either way.
+     */
+    @Volatile
+    private var screenOn: Boolean = true
+
+    fun setScreenOn(on: Boolean) {
+        screenOn = on
+    }
 
     @Volatile
     var devicePlatform: () -> String = { "unknown" }
@@ -653,8 +667,14 @@ object WirelessDisplay {
 
         while (true) {
             runCatching {
-                broadcastBeacon(socket)
-                socket.soTimeout = BEACON_INTERVAL_MS.toInt()
+                // A sleeping phone has nobody looking at a display picker: skip the transmit and
+                // wait six times as long before looking again. A live link still talks.
+                if (screenOn || isConnected()) broadcastBeacon(socket)
+                socket.soTimeout = if (screenOn || isConnected()) {
+                    BEACON_INTERVAL_MS.toInt()
+                } else {
+                    60_000
+                }
                 val packet = DatagramPacket(buffer, buffer.size)
                 socket.receive(packet)
                 acceptBeacon(packet)
@@ -730,7 +750,10 @@ object WirelessDisplay {
         server = listener
 
         while (true) {
-            val client = runCatching { listener.accept() }.getOrNull() ?: continue
+            // A closed or broken listener makes accept throw immediately, and `continue` here
+            // turned that into a core pegged at 100% for as long as the process lived. There is
+            // nothing left to accept once the listener itself has failed, so stop.
+            val client = runCatching { listener.accept() }.getOrNull() ?: break
             thread(name = "prism-display-client", isDaemon = true) {
                 acceptClient(client)
             }

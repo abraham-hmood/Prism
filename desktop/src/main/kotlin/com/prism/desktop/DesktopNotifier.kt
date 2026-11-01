@@ -61,6 +61,18 @@ class DesktopNotifier : Notifier {
         icon.displayMessage(title, body, TrayIcon.MessageType.INFO)
     }
 
+    /**
+     * A one-line status in the tray icon's tooltip.
+     *
+     * A balloon cannot be replaced by id, so without this a render's percentage exists only inside
+     * the window that started it. The tooltip is the desktop counterpart of Android's foreground
+     * notification: hovering the icon answers "how far along is it?" without bringing Prism
+     * forward. Passing null restores the plain app name.
+     */
+    fun status(text: String?) {
+        trayIcon?.toolTip = text?.takeIf { it.isNotBlank() } ?: "Prism"
+    }
+
     /** Not supported by AWT. See the class comment -- this is a real gap, not a stub. */
     override fun cancel(id: Int) = Unit
 

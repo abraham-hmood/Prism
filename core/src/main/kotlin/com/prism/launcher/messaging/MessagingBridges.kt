@@ -5,14 +5,19 @@ import com.prism.launcher.PrismSettings
 /**
  * The messaging apps Prism can hand off to: WhatsApp, Facebook Messenger and Signal.
  *
- * ## What "integration" can honestly mean
+ * RCS is deliberately NOT in this list. It used to be a handoff row that opened the carrier app,
+ * which is not RCS support; Prism carries rich messages itself now. See
+ * [com.prism.launcher.messaging.RcsChat].
  *
- * None of the three publishes a public API, and none of their protocols is something Prism can join
- * without becoming a different client with the user's credentials. So this is not a gateway that
- * pretends to merge three private networks -- that would break on the next app update and would
- * mean holding a session that could read every message.
+ * ## What "integration" means now
  *
- * What Prism can do, and what this class describes, is the three things a launcher actually owns:
+ * Each service DOES have a public interface, but not the one a personal chat client has. WhatsApp
+ * Cloud API is a business-number API, Messenger Platform is a Page API, and Signal is reached
+ * through a signal-cli bridge. [MessagingApps] owns those credentials and [MessagingApi] speaks
+ * them; this class is the narrower handoff layer that still opens the installed app when the user
+ * wants the personal client, and keeps the switches shared between platforms.
+ *
+ * What this class describes is the three things a launcher owns regardless of API:
  *
  *  - **Presence in one place.** Enabled bridges appear in Messages and on the desktop, so the
  *    user does not have to remember which app a conversation lives in.
@@ -52,8 +57,8 @@ object MessagingBridges {
             appUri = "whatsapp://send",
             webUrl = "https://web.whatsapp.com/",
             sendUriPrefix = "https://wa.me/?text=",
-            note = "WhatsApp has no public send API. Prism opens a chat with your text ready to " +
-                "send, and captures the notifications the app posts.",
+            note = "Uses WhatsApp Cloud API for your business number, or opens the personal app. " +
+                "Personal chats are not readable through the API.",
         ),
         Bridge(
             id = "messenger",
@@ -62,8 +67,8 @@ object MessagingBridges {
             appUri = "fb-messenger://",
             webUrl = "https://www.messenger.com/",
             sendUriPrefix = "",
-            note = "Messenger has no public send API. Prism opens the app or the web client, and " +
-                "captures the notifications the app posts.",
+            note = "Uses Messenger Platform for a Facebook Page, or opens the personal app. Page " +
+                "conversations are the ones the API can read.",
         ),
         Bridge(
             id = "signal",
@@ -72,8 +77,8 @@ object MessagingBridges {
             appUri = "sgnl://",
             webUrl = "https://signal.org/download/",
             sendUriPrefix = "",
-            note = "Signal has no web client and no public send API. Prism opens the installed " +
-                "app and captures the notifications it posts.",
+            note = "Uses signal-cli-rest-api as a linked device, or opens the installed app. " +
+                "Signal has no first-party server API.",
         ),
     )
 

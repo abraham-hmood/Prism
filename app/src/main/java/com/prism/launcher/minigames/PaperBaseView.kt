@@ -35,6 +35,7 @@ class PaperBaseView(
 
     private val density = resources.displayMetrics.density
     private val dark: Boolean get() = PaperUi.isDark(context)
+    private val neon: Boolean by lazy { PaperUi.isNeon(context) }
 
     var base: PaperBase = PaperBase("", 0)
         set(value) {
@@ -199,7 +200,10 @@ class PaperBaseView(
         if (width <= 0 || height <= 0) return
 
         val cell = cellSize()
-        val ink = PencilStyle.pencil(1.9f * density, PencilStyle.graphite(dark))
+        val ink = PencilStyle.pencil(
+            1.9f * density,
+            if (neon) PencilStyle.NEON_CYAN else PencilStyle.graphite(dark),
+        )
         val frame = battleFrame
         val cast = battleCast
 
@@ -273,6 +277,7 @@ class PaperBaseView(
         h = h * 31 + width
         h = h * 31 + height
         h = h * 31 + (if (dark) 1 else 0)
+        h = h * 31 + (if (neon) 1 else 0)
         // The plot's own size, so a boundary expansion redraws the border and grid even though the
         // set of buildings has not changed.
         h = h * 31 + base.plotSize
@@ -315,11 +320,15 @@ class PaperBaseView(
         val canvas = layerCanvas ?: Canvas(target).also { layerCanvas = it }
         if (canvas.width != target.width) layerCanvas = Canvas(target)
 
-        val faint = PencilStyle.pencil(1.1f * density, PencilStyle.graphiteLight(dark), alpha = 80)
+        val faint = PencilStyle.pencil(
+            1.1f * density,
+            if (neon) PencilStyle.NEON_BLUE else PencilStyle.graphiteLight(dark),
+            alpha = if (neon) 105 else 80,
+        )
         val frame = battleFrame
         val cast = battleCast
 
-        PencilStyle.drawPaper(canvas, width, height, dark, density)
+        PencilStyle.drawPaper(canvas, width, height, dark, density, neon = neon)
         canvas.save()
         canvas.clipRect(0, 0, width, height)
         // The plot: a wobbly border round the buildable area, the way you box off a drawing.
@@ -349,7 +358,11 @@ class PaperBaseView(
         drawRoads(canvas, cell, ink)
 
         // Hoisted out of the loop: one Paint for the lot instead of one per building per frame.
-        val fillPaint = PencilStyle.pencil(1f * density, PencilStyle.graphiteLight(dark), alpha = 70)
+        val fillPaint = PencilStyle.pencil(
+            1f * density,
+            if (neon) PencilStyle.NEON_CYAN else PencilStyle.graphiteLight(dark),
+            alpha = if (neon) 95 else 70,
+        )
         ruins.clear()
         // Sorted back to front so a building overlaps the one behind it. Cached, because the order
         // only changes when something is built or destroyed, not sixty times a second.
@@ -399,7 +412,11 @@ class PaperBaseView(
                 val frac = (current.toFloat() / b.maxHitPoints).coerceIn(0f, 1f)
                 val barY = r.top + cell * 0.06f
                 PencilStyle.line(canvas, r.left, barY, r.left + r.width() * frac, barY,
-                    PencilStyle.pencil(2.6f * density, PencilStyle.RED_PENCIL, alpha = 210), seed + 99, 0.5f)
+                    PencilStyle.pencil(
+                        2.6f * density,
+                        if (neon) PencilStyle.NEON_MAGENTA else PencilStyle.RED_PENCIL,
+                        alpha = 210,
+                    ), seed + 99, 0.5f)
             }
 
             // A stick figure or two outside the military buildings, so the base has people in it.
@@ -825,6 +842,34 @@ class PaperBaseView(
                 PencilStyle.markUnit(
                     squadStrokes[slot], squadDots[slot], shape,
                     cx, feetY, size, facingRight, phase + index,
+                )
+            }
+        }
+
+        // The garrison, out in the open. Drawn in the defender's red so an invading player can
+        // tell at a glance which figures are theirs and which have come out of the barracks.
+        if (cast.guardCount > 0) {
+            val guardPaint = PencilStyle.pencil(1.8f * density, PencilStyle.RED_PENCIL)
+            for (index in 0 until cast.guardCount) {
+                if (!frame.guardAlive(index)) continue
+                val gx = offsetX + frame.gx(index) * cell
+                val gy = offsetY + frame.gy(index) * cell + cell * 0.4f
+                val size = cell * 0.92f
+                val facingRight = frame.gx(index) < base.plotSize / 2f
+                PencilStyle.unit(
+                    canvas,
+                    shape = PencilStyle.UnitShape.FOOT,
+                    cx = gx,
+                    feetY = gy,
+                    size = size,
+                    paint = guardPaint,
+                    seed = 4000L + index,
+                    phase = phase + index,
+                    facingRight = facingRight,
+                    held = PencilStyle.heldFor(
+                        cast.guardWeaponIds.getOrNull(index)?.let { WeaponCatalog.byId(it) }?.weaponClass
+                            ?: WeaponCatalog.WeaponClass.BLADE,
+                    ),
                 )
             }
         }

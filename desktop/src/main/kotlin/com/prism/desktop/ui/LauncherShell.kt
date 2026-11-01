@@ -88,6 +88,54 @@ fun LauncherShell(onExit: () -> Unit) {
 
     fun step(delta: Int) = goTo((pagerState.currentPage + delta).coerceIn(slots.indices))
 
+    /**
+     * A slot borrowed for a page that has none, and the page it displaced.
+     *
+     * The drawer lists every page this build can show, not only placed ones. Tapping an unplaced
+     * page would otherwise be a tap that does nothing, so the shell lends it a random slot and takes
+     * it back as soon as the user pages away. Inserting a slot instead would renumber every later
+     * page and shift the desktop cells keyed to those numbers -- a tap in the drawer must not
+     * rearrange the user's home screens.
+     */
+    var borrowed by remember { mutableStateOf<Pair<Int, SlotAssignment>?>(null) }
+    var borrowedOn by remember { mutableStateOf(false) }
+
+    fun restoreBorrowed() {
+        val loan = borrowed ?: return
+        borrowed = null
+        borrowedOn = false
+        if (loan.first !in prefs.getAssignments().indices) return
+        prefs.setAt(loan.first, loan.second)
+        slots = prefs.getAssignments().toList()
+    }
+
+    fun openSlot(assignment: SlotAssignment) {
+        restoreBorrowed()
+        val list = prefs.getAssignments()
+        val existing = list.indexOfFirst { it.serialize() == assignment.serialize() }
+        if (existing >= 0) {
+            goTo(existing)
+            return
+        }
+        if (list.isEmpty()) return
+        val slot = list.indices.random()
+        borrowed = slot to list[slot]
+        // If the borrowed slot is already the one on screen, the page change below never fires and
+        // this is what lets leaving it restore the slot.
+        borrowedOn = pagerState.currentPage == slot
+        prefs.setAt(slot, assignment)
+        slots = prefs.getAssignments().toList()
+        scope.launch { pagerState.animateScrollToPage(slot) }
+    }
+
+    // Give a borrowed slot back when the borrowed page stops being the one on screen. Keyed on the
+    // page alone: keying it on [slots] too would run it during the very assignment that borrows the
+    // slot and hand it straight back.
+    LaunchedEffect(pagerState.currentPage) {
+        val loan = borrowed ?: return@LaunchedEffect
+        if (pagerState.currentPage == loan.first) borrowedOn = true else if (borrowedOn) restoreBorrowed()
+    }
+
     // A connected display follows the pager. Extend uses this to pick the page AFTER the one on
     // screen; mimic ignores it and streams the screen itself.
     LaunchedEffect(pagerState.currentPage, slots) {
@@ -155,8 +203,10 @@ fun LauncherShell(onExit: () -> Unit) {
                 modifier = Modifier.weight(1f).fillMaxWidth(),
             ) { index ->
                 // Full width. The page fills the window exactly as it fills a phone screen.
-                Box(Modifier.fillMaxSize()) {
-                    SlotPage(slots.getOrNull(index) ?: SlotAssignment.Default, index)
+                CompositionLocalProvider(LocalSlotOpener provides { slot -> openSlot(slot) }) {
+                    Box(Modifier.fillMaxSize()) {
+                        SlotPage(slots.getOrNull(index) ?: SlotAssignment.Default, index)
+                    }
                 }
             }
 
@@ -278,6 +328,19 @@ private fun SlotPage(slot: SlotAssignment, index: Int) {
         is SlotAssignment.Mouse -> MousePage()
         is SlotAssignment.Photos -> PhotosPage()
         is SlotAssignment.PhotoPix -> PhotoPixPage()
+        is SlotAssignment.VideoCraft -> VideoCraftPage()
+        is SlotAssignment.ImageCraft -> ImageCraftPage()
+        is SlotAssignment.AudioCraft -> AudioCraftPage()
+        is SlotAssignment.ModelCraft -> ModelCraftPage()
+        is SlotAssignment.DatasetCraft -> DatasetCraftPage()
+        is SlotAssignment.AssetCraft -> AssetCraftPage()
+        is SlotAssignment.GameCraft -> GameCraftPage()
+        is SlotAssignment.EmailServer -> EmailServerPage()
+        is SlotAssignment.EmailClient -> EmailClientPage()
+        is SlotAssignment.TimeMachine -> TimeMachinePage()
+        is SlotAssignment.Journal -> JournalPage()
+        is SlotAssignment.AppStore -> AppStorePage()
+        is SlotAssignment.TaskManager -> TaskManagerPage()
         is SlotAssignment.Custom -> UnsupportedSlot(
             "Plugin page",
             "Android loads these from installed APKs. On the desktop a plugin page has to come " +
@@ -438,6 +501,9 @@ private fun SlotEditorDialog(
             SlotAssignment.Notifications, SlotAssignment.Language, SlotAssignment.Minigames,
             SlotAssignment.Cloud, SlotAssignment.Meshvoice, SlotAssignment.Maps,
             SlotAssignment.Mouse, SlotAssignment.Photos, SlotAssignment.PhotoPix,
+            SlotAssignment.VideoCraft, SlotAssignment.ImageCraft,
+            SlotAssignment.AudioCraft, SlotAssignment.ModelCraft,
+            SlotAssignment.AssetCraft,
         )
     }
 
@@ -523,6 +589,19 @@ private fun slotLabel(slot: SlotAssignment): String = when (slot) {
     is SlotAssignment.Mouse -> "Mouse"
     is SlotAssignment.Photos -> "Photos"
     is SlotAssignment.PhotoPix -> "PhotoPix"
+    is SlotAssignment.VideoCraft -> "VideoCraft"
+    is SlotAssignment.ImageCraft -> "ImageCraft"
+    is SlotAssignment.AudioCraft -> "AudioCraft"
+    is SlotAssignment.ModelCraft -> "ModelCraft"
+    is SlotAssignment.DatasetCraft -> "DatasetCraft"
+    is SlotAssignment.AssetCraft -> "AssetCraft"
+    is SlotAssignment.GameCraft -> "GameCraft"
+    is SlotAssignment.EmailServer -> "Email server"
+    is SlotAssignment.EmailClient -> "Email"
+    is SlotAssignment.TimeMachine -> "Time Machine"
+    is SlotAssignment.Journal -> "Journal"
+    is SlotAssignment.AppStore -> "App Store"
+    is SlotAssignment.TaskManager -> "Task Manager"
     is SlotAssignment.Custom -> "Plugin"
 }
 
@@ -539,6 +618,10 @@ private fun slotIcon(slot: SlotAssignment): ImageVector = when (slot) {
     is SlotAssignment.Models -> Icons.Filled.Tune
     is SlotAssignment.ModelStore -> Icons.Filled.Science
     is SlotAssignment.AgenticTools -> Icons.Filled.Build
+    is SlotAssignment.TimeMachine -> Icons.Filled.History
+    is SlotAssignment.Journal -> Icons.Filled.MenuBook
+    is SlotAssignment.AppStore -> Icons.Filled.Storefront
+    is SlotAssignment.TaskManager -> Icons.Filled.Build
     is SlotAssignment.Wallet -> Icons.Filled.AccountBalanceWallet
     is SlotAssignment.Editor -> Icons.Filled.Code
     is SlotAssignment.Science -> Icons.Filled.Biotech
@@ -551,5 +634,14 @@ private fun slotIcon(slot: SlotAssignment): ImageVector = when (slot) {
     is SlotAssignment.Mouse -> Icons.Filled.TouchApp
     is SlotAssignment.Photos -> Icons.Filled.PhotoLibrary
     is SlotAssignment.PhotoPix -> Icons.Filled.Brush
+    is SlotAssignment.VideoCraft -> Icons.Filled.Movie
+    is SlotAssignment.ImageCraft -> Icons.Filled.AutoFixHigh
+    is SlotAssignment.AudioCraft -> Icons.Filled.LibraryMusic
+    is SlotAssignment.ModelCraft -> Icons.Filled.Memory
+    is SlotAssignment.DatasetCraft -> Icons.Filled.Storage
+    is SlotAssignment.AssetCraft -> Icons.Filled.SportsEsports
+    is SlotAssignment.GameCraft -> Icons.Filled.SportsEsports
+    is SlotAssignment.EmailServer -> Icons.Filled.Dns
+    is SlotAssignment.EmailClient -> Icons.Filled.Mail
     is SlotAssignment.Custom -> Icons.Filled.Extension
 }

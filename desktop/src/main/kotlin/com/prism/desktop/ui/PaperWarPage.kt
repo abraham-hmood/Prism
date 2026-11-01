@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -19,10 +20,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -31,8 +34,10 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
@@ -52,6 +57,7 @@ import com.prism.launcher.minigames.PaperBase
 import com.prism.launcher.minigames.PlacedBuilding
 import com.prism.launcher.minigames.WeaponCatalog
 import com.prism.launcher.minigames.WorldMap
+import com.prism.launcher.theme.PrismThemes
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -89,8 +95,14 @@ import kotlinx.coroutines.withContext
  */
 @Composable
 fun PaperWarPage() {
-    val colors = LocalPrismColors.current
+    val baseColors = LocalPrismColors.current
     val scope = rememberCoroutineScope()
+    // PAPER EMPIRE KEEPS ITS PAGE, but under xOS the page is lit like a blacklight poster: the
+    // same paper ground and hand-drawn outlines, in electric cyan and magenta. Other themes leave
+    // the pencil exactly as it was. The palette is overridden for this page only, so the plot, the
+    // cards, the buttons and the laws all agree about which light they are under.
+    val neon = PrismThemes.active().id == "xos"
+    val colors = if (neon) neonPaperColors(baseColors) else baseColors
 
     var base by remember { mutableStateOf<PaperBase?>(null) }
     var view by remember { mutableStateOf(WarView.BASE) }
@@ -158,6 +170,31 @@ fun PaperWarPage() {
     }
 
     val current = base
+    Box(
+        Modifier
+            .fillMaxSize()
+            .drawBehind { if (neon) drawNeonPaper() },
+    ) {
+    CompositionLocalProvider(LocalPrismColors provides colors) {
+    // Material's own defaults (Card, Button, OutlinedButton) read the colour scheme, not
+    // LocalPrismColors, so the scheme is overridden too. Without this the paper and the headings
+    // turn electric while the cards and buttons stay macOS grey.
+    MaterialTheme(
+        colorScheme = if (neon) MaterialTheme.colorScheme.copy(
+            primary = PAPER_CYAN,
+            onPrimary = Color(0xFF041014),
+            secondary = PAPER_MAGENTA,
+            onSecondary = Color(0xFF160016),
+            background = Color(0xFF0B0A1A),
+            onBackground = Color(0xFFEAFBFF),
+            surface = Color(0xE60B0A1A),
+            onSurface = Color(0xFFEAFBFF),
+            surfaceVariant = Color(0xF20E0C22),
+            onSurfaceVariant = Color(0xFF8FE9FF),
+            outline = Color(0xFF3B9DFF),
+            error = Color(0xFFFF6B9A),
+        ) else MaterialTheme.colorScheme,
+    ) {
     PageScaffold(
         "Paper War",
         current?.let {
@@ -204,6 +241,7 @@ fun PaperWarPage() {
 
             when (view) {
                 WarView.BASE -> BaseView(
+                    neon = neon,
                     base = current,
                     selectedType = selectedType,
                     onSelectType = { selectedType = it },
@@ -306,6 +344,7 @@ fun PaperWarPage() {
 
                 WarView.BATTLE -> BattleView(
                     raid = raid,
+                    neon = neon,
                     onBack = { view = WarView.WORLD },
                 )
 
@@ -327,10 +366,59 @@ fun PaperWarPage() {
             }
         }
     }
+    }
+    }
+    }
 }
 
 private enum class WarView(val label: String) {
     BASE("Base"), WORLD("World"), BATTLE("Battle"), PROVINCES("Provinces"), LAWS("Laws")
+}
+
+// The xOS colouring pencils, matching PencilStyle.NEON_* on Android. Paper Empire is the only
+// page that gets them; every other page keeps the macOS palette.
+private val PAPER_CYAN = Color(0xFF00F0FF)
+private val PAPER_MAGENTA = Color(0xFFFF3CF2)
+
+/** The palette Paper Empire wears under the blacklight, applied to this page's subtree only. */
+private fun neonPaperColors(base: PrismColors): PrismColors = base.copy(
+    accent = PAPER_CYAN,
+    background = Color(0xFF0B0A1A),
+    surface = Color(0xE60B0A1A),
+    surfaceRaised = Color(0xF20E0C22),
+    card = Color(0xCC0E0C22),
+    onSurface = Color(0xFFEAFBFF),
+    muted = Color(0xFF8FE9FF),
+    faint = Color(0xFF5C9AB8),
+    divider = Color(0x663B9DFF),
+    border = 1,
+    elevation = 0,
+)
+
+/**
+ * The page under the blacklight.
+ *
+ * Still a sheet of ruled paper: the ground is paper, the ruling is a line, the margin is where a
+ * margin goes. What changes is the light -- a cyan-to-magenta wash that makes the sheet look lit
+ * from underneath, and the electric ruling that belongs to it.
+ */
+private fun DrawScope.drawNeonPaper() {
+    drawRect(Color(0xFF0B0A1A))
+    drawRect(
+        Brush.linearGradient(
+            colors = listOf(Color(0x3300F0FF), Color(0x22FF3CF2)),
+            start = Offset.Zero,
+            end = Offset(size.width, size.height),
+        ),
+    )
+    val spacing = 26.dp.toPx()
+    var y = spacing
+    while (y < size.height) {
+        drawLine(Color(0x3300F0FF), Offset(0f, y), Offset(size.width, y), 1.dp.toPx())
+        y += spacing
+    }
+    val margin = 48.dp.toPx()
+    drawLine(Color(0x55FF3CF2), Offset(margin, 0f), Offset(margin, size.height), 1.4.dp.toPx())
 }
 
 /** Why a placement was refused, read off the engine's own answer rather than guessed. */
@@ -370,6 +458,7 @@ private fun fightRaid(base: PaperBase, country: WorldMap.Country): Raid {
             seed = System.nanoTime(),
             attackerSupportIds = base.supportWeaponIds.orEmpty(),
             attackerMilitaryBonus = base.militaryBonus,
+            defenderSortie = true,
         ),
     )
 }
@@ -385,6 +474,7 @@ private data class Raid(
 
 @Composable
 private fun BaseView(
+    neon: Boolean,
     base: PaperBase,
     selectedType: BuildingCatalog.BuildingType?,
     onSelectType: (BuildingCatalog.BuildingType?) -> Unit,
@@ -409,7 +499,7 @@ private fun BaseView(
                             }
                         },
                 ) {
-                    drawPlot(base, now, colors.accent)
+                    drawPlot(base, now, colors.accent, neon)
                 }
                 Spacer(Modifier.height(6.dp))
                 Text(
@@ -617,17 +707,28 @@ private suspend fun androidx.compose.ui.input.pointer.PointerInputScope.detectTa
     }
 }
 
-private fun DrawScope.drawPlot(base: PaperBase, now: Long, accent: Color) {
+private fun DrawScope.drawPlot(base: PaperBase, now: Long, accent: Color, neon: Boolean) {
     val plot = base.plotSize
     val cell = size.width / plot
+    val paper = if (neon) Color(0xFF0B0A1A) else PAPER
+    val grid = if (neon) Color(0x5500F0FF) else GRID
+    val ink = if (neon) Color(0xFF00F0FF) else GRAPHITE
 
-    // Paper, then the grid. The paper colour is what makes the graphite read as graphite -- the same
-    // outlines on a dark ground look like neon.
-    drawRect(color = PAPER, size = size)
+    drawRect(color = paper, size = size)
+    if (neon) {
+        drawRect(
+            brush = Brush.linearGradient(
+                listOf(Color(0x2200F0FF), Color(0x18FF3CF2)),
+                start = Offset.Zero,
+                end = Offset(size.width, size.height),
+            ),
+            size = size,
+        )
+    }
     for (i in 0..plot) {
         val p = i * cell
-        drawLine(GRID, Offset(p, 0f), Offset(p, size.height), strokeWidth = 1f)
-        drawLine(GRID, Offset(0f, p), Offset(size.width, p), strokeWidth = 1f)
+        drawLine(grid, Offset(p, 0f), Offset(p, size.height), strokeWidth = 1f)
+        drawLine(grid, Offset(0f, p), Offset(size.width, p), strokeWidth = 1f)
     }
 
     // Roads first, because they run between buildings and have to sit under them.
@@ -636,7 +737,7 @@ private fun DrawScope.drawPlot(base: PaperBase, now: Long, accent: Color) {
         val to = base.buildings.firstOrNull { it.id == road.connectsTo }
         if (from == null || to == null) return@forEach
         drawLine(
-            color = GRAPHITE.copy(alpha = 0.35f),
+            color = ink.copy(alpha = 0.35f),
             // centreX/centreY are Doubles -- a building's centre is genuinely fractional for an
             // even footprint -- so each is converted before it meets a Float cell size.
             start = Offset((from.centreX() * cell).toFloat(), (from.centreY() * cell).toFloat()),
@@ -660,13 +761,13 @@ private fun DrawScope.drawPlot(base: PaperBase, now: Long, accent: Color) {
         }
 
         drawRect(color = fill, topLeft = Offset(left + 1f, top + 1f), size = Size(span - 2f, span - 2f))
-        sketchRect(left, top, span, span, building.id)
+        sketchRect(left, top, span, span, building.id, ink)
 
         if (!building.complete) {
             // A dashed outline and a fill bar: scaffolding, which is what the phone draws too, and
             // it is immediately distinguishable from a finished building at a glance.
             drawRect(
-                color = GRAPHITE,
+                color = ink,
                 topLeft = Offset(left + 2f, top + 2f),
                 size = Size(span - 4f, span - 4f),
                 style = Stroke(
@@ -714,7 +815,7 @@ private fun DrawScope.drawPlot(base: PaperBase, now: Long, accent: Color) {
  * which reads as a rendering fault rather than as a drawing; seeding it off the building's own id
  * means it wobbles the same way for as long as it stands, which is what a pencil line does.
  */
-private fun DrawScope.sketchRect(left: Float, top: Float, w: Float, h: Float, key: String) {
+private fun DrawScope.sketchRect(left: Float, top: Float, w: Float, h: Float, key: String, ink: Color = GRAPHITE) {
     val seed = key.hashCode()
     fun jitter(n: Int): Float {
         val x = (seed * 31 + n * 2654435761L.toInt())
@@ -728,7 +829,7 @@ private fun DrawScope.sketchRect(left: Float, top: Float, w: Float, h: Float, ke
     )
     for (i in corners.indices) {
         drawLine(
-            color = GRAPHITE,
+            color = ink,
             start = corners[i],
             end = corners[(i + 1) % corners.size],
             strokeWidth = 1.5f,
@@ -905,7 +1006,7 @@ private fun relationColour(relation: WorldMap.Relation): Color = when (relation)
  * which is the whole reason that field exists.
  */
 @Composable
-private fun BattleView(raid: Raid?, onBack: () -> Unit) {
+private fun BattleView(raid: Raid?, neon: Boolean, onBack: () -> Unit) {
     val colors = LocalPrismColors.current
     val playback = raid?.playback
     var frameIndex by remember(playback) { mutableStateOf(0) }
@@ -945,7 +1046,7 @@ private fun BattleView(raid: Raid?, onBack: () -> Unit) {
         val frame = playback.frames.getOrNull(frameIndex) ?: playback.frames.last()
 
         Canvas(Modifier.fillMaxWidth().aspectRatio(1f)) {
-            drawBattle(raid.defender, playback, frame, colors.accent)
+            drawBattle(raid.defender, playback, frame, colors.accent, neon)
         }
 
         Spacer(Modifier.height(8.dp))
@@ -1005,19 +1106,33 @@ private fun DrawScope.drawBattle(
     playback: Battle.Playback,
     frame: Battle.Frame,
     accent: Color,
+    neon: Boolean,
 ) {
     val cast = playback.cast
     // The field is the defender's own plot -- an expanded base is fought over on that bigger field,
     // which is what the simulation spawns attackers at the edges of.
     val field = defender.plotSize.toFloat().coerceAtLeast(1f)
     val scale = size.width / field
+    val paper = if (neon) Color(0xFF0B0A1A) else PAPER
+    val grid = if (neon) Color(0x5500F0FF) else GRID
+    val ink = if (neon) Color(0xFF00F0FF) else GRAPHITE
 
-    drawRect(color = PAPER, size = size)
+    drawRect(color = paper, size = size)
+    if (neon) {
+        drawRect(
+            brush = Brush.linearGradient(
+                listOf(Color(0x2200F0FF), Color(0x18FF3CF2)),
+                start = Offset.Zero,
+                end = Offset(size.width, size.height),
+            ),
+            size = size,
+        )
+    }
     val step = size.width / 20f
     var g = 0f
     while (g <= size.width) {
-        drawLine(GRID, Offset(g, 0f), Offset(g, size.height), strokeWidth = 1f)
-        drawLine(GRID, Offset(0f, g), Offset(size.width, g), strokeWidth = 1f)
+        drawLine(grid, Offset(g, 0f), Offset(g, size.height), strokeWidth = 1f)
+        drawLine(grid, Offset(0f, g), Offset(size.width, g), strokeWidth = 1f)
         g += step
     }
 
@@ -1040,7 +1155,7 @@ private fun DrawScope.drawBattle(
             size = Size(span, span),
         )
         drawRect(
-            color = if (standing) GRAPHITE else Color(0x99803030),
+            color = if (standing) ink else Color(0x99803030),
             topLeft = Offset(left, top),
             size = Size(span, span),
             style = Stroke(width = 1.4f),
@@ -1074,16 +1189,23 @@ private fun DrawScope.drawBattle(
         }
     }
 
-    // EVERY FIGHTER IN THE CAST IS AN ATTACKER. The defence is emplacements -- turrets and the
-    // garrison inside buildings -- which live in the building arrays, not the fighter ones. There is
-    // no attacker/defender split to colour by, and inventing one would have drawn half the invading
-    // army in the defender's colour.
+    // Attackers first, in the theme accent. The defending garrison is a separate array because it
+    // left its buildings to fight; drawing it in the defender's red is what makes a sortie read as
+    // defenders rather than as more invaders.
     for (i in frame.fighterHp.indices) {
         if (!frame.alive(i)) continue
         drawCircle(
             color = accent,
             radius = (scale * 0.9f).coerceIn(1.4f, 4f),
             center = Offset(frame.x(i) * scale, frame.y(i) * scale),
+        )
+    }
+    for (i in frame.guardHp.indices) {
+        if (!frame.guardAlive(i)) continue
+        drawCircle(
+            color = Color(0xE6FF5B6E),
+            radius = (scale * 1.0f).coerceIn(1.6f, 4.5f),
+            center = Offset(frame.gx(i) * scale, frame.gy(i) * scale),
         )
     }
 }

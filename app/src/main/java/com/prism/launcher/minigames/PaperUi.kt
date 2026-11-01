@@ -2,8 +2,10 @@ package com.prism.launcher.minigames
 
 import android.content.Context
 import android.graphics.Canvas
+import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.RectF
+import android.graphics.Shader
 import android.graphics.drawable.Drawable
 import android.view.Gravity
 import android.view.View
@@ -13,6 +15,7 @@ import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import com.prism.launcher.theme.PrismThemes
 
 /**
  * The widgets the paper game is made of: torn-out sheets, pencil buttons, drawn icons.
@@ -34,6 +37,41 @@ object PaperUi {
             android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
             android.content.res.Configuration.UI_MODE_NIGHT_YES
 
+    /**
+     * Paper Empire's blacklight treatment, only while xOS is the active theme.
+     *
+     * The check lives here rather than in every drawing call because the game has four renderers
+     * and they all have to agree about what page they are on. It is read once per view (the views
+     * cache it), not once per frame.
+     */
+    fun isNeon(context: Context): Boolean = PrismThemes.active().id == "xos"
+
+    // -- The pencils ----------------------------------------------------------
+
+    /** The ink a paper widget draws with, already switched for the blacklight on xOS. */
+    fun ink(context: Context, colour: Int? = null): Int = colour ?: if (isNeon(context)) {
+        PencilStyle.NEON_CYAN
+    } else {
+        PencilStyle.graphite(isDark(context))
+    }
+
+    /** The quieter ink: notes, labels and the ruling that should not compete with the drawing. */
+    fun mutedInk(context: Context, colour: Int? = null): Int = colour ?: if (isNeon(context)) {
+        PencilStyle.NEON_BLUE
+    } else {
+        PencilStyle.graphiteLight(isDark(context))
+    }
+
+    /** The one colour that marks the selected or urgent thing. */
+    fun accentInk(context: Context): Int =
+        if (isNeon(context)) PencilStyle.NEON_MAGENTA else PencilStyle.RED_PENCIL
+
+    /** A soft halo, only under the blacklight. Text keeps its shape; the light spreads. */
+    fun <T : TextView> glow(view: T, colour: Int): T {
+        if (isNeon(view.context)) view.setShadowLayer(9f, 0f, 0f, colour)
+        return view
+    }
+
     // -- Backgrounds ----------------------------------------------------------
 
     /** A sheet of ruled paper with a hand-drawn edge, for popups and panels. */
@@ -46,23 +84,56 @@ object PaperUi {
 
         override fun draw(canvas: Canvas) {
             val dark = isDark(context)
+            val neon = isNeon(context)
             val r = RectF(bounds)
             val inset = 3f * density
             r.inset(inset, inset)
 
             canvas.drawColor(0)
-            val fill = PencilStyle.shading(PencilStyle.paper(dark), alpha = 255)
+            val paper = if (neon) PencilStyle.neonPaper(dark) else PencilStyle.paper(dark)
+            val fill = PencilStyle.shading(paper, alpha = 255)
             canvas.drawRect(r, fill)
 
+            // The blacklight wash. The page is still paper; this is the light sitting on it.
+            if (neon) {
+                val wash = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    shader = LinearGradient(
+                        r.left, r.top, r.right, r.bottom,
+                        0x3300F0FF, 0x22FF3CF2, Shader.TileMode.CLAMP,
+                    )
+                }
+                canvas.drawRect(r, wash)
+            }
+
             // Ruling inside the sheet, so a popup is a page and not a panel.
-            val rulePaint = PencilStyle.pencil(1f * density, PencilStyle.rule(dark), alpha = 150)
+            val rulePaint = PencilStyle.pencil(
+                1f * density,
+                if (neon) PencilStyle.NEON_BLUE else PencilStyle.rule(dark),
+                alpha = if (neon) 210 else 150,
+            )
             var y = r.top + PencilStyle.LINE_SPACING_DP * density
             while (y < r.bottom) {
+                if (neon) {
+                    canvas.drawLine(
+                        r.left + 4f * density, y, r.right - 4f * density, y,
+                        PencilStyle.pencil(3f * density, PencilStyle.NEON_CYAN, alpha = 32),
+                    )
+                }
                 canvas.drawLine(r.left + 4f * density, y, r.right - 4f * density, y, rulePaint)
                 y += PencilStyle.LINE_SPACING_DP * density
             }
+            if (neon) {
+                val marginX = r.left + 34f * density
+                canvas.drawLine(
+                    marginX, r.top, marginX, r.bottom,
+                    PencilStyle.pencil(1.4f * density, PencilStyle.NEON_MAGENTA, alpha = 170),
+                )
+            }
 
-            val ink = PencilStyle.pencil(2f * density, PencilStyle.graphite(dark))
+            val ink = PencilStyle.pencil(
+                2f * density,
+                if (neon) PencilStyle.NEON_CYAN else PencilStyle.graphite(dark),
+            )
             if (torn) {
                 // A torn left edge: the sheet came out of a book.
                 val rng = Rng(seed)
@@ -100,14 +171,28 @@ object PaperUi {
 
         override fun draw(canvas: Canvas) {
             val dark = isDark(context)
+            val neon = isNeon(context)
             val r = RectF(bounds)
             r.inset(2.5f * density, 2.5f * density)
-            val ink = PencilStyle.pencil(2f * density, colour ?: PencilStyle.graphite(dark))
+            val base = ink(context, colour)
+            val ink = PencilStyle.pencil(2f * density, base)
             if (filled) {
                 PencilStyle.hatch(
                     canvas, r,
-                    PencilStyle.pencil(1.2f * density, colour ?: PencilStyle.graphite(dark), alpha = 90),
+                    PencilStyle.pencil(
+                        1.2f * density,
+                        if (neon) PencilStyle.NEON_MAGENTA else base,
+                        alpha = 90,
+                    ),
                     seed + 5, 5f * density,
+                )
+            }
+            if (neon) {
+                // A second, wider stroke is what makes a line look lit rather than merely bright.
+                PencilStyle.rect(
+                    canvas, r,
+                    PencilStyle.pencil(4.2f * density, base, alpha = 35),
+                    seed, 1.1f,
                 )
             }
             PencilStyle.rect(canvas, r, ink, seed, 1.1f)
@@ -124,20 +209,21 @@ object PaperUi {
     fun heading(context: Context, text: String): TextView = TextView(context).apply {
         this.text = text
         textSize = 19f
-        setTextColor(PencilStyle.graphite(isDark(context)))
+        setTextColor(ink(context))
         typeface = android.graphics.Typeface.create(android.graphics.Typeface.SERIF, android.graphics.Typeface.BOLD)
         setPadding(0, dp(context, 2f), 0, dp(context, 6f))
+        glow(this, ink(context))
     }
 
     fun body(context: Context, text: String, colour: Int? = null): TextView = TextView(context).apply {
         this.text = text
         textSize = 14f
-        setTextColor(colour ?: PencilStyle.graphite(isDark(context)))
+        setTextColor(ink(context, colour))
         typeface = android.graphics.Typeface.SERIF
         setLineSpacing(dp(context, 2f).toFloat(), 1f)
     }
 
-    fun note(context: Context, text: String): TextView = body(context, text, PencilStyle.graphiteLight(isDark(context))).apply {
+    fun note(context: Context, text: String): TextView = body(context, text, mutedInk(context)).apply {
         textSize = 12f
     }
 
@@ -167,8 +253,9 @@ object PaperUi {
         textSize = 15f
         gravity = Gravity.CENTER
         typeface = android.graphics.Typeface.SERIF
-        setTextColor(colour ?: PencilStyle.graphite(isDark(context)))
+        setTextColor(ink(context, colour))
         background = PencilButtonDrawable(context, seed, colour, filled)
+        glow(this, ink(context, colour))
         setPadding(dp(context, 16f), dp(context, 10f), dp(context, 16f), dp(context, 10f))
         isClickable = true
         setOnClickListener { onClick() }
@@ -214,7 +301,9 @@ object PaperUi {
             val pad = 9f * density
             val labelRoom = if (label == null) 0f else 13f * density
             val r = RectF(pad, pad, width - pad, height - pad - labelRoom)
-            val ink = PencilStyle.pencil(2.3f * density, colour ?: PencilStyle.graphite(dark))
+            val neon = isNeon(context)
+            val base = ink(context, colour)
+            val ink = PencilStyle.pencil(2.3f * density, base)
 
             when (glyph) {
                 Glyph.MAP -> PencilStyle.mapGlyph(canvas, r, ink, seed)
@@ -234,8 +323,10 @@ object PaperUi {
             }
 
             label?.let {
-                val text = PencilStyle.textPaint(10.5f * density, dark, colour ?: PencilStyle.graphiteLight(dark))
-                    .apply { textAlign = Paint.Align.CENTER }
+                val text = PencilStyle.textPaint(
+                    10.5f * density, dark,
+                    colour ?: mutedInk(context),
+                ).apply { textAlign = Paint.Align.CENTER }
                 // Shrunk to fit rather than clipped or abbreviated. The label is the only thing
                 // saying what a hand-drawn anvil is for, so "Research" has to be allowed to say
                 // "Research" — calling it "Arms" to save eight pixels made the research button
@@ -252,9 +343,10 @@ object PaperUi {
                 // A circled number in red pencil, in the corner, the way you mark something urgent.
                 val bx = width - 9f * density
                 val by = 10f * density
-                val red = PencilStyle.pencil(1.8f * density, PencilStyle.RED_PENCIL)
+                val alert = accentInk(context)
+                val red = PencilStyle.pencil(1.8f * density, alert)
                 canvas.drawCircle(bx, by, 8.5f * density, red)
-                val text = PencilStyle.textPaint(11f * density, dark, PencilStyle.RED_PENCIL).apply {
+                val text = PencilStyle.textPaint(11f * density, dark, alert).apply {
                     textAlign = Paint.Align.CENTER
                 }
                 canvas.drawText(count.coerceAtMost(9).toString(), bx, by + 4f * density, text)
@@ -385,7 +477,7 @@ object PaperUi {
         override fun onDraw(canvas: Canvas) {
             PencilStyle.line(
                 canvas, 0f, height / 2f, width.toFloat(), height / 2f,
-                PencilStyle.pencil(1.6f * density, PencilStyle.graphiteLight(isDark(context)), alpha = 150),
+                PencilStyle.pencil(1.6f * density, mutedInk(context), alpha = 150),
                 seed = 404, amount = 1.1f,
             )
         }

@@ -34,6 +34,17 @@ object Pinball {
     const val STEP_MILLIS = 1000.0 / STEPS_PER_SECOND
     const val MAX_SPEED = 26.0
 
+    /**
+     * How many collision checks a single 120 Hz tick is cut into.
+     *
+     * One check per tick is not enough. At [MAX_SPEED] the ball moves 26 units in a tick, which is
+     * more than three times its radius: a zero-thickness wall can pass entirely between the old and
+     * new centres, and the ball sails through the table. Twelve substeps keep every movement below
+     * a third of the ball's radius (2.17 units), so a crossing always ends with the centre close
+     * enough to the segment to be pushed out and reflected.
+     */
+    private const val COLLISION_SUBSTEPS = 12
+
     /** How hard the plunger sends the ball up the lane. */
     const val LAUNCH_SPEED = 21.0
 
@@ -87,6 +98,9 @@ object Pinball {
         /** Milliseconds-equivalent of the flash, decremented per step. */
         val litFor: Int = 0,
         val best: Int = 0,
+        /** The generated table this ball was launched on. Carried in the state so a test or a
+         *  replay steps exactly the geometry it was given. */
+        val table: Table = Pinball.table,
     ) {
         enum class Status { READY, PLAYING, GAME_OVER }
     }
@@ -99,15 +113,27 @@ object Pinball {
     private fun l(x1: Double, y1: Double, x2: Double, y2: Double, bounce: Double = WALL_BOUNCE) =
         Segment(x1, y1, x2, y2, bounce)
 
-    private fun arc(cx: Double, cy: Double, radius: Double, from: Double, to: Double, steps: Int = 10): List<Segment> {
+    private fun arc(cx: Double, cy: Double, radius: Double, from: Double, to: Double, steps: Int = 10): List<Segment> =
+        ellipse(cx, cy, radius, radius, from, to, steps)
+
+    /** A squashed arc, for a table top that has to stay inside the table's own height. */
+    private fun ellipse(
+        cx: Double,
+        cy: Double,
+        rx: Double,
+        ry: Double,
+        from: Double,
+        to: Double,
+        steps: Int = 14,
+    ): List<Segment> {
         val out = ArrayList<Segment>(steps)
         var previous = from
         for (i in 1..steps) {
             val angle = from + (to - from) * i / steps
             out.add(
                 l(
-                    cx + cos(previous) * radius, cy + sin(previous) * radius,
-                    cx + cos(angle) * radius, cy + sin(angle) * radius,
+                    cx + cos(previous) * rx, cy + sin(previous) * ry,
+                    cx + cos(angle) * rx, cy + sin(angle) * ry,
                 )
             )
             previous = angle
@@ -127,11 +153,25 @@ object Pinball {
         // Outer shell, from the lane mouth round the top and down the left.
         walls += l(376.0, 700.0, 376.0, 512.0, 0.55)   // lane divider
         walls += l(404.0, 700.0, 404.0, 120.0)
-        walls += arc(210.0, 120.0, 194.0, 0.0, -Math.PI)
+        // 104, not 194: a circular cap of radius 194 put the top of the table at y=-74, so a
+        // launched ball left the screen before it hit anything. The elliptical cap still meets
+        // both side walls at y=120 but tops out at y=16, inside the table.
+        walls += ellipse(210.0, 120.0, 194.0, 104.0, 0.0, -Math.PI)
+        // THE LANE DEFLECTOR. Without it, the launch lane is a dead-end chimney: the plunger
+        // sends the ball straight up into the underside of the top cap, which reflects it straight
+        // back down, and it drains before the player ever touches it. This slanted guide hangs
+        // over the lane like the gate on a real machine and turns the upward launch into a shot
+        // down-left across the playfield. Its left end is in open space above the divider, so the
+        // ball has somewhere to go.
+        walls += l(366.0, 296.0, 404.0, 330.0, 0.62)
         walls += l(16.0, 120.0, 16.0, 560.0)
         // Funnels into the drain.
         walls += l(16.0, 560.0, 120.0, 640.0)
-        walls += l(404.0, 560.0, 300.0, 640.0)
+        // THE FUNNEL MUST START AT THE LANE DIVIDER, NOT AT THE OUTER WALL. Starting it at 404
+        // put a diagonal straight across the launch lane at y≈571: every launch hit it and fell
+        // back onto the plunger. From 376 it guards the drain while leaving the lane clear all the
+        // way to the mouth at y=512.
+        walls += l(376.0, 512.0, 300.0, 640.0)
         walls += l(120.0, 640.0, 120.0, 700.0)
         walls += l(300.0, 640.0, 300.0, 700.0)
 
@@ -151,21 +191,66 @@ object Pinball {
             walls = walls,
             bumpers = bumpers,
             slings = slings,
-            leftFlipper = Flipper(pivotX = 132.0, pivotY = 604.0, length = 76.0, restAngle = 0.30, activeAngle = -0.62),
-            rightFlipper = Flipper(pivotX = 288.0, pivotY = 604.0, length = 76.0, restAngle = Math.PI - 0.30, activeAngle = Math.PI + 0.62),
+            // A 38-unit gap between the tips at rest. The old 132/288 pivots with 76-long
+            // flippers left an 11-unit gap -- narrower than the 16-unit ball -- so it settled on
+            // both tips and bounced there for ever. That was the ball that "could not go
+            // anywhere".
+            leftFlipper = Flipper(pivotX = 124.0, pivotY = 604.0, length = 70.0, restAngle = 0.30, activeAngle = -0.62),
+            rightFlipper = Flipper(pivotX = 296.0, pivotY = 604.0, length = 70.0, restAngle = Math.PI - 0.30, activeAngle = Math.PI + 0.62),
             drainY = 716.0,
             laneX = 390.0,
         )
     }
 
+    /**
+     * A table for this game's seed.
+     *
+     * The shell, flippers and drain are fixed because they are the rules of the machine; the
+     * bumpers are not. Every generated bumper is kept clear of the launch lane and of the mouth
+     * where the lane opens into the playfield, so no seed can produce a table that traps the ball
+     * on the plunger -- the exact bug the hand-built funnel had.
+     */
+    fun tableFor(seed: Long): Table {
+        val rng = Rng(seed xor 0x5A17B00L)
+        val bumpers = ArrayList<Bumper>()
+        val wanted = 3 + rng.nextInt(3)
+        var attempts = 0
+        while (bumpers.size < wanted && attempts < 240) {
+            attempts++
+            val radius = 17.0 + rng.nextDouble() * 11.0
+            val x = 72.0 + rng.nextDouble() * 248.0
+            val y = 168.0 + rng.nextDouble() * 250.0
+            // Right edge of the bumper stays left of the lane divider.
+            if (x + radius > 344.0) continue
+            if (bumpers.any { hypot(it.x - x, it.y - y) < it.radius + radius + 22.0 }) continue
+            bumpers.add(
+                Bumper(
+                    x = x,
+                    y = y,
+                    radius = radius,
+                    points = 50 * (1 + rng.nextInt(4)),
+                    id = "b${bumpers.size}",
+                ),
+            )
+        }
+        // The loop has 240 attempts; this is the deterministic floor in the pathological case.
+        while (bumpers.size < 3) {
+            bumpers.add(
+                Bumper(
+                    x = 120.0 + bumpers.size * 80.0,
+                    y = 240.0 + bumpers.size * 40.0,
+                    radius = 22.0,
+                    points = 100,
+                    id = "fallback${bumpers.size}",
+                ),
+            )
+        }
+        return table.copy(bumpers = bumpers)
+    }
+
     // ── Lifecycle ─────────────────────────────────────────────────────────
 
-    fun newGame(seed: Long, table: Table = Pinball.table): State {
-        // The seed is not used for physics -- the table is not random. It is kept so a future
-        // multiplayer table with a skill shot or a random award replays from the same value, and it
-        // is deliberately part of the signature rather than added later.
-        @Suppress("UNUSED_VARIABLE")
-        val unusedSeed = seed
+    fun newGame(seed: Long, table: Table = tableFor(seed)): State {
         return State(
             ballX = table.laneX,
             ballY = 640.0,
@@ -178,6 +263,7 @@ object Pinball {
             step = 0,
             inLane = true,
             status = State.Status.READY,
+            table = table,
         )
     }
 
@@ -202,7 +288,7 @@ object Pinball {
      * The flippers move first, because the impulse they impart depends on how fast they were
      * travelling when the ball reached them.
      */
-    fun step(state: State, input: Input, table: Table = Pinball.table): State {
+    fun step(state: State, input: Input, table: Table = state.table): State {
         if (state.status == State.Status.GAME_OVER) return state
 
         val leftBefore = state.leftAngle
@@ -218,10 +304,10 @@ object Pinball {
             return s
         }
 
-        var x = s.ballX + s.vx
-        var y = s.ballY + s.vy
+        var x = s.ballX
+        var y = s.ballY
         var vx = s.vx
-        var vy = s.vy + GRAVITY
+        var vy = s.vy
         var score = s.score
         var lit = s.lit
         var litFor = s.litFor
@@ -235,46 +321,87 @@ object Pinball {
         }
 
         // Walls and slings: closest point on the segment, then push out and reflect.
+        //
+        // THE NORMAL COMES FROM WHERE THE BALL CAME FROM, NOT WHERE IT ENDED UP. A zero-thickness
+        // wall has two sides, and a ball that crossed it in this substep is now on the wrong one.
+        // Measuring from the new centre flips the normal to point further through the wall, so the
+        // push lands on the far side and the next substep repeats the escape: the ball sails out
+        // of the table while the collision code reports that it touched something. The previous
+        // centre is still on the playfield side, so it selects the side the ball should be returned
+        // to. The reflection is applied only when the velocity is still heading into the wall, so
+        // a ball already travelling away is pushed out without gaining another bounce.
         val solids = table.walls + table.slings
-        for (seg in solids) {
-            val (px, py) = closestPoint(seg, x, y)
-            val dx = x - px
-            val dy = y - py
-            val distance = hypot(dx, dy)
-            if (distance < BALL_RADIUS && distance > 0.0001) {
-                val nx = dx / distance
-                val ny = dy / distance
-                x = px + nx * BALL_RADIUS
-                y = py + ny * BALL_RADIUS
-                val dot = vx * nx + vy * ny
-                vx = (vx - 2 * dot * nx) * seg.bounce
-                vy = (vy - 2 * dot * ny) * seg.bounce
-                if (seg.bounce > 1.0) {
-                    // A slingshot adds an impulse along its normal rather than merely reflecting.
-                    vx += nx * 3.2
-                    vy += ny * 3.2
-                    score += 25
+        fun collideWalls(previousX: Double, previousY: Double) {
+            // Two passes, because pushing out of one segment can put the ball into a neighbouring
+            // one at a corner. One pass leaves a corner able to absorb a fast ball for a frame.
+            repeat(2) {
+                for (seg in solids) {
+                    val (px, py) = closestPoint(seg, x, y)
+                    val dx = x - px
+                    val dy = y - py
+                    val distance = hypot(dx, dy)
+                    if (distance >= BALL_RADIUS) continue
+
+                    // The side the ball was on before it moved. When it started exactly on the
+                    // line, fall back to the current side; there is no earlier side to recover.
+                    val fromX = previousX - px
+                    val fromY = previousY - py
+                    val fromDistance = hypot(fromX, fromY)
+                    val nx: Double
+                    val ny: Double
+                    if (fromDistance > 0.0001) {
+                        nx = fromX / fromDistance
+                        ny = fromY / fromDistance
+                    } else if (distance > 0.0001) {
+                        nx = dx / distance
+                        ny = dy / distance
+                    } else {
+                        // Dead centre on the segment: the velocity is the only side information.
+                        val speed = hypot(vx, vy)
+                        if (speed < 0.0001) continue
+                        nx = -vx / speed
+                        ny = -vy / speed
+                    }
+
+                    // Already clear on the side it came from, relative to this normal.
+                    if (dx * nx + dy * ny > BALL_RADIUS) continue
+                    x = px + nx * BALL_RADIUS
+                    y = py + ny * BALL_RADIUS
+                    val dot = vx * nx + vy * ny
+                    if (dot < 0) {
+                        vx = (vx - 2 * dot * nx) * seg.bounce
+                        vy = (vy - 2 * dot * ny) * seg.bounce
+                        if (seg.bounce > 1.0) {
+                            // A slingshot adds an impulse along its normal rather than merely
+                            // reflecting.
+                            vx += nx * 3.2
+                            vy += ny * 3.2
+                            score += 25
+                        }
+                    }
                 }
             }
         }
 
         // Bumpers.
-        for (bumper in table.bumpers) {
-            val dx = x - bumper.x
-            val dy = y - bumper.y
-            val distance = hypot(dx, dy)
-            val reach = BALL_RADIUS + bumper.radius
-            if (distance < reach && distance > 0.0001) {
-                val nx = dx / distance
-                val ny = dy / distance
-                x = bumper.x + nx * reach
-                y = bumper.y + ny * reach
-                val dot = vx * nx + vy * ny
-                vx = (vx - 2 * dot * nx) * BUMPER_BOUNCE
-                vy = (vy - 2 * dot * ny) * BUMPER_BOUNCE
-                score += bumper.points
-                lit = bumper.id
-                litFor = STEPS_PER_SECOND / 3
+        fun collideBumpers() {
+            for (bumper in table.bumpers) {
+                val dx = x - bumper.x
+                val dy = y - bumper.y
+                val distance = hypot(dx, dy)
+                val reach = BALL_RADIUS + bumper.radius
+                if (distance < reach && distance > 0.0001) {
+                    val nx = dx / distance
+                    val ny = dy / distance
+                    x = bumper.x + nx * reach
+                    y = bumper.y + ny * reach
+                    val dot = vx * nx + vy * ny
+                    vx = (vx - 2 * dot * nx) * BUMPER_BOUNCE
+                    vy = (vy - 2 * dot * ny) * BUMPER_BOUNCE
+                    score += bumper.points
+                    lit = bumper.id
+                    litFor = STEPS_PER_SECOND / 3
+                }
             }
         }
 
@@ -307,10 +434,22 @@ object Pinball {
                 score += 10
             }
         }
-        hitFlipper(table.leftFlipper, leftAngle, leftBefore)
-        hitFlipper(table.rightFlipper, rightAngle, rightBefore)
 
-        clampSpeed()
+        // Swept motion in equal time slices. Gravity is applied per slice, and the collision
+        // response runs after every one, so a fast ball cannot jump a wall between checks.
+        val slice = 1.0 / COLLISION_SUBSTEPS
+        repeat(COLLISION_SUBSTEPS) {
+            val previousX = x
+            val previousY = y
+            vy += GRAVITY * slice
+            x += vx * slice
+            y += vy * slice
+            collideWalls(previousX, previousY)
+            collideBumpers()
+            hitFlipper(table.leftFlipper, leftAngle, leftBefore)
+            hitFlipper(table.rightFlipper, rightAngle, rightBefore)
+            clampSpeed()
+        }
 
         s = s.copy(
             ballX = x,

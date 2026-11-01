@@ -46,6 +46,93 @@ class SwapRegion(
     private var used = 0L
     private var failed = false
 
+    /**
+     * A named slice of this region with its own bump cursor.
+     *
+     * WHY SLICES RATHER THAN ONE CURSOR. Prism Swap used to be one file per feature (Sam's
+     * weights, Nora's tensors, Aether's staging buffers, VideoCraft's frame scratch), which meant
+     * four settings, four files and four chances for a user to turn one of them off and not the
+     * others. One file is now shared, so each consumer needs to be able to throw its own memory
+     * away without moving the cursor another consumer is still filling -- a brain rebuild must not
+     * hand Sam's mapped weights back to the allocator.
+     */
+    inner class Arena internal constructor(
+        private val label: String,
+        private val startFraction: Double,
+        private val endFraction: Double,
+    ) {
+        private var cursor = 0L
+
+        // Resolved against the CURRENT mapping, so a capacity change (the setting moved) does not
+        // leave an arena pointing at offsets from the old file.
+        private fun limits(): Pair<Long, Long> {
+            val total = capacity
+            if (total <= 0L) return 0L to 0L
+            val start = (total * startFraction.coerceIn(0.0, 1.0)).toLong()
+            val end = (total * endFraction.coerceIn(0.0, 1.0)).toLong()
+            return start to (end - start).coerceAtLeast(0L)
+        }
+
+        fun label(): String = label
+        fun capacityBytes(): Long = limits().second
+        fun usedBytes(): Long = cursor
+
+        @Synchronized
+        fun allocate(elements: Int): FloatStore? {
+            if (elements <= 0 || elements > FloatStore.MAX_ELEMENTS) return null
+            val (base, length) = limits()
+            if (length <= 0L) return null
+            val bytes = elements.toLong() * 4L
+            val start = (cursor + 7L) and 7L.inv()
+            if (start + bytes > length) return null
+            val slice = mapRange(base + start, bytes) ?: return null
+            cursor = start + bytes
+            return FloatStore.mapped(elements, slice.order(ByteOrder.nativeOrder()).asFloatBuffer())
+        }
+
+        @Synchronized
+        fun allocateBytes(byteCount: Long): ByteBuffer? {
+            if (byteCount <= 0 || byteCount > Int.MAX_VALUE) return null
+            val (base, length) = limits()
+            if (length <= 0L) return null
+            val start = (cursor + 7L) and 7L.inv()
+            if (start + byteCount > length) return null
+            val view = mapRange(base + start, byteCount) ?: return null
+            cursor = start + byteCount
+            return view.order(ByteOrder.nativeOrder())
+        }
+
+        /** Drops this consumer's allocations only; the mapping itself stays open. */
+        @Synchronized
+        fun reset() {
+            cursor = 0L
+        }
+    }
+
+    /**
+     * The named slice [startFraction]..[endFraction] of the mapped file. Allocating is lazy, so an
+     * unused slice costs address space and nothing else. The shares of every arena a caller takes
+     * add up to at most 1.0 -- see `PrismSwap.Arena` for the table.
+     */
+    fun arena(label: String, startFraction: Double, endFraction: Double): Arena =
+        Arena(label, startFraction, endFraction)
+
+    /** A duplicate view of [bytes] starting at [offset], or null when swap is closed. */
+    private fun mapRange(offset: Long, bytes: Long): ByteBuffer? {
+        val mb = mapped ?: return null
+        if (offset < 0 || bytes <= 0 || offset + bytes > capacity) return null
+        return try {
+            val slice = mb.duplicate()
+            slice.order(ByteOrder.nativeOrder())
+            slice.position(offset.toInt())
+            slice.limit((offset + bytes).toInt())
+            slice.slice()
+        } catch (t: Throwable) {
+            PrismPlatform.log.error(logTag, "Swap slice failed: ${t.message}", t)
+            null
+        }
+    }
+
     fun capacityBytes(): Long = capacity
     fun usedBytes(): Long = used
     fun isOpen(): Boolean = mapped != null

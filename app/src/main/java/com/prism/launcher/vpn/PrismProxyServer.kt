@@ -155,6 +155,43 @@ class PrismProxyServer(
 
             val firstLine = readLine(input) ?: return@withContext
 
+            // 0. Fleet bridge handshake. One request, one JSON document, then close -- it never
+            // becomes a tunnel, so it cannot be used to reach anything this server would not
+            // already serve to an authenticated peer.
+            if (firstLine.startsWith("PRISM_BRIDGE")) {
+                val supplied = firstLine.removePrefix("PRISM_BRIDGE").trim()
+                if (!bridgeAuthorized(supplied)) {
+                    output.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n".toByteArray())
+                    output.flush()
+                    clientSocket.close()
+                    return@withContext
+                }
+                // The bridge offers its own names first. Merging them HERE is what makes the
+                // bridge bidirectional: the server's peers can resolve names that live on the
+                // bridge's other servers without those peers knowing a bridge exists.
+                val offered = runCatching { readLine(input) }.getOrNull().orEmpty()
+                if (offered.startsWith("{")) {
+                    runCatching {
+                        val push = com.prism.core.json.JSONObject(offered)
+                        push.optJSONArray("dns")?.let { dns ->
+                            if (com.prism.core.MeshDns.importJson(clientSocket.inetAddress?.hostAddress ?: "bridge", dns.toString()) > 0) {
+                                com.prism.core.MeshCore.broadcastToOthers(
+                                    com.prism.core.MeshDns.OPCODE_DNS_WRITE,
+                                    dns.toString(),
+                                )
+                            }
+                        }
+                    }.onFailure {
+                        com.prism.launcher.PrismLogger.logWarning(serverName, "Bridge push was not valid: ${it.message}")
+                    }
+                }
+                val document = FleetBridge.snapshot().toString()
+                output.write((document + "\n").toByteArray(Charsets.UTF_8))
+                output.flush()
+                clientSocket.close()
+                return@withContext
+            }
+
             // 1. Mesh Node Handshake (PRISM_CONNECT)
             if (firstLine.startsWith("PRISM_CONNECT")) {
                 if (isProxyMode) {
@@ -313,6 +350,23 @@ class PrismProxyServer(
         }
     }
     
+    /**
+     * Checks the Base64 `user:pass` a bridge sends.
+     *
+     * A server with no credentials configured accepts any bridge: it is already open to the mesh,
+     * and refusing a bridge while allowing anonymous proxy clients would protect nothing. A server
+     * WITH credentials requires the same pair the proxy requires, so the fleet screen's existing
+     * username and password are the only thing a bridge has to know.
+     */
+    private fun bridgeAuthorized(supplied: String): Boolean {
+        val requiredUser = authUsername ?: return true
+        val requiredPassword = authPassword ?: return true
+        val decoded = runCatching {
+            String(java.util.Base64.getDecoder().decode(supplied), Charsets.UTF_8)
+        }.getOrNull() ?: return false
+        return decoded == "$requiredUser:$requiredPassword"
+    }
+
     /**
      * Reads a full HTTP request head (request line + headers, through the blank line) from a
      * stream that may hold pushed-back bytes.

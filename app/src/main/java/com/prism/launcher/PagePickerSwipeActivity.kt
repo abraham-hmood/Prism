@@ -43,9 +43,10 @@ class PagePickerSwipeActivity : PrismBaseActivity() {
         })
 
         column.addView(TextView(this).apply {
-            text = "This is the gesture that replaces the current page. It works anywhere the page " +
-                "cannot scroll in that direction; left and right swipes are accepted from the " +
-                "screen edge only, so normal paging keeps working."
+            text = "This is the gesture that opens the page switcher. Draw any shape and press as " +
+                "you do it: Prism records the path and your average pressure, and requires both. " +
+                "A straight horizontal swipe is accepted from the screen edge only, so normal " +
+                "paging keeps working."
             textSize = 14f
             setTextColor(IosUi.secondaryLabel(this@PagePickerSwipeActivity))
             setPadding(0, IosUi.dp(this@PagePickerSwipeActivity, 8f), 0, IosUi.dp(this@PagePickerSwipeActivity, 16f))
@@ -62,7 +63,7 @@ class PagePickerSwipeActivity : PrismBaseActivity() {
         PrismSettings.getPagePickerSwipe()?.let { setup.prefill(it) }
         setup.onCaptured = { trigger ->
             PrismSettings.setPagePickerSwipe(trigger)
-            Toast.makeText(this, "Page picker: ${trigger.direction.label.lowercase()}", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Page picker: ${trigger.label.lowercase()}", Toast.LENGTH_SHORT).show()
             renderStatus()
         }
         column.addView(setup, LinearLayout.LayoutParams(
@@ -88,7 +89,7 @@ class PagePickerSwipeActivity : PrismBaseActivity() {
         status.text = if (trigger == null) {
             "Currently using the built-in vertical overscroll."
         } else {
-            "Current trigger: ${trigger.direction.label.lowercase()} — at least ${trigger.distanceDp} dp."
+            "Current trigger: ${trigger.label.lowercase()} — ${trigger.detail}."
         }
     }
 }

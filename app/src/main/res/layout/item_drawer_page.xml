@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="80dp"
+    android:layout_height="wrap_content"
+    android:gravity="center"
+    android:orientation="vertical"
+    android:paddingVertical="8dp"
+    android:clipChildren="false"
+    android:clipToPadding="false">
+
+    <FrameLayout
+        android:id="@+id/pageIconWrapper"
+        android:layout_width="72dp"
+        android:layout_height="72dp"
+        android:clipChildren="false"
+        android:clipToPadding="false"
+        android:padding="4dp">
+
+        <TextView
+            android:id="@+id/pageGlyph"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:layout_gravity="center"
+            android:gravity="center"
+            android:textSize="24sp"
+            android:includeFontPadding="false" />
+
+        <TextView
+            android:id="@+id/pageSlotBadge"
+            android:layout_width="wrap_content"
+            android:layout_height="18dp"
+            android:layout_gravity="top|end"
+            android:background="@drawable/bg_page_badge"
+            android:gravity="center"
+            android:minWidth="18dp"
+            android:paddingHorizontal="5dp"
+            android:textColor="#FFFFFFFF"
+            android:textSize="9sp"
+            android:visibility="gone" />
+    </FrameLayout>
+
+    <TextView
+        android:id="@+id/pageLabel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:ellipsize="end"
+        android:gravity="center"
+        android:maxLines="2"
+        android:paddingHorizontal="4dp"
+        android:textColor="?attr/prismTextPrimary"
+        android:textSize="12sp" />
+</LinearLayout>

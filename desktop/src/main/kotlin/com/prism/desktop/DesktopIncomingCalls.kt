@@ -56,24 +56,57 @@ object DesktopIncomingCalls {
     val call = mutableStateOf<MeshCalls.Call?>(null)
 
     /**
-     * Installs the window-wide listener.
+     * Why a call that reached this machine could not be shown.
      *
-     * Idempotent, and deliberately does NOT overwrite a handler a page installed later: the dialer
-     * saves this lambda and restores it on the way out, so the window keeps listening after the page
-     * is closed.
+     * A locked wallet is the common case, and it used to be a log line nobody reads: the caller's
+     * phone rang the desktop, the desktop dropped the packet, and both users concluded the mesh
+     * was broken. The banner says it in the window instead.
+     */
+    val notice = mutableStateOf<String?>(null)
+
+    @Volatile private var installed = false
+
+    /**
+     * The window's own observers, held as fields so a re-install cannot register them twice.
+     *
+     * These are registered as LISTENERS rather than assigned to MeshCalls.onIncoming, because the
+     * dialer page used to assign itself to that single slot and take the window's routing with it
+     * when it was disposed -- the reason a call could arrive while the desktop sat on another page
+     * and produce no banner at all.
+     */
+    private val incoming: (MeshCalls.Call) -> Unit = { invite ->
+        PrismPlatform.log.info("PrismCalls", "Incoming mesh call from ${invite.peerName} at ${invite.peerIp}")
+        publish(invite)
+        PrismPlatform.notifier.notify(
+            channel = "calls",
+            id = 0x0CA11,
+            title = "Incoming mesh call",
+            body = "${invite.peerName} is calling. Answer from the banner.",
+        )
+    }
+
+    private val state: (MeshCalls.Call?) -> Unit = { current -> publish(current) }
+
+    /**
+     * Installs the window-wide listener. Idempotent.
+     *
+     * It deliberately does NOT overwrite a handler a page installs later: pages add their own
+     * listeners now instead of replacing this one.
      */
     fun install() {
-        MeshCalls.onIncoming = { invite ->
-            PrismPlatform.log.info("PrismCalls", "Incoming mesh call from ${invite.peerName} at ${invite.peerIp}")
-            publish(invite)
+        if (installed) return
+        installed = true
+        MeshCalls.addIncomingListener(incoming)
+        MeshCalls.addStateListener(state)
+        MeshCalls.onUndeliverableInvite = { reason ->
+            SwingUtilities.invokeLater { notice.value = reason }
             PrismPlatform.notifier.notify(
                 channel = "calls",
-                id = 0x0CA11,
-                title = "Incoming mesh call",
-                body = "${invite.peerName} is calling. Open the Dialer to answer.",
+                id = 0x0CA12,
+                title = "A mesh call could not be shown",
+                body = reason,
             )
         }
-        MeshCalls.onState = { current -> publish(current) }
         // Said out loud once. When calls do not arrive, the first useful question is whether this
         // listener was installed at all, and the startup log is where that is answered.
         PrismPlatform.log.info(
@@ -101,6 +134,10 @@ object DesktopIncomingCalls {
     fun decline() {
         MeshCalls.decline()
     }
+
+    fun dismissNotice() {
+        notice.value = null
+    }
 }
 
 /**
@@ -112,8 +149,37 @@ object DesktopIncomingCalls {
  */
 @Composable
 fun IncomingCallBanner() {
-    val current = DesktopIncomingCalls.call.value ?: return
-    if (current.state != MeshCalls.State.RINGING) return
+    val current = DesktopIncomingCalls.call.value
+    if (current == null || current.state != MeshCalls.State.RINGING) {
+        // No live invitation: still surface the reason a call was dropped, because silence on
+        // both ends is what made the broken path look like a network problem.
+        val notice = DesktopIncomingCalls.notice.value
+        if (notice != null) {
+            val colors = LocalPrismColors.current
+            Box(Modifier.fillMaxWidth().padding(18.dp), contentAlignment = Alignment.TopCenter) {
+                Surface(
+                    color = colors.card,
+                    contentColor = colors.onSurface,
+                    shape = RoundedCornerShape(16.dp),
+                    tonalElevation = 8.dp,
+                    shadowElevation = 12.dp,
+                ) {
+                    Row(
+                        Modifier.padding(horizontal = 18.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                    ) {
+                        Box(Modifier.size(10.dp).clip(CircleShape).background(Color(0xFFFFB454)))
+                        Text(notice, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                        OutlinedButton(onClick = { DesktopIncomingCalls.dismissNotice() }) {
+                            Text("Dismiss")
+                        }
+                    }
+                }
+            }
+        }
+        return
+    }
     val colors = LocalPrismColors.current
 
     Box(Modifier.fillMaxWidth().padding(18.dp), contentAlignment = Alignment.TopCenter) {

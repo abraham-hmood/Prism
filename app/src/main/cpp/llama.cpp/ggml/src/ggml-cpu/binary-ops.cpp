@@ -46,6 +46,38 @@ static inline void vec_binary_op_non_contiguous(const int64_t n, const int64_t n
     }
 }
 
+/**
+ * PRISM: the layout sd_bridge actually hands this kernel.
+ *
+ * The two branches above are fast paths that require the destination and the left operand to be
+ * packed. Stable Diffusion's text encoder adds a token embedding produced by `ggml_get_rows` (which
+ * keeps a view's row shape) to a position embedding, and that left operand arrives with a row
+ * stride larger than its element size. Before this function existed, the kernel asserted
+ * `nb0 == sizeof(dst_t)` and the whole process died inside CLIP -- after the checkpoint had loaded
+ * successfully, which made it look like a bad model rather than a bad kernel.
+ *
+ * This is the general case: every operand is addressed through its own strides, and broadcasting
+ * on dim 0 is handled by taking the left operand's index modulo the right operand's extent, which
+ * is what ggml's repeat contract means. It is slower than the packed loop, and it is only reached
+ * for the tensors that actually need it.
+ */
+template <float (*op)(float, float), typename src0_t, typename src1_t, typename dst_t>
+static inline void vec_binary_op_strided(
+        const int64_t ne0, const int64_t ne10,
+        const size_t nb, const size_t nb0, const size_t nb10,
+        char * z, const char * x, const char * y) {
+    constexpr auto src0_to_f32 = type_conversion_table<src0_t>::to_f32;
+    constexpr auto src1_to_f32 = type_conversion_table<src1_t>::to_f32;
+    constexpr auto f32_to_dst  = type_conversion_table<dst_t >::from_f32;
+
+    for (int64_t i = 0; i < ne0; i++) {
+        const int64_t i10 = i % ne10;
+        const auto a = *(const src0_t *)(x + i*nb0);
+        const auto b = *(const src1_t *)(y + i10*nb10);
+        *(dst_t *)(z + i*nb) = f32_to_dst(op(src0_to_f32(a), src1_to_f32(b)));
+    }
+}
+
 template <float (*op)(float, float), typename src0_t, typename src1_t, typename dst_t>
 static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
@@ -55,8 +87,13 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    GGML_ASSERT( nb0 == sizeof(dst_t));
-    GGML_ASSERT(nb00 == sizeof(src0_t));
+    // A packed destination and a packed left operand are what the vectorised paths below assume.
+    // The assertions that used to live here checked the WRONG variables (src0's row stride against
+    // the DESTINATION's element size), so a perfectly valid mixed-layout add aborted the process.
+    // The check is now explicit, and the general path below handles the cases that fail it.
+    const bool packed_dst  = nb0  == sizeof(dst_t);
+    const bool packed_src0 = nb00 == sizeof(src0_t);
+    const bool packed_src1 = nb10 == sizeof(src1_t);
 
     const auto [ir0, ir1] = get_thread_range(params, src0);
     const bool is_src1_contiguous_rows = ggml_is_contiguous_rows(src1);
@@ -90,7 +127,7 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
         const src0_t * src0_ptr = (const src0_t *) ((const char *) src0->data + i03*nb03 + i02*nb02 + i01*nb01);
         const src1_t * src1_ptr = (const src1_t *) ((const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11);
 
-        if (is_src1_contiguous_rows) {
+        if (packed_dst && packed_src0 && packed_src1 && is_src1_contiguous_rows) {
             // src1 is broadcastable across src0 and dst in i1, i2, i3
             const int64_t nr0 = ne00 / ne10;
 
@@ -105,8 +142,12 @@ static void apply_binary_op(const ggml_compute_params * params, ggml_tensor * ds
 #endif
                 vec_binary_op_contiguous<op>(ne10, dst_ptr + r*ne10, src0_ptr + r*ne10, src1_ptr);
             }
-        } else {
+        } else if (packed_dst && packed_src0) {
             vec_binary_op_non_contiguous<op>(ne0, ne10, nb10, dst_ptr, src0_ptr, src1_ptr);
+        } else {
+            vec_binary_op_strided<op, src0_t, src1_t, dst_t>(
+                ne0, ne10, nb0, nb00, nb10,
+                (char *) dst_ptr, (const char *) src0_ptr, (const char *) src1_ptr);
         }
     }
 }

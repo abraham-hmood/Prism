@@ -4,6 +4,8 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- Miracast discovery uses Wi-Fi Direct, which many TVs support but some tablets do not. -->
+    <uses-feature android:name="android.hardware.wifi.direct" android:required="false" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
@@ -57,12 +59,16 @@
     <!-- Dictation in Messages and Nebula. Requested at the moment the mic is first tapped. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
+
     <!-- The Science page uses the camera sensor as a particle detector: a covered lens taking
          long exposures, where the only bright pixels left are particle hits or sensor noise.
          No image is ever stored or shown - the frames are scanned for bright pixels and
          discarded. Optional hardware, so a device without a camera still installs. -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <!-- GeoTag needs ARCore for wall/floor/ceiling detection. Optional, because browsing the
+         library and the rest of Prism must still work on hardware that cannot run AR. -->
+    <uses-feature android:name="android.hardware.camera.ar" android:required="false" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />
     <!-- The debug bridge can receive an APK from a trusted device. Android still shows its own
          confirmation, and the user must allow Prism to install unknown apps. -->
@@ -137,6 +143,13 @@
         android:theme="@style/Theme.PrismLauncher"
         android:hardwareAccelerated="true"
         android:largeHeap="true">
+
+        <!-- Asked for by ArCoreApk.requestInstall. "optional" keeps Prism installable without the
+             Play Services for AR runtime; GeoTag then explains what is missing instead of failing
+             to launch the whole launcher. -->
+        <meta-data
+            android:name="com.google.ar.core"
+            android:value="optional" />
 
         <activity
             android:name=".LauncherActivity"
@@ -232,6 +245,14 @@
             android:screenOrientation="fullUser"
             android:exported="false"
             android:theme="@style/Theme.PrismSettings" />
+        <!-- GeoTag: live camera, a placed artwork, and a wall key from the device's location. Not
+             exported, because it is only ever opened from the Minigames page. -->
+        <activity
+            android:name=".minigames.GeoTagActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="portrait"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
         <activity
             android:name=".display.DisplayReceiverActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
@@ -322,6 +343,47 @@
             android:screenOrientation="fullUser"
             android:exported="false"
             android:theme="@style/Theme.PrismSettings" />
+
+        <!-- VideoCraft. dataSync: a render is long work the user started and expects to keep
+             running while they are elsewhere, with a visible progress notification. -->
+        <activity
+            android:name=".videocraft.VideoCraftActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.PrismSettings" />
+        <service
+            android:name=".videocraft.VideoCraftService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+        <!-- ImageCraft runs the same way VideoCraft does: a foreground service so a render survives
+             the page being swiped away, with the progress in a notification. dataSync is the type
+             that fits, because the work is a local computation whose output is written to storage. -->
+        <service
+            android:name=".imagecraft.ImageCraftService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+        <activity
+            android:name=".imagecraft.ImageCraftActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
+        <!-- The mail stack. The pages live in the launcher's pager; these two activities are the
+             doorway Settings opens, mounting the very same views so there is no second dashboard. -->
+        <activity
+            android:name=".email.EmailServerActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
+        <activity
+            android:name=".email.EmailClientActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
         <activity
             android:name=".CloudModelsActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
@@ -400,6 +462,29 @@
             android:name=".DiagnosticsActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
             android:screenOrientation="fullUser"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
+
+        <!-- System Update. Two activities rather than one with a mode: the repository list and
+             the release check have different state, and a shared screen would have to hide half
+             of its chrome in each mode. -->
+        <activity
+            android:name=".update.UpdateRepositoriesActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
+        <activity
+            android:name=".update.UpdateCheckActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
+        <activity
+            android:name=".appstore.AppStorePublishActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:windowSoftInputMode="adjustResize"
             android:exported="false"
             android:theme="@style/Theme.PrismSettings" />
 
@@ -695,6 +780,14 @@
             android:theme="@style/Theme.PrismSettings"
             android:windowSoftInputMode="adjustResize" />
 
+        <activity
+            android:name=".messaging.LinkedChatActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings"
+            android:windowSoftInputMode="adjustResize" />
+
         <!--
             Opens Windows executables. android:enabled="false" is load-bearing: the component is
             switched on only when the user turns Windows mode on, so Prism does not appear in the
@@ -967,6 +1060,16 @@
 
         <activity
             android:name=".stremio.StremioAddonsActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- How a Stremio torrent stream is played: a debrid account, Prism's torrent client, or
+             both. Separate from the add-on screens because an API key is a different decision from
+             installing a web address. -->
+        <activity
+            android:name=".stremio.StremioPlaybackActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
             android:exported="false"
             android:theme="@style/Theme.PrismSettings"

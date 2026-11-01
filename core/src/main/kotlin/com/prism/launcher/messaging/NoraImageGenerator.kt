@@ -52,14 +52,28 @@ class NoraImageGenerator : ImageGenerator {
         }
     }
 
-    override fun generate(prompt: String, onStage: ((String) -> Unit)?): PrismImage? {
+    override fun generate(
+        prompt: String,
+        onStage: ((String) -> Unit)?,
+        onProgress: ((Float) -> Unit)?,
+        size: ImageSize?,
+    ): PrismImage? {
         onStage?.invoke("Loading the connectome…")
         val brain = NoraBrain()
         val loaded = runCatching { NoraPersistence.load(brain) }.getOrDefault(false)
         if (!loaded) return null
 
         onStage?.invoke("Settling on \"$prompt\"…")
+        // The imagery surface is the network's own size, fixed by the connectome's visual layer -- a
+        // requested resolution is not something this engine can honour, and it says so afterwards
+        // rather than returning a quiet 128x128 that the page's setting would appear to have caused.
         val image = MentalImagery(brain).generateStill(prompt)
+        if (size != null && (image.width != size.width || image.height != size.height)) {
+            onStage?.invoke(
+                "Nora renders at its own surface size (${image.width}\u00d7${image.height}); the " +
+                    "${size.label} setting does not apply to it.",
+            )
+        }
 
         // THE BLANK-OUTPUT CASE, caught here rather than shown. A surface range of essentially zero
         // means every pixel settled to the same value: the image is a constant, and handing it back
@@ -73,30 +87,7 @@ class NoraImageGenerator : ImageGenerator {
     }
 }
 
-/**
- * The desktop diffusion route the plan names, not built yet.
- *
- * Registered rather than omitted so that the Models and image pages can SHOW what desktop is missing
- * and why, which is the same disabled-not-hidden rule the browser menu and the agentic tool list
- * follow. A capability that is absent from a list teaches nobody anything.
- *
- * What it would take, recorded where somebody will find it: stable-diffusion.cpp builds with the same
- * CMake toolchain llama.cpp already uses here, so the native side is a second target in an existing
- * build rather than a new one. What it adds is a weights download of several gigabytes and a sampler
- * loop, and the reason it is not done is that neither is a small job — not that it is blocked.
- */
-class StableDiffusionCppGenerator : ImageGenerator {
-
-    override val id = "sdcpp"
-    override val label = "Stable Diffusion (local)"
-    override val description =
-        "A real diffusion model running on this machine. Not built yet — see PHASE 34."
-
-    override fun availability(): ImageGenerator.Availability =
-        ImageGenerator.Availability.Unavailable(
-            "Not built. stable-diffusion.cpp compiles with the same toolchain as llama.cpp, so this " +
-                "is a second native target plus a weights download — planned, not blocked."
-        )
-
-    override fun generate(prompt: String, onStage: ((String) -> Unit)?): PrismImage? = null
-}
+// The third route -- a real diffusion checkpoint through stable-diffusion.cpp -- lives in
+// com.prism.launcher.diffusion.LocalDiffusionGenerator. It was a stub here that reported itself
+// unavailable; it is now a built library, so keeping a second class with the same id in this file
+// would mean two engines racing to register `sdcpp` and whichever loaded last deciding the answer.

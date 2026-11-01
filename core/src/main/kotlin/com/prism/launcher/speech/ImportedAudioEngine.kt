@@ -25,6 +25,10 @@ import java.io.File
  * so importing a different Kokoro build -- a newer export, a different quantisation, a fine-tune --
  * works and behaves identically.
  *
+ * A **ModelCraft speech model** -- the folder a text-to-speech or cloning run trained -- is the other
+ * runnable format. Its own engine is [com.prism.launcher.modelcraft.ModelCraftSpeechEngine]: text in,
+ * a WAV out, with the reference recording used as the voice when the model is a clone.
+ *
  * GGUF and TFLite speech models are accepted by the importer and registered, so they are on disk and
  * listed, but nothing here can drive them yet. They are named in [describe] rather than silently
  * ignored.
@@ -36,6 +40,12 @@ object ImportedAudioEngine {
     enum class Format {
         /** An ONNX export with Kokoro's input signature; runnable through the Kokoro pipeline. */
         KOKORO_ONNX,
+
+        /**
+         * A folder trained by ModelCraft: a voice recording chosen from the dataset, spoken by the
+         * Pocket TTS neural engine, beside the compact diagnostic pipeline's weights.
+         */
+        PRISM_TTS,
 
         /** Recognised, registered, not yet runnable. */
         GGUF,
@@ -50,14 +60,25 @@ object ImportedAudioEngine {
     }
 
     /** Extensions the picker should accept when importing an audio model. */
-    val ACCEPTED_EXTENSIONS = listOf("onnx", "gguf", "tflite", "bin", "pt", "pth")
+    val ACCEPTED_EXTENSIONS = listOf("onnx", "gguf", "tflite", "bin", "pt", "pth", "json")
 
-    fun formatOf(path: String): Format = when (File(path).extension.lowercase()) {
+    fun formatOf(path: String): Format {
+        val file = File(path)
+        if (file.isDirectory) return if (com.prism.launcher.modelcraft.TtsTrainer.trained(file)) {
+            Format.PRISM_TTS
+        } else {
+            Format.UNKNOWN
+        }
+        if (file.name.equals(com.prism.launcher.modelcraft.TtsTrainer.METADATA_FILE, true)) {
+            return Format.PRISM_TTS
+        }
+        return when (file.extension.lowercase()) {
         "onnx" -> Format.KOKORO_ONNX
         "gguf" -> Format.GGUF
         "tflite" -> Format.TFLITE
         "pt", "pth" -> Format.TORCH
         else -> Format.UNKNOWN
+        }
     }
 
     /** One line for a settings row: what the file is, and whether it can speak. */
@@ -66,6 +87,7 @@ object ImportedAudioEngine {
         val name = File(path).name
         return when (formatOf(path)) {
             Format.KOKORO_ONNX -> "$name — ONNX, used for speech"
+            Format.PRISM_TTS -> "$name — ModelCraft speech model, used for text-to-speech and cloning"
             Format.GGUF -> "$name — GGUF, recognised but not yet runnable for speech"
             Format.TFLITE -> "$name — TFLite, recognised but not yet runnable for speech"
             Format.TORCH ->
@@ -82,7 +104,25 @@ object ImportedAudioEngine {
      */
     fun openOrNull(path: String): TtsEngine? {
         if (path.isEmpty()) return null
-        val file = File(path)
+
+        // A ModelCraft model first: it may be a folder, which the extension-based reader below
+        // would reject before looking inside.
+        com.prism.launcher.modelcraft.ModelCraftSpeechEngine.openOrNull(path)?.let { engine ->
+            PrismPlatform.log.info(TAG, "Using ModelCraft speech model ${engine.displayName}")
+            return engine
+        }
+        val pathFile = File(path)
+        if (pathFile.isDirectory || pathFile.name.equals(
+                com.prism.launcher.modelcraft.TtsTrainer.METADATA_FILE, true,
+            )
+        ) {
+            PrismPlatform.log.warn(
+                TAG,
+                "$path is a ModelCraft speech folder without readable weights; keeping the current voice",
+            )
+            return null
+        }
+        val file = pathFile
         if (!file.isFile) {
             PrismPlatform.log.warn(TAG, "The imported audio model is missing: $path")
             return null
@@ -90,10 +130,20 @@ object ImportedAudioEngine {
 
         return when (formatOf(path)) {
             Format.KOKORO_ONNX -> {
-                // The runtime that would load this is not wired up yet. Logged at info, because an
-                // unfinished path is not an error and the user is told in Settings either way.
-                PrismPlatform.log.info(TAG, "ONNX speech models are recognised but not yet runnable")
-                null
+                // Kokoro's input contract is known exactly -- phoneme ids, a style row and a speed --
+                // so a compatible ONNX export runs through the same pipeline as the built-in
+                // weights. Anything whose signature differs fails to open and the caller keeps the
+                // engine it already had, which is the documented behaviour for every format here.
+                KokoroEngine.openOrNull(path).also { engine ->
+                    if (engine != null) {
+                        PrismPlatform.log.info(TAG, "Using imported Kokoro-format model ${file.name}")
+                    } else {
+                        PrismPlatform.log.warn(
+                            TAG,
+                            "${file.name} is ONNX but not a compatible Kokoro export; keeping the current voice",
+                        )
+                    }
+                }
             }
             else -> {
                 PrismPlatform.log.info(TAG, "No runner for ${file.name}; keeping the current voice")

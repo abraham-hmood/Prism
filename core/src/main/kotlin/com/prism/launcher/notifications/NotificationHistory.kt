@@ -74,13 +74,25 @@ object NotificationHistory {
         val ongoing: Boolean = false,
         /** How many times this same content was posted. See the collapsing note above. */
         val count: Int = 1,
+        /**
+         * The conversation the notification belongs to, when the app names one.
+         *
+         * Android puts a group chat's name in `EXTRA_CONVERSATION_TITLE` while `EXTRA_TITLE` is the
+         * sender. Without this field every member of a group text looked like a separate
+         * conversation in Messages, because the sender was the only grouping key there was.
+         */
+        val conversation: String = "",
     ) {
         /** What a search matches against: title, body and app name, which is what was asked for. */
         fun matches(needle: String): Boolean =
             title.contains(needle, ignoreCase = true) ||
                 text.contains(needle, ignoreCase = true) ||
                 appLabel.contains(needle, ignoreCase = true) ||
-                packageName.contains(needle, ignoreCase = true)
+                packageName.contains(needle, ignoreCase = true) ||
+                conversation.contains(needle, ignoreCase = true)
+
+        /** The thread a notification belongs to, for grouping: the conversation name when there is one. */
+        val conversationKey: String get() = conversation.ifBlank { title }
     }
 
     private val lock = Any()
@@ -134,12 +146,14 @@ object NotificationHistory {
         at: Long = System.currentTimeMillis(),
         key: String = "",
         ongoing: Boolean = false,
+        conversation: String = "",
     ): Boolean {
         if (!PrismSettings.getNotificationHistoryEnabled()) return false
         if (packageName.isBlank()) return false
 
         val cleanTitle = title.trim().take(MAX_TITLE_CHARS)
         val cleanText = text.trim().take(MAX_TEXT_CHARS)
+        val cleanConversation = conversation.trim().take(MAX_TITLE_CHARS)
         // A notification with neither a title nor a body is a placeholder -- a media session's
         // transport controls, a foreground-service stub. There is nothing to show or search for.
         if (cleanTitle.isEmpty() && cleanText.isEmpty()) return false
@@ -163,7 +177,8 @@ object NotificationHistory {
                 if (kotlin.math.abs(at - existing.at) > DEDUPE_WINDOW_MS) continue
                 if (existing.packageName == packageName &&
                     existing.title == cleanTitle &&
-                    existing.text == cleanText
+                    existing.text == cleanText &&
+                    existing.conversation == cleanConversation
                 ) {
                     list[index] = existing.copy(
                         at = maxOf(at, existing.at),
@@ -184,6 +199,7 @@ object NotificationHistory {
                 at = at,
                 key = key,
                 ongoing = ongoing,
+                conversation = cleanConversation,
             )
             // Inserted in time order rather than appended, so "newest first" on the way out needs no
             // sort. Almost always an append -- a notification that has just arrived is the newest
@@ -319,6 +335,7 @@ object NotificationHistory {
             if (record.key.isNotEmpty()) put("k", record.key)
             if (record.ongoing) put("o", true)
             if (record.count != 1) put("c", record.count)
+            if (record.conversation.isNotEmpty()) put("cv", record.conversation)
         }.toString()
 
     private fun decode(line: String): Record? = runCatching {
@@ -332,6 +349,7 @@ object NotificationHistory {
             key = json.optString("k", ""),
             ongoing = json.optBoolean("o", false),
             count = json.optInt("c", 1),
+            conversation = json.optString("cv", ""),
         ).takeIf { it.packageName.isNotEmpty() }
     }.getOrNull()
 }

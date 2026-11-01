@@ -1,6 +1,7 @@
 package com.prism.launcher.aether
 
 import com.prism.core.PrismPlatform
+import com.prism.launcher.PrismSettings
 
 /**
  * Aether's performance switches: where her large structures live, not what she computes.
@@ -18,11 +19,19 @@ object AetherPerformance {
     /** Put large structures in direct byte buffers -- off the managed heap, still in RAM. */
     var offHeapEnabled = false
 
-    /** Put large structures in a memory-mapped file. Overrides [offHeapEnabled] when both are on. */
-    var swapEnabled = false
+    /**
+     * Put large structures in a memory-mapped file. Overrides [offHeapEnabled] when both are on.
+     * A view of Prism Swap's single switch -- see `NoraPerformance.swapEnabled` for why the
+     * per-feature toggle is gone.
+     */
+    var swapEnabled: Boolean
+        get() = PrismSettings.getPrismSwapEnabled()
+        set(value) { PrismSettings.setPrismSwapEnabled(value) }
 
-    /** Bytes the swap file may occupy. Set by a settings slider, bounded by free storage. */
-    var swapBytes = 256L shl 20
+    /** Bytes the shared swap file may occupy. Same setting as Developer options → Prism Swap. */
+    var swapBytes: Long
+        get() = PrismSettings.getPrismSwapBytes()
+        set(value) { PrismSettings.setPrismSwapBytes(value) }
 
     class Flag(
         val key: String,
@@ -53,20 +62,17 @@ object AetherPerformance {
     fun load() {
         val p = PrismPlatform.host.prefs(PREFS)
         for (flag in FLAGS) if (p.contains(flag.key)) flag.write(p.getBoolean(flag.key, flag.read()))
-        swapBytes = p.getLong(KEY_SWAP_BYTES, swapBytes).coerceAtLeast(AetherSwap.MIN_BYTES)
     }
 
     fun save() {
         val p = PrismPlatform.host.prefs(PREFS)
         for (flag in FLAGS) p.putBoolean(flag.key, flag.read())
-        p.putLong(KEY_SWAP_BYTES, swapBytes)
         p.flush()
     }
 
     fun resetToDefaults() {
         PrismPlatform.host.prefs(PREFS).clear()
         for ((i, flag) in FLAGS.withIndex()) flag.write(FLAG_DEFAULTS[i])
-        swapBytes = DEFAULT_SWAP_BYTES
     }
 
     fun changedCount(): Int {

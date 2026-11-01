@@ -8,12 +8,15 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.Key
@@ -28,6 +31,7 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.prism.core.PrismImage
@@ -235,6 +239,92 @@ private fun Modifier.commitOn(commit: () -> Unit): Modifier = this
         } else false
     }
     .onFocusChanged { if (!it.isFocused) commit() }
+
+/**
+ * One labelled choice, drawn as a field that opens a menu.
+ *
+ * The menu is Compose's own [DropdownMenu] rather than a picker of our own, so it dismisses on an
+ * outside click and takes the keyboard the way every other menu in the app does. The label is upper
+ * case and faint the way the settings pages write theirs, because a dropdown with no label is a
+ * question with no question.
+ */
+@Composable
+fun PrismDropdown(
+    label: String,
+    selection: String,
+    options: List<String>,
+    enabled: Boolean = true,
+    modifier: Modifier = Modifier,
+    onSelect: (String) -> Unit,
+) {
+    val colors = LocalPrismColors.current
+    var open by remember { mutableStateOf(false) }
+    Column(modifier) {
+        if (label.isNotBlank()) {
+            Text(label.uppercase(), fontSize = 10.sp, letterSpacing = 1.1.sp, color = colors.faint)
+            Spacer(Modifier.height(5.dp))
+        }
+        Box {
+            Surface(
+                color = if (enabled) colors.surfaceRaised else colors.surface,
+                shape = RoundedCornerShape(if (colors.pill) 999.dp else colors.fieldRadius),
+                border = if (colors.border > 0) BorderStroke(colors.border.dp, colors.divider) else null,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .alphaIf(enabled)
+                    .clickableRow { if (enabled) open = true },
+            ) {
+                Row(
+                    Modifier.fillMaxWidth().padding(start = 12.dp, end = 8.dp, top = 10.dp, bottom = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        selection,
+                        fontSize = 14.sp,
+                        color = if (enabled) colors.onSurface else colors.faint,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Icon(Icons.Filled.KeyboardArrowDown, null, tint = colors.faint, modifier = Modifier.size(18.dp))
+                }
+            }
+            DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+                options.forEach { option ->
+                    DropdownMenuItem(
+                        text = { Text(option, fontSize = 13.sp) },
+                        onClick = { open = false; onSelect(option) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * A progress bar in the theme's own colours.
+ *
+ * Drawn rather than taken from Material so that a theme with square corners or a different accent
+ * shows in the one widget every long job in the app reports through.
+ */
+@Composable
+fun PrismProgressBar(progress: Float, modifier: Modifier = Modifier) {
+    val colors = LocalPrismColors.current
+    Box(
+        modifier
+            .fillMaxWidth()
+            .height(6.dp)
+            .clip(RoundedCornerShape(3.dp))
+            .background(colors.divider),
+    ) {
+        Box(
+            Modifier
+                .fillMaxWidth(progress.coerceIn(0f, 1f))
+                .fillMaxHeight()
+                .background(colors.accent),
+        )
+    }
+}
 
 /**
  * A secondary-click handler, for the per-item context menus a desktop expects.

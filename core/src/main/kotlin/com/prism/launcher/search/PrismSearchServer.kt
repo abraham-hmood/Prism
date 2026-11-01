@@ -51,6 +51,15 @@ object PrismSearchServer {
     @Volatile var lastCrawlSummary: String = "never crawled"
         private set
 
+    /**
+     * Whether a scheduled crawl may run right now.
+     *
+     * A crawl is hundreds of HTTP requests and a full parse of every page; on a phone that is real
+     * work, so the Android host points this at "the charger is connected". A platform that does not
+     * set it keeps the old behaviour.
+     */
+    @Volatile var crawlAllowed: () -> Boolean = { true }
+
     /** Where the engine is reachable, for the UI to display and copy. */
     fun address(): String = PrismSettings.prismSearchBaseUrl()
 
@@ -171,13 +180,20 @@ object PrismSearchServer {
         while (scope.isActive) {
             val hours = PrismSettings.getSearchCrawlIntervalHours()
             if (hours <= 0) {
-                delay(60_000L)              // disabled: idle, but keep watching for a settings change
+                delay(5 * 60_000L)          // disabled: idle, but keep watching for a settings change
                 continue
             }
             val intervalMs = hours * 3_600_000L
             val since = System.currentTimeMillis() - PrismSearchIndex.lastCrawlAt
             if (PrismSearchIndex.lastCrawlAt == 0L || since >= intervalMs) {
-                crawlNow()
+                if (crawlAllowed()) {
+                    crawlNow()
+                } else {
+                    // Battery, not schedule: try again shortly rather than marking the crawl done
+                    // and leaving the index stale for another full interval.
+                    delay(5 * 60_000L)
+                    continue
+                }
             }
             // Re-check often enough that shortening the interval in Settings takes effect promptly.
             delay(minOf(intervalMs, 15 * 60_000L))
@@ -276,16 +292,25 @@ object PrismSearchServer {
 
     private fun resultsJson(query: String): String {
         val arr = JSONArray()
-        if (query.isNotBlank()) {
-            for (r in PrismSearchIndex.search(query, limit = 25)) {
+        val outcome = if (query.isBlank()) null else PrismSearchIndex.searchOutcome(query, limit = 25)
+        if (outcome != null) {
+            for (r in outcome.results) {
                 arr.put(
                     JSONObject().put("url", r.url).put("title", r.title)
                         .put("snippet", r.snippet).put("score", r.score).put("pageRank", r.pageRank)
                 )
             }
         }
+        val expanded = JSONArray()
+        outcome?.expanded?.forEach { expanded.put(it) }
         return JSONObject()
             .put("query", query)
+            // The correction and expansion lists are part of the contract, not decoration: a
+            // caller needs to know that the results it got are for a different query than the one
+            // it typed, or "did you mean" becomes impossible to render honestly.
+            .put("corrected", outcome?.corrected)
+            .put("expanded", expanded)
+            .put("tookMs", outcome?.tookMs ?: 0L)
             .put("indexed", PrismSearchIndex.documentCount())
             .put("results", arr)
             .toString()
@@ -299,8 +324,22 @@ object PrismSearchServer {
      * constraint the Nebula page is built under.
      */
     private fun page(query: String): String {
-        val results = if (query.isBlank()) emptyList() else PrismSearchIndex.search(query, limit = 25)
+        val outcome = if (query.isBlank()) null else PrismSearchIndex.searchOutcome(query, limit = 25)
+        val results = outcome?.results ?: emptyList()
         val indexed = PrismSearchIndex.documentCount()
+
+        // The correction is shown ABOVE the results, in the same place a search engine puts
+        // "Showing results for". Silently returning results for a different query is worse than
+        // returning none, because the user cannot tell the engine guessed.
+        val correctionBlock = if (outcome?.corrected != null && outcome.corrected != query) {
+            "<div class=\"correct\">Showing results for <b>" + esc(outcome.corrected) +
+                "</b>. <a href=\"/?q=" + java.net.URLEncoder.encode(query, "UTF-8") +
+                "\">Search instead for " + esc(query) + "</a></div>"
+        } else ""
+
+        val expandedBlock = if (!outcome?.expanded.isNullOrEmpty()) {
+            "<div class=\"correct dim\">Also matched: " + esc(outcome!!.expanded.joinToString(", ")) + "</div>"
+        } else ""
 
         val body = StringBuilder()
         if (query.isNotBlank()) {
@@ -332,7 +371,8 @@ object PrismSearchServer {
 
         val resultsBlock = if (query.isBlank()) "" else "<section class=\"results\">$body</section>"
         val meta = if (query.isBlank()) "$indexed pages indexed" else
-            "${results.size} result${if (results.size == 1) "" else "s"} · $indexed pages indexed"
+            "${results.size} result${if (results.size == 1) "" else "s"} · $indexed pages indexed" +
+                (outcome?.tookMs?.let { " · ${it}ms" } ?: "")
 
         return """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -385,6 +425,8 @@ border-radius:16px;padding:16px 18px;margin:0 0 14px;text-align:left;box-sizing:
 .rsnip{font-size:14px;color:var(--fg);opacity:.85;overflow-wrap:anywhere}
 .empty{padding:28px 20px;text-align:center}
 .dim{color:var(--dim);font-size:14px}
+.correct{width:100%;max-width:640px;font-size:13px;color:var(--dim);margin:0 2px 10px}
+.correct a{color:var(--accent)}
 </style></head><body>
 <div class="brand">Prism</div>
 <form action="/" method="get" role="search">
@@ -393,8 +435,9 @@ border-radius:16px;padding:16px 18px;margin:0 0 14px;text-align:left;box-sizing:
            autocomplete="off" spellcheck="false" aria-label="Search">
     <button type="submit">Search</button>
   </div>
-</form>
-<div class="meta">$meta</div>
+</form>        <div class="meta">$meta</div>
+$correctionBlock
+$expandedBlock
 $summaryBlock
 $resultsBlock
 </body></html>"""

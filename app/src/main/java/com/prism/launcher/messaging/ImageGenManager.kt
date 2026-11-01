@@ -23,7 +23,10 @@ object ImageGenManager {
         val mode = PrismSettings.getAiMode()
         
         return@withContext if (mode == PrismSettings.AI_MODE_CLOUD) {
-            val cloudModel = PrismSettings.getActiveCloudModel() ?: return@withContext null
+            // The IMAGE profile, not whichever endpoint answers chat: an image request against a
+            // text model is a 400 from every provider, and the kinds exist to stop that.
+            val cloudModel = PrismSettings.getActiveCloudModel(PrismSettings.KIND_IMAGE)
+                ?: return@withContext null
 
             // CloudAiService returns the portable PrismImage now that it lives in :core.
             // Converting here is the right place: this is the boundary where the image stops
@@ -50,7 +53,7 @@ object ImageGenManager {
      * about never appeared. Pre-29 writes the file itself and records its DATA path, which is how
      * that API expects a MediaStore image to be created.
      */
-    private fun saveToPublicStore(context: Context, bitmap: Bitmap): Uri? {
+    fun saveToPublicStore(context: Context, bitmap: Bitmap): Uri? {
         val fileName = "gen_${UUID.randomUUID()}.jpg"
         return runCatching {
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {

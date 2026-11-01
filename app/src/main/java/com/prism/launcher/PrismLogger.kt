@@ -67,7 +67,12 @@ object PrismLogger {
         val oldHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             val threadInfo = "Name: ${thread.name}, ID: ${thread.id}"
-            logError("CRASH", "Uncaught exception in thread [$threadInfo]", throwable)
+            // Written SYNCHRONOUSLY, not through append(): append() hands the entry to an IO
+            // coroutine, and the process is killed before that coroutine is guaranteed to run, so
+            // the one line worth keeping never reached the file. writeToFile flushes ERROR entries.
+            val message = "Uncaught exception in thread [$threadInfo]\n" +
+                Log.getStackTraceString(throwable)
+            runCatching { writeToFile(LogEntry(getTimestamp(), Level.ERROR, "CRASH", message)) }
             // The process is about to die, so the buffered writer has to be pushed out NOW --
             // a crash report that is still sitting in a BufferedWriter when the process is
             // killed is a crash report that never existed.
@@ -208,6 +213,52 @@ object PrismLogger {
     fun filePath(): String? = logFile?.absolutePath
 
     /**
+     * The last [limit] entries already on disk, oldest first.
+     *
+     * The live feed only starts when this process does, so without this a crash that killed the
+     * previous process is invisible on the diagnostics screen even though it was logged. Lines are
+     * read back in the format [writeToFile] writes; a stack trace continues the entry above it
+     * rather than starting a new one.
+     */
+    fun recentEntries(limit: Int = 400): List<LogEntry> {
+        val file = logFile ?: return emptyList()
+        if (!file.isFile) return emptyList()
+        val entries = ArrayList<LogEntry>()
+        try {
+            file.bufferedReader().useLines { lines ->
+                var current: LogEntry? = null
+                fun finish() {
+                    current?.let { entries.add(it) }
+                    if (entries.size > limit * 4) entries.subList(0, entries.size - limit * 4).clear()
+                }
+                for (line in lines) {
+                    val header = HEADER.matchEntire(line)
+                    if (header != null) {
+                        finish()
+                        val level = Level.entries.firstOrNull { it.name == header.groupValues[2] }
+                            ?: Level.INFO
+                        current = LogEntry(
+                            timestamp = header.groupValues[1],
+                            level = level,
+                            tag = header.groupValues[3],
+                            message = header.groupValues[4],
+                        )
+                    } else if (current != null) {
+                        // A continuation line of a multi-line message, such as a stack trace.
+                        current = current.copy(message = current.message + "\n" + line)
+                    }
+                }
+                finish()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not read the diagnostics log", e)
+            return emptyList()
+        }
+        return if (entries.size > limit) entries.subList(entries.size - limit, entries.size).toList()
+        else entries
+    }
+
+    /**
      * Re-opens file logging after it has given up.
      *
      * Resets the failure counter and PROVES the file is writable with a real write before
@@ -263,4 +314,7 @@ object PrismLogger {
     }
 
     private fun getTimestamp(): String = sdf.format(Date())
+
+    /** One header line, as [writeToFile] writes it: `[time] [LEVEL] [TAG] message`. */
+    private val HEADER = Regex("^\\[(.*?)\\] \\[(.*?)\\] \\[(.*?)\\] (.*)$")
 }

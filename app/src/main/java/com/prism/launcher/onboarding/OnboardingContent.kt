@@ -37,7 +37,7 @@ object OnboardingContent {
          */
         val special: Special = Special.NONE,
     ) {
-        enum class Special { NONE, PAGE_PICKER, SWIPE_TRIGGER, WALLET_SETUP, MESSAGING_BRIDGES }
+        enum class Special { NONE, PAGE_PICKER, SWIPE_TRIGGER, WALLET_SETUP, LYKE_ACCOUNT, MESSAGING_BRIDGES }
     }
 
     data class Section(
@@ -68,12 +68,13 @@ object OnboardingContent {
                 Step.Special.PAGE_PICKER,
             ),
             Step(
-                "Choose the swipe that opens it",
-                "Do your swipe three times. Prism records the direction and how far you travel, " +
-                    "then uses that gesture from now on.\n\n" +
-                    "The count restarts if the direction changes, so the three swipes have to " +
-                    "agree. Horizontal swipes are edge-only, because a horizontal swipe in the " +
-                    "middle of the screen already changes pages.",
+                "Draw the gesture that opens it",
+                "Draw your gesture three times. It can be any shape -- a line, a diagonal, a " +
+                    "loop, a triangle -- and Prism records the path plus the average pressure you " +
+                    "used. Both are required to open the page picker from then on.\n\n" +
+                    "The three attempts have to be recognisably the same shape. A straight " +
+                    "horizontal swipe is still edge-only, because one in the middle of the screen " +
+                    "already changes pages.",
                 "⇅",
                 "Settings > Other > Page picker swipe",
                 Step.Special.SWIPE_TRIGGER,
@@ -99,6 +100,27 @@ object OnboardingContent {
                 "◈",
                 "Settings → Trusted devices, and the Wallet page",
                 Step.Special.WALLET_SETUP,
+            ),
+        )),
+
+        // ── The account the mail stack signs in with ────────────────────────
+        //
+        // FORCED, like the wallet above it and for a more concrete reason: the mail client's login
+        // IS this username and password. A generated default is one the user cannot type into
+        // another device, so the client would be readable on exactly one machine and nobody would
+        // know why.
+        Section("Your Prism account", listOf(
+            Step(
+                "Choose the account your mail lives on",
+                "Prism can serve your mail itself. The address it serves is your username at your " +
+                    "mesh domain, and the client signs in to it with the password you choose here. " +
+                    "The same name is your Lyke name.\n\n" +
+                    "The password is encrypted with your wallet phrase, so it is recoverable on " +
+                    "another device with the same wallet -- and readable by anyone holding that " +
+                    "phrase. Use one you are willing to type into a mail client.",
+                "✉",
+                "Settings → Email, and the Email page",
+                Step.Special.LYKE_ACCOUNT,
             ),
         )),
 

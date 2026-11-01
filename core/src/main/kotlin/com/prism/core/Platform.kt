@@ -23,10 +23,52 @@ import java.io.File
  * exactly the friction that stops tests being written. Prism-on-desktop is, to a first
  * approximation, this file's defaults plus a user interface.
  */
+/**
+ * One installed application, as a backup needs to know it.
+ *
+ * [apkPath] is the path of the installed package, which is the only part of a third-party app
+ * Prism can legitimately copy without root. Its private data is not readable by another app, which
+ * is why [com.prism.launcher.timemachine.TimeMachine] says so instead of producing a backup that
+ * silently omits it.
+ */
+data class BackupApp(
+    val packageName: String,
+    val label: String,
+    val versionName: String,
+    val apkPath: String,
+    val system: Boolean = false,
+)
+
 interface PlatformHost {
+
+    /**
+     * The running build's version name, for update comparison.
+     *
+     * A default rather than an abstract member so every existing host keeps compiling. A host
+     * that does not know its version returns the default, and the updater then reports the
+     * installed version as unknown instead of inventing one.
+     */
+    fun appVersion(): String = "0.0.0"
 
     /** Private, persistent, app-owned. Connectomes, swap files, spill files. */
     fun dataDir(): File
+
+    /**
+     * The private directories a snapshot may copy.
+     *
+     * Defaults to [dataDir], which is correct on desktop. Android overrides it with the whole app
+     * data root so `shared_prefs` and `databases` are included -- those are where the settings and
+     * page layout actually live, and a backup that omitted them restored a launcher with none of
+     * its configuration.
+     *
+     * [noBackupDir] is excluded by the archiver regardless of what this returns: that directory
+     * holds credentials and a private CA, and copying it to another machine would move a security
+     * boundary with it.
+     */
+    fun backupRoots(): List<File> = listOf(dataDir())
+
+    /** Installed applications whose APKs a snapshot may include. Empty where that makes no sense. */
+    fun backupApps(): List<BackupApp> = emptyList()
 
     /**
      * Private and persistent, but deliberately excluded from platform backup.
@@ -91,6 +133,33 @@ interface PlatformHost {
     fun hasActiveCellularLine(): Boolean = false
 
     /**
+     * Stops one task, returning null on success or the operating system's reason for refusing.
+     *
+     * A capability rather than a pid-and-signal helper because Android is not allowed to signal
+     * another application at all. It has to ask ActivityManager, which only stops a background
+     * app, and the reason it gives when that fails is the useful part. Desktop hosts inherit the
+     * process-tree implementation below; Android overrides it in `AndroidHost`.
+     */
+    open fun killTask(pid: Int, packageName: String?): String? {
+        if (pid <= 0) return "That task has no process id."
+        val windows = System.getProperty("os.name").orEmpty().lowercase().contains("win")
+        val command = if (windows) {
+            listOf("taskkill", "/PID", pid.toString(), "/T", "/F")
+        } else {
+            listOf("kill", "-9", pid.toString())
+        }
+        return try {
+            val process = ProcessBuilder(command).redirectErrorStream(true).start()
+            val output = process.inputStream.bufferedReader().readText().trim()
+            val finished = process.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)
+            if (finished && process.exitValue() == 0) null
+            else output.ifBlank { "The operating system refused to stop pid $pid." }
+        } catch (error: Exception) {
+            "Could not stop pid $pid: ${error.message ?: error.javaClass.simpleName}"
+        }
+    }
+
+    /**
      * The hard ceiling on managed-heap allocation.
      *
      * A real limit on Android, where ART caps a process at a few hundred megabytes regardless of
@@ -128,6 +197,14 @@ interface PlatformHost {
      * "SM-S901U" or a hostname, not a UUID. The user can override it; this is only the seed.
      */
     fun deviceName(): String
+
+    /**
+     * The SoC part number, when the host can name one -- "SM8450" for a Snapdragon 8 Gen 1.
+     *
+     * Empty everywhere it cannot be read, which is every desktop and every test host. Callers
+     * must treat that as "unknown", never as a match.
+     */
+    fun socModel(): String = ""
 }
 
 /**
@@ -406,6 +483,10 @@ class JvmHost(
     private val os = System.getProperty("os.name").orEmpty().lowercase()
     private val home = File(System.getProperty("user.home").orEmpty())
 
+    /** Set by the desktop launcher's start script or the JVM; unknown otherwise. */
+    override fun appVersion(): String =
+        System.getProperty("prism.version").orEmpty().ifBlank { "0.0.0" }
+
     private val isWindows = os.contains("win")
     private val isMac = os.contains("mac") || os.contains("darwin")
 
@@ -438,15 +519,64 @@ class JvmHost(
         dir
     }
 
-    private val documentsRoot: File by lazy {
-        (rootOverride?.let { File(it, "documents") } ?: File(home, appName)).also { it.mkdirs() }
+    private val stores = HashMap<String, KeyValueStore>()
+
+    /**
+     * The packaged app's native payload, which is NOT beside the binary.
+     *
+     * The default null is right for a plain `java -jar` deployment and wrong for the one Prism
+     * actually ships: a jpackage image puts `Prism.exe` in `<app>/Prism/` and every DLL in
+     * `<app>/Prism/app/resources/`. `System.loadLibrary` searches the executable's directory, PATH
+     * and `java.library.path`, and none of those contain it.
+     *
+     * MEASURED in the packaged desktop build before this existed: `gguf_bridge unavailable
+     * (UnsatisfiedLinkError)`, followed by ggml reporting its one backend because a *different*
+     * bridge had loaded ggml first -- so local text inference was reported off while the process
+     * clearly had working native code in it. The same silence would have hit `sd_bridge`.
+     *
+     * Resolved from the location of Prism's own jar rather than a hard-coded path, so it works for
+     * an install, a build tree and a renamed output directory. `prism.native.dir` overrides it for
+     * a launcher that wants to be explicit.
+     */
+    override fun nativeLibraryDir(): File? {
+        System.getProperty("prism.native.dir")?.takeIf { it.isNotBlank() }
+            ?.let { File(it) }?.takeIf { it.isDirectory }?.let { return it }
+
+        val codeSource = runCatching {
+            File(JvmHost::class.java.protectionDomain.codeSource.location.toURI())
+        }.getOrNull() ?: return null
+        val base = if (codeSource.isDirectory) codeSource else codeSource.parentFile
+        val candidates = listOf(
+            File(base, "resources"),
+            base.parentFile?.let { File(it, "resources") },
+            File(System.getProperty("user.dir").orEmpty(), "resources"),
+        ).filterNotNull()
+        return candidates.firstOrNull { it.isDirectory && carriesPrismLibraries(it) }
     }
 
-    private val stores = HashMap<String, KeyValueStore>()
+    /** True when [dir] holds any of the bridges or their ggml, by name, on any platform. */
+    private fun carriesPrismLibraries(dir: File): Boolean = dir.listFiles()?.any { file ->
+        file.isFile && PRISM_LIBRARY_PREFIXES.any { prefix ->
+            file.name.startsWith(prefix) &&
+                (file.name.endsWith(".dll") || file.name.endsWith(".so") || file.name.endsWith(".dylib"))
+        }
+    } == true
+
+    private companion object {
+        val PRISM_LIBRARY_PREFIXES = listOf("ggml", "sd_bridge", "gguf_bridge", "libsd_bridge", "libggml", "libgguf_bridge")
+    }
 
     override fun dataDir(): File = dataRoot
     override fun cacheDir(): File = cacheRoot
-    override fun documentsDir(): File = documentsRoot
+
+    /**
+     * Resolved on every call rather than cached, because Settings can move it while Prism runs.
+     *
+     * The default is the platform's conventional location; [PrismStorage] is consulted so a folder
+     * chosen on another screen is honoured here without every caller knowing about it.
+     */
+    override fun documentsDir(): File =
+        PrismStorage.resolve(rootOverride?.let { File(it, "documents") } ?: File(home, appName))
 
     @Synchronized
     override fun prefs(name: String): KeyValueStore =

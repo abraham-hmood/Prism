@@ -14,4 +14,19 @@
     <!-- Packages received by the Prism Debug Bridge. Only this directory is exposed so Android's
          installer can read one file, never the app's private data. -->
     <files-path name="pdb_incoming" path="pdb/incoming/" />
+    <!-- A Prism update after it passes quarantine. Without this entry the FileProvider refused the
+         URI and the install button did nothing, which is exactly the kind of silent failure a
+         security check must not have. Scoped to the downloads Prism itself wrote. -->
+    <cache-path name="updates" path="updates/" />
+    <!-- A package just downloaded by the App Store, handed to Android's installer. Only that
+         folder is exposed: the store's other cache files are not the installer's business. -->
+    <cache-path name="appstore" path="appstore/" />
+    <!--
+        Finished VideoCraft films. They are written to Prism/VideoCraft/ in shared storage (see
+        VideoCraftStore.root), so they need an <external-path> entry: a FileProvider cannot grant
+        a path it has no root for. Without this, getUriForFile threw, the intent fell back to a
+        file:// URI, and Android 7+ refused to open the film in any player. Scoped to the one
+        folder the films live in, not to Prism/ as a whole.
+    -->
+    <external-path name="videocraft_films" path="Prism/VideoCraft/" />
 </paths>

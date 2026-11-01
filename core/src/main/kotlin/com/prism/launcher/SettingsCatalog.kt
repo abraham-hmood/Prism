@@ -1,6 +1,9 @@
 package com.prism.launcher
 
+import com.prism.core.PrismPlatform
+import com.prism.launcher.messaging.AiBackend
 import com.prism.launcher.mouse.MouseGlow
+import com.prism.launcher.stremio.StremioPlaybackSettings
 
 /**
  * Every Prism setting, declared once, in the order the phone shows them.
@@ -63,6 +66,14 @@ object SettingsCatalog {
 
         /** Whether the row applies right now, given the other settings. */
         val relevant: () -> Boolean
+
+        /**
+         * Whether the row can be used right now. Distinct from [relevant]: a hidden row has no
+         * meaning at all, while a disabled row has a meaning that needs something else first. The
+         * inference-mode rows are the first of the second kind -- they exist without a local model,
+         * and say so, rather than disappearing from a settings screen the user is searching.
+         */
+        val enabled: () -> Boolean get() = { true }
     }
 
     /** A boolean. */
@@ -102,6 +113,13 @@ object SettingsCatalog {
         val normalise: (String) -> String = { it },
         override val reach: Reach = Reach.EVERYWHERE,
         override val relevant: () -> Boolean = { true },
+        override val enabled: () -> Boolean = { true },
+        /**
+         * A confirmation the host must show before storing [values] entry. Returning null means
+         * the value is safe to store immediately. The phone uses this for forced diffusion; the
+         * desktop renders it as a modal, so the two hosts cannot disagree about the warning.
+         */
+        val warning: ((String) -> String?)? = null,
     ) : Item {
         init {
             require(labels.size == values.size) {
@@ -134,6 +152,7 @@ object SettingsCatalog {
         val target: Target,
         override val reach: Reach = Reach.EVERYWHERE,
         override val relevant: () -> Boolean = { true },
+        override val enabled: () -> Boolean = { true },
     ) : Item
 
     /** Read-only, for something worth showing that nobody edits here. */
@@ -163,6 +182,11 @@ object SettingsCatalog {
         SELECT_CUSTOM_FONT, SUMMARY_STATUS, SELECT_ISO, OPEN_TOUR, OPEN_LOCK_SCREEN,
         EMERGENCY_CONTACTS, STREMIO_REPOSITORIES, STREMIO_ADDONS, WIRELESS_DISPLAYS,
         OPEN_MOUSE_COLOR_STYLE_EDITOR, OPEN_MOUSE_FLOW_EDITOR, OPEN_PDB,
+        MOVE_PRISM_FOLDER, SELECT_ECHO_ASSETS, RESET_ECHO_ASSETS,
+        SELECT_ZOMBIES_ASSETS, RESET_ZOMBIES_ASSETS,
+        OPEN_EMAIL_SERVER, OPEN_EMAIL_CLIENT, EMAIL_CHECK_PORTS, EMAIL_BACKUP,
+        EMAIL_CLEAR_LOG, EMAIL_REPUTATION,
+        UPDATE_REPOSITORIES, CHECK_FOR_UPDATES, AUTO_SELECT_INFERENCE_MODE,
     }
 
     data class Section(val title: String, val items: List<Item>)
@@ -200,7 +224,7 @@ object SettingsCatalog {
             "AI engine, models, image generation, Nora, Aether and response behaviour",
             listOf(
                 "Intelligence & Messaging", "Speech", "Available LLM Models",
-                "Visual Intelligence (Diffusion)", "Nora (Brain-Based Generation)",
+                "Visual Intelligence (Diffusion)", "AI Images", "Nora (Brain-Based Generation)",
                 "Aether (Second Brain-Based AI)", "Response Behavior",
             ),
         ),
@@ -212,6 +236,21 @@ object SettingsCatalog {
         Group("Mouse", "RGB glow styles, flows and custom effects", listOf("Mouse")),
         Group("Personal", "Lock screen, medical card and getting started", listOf("Medical", "Getting started")),
         Group("Media", "Stremio", listOf("Stremio")),
+        Group(
+            "Email",
+            "The mail server this device serves, and the client that reads it",
+            listOf("Email"),
+        ),
+        Group(
+            "Storage",
+            "Where Prism keeps imported models, datasets, editor projects and generated files",
+            listOf("Storage"),
+        ),
+        Group(
+            "Minigames",
+            "Cabinet defaults and the optional Echo Chamber asset overrides",
+            listOf("Minigames"),
+        ),
         // AN EXPLICIT "Other" RATHER THAN LEAVING IT TO THE FALLBACK. A section named in no group
         // lands there anyway, but then nothing can SAY that it belongs there on purpose -- and a
         // display is a local-network feature that is neither a launcher preference nor a privacy
@@ -220,6 +259,7 @@ object SettingsCatalog {
         // A group of its own rather than another row under Trusted devices: the bridge needs
         // trust first, but it is a shell and not a sharing permission. Keeping it separate is
         // also what makes it discoverable when something has gone wrong.
+        Group("System Update", "Update repositories and installing a newer Prism build", listOf("System Update")),
         Group("Developer options", "Prism Debug Bridge and developer tooling", listOf("Developer options")),
     )
 
@@ -239,9 +279,9 @@ object SettingsCatalog {
     fun sections(): List<Section> = listOf(
         launcher(), launcherAesthetic(), browser(), privacyAndVpn(), meshBootstrap(),
         privacyAndHistory(), accessPoints(), wireGuard(), intelligence(), speech(), llmModels(),
-        diffusion(), nora(), aether(), responseBehavior(), trustedDevices(), blocklist(),
+        diffusion(), aiImages(), nora(), aether(), responseBehavior(), trustedDevices(), blocklist(),
         nameSystem(), typography(), writer(), mining(), sellingModels(), virtualization(),
-        gettingStarted(), medical(), stremio(), display(), mouse(), developer(),
+        gettingStarted(), medical(), stremio(), email(), systemUpdate(), storage(), display(), mouse(), minigames(), developer(),
     )
 
     /** Every item, flattened, for a search box. */
@@ -476,9 +516,15 @@ object SettingsCatalog {
                 relevant = prismVpn,
             ),
             Choice(
-                "Prism VPN role", "Serve the tunnel, or connect to somebody who does",
-                labels = listOf("Client", "Server"),
-                values = listOf(PrismSettings.PRISM_ROLE_CLIENT, PrismSettings.PRISM_ROLE_SERVER),
+                "Prism VPN role",
+                "Serve, connect, bridge several fleet servers, or relay for the mesh",
+                labels = listOf("Client", "Server", "Bridge", "Relay"),
+                values = listOf(
+                    PrismSettings.PRISM_ROLE_CLIENT,
+                    PrismSettings.PRISM_ROLE_SERVER,
+                    PrismSettings.PRISM_ROLE_BRIDGE,
+                    PrismSettings.PRISM_ROLE_RELAY,
+                ),
                 get = { PrismSettings.getPrismVpnRole() },
                 set = { PrismSettings.setPrismVpnRole(it) },
                 relevant = prismVpn,
@@ -654,6 +700,34 @@ object SettingsCatalog {
     private fun intelligence() = Section(
         "Intelligence & Messaging",
         listOf(
+            // FIRST, deliberately: this changes how every local answer is produced, and a user
+            // looking for it should not have to scroll past the model picker to find it.
+            Choice(
+                "Inference mode",
+                "How local generation spends model passes. Forced diffusion is experimental; the " +
+                    "parallel modes trade sampling variety for speed.",
+                labels = com.prism.launcher.messaging.InferenceMode.selectable.map { it.label },
+                values = com.prism.launcher.messaging.InferenceMode.selectable.map { it.id },
+                get = { PrismSettings.getInferenceMode() },
+                set = { PrismSettings.setInferenceMode(it) },
+                enabled = { PrismSettings.hasActiveLocalModel() },
+                warning = { value ->
+                    if (value == com.prism.launcher.messaging.InferenceMode.FORCED_DIFFUSION.id) {
+                        "Forced diffusion applies diffusion-style parallel denoising to a model " +
+                            "that was not trained for it. Replies are greedy, can be less coherent, " +
+                            "and can repeat themselves.\n\nEnable it anyway?"
+                    } else {
+                        null
+                    }
+                },
+            ),
+            Action(
+                "Select the fastest inference mode",
+                "Runs a short smoke test on the active local model and keeps whichever mode " +
+                    "measured the highest tokens per second.",
+                Target.AUTO_SELECT_INFERENCE_MODE,
+                enabled = { PrismSettings.hasActiveLocalModel() },
+            ),
             Choice(
                 "Prism AI engine", "Where answers come from",
                 labels = listOf("Local AI", "Cloud API", "Local cloud (Ollama)"),
@@ -702,6 +776,34 @@ object SettingsCatalog {
         ),
     )
 
+    /**
+     * The AI Images section: what ImageCraft draws at.
+     *
+     * A SECTION OF ITS OWN rather than a row under Diffusion, because the two answer different
+     * questions: Diffusion is where an image model comes FROM, and this is how the page that uses one
+     * behaves. The row is a list of sizes rather than a pair of number fields because the useful range
+     * is narrow -- a phone renders hundreds of pixels, not thousands -- and a slider between 64 and
+     * 4096 would spend most of its travel on sizes no checkpoint was trained for.
+     */
+    private fun aiImages() = Section(
+        "AI Images",
+        listOf(
+            Choice(
+                "Image resolution",
+                "What ImageCraft asks the image model for. A checkpoint trained at 512 is clamped to " +
+                    "what it can actually draw, and says so.",
+                labels = com.prism.launcher.messaging.ImageSize.CHOICES.map { it.label },
+                values = com.prism.launcher.messaging.ImageSize.CHOICES.map { it.stored },
+                get = { PrismSettings.getImageCraftSize().stored },
+                set = {
+                    PrismSettings.setImageCraftSize(
+                        com.prism.launcher.messaging.ImageSize.parse(it),
+                    )
+                },
+            ),
+        ),
+    )
+
     private fun nora() = Section(
         "Nora (Brain-Based Generation)",
         listOf(Action("Nora", "A predictive-coding brain rather than a model", Target.OPEN_NORA)),
@@ -734,13 +836,16 @@ object SettingsCatalog {
                 set = { PrismSettings.setKvCacheQuant(it) },
             ),
             Choice(
-                "AI backend", "Which processor runs the model",
+                "AI backend",
+                // THE ACCELERATOR QUESTION, ANSWERED WITH THE DEVICE IN FRONT OF THE USER. The row's
+                // description ends with what this machine's NPU actually is and which formats it can
+                // take, so choosing NPU is an informed act rather than a third unexplained option.
+                "Which processor runs the model. " + AiBackend.describe(),
                 labels = listOf("CPU", "GPU", "NPU"),
                 values = listOf("0", "1", "2"),
                 get = { PrismSettings.getAiBackend().toString() },
                 set = { PrismSettings.setAiBackend(it.toIntOrNull() ?: 0) },
             ),
-            Action("Prism Swap", "Lend a model more memory than the device has", Target.OPEN_PRISM_SWAP),
             Action("Dataset downloads", "What Prism may fetch to train on", Target.OPEN_DATASETS),
             Choice(
                 "Nebula post interval", "How often the personas post",
@@ -770,6 +875,21 @@ object SettingsCatalog {
                 "Run a shell on a trusted device over the mesh. No USB or wireless debugging needed.",
                 Target.OPEN_PDB,
             ),
+            // PRISM SWAP LIVES HERE NOW. It is not a preference a normal user should be tuning:
+            // it is the file the launcher pages offload into and the models page out of, and its
+            // size slider is the kind of thing that turns a working device into a slow one.
+            Action(
+                "Prism Swap",
+                "One shared swap file for models, brains, frame scratch and offloaded pages. On by default.",
+                Target.OPEN_PRISM_SWAP,
+            ),
+            Switch(
+                "Offload inactive pages",
+                "Pages that are not current and have no background work are written to Prism " +
+                    "Swap and released from memory. Costs a short reload when you swipe back.",
+                get = { PrismSettings.getPageOffloadEnabled() },
+                set = { PrismSettings.setPageOffloadEnabled(it) },
+            ),
         ),
     )
 
@@ -798,6 +918,299 @@ object SettingsCatalog {
             Action("Manage P2P DNS", "Names the mesh knows", Target.MANAGE_DNS_RECORDS),
             Action("P2P web hosting", "What this device serves", Target.MANAGE_WEB_HOSTING),
             Action("System diagnostics", "What is running", Target.OPEN_DIAGNOSTICS),
+        ),
+    )
+
+    /**
+     * The email stack. One section for both halves, because they are one account: the client logs
+     * in to the server this device serves with the same Lyke name and password.
+     *
+     * PORTS ARE NOT A FREE CHOICE ON THE INTERNET, so the fixed ones are the defaults and the
+     * mesh-only fields are labelled as such. A user who changes the internet port to 2525 will
+     * find no other mail server talking to it, which the status row says when the bind succeeds
+     * but nothing arrives.
+     */
+    private fun email(): Section {
+        fun config() = runCatching { com.prism.launcher.email.EmailSettings.load() }
+            .getOrElse { com.prism.launcher.email.EmailConfig() }
+        fun edit(block: (com.prism.launcher.email.EmailConfig) -> com.prism.launcher.email.EmailConfig) {
+            val next = block(config())
+            next.save()
+        }
+        return Section(
+            "Email",
+            listOf(
+                Switch(
+                    "Email server",
+                    "Serve inbound mail, submission and IMAP from this device",
+                    get = { config().enabled },
+                    set = { on -> edit { it.copy(enabled = on) } },
+                ),
+                Choice(
+                    "Network",
+                    "Auto follows the mesh; internet always uses 25, 587 and 993",
+                    labels = listOf("Auto", "Internet only", "Meshnet only"),
+                    values = com.prism.launcher.email.EmailConfig.Mode.entries.map { it.name },
+                    get = { config().mode.name },
+                    set = { edit { c -> c.copy(mode = com.prism.launcher.email.EmailConfig.Mode.valueOf(it)) } },
+                ),
+                Text(
+                    "Mesh domain",
+                    "The mail name this device claims in the P2P DNS, e.g. prism.com",
+                    get = { config().domain },
+                    set = { raw ->
+                        val next = config().copy(domain = raw.lowercase().trim().trimEnd('.'))
+                        next.save()
+                        if (next.enabled) com.prism.launcher.email.EmailSettings.publishMeshDomain(next.domain)
+                    },
+                ),
+                Text(
+                    "Inbound SMTP port", "Internet mail always arrives on 25",
+                    get = { config().inboundPort.toString() },
+                    set = { edit { c -> c.copy(inboundPort = it.toIntOrNull() ?: c.inboundPort) } },
+                    numeric = true,
+                ),
+                Text(
+                    "Submission port", "Internet submission always uses 587",
+                    get = { config().submissionPort.toString() },
+                    set = { edit { c -> c.copy(submissionPort = it.toIntOrNull() ?: c.submissionPort) } },
+                    numeric = true,
+                ),
+                Text(
+                    "IMAP port", "TLS-only; internet IMAP always uses 993",
+                    get = { config().imapPort.toString() },
+                    set = { edit { c -> c.copy(imapPort = it.toIntOrNull() ?: c.imapPort) } },
+                    numeric = true,
+                ),
+                Text(
+                    "Mesh inbound port", "What the server listens on when the meshnet is in use",
+                    get = { config().meshInboundPort.toString() },
+                    set = { edit { c -> c.copy(meshInboundPort = it.toIntOrNull() ?: c.meshInboundPort) } },
+                    numeric = true,
+                ),
+                Text(
+                    "Mesh submission port", "Mesh-only override for 587",
+                    get = { config().meshSubmissionPort.toString() },
+                    set = { edit { c -> c.copy(meshSubmissionPort = it.toIntOrNull() ?: c.meshSubmissionPort) } },
+                    numeric = true,
+                ),
+                Text(
+                    "Mesh IMAP port", "Mesh-only override for 993",
+                    get = { config().meshImapPort.toString() },
+                    set = { edit { c -> c.copy(meshImapPort = it.toIntOrNull() ?: c.meshImapPort) } },
+                    numeric = true,
+                ),
+                Switch(
+                    "Require TLS", "Refuse to authenticate or send over a plaintext session",
+                    get = { config().requireTls },
+                    set = { on -> edit { it.copy(requireTls = on) } },
+                ),
+                Switch(
+                    "Accept external mail", "Take mail from servers outside this meshnet",
+                    get = { config().acceptExternalMail },
+                    set = { on -> edit { it.copy(acceptExternalMail = on) } },
+                ),
+                Switch(
+                    "Relay outgoing mail", "Hand submission to a smart host instead of delivering directly",
+                    get = { config().allowRelay },
+                    set = { on -> edit { it.copy(allowRelay = on) } },
+                ),
+                Text(
+                    "Relay host", "The smart host that sends on your behalf",
+                    get = { config().relayHost },
+                    set = { edit { c -> c.copy(relayHost = it.trim()) } },
+                    relevant = { config().allowRelay },
+                ),
+                Text(
+                    "Relay port", "Usually 587 with STARTTLS",
+                    get = { config().relayPort.toString() },
+                    set = { edit { c -> c.copy(relayPort = it.toIntOrNull() ?: c.relayPort) } },
+                    numeric = true,
+                    relevant = { config().allowRelay },
+                ),
+                Text(
+                    "Relay username", "The smart host account",
+                    get = { config().relayUsername },
+                    set = { edit { c -> c.copy(relayUsername = it.trim()) } },
+                    relevant = { config().allowRelay },
+                ),
+                Text(
+                    "Relay password", "Stored with the rest of the mail settings",
+                    get = { config().relayPassword },
+                    set = { edit { c -> c.copy(relayPassword = it) } },
+                    secret = true,
+                    relevant = { config().allowRelay },
+                ),
+                Switch(
+                    "Spam filtering", "Score every incoming message and sort what scores too high",
+                    get = { config().spamFilter },
+                    set = { on -> edit { it.copy(spamFilter = on) } },
+                ),
+                Text(
+                    "Spam threshold", "Higher lets more through",
+                    get = { config().spamThreshold.toString() },
+                    set = { edit { c -> c.copy(spamThreshold = it.toIntOrNull() ?: c.spamThreshold) } },
+                    numeric = true,
+                    relevant = { config().spamFilter },
+                ),
+                Switch(
+                    "Malware filtering", "Quarantine executables and dangerous attachments",
+                    get = { config().malwareFilter },
+                    set = { on -> edit { it.copy(malwareFilter = on) } },
+                ),
+                Switch(
+                    "Blocklist recovery", "Check sending IPs against blocklists and explain how to delist",
+                    get = { config().blocklistRecovery },
+                    set = { on -> edit { it.copy(blocklistRecovery = on) } },
+                ),
+                Switch(
+                    "Backups", "Keep a copy of the mailbox on a schedule",
+                    get = { config().backups },
+                    set = { on -> edit { it.copy(backups = on) } },
+                ),
+                Text(
+                    "Backup interval", "Hours between backups",
+                    get = { config().backupEveryHours.toString() },
+                    set = { edit { c -> c.copy(backupEveryHours = it.toIntOrNull() ?: c.backupEveryHours) } },
+                    numeric = true,
+                    relevant = { config().backups },
+                ),
+                Text(
+                    "Retention", "Days a message is kept before pruning",
+                    get = { config().retentionDays.toString() },
+                    set = { edit { c -> c.copy(retentionDays = it.toIntOrNull() ?: c.retentionDays) } },
+                    numeric = true,
+                ),
+                Text(
+                    "Largest message", "Megabytes; bigger mail is refused before it is read",
+                    get = { (config().maxMessageBytes / (1024 * 1024)).toString() },
+                    set = { raw ->
+                        val mb = raw.toLongOrNull()?.coerceIn(1, 200) ?: 25
+                        edit { it.copy(maxMessageBytes = mb * 1024 * 1024) }
+                    },
+                    numeric = true,
+                ),
+                Text(
+                    "Abuse contact", "The mailbox complaints are sent to",
+                    get = { config().abuseContact },
+                    set = { edit { c -> c.copy(abuseContact = it.trim()) } },
+                ),
+                Text(
+                    "Privacy contact", "The mailbox data-protection requests are sent to",
+                    get = { config().privacyContact },
+                    set = { edit { c -> c.copy(privacyContact = it.trim()) } },
+                ),
+                Choice(
+                    "DMARC policy", "What receivers do with mail that fails both SPF and DKIM",
+                    labels = listOf("None (monitor)", "Quarantine", "Reject"),
+                    values = listOf("none", "quarantine", "reject"),
+                    get = { config().dmarcPolicy },
+                    set = { edit { c -> c.copy(dmarcPolicy = it) } },
+                ),
+                Text(
+                    "DKIM selector", "The name the public key is published under",
+                    get = { config().dkimSelector },
+                    set = { edit { c -> c.copy(dkimSelector = it.trim().ifBlank { "prism" }) } },
+                ),
+                Action("Email server dashboard", "Services, log, certificates and DNS records", Target.OPEN_EMAIL_SERVER),
+                Action("Email client", "Inbox, folders, filters, accounts and text alerts", Target.OPEN_EMAIL_CLIENT),
+                Action("Check mail ports", "Whether 25, 587 and 993 can be bound on this network", Target.EMAIL_CHECK_PORTS),
+                Action("Back up the mailbox now", "Write a copy into the email backups folder", Target.EMAIL_BACKUP),
+                Action("Refresh IP reputation", "Ask the blocklists about this public address", Target.EMAIL_REPUTATION),
+                Action("Clear the server log", "Remove what the dashboard is showing", Target.EMAIL_CLEAR_LOG),
+            ),
+        )
+    }
+
+    /**
+     * Echo Chamber's knobs.
+     *
+     * A section rather than rows on the Games page because they are defaults for every match, and
+     * because the asset folder is the kind of thing somebody configures once and expects to find in
+     * Settings rather than in a game's start screen.
+     */
+    private fun minigames() = Section(
+        "Minigames",
+        listOf(
+            Switch(
+                "Use custom Echo Chamber assets",
+                "Replace the generated 1024² textures and 3D meshes with the folder below",
+                get = { PrismSettings.getEchoChamberUseCustomAssets() },
+                set = { PrismSettings.setEchoChamberUseCustomAssets(it) },
+            ),
+            Action(
+                "Choose Echo Chamber assets folder",
+                "wall/floor/ceiling/enemy/exit .png and enemy/exit .obj; any file may be left out",
+                Target.SELECT_ECHO_ASSETS,
+            ),
+            Text(
+                "Echo Chamber assets folder",
+                "Where the optional custom textures and models live",
+                get = { PrismSettings.getEchoChamberAssetPath() },
+                set = { PrismSettings.setEchoChamberAssetPath(it.trim()) },
+            ),
+            Action(
+                "Reset Echo Chamber assets",
+                "Forget the custom folder and use the generated pack",
+                Target.RESET_ECHO_ASSETS,
+            ),
+            Choice(
+                "Echo Chamber difficulty",
+                "How fast and how persistent the hunters are",
+                labels = listOf("Shadow", "Hunter", "Nightmare"),
+                values = listOf("0", "1", "2"),
+                get = { PrismSettings.getEchoChamberDifficulty().toString() },
+                set = { PrismSettings.setEchoChamberDifficulty(it.toIntOrNull() ?: 1) },
+            ),
+            Text(
+                "Echo Chamber hunters",
+                "How many enemies share the maze (1–8)",
+                get = { PrismSettings.getEchoChamberEnemies().toString() },
+                set = { PrismSettings.setEchoChamberEnemies(it.toIntOrNull() ?: 3) },
+                numeric = true,
+            ),
+            // ── Zombies ──────────────────────────────────────────────────────
+            // A mesh host supplies the whole lobby's art. The folder mirrors the generated
+            // pack: maps/, models/, textures/ and sounds/. Any missing file falls back to the
+            // built-in generated one, so a host can replace one gun texture without shipping a
+            // complete game.
+            Switch(
+                "Use custom Zombies assets",
+                "Replace the generated maps, meshes, 1024² textures and sounds with the folder below",
+                get = { PrismSettings.getZombiesUseCustomAssets() },
+                set = { PrismSettings.setZombiesUseCustomAssets(it) },
+            ),
+            Action(
+                "Choose Zombies assets folder",
+                "maps/, models/, textures/, sounds/ — any file may be left out",
+                Target.SELECT_ZOMBIES_ASSETS,
+            ),
+            Text(
+                "Zombies assets folder",
+                "Where the optional baseline maps, meshes, textures and sounds live",
+                get = { PrismSettings.getZombiesAssetPath() },
+                set = { PrismSettings.setZombiesAssetPath(it.trim()) },
+            ),
+            Action(
+                "Reset Zombies assets",
+                "Forget the custom folder and use the generated baseline pack",
+                Target.RESET_ZOMBIES_ASSETS,
+            ),
+            Choice(
+                "Echo Chamber microphone sensitivity",
+                "How loud a sound has to be before it becomes a shout",
+                labels = listOf("Whisper friendly", "Normal", "Loud room"),
+                values = listOf("0.028", "0.055", "0.10"),
+                get = {
+                    val current = PrismSettings.getEchoChamberMicSensitivity()
+                    when {
+                        current < 0.04f -> "0.028"
+                        current > 0.08f -> "0.10"
+                        else -> "0.055"
+                    }
+                },
+                set = { PrismSettings.setEchoChamberMicSensitivity(it.toFloatOrNull() ?: 0.055f) },
+            ),
         ),
     )
 
@@ -1063,6 +1476,29 @@ object SettingsCatalog {
         ),
     )
 
+    /**
+     * Prism's own update channels.
+     *
+     * A section of its own rather than rows under About: a failed update is a security event, and
+     * the repository list is the user's own trust boundary. Burying it under an informational screen
+     * would make it look like a build detail rather than something that decides what gets installed.
+     */
+    private fun systemUpdate() = Section(
+        "System Update",
+        listOf(
+            Action(
+                "Update repositories",
+                "The GitHub repositories Prism may read releases from, including forks",
+                Target.UPDATE_REPOSITORIES,
+            ),
+            Action(
+                "Check for updates",
+                "Read every repository, quarantine the release, then install it only if it passes",
+                Target.CHECK_FOR_UPDATES,
+            ),
+        ),
+    )
+
     private fun gettingStarted() = Section(
         "Getting started",
         listOf(Action("Take the tour again", "What Prism is and where things are", Target.OPEN_TOUR)),
@@ -1148,6 +1584,50 @@ object SettingsCatalog {
         listOf(
             Action("Stremio repositories", "Where add-ons come from", Target.STREMIO_REPOSITORIES),
             Action("Stremio add-ons", "What is installed", Target.STREMIO_ADDONS),
+            Choice(
+                "Debrid account",
+                "A service that downloads a torrent for you and serves it as a direct link",
+                labels = StremioPlaybackSettings.PROVIDERS.map { StremioPlaybackSettings.label(it) },
+                values = StremioPlaybackSettings.PROVIDERS,
+                get = { StremioPlaybackSettings.provider() },
+                set = { StremioPlaybackSettings.setProvider(it) },
+            ),
+            Text(
+                "Debrid API key",
+                "Sent only to the provider above; it is the key from your account's dashboard",
+                get = { StremioPlaybackSettings.token() },
+                set = { StremioPlaybackSettings.setToken(it) },
+                secret = true,
+            ),
+            Switch(
+                "Play torrents",
+                "Use Prism's own torrent client when no debrid account is configured",
+                get = { StremioPlaybackSettings.torrentsEnabled() },
+                set = { StremioPlaybackSettings.setTorrentsEnabled(it) },
+            ),
+        ),
+    )
+
+    /**
+     * The one folder every feature writes user data into.
+     *
+     * A folder, not a path box. A typed path can point at a directory that does not exist, is not
+     * writable, or is inside the current one; a picker can only return a directory that exists, and
+     * the move itself refuses the nested and non-empty cases with an explanation.
+     */
+    private fun storage() = Section(
+        "Storage",
+        listOf(
+            Info(
+                "Prism data folder",
+                "Imported models, datasets, editor projects, generated video and audio",
+                value = { PrismPlatform.host.documentsDir().absolutePath },
+            ),
+            Action(
+                "Move Prism data folder",
+                "Copy everything to another folder, switch to it, then remove the old copy",
+                Target.MOVE_PRISM_FOLDER,
+            ),
         ),
     )
 }

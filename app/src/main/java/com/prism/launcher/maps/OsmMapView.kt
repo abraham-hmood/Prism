@@ -60,6 +60,8 @@ class OsmMapView(context: Context) : View(context) {
     var trusted: List<TrustedDevices.Trust> = emptyList()
     var favorites: List<MapPlace> = emptyList()
     var pois: List<MapPoi> = emptyList()
+    /** Walls tagged in GeoTag. Drawn as a second, distinct pin so they are not mistaken for POIs. */
+    var geoTagPins: List<MapPoi> = emptyList()
     var selectedPlace: MapPlace? = null
     var current: LatLon? = null
     var routePoints: List<LatLon> = emptyList()
@@ -356,6 +358,22 @@ class OsmMapView(context: Context) : View(context) {
             canvas.drawText("★", x, y + dp(6f), starPaint)
             starPaint.alpha = 255
         }
+
+        geoTagPins.forEach { pin ->
+            val x = screenX(pin.lon)
+            val y = screenY(pin.lat)
+            if (x < -30 || y < -30 || x > width + 30 || y > height + 30) return@forEach
+            paint.color = Color.rgb(255, 79, 216)
+            canvas.drawCircle(x, y, dp(11f), paint)
+            paint.color = Color.WHITE
+            canvas.drawCircle(x, y, dp(7f), paint)
+            starPaint.textSize = dp(11f)
+            starPaint.textAlign = Paint.Align.CENTER
+            starPaint.color = Color.rgb(255, 79, 216)
+            canvas.drawText("◆", x, y + dp(4f), starPaint)
+        }
+        // The favourite stars are drawn before this loop and rely on the default left alignment.
+        starPaint.textAlign = Paint.Align.LEFT
 
         selectedPlace?.let { place ->
             val x = screenX(place.lon)

@@ -1,4 +1,5 @@
 import org.jetbrains.compose.desktop.application.dsl.TargetFormat
+import java.io.File
 
 /**
  * Prism for Windows and Linux.
@@ -86,8 +87,18 @@ dependencies {
     implementation("org.jcodec:jcodec:0.2.5")
     implementation("org.jcodec:jcodec-javase:0.2.5")
 
+    // MP3 decoding for javax.sound. Java Sound has no MP3 reader of its own, and the voices and
+    // datasets Prism is pointed at are frequently MP3s. mp3spi registers a Java Sound SPI backed by
+    // JLayer, so AudioSystem.getAudioInputStream(file) opens an MP3 and the same conversion path as
+    // every other supported container turns it into PCM. Pure Java, no native component, ~200 KB.
+    implementation("com.googlecode.soundlibs:mp3spi:1.9.5.4")
+
     // The speech engines' tests: the parity harness runs the real engine classes on the JVM.
     testImplementation(kotlin("test"))
+
+    // JUnit 4 explicitly. kotlin("test") above resolves to whatever test framework the build uses,
+    // and the diffusion test needs Assume -- which exists in both, with different package names.
+    testImplementation("junit:junit:4.13.2")
 }
 
 // THE SAME PYTHON BOTH PLATFORMS RUN. prism_cakechat.py and prism_corpus.py live in the Android
@@ -113,7 +124,43 @@ compose.desktop {
 
         // The heap ceiling IS Nora's size budget -- NoraGeometry reads Runtime.maxMemory()
         // directly -- so this is a model-capacity setting, not just a JVM tuning knob.
-        jvmArgs("-Xmx4g")
+        //
+        // RAISED FROM 4G BECAUSE THE APP WAS DYING WITH "GC overhead limit exceeded", AND THEN MADE
+        // A FRACTION OF THE MACHINE RATHER THAN A FIXED NUMBER, which is the part that matters.
+        //
+        // That message is not an allocation failure -- it means the heap was full of live data and
+        // the collector never got ahead of it. A LARGER FIXED CEILING DOES NOT PREVENT IT: on a
+        // machine with little memory free, "-Xmx6g" on a box that has less than that to give does
+        // not raise a limit, it orders the JVM to page, and a heap that is being paged in is exactly
+        // how a collector falls behind. It is also a bigger Nora budget either way, which is why
+        // NoraGeometry reads maxMemory() instead of a hard-coded size.
+        //
+        // So the ceiling is a PERCENTAGE of physical RAM: 40% leaves the Gradle daemon, the Kotlin
+        // daemon, an IDE and the rest of the desktop room to work, and it scales down on a small
+        // machine (where a fixed 6 GB was the bug) and up on a large one (where a fixed 6 GB was
+        // leaving the app half the memory it could have used).
+        //
+        // The rest is ordinary G1 tuning for a desktop app that allocates in bursts: a bounded
+        // metaspace (a slow crawl into swap there also reports as a GC-overhead death), a region
+        // size that suits multi-megabyte image buffers, parallel reference processing because this
+        // app holds a lot of soft/weak caches, and string deduplication -- the resource tables
+        // (themes, word lists, the bip39 list) are full of duplicate strings by construction.
+        //
+        // The strings MEASURED at the top are kept as comments, because JVM arguments that race the
+        // allocator are worth being able to read back: the logs collected from the runs that
+        // reported this were full of
+        //     [WARN] [GgufInferenceService] RAM short by 0.56GB ... trying Tier 2 (full Prism Swap)
+        // on a desktop, for a 0.5B model -- i.e. the box had no free physical memory at all.
+        jvmArgs(
+            "-XX:MaxRAMPercentage=40",
+            "-XX:InitialRAMPercentage=6",
+            "-XX:MaxMetaspaceSize=1024m",
+            "-XX:+UseG1GC",
+            "-XX:G1HeapRegionSize=16m",
+            "-XX:+ParallelRefProcEnabled",
+            "-XX:+UseStringDeduplication",
+            "-XX:MaxGCPauseMillis=200",
+        )
 
         // NO -Djava.library.path HERE, AND THAT IS A FIX RATHER THAN AN OMISSION. It used to be set
         // to build/nativeLibs plus the developer's own PATH. jvmArgs are baked into the PACKAGED
@@ -164,6 +211,72 @@ compose.desktop {
                 packageName = "prism"
                 menuGroup = "Prism"
             }
+        }
+
+        // PROGUARD IS OFF FOR RELEASE PACKAGING, DELIBERATELY. The default release pipeline runs
+        // ProGuard 7.2.2 with -dontobfuscate and a keep rule for MainKt only, and it aborts on the
+        // 731 unresolved references in this classpath (JCEF, JNA and optional platform classes),
+        // so packageReleaseUberJarForCurrentOS could never finish. Turning shrinking off produces a
+        // bigger jar, but one that still contains the reflectively-loaded plugin and Room classes
+        // this app depends on; obfuscation was already disabled, so names are unchanged.
+        buildTypes.release.proguard {
+            isEnabled.set(false)
+        }
+    }
+}
+
+// ── The development classpath is frozen for the life of a run ────────────────────────────────
+//
+// `:desktop:run` puts the desktop and core jars on the JVM's classpath. A second Gradle build --
+// Android Studio's auto-build, another terminal, an app build
+// -- can rewrite or replace those files while this process is running. Classes already loaded keep
+// working; the next nested class the JVM loads lazily, such as `ModelCraft$Store` or a lambda,
+// fails with NoClassDefFoundError and takes the AWT thread with it.
+//
+// Copy the project-owned entries to a per-run directory before launch, so a build cannot pull the
+// files out from under the running app. Jars in the Gradle cache stay where they are; nothing
+// rebuilds those. Frozen directories are kept for a week rather than deleted on the next run: an
+// app that is still open may not have loaded every class yet, and deleting its classpath is the
+// failure this exists to prevent.
+// The Compose plugin registers `run` during its own apply, which is later than this script is
+// evaluated; configure each JavaExec as it appears rather than looking the task up by name.
+tasks.withType<JavaExec>().configureEach {
+    if (name == "run") {
+        val projectRoot = rootProject.layout.projectDirectory.asFile
+        val frozenRoot = layout.buildDirectory.dir("run-classpath").get().asFile
+
+        doFirst {
+            val stamp = System.currentTimeMillis().toString(36) + "-" + System.nanoTime().toString(36)
+            val frozen = File(frozenRoot, stamp).apply { mkdirs() }
+            val entries = mutableListOf<File>()
+            classpath.files.forEach { entry ->
+                if (!entry.exists()) return@forEach
+                if (entry.absolutePath.startsWith(frozenRoot.absolutePath + File.separator, true)) {
+                    return@forEach
+                }
+                val owned = entry.absolutePath.startsWith(
+                    projectRoot.absolutePath + File.separator,
+                    ignoreCase = true,
+                )
+                if (!owned) {
+                    entries += entry
+                    return@forEach
+                }
+                val copy = File(frozen, entry.relativeTo(projectRoot).path)
+                copy.parentFile?.mkdirs()
+                if (entry.isDirectory) {
+                    entry.copyRecursively(copy, overwrite = true)
+                } else {
+                    entry.copyTo(copy, overwrite = true)
+                }
+                entries += copy
+            }
+            classpath = project.files(entries)
+
+            val cutoff = System.currentTimeMillis() - 7L * 24 * 60 * 60 * 1000
+            frozenRoot.listFiles()
+                ?.filter { it != frozen && it.isDirectory && it.lastModified() < cutoff }
+                ?.forEach { old -> runCatching { old.deleteRecursively() } }
         }
     }
 }
@@ -240,6 +353,34 @@ val buildNativeKernels by tasks.registering(Exec::class) {
                 logger.lifecycle("nora_conv -> ${File(target, lib.name).absolutePath}")
             }
     }
+}
+
+// TESTS THAT TOUCH NATIVE BINDINGS NEED THE LIBRARY PATH. The packaged application finds the
+// libraries through its resources and `run` finds them through the JavaExec below, but a test JVM
+// gets neither -- so a test of the diffusion bridge would report "engine unavailable" and look like
+// a broken build rather than a missing path. Set here rather than copying libraries per test, and
+// harmless for tests that never load one.
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+    // A TEST JVM GETS 512 MB BY DEFAULT, which is where the desktop suite's own "GC overhead limit
+    // exceeded" came from: the diffusion and transcription tests load real weights, and a full run
+    // keeps every test class the JVM has touched alive for the whole session. Overridable, because a
+    // machine that cannot spare 3 GB should be able to say so rather than fail to run any tests.
+    maxHeapSize = providers.gradleProperty("prism.testHeap").orNull ?: "3g"
+    jvmArgs("-XX:+UseG1GC", "-XX:MaxMetaspaceSize=768m", "-XX:+ParallelRefProcEnabled")
+    systemProperty(
+        "java.library.path",
+        layout.buildDirectory.dir("nativeLibs").get().asFile.absolutePath +
+            File.pathSeparator + System.getProperty("java.library.path")
+    )
+    // Only when asked for: the diffusion test has its own default checkpoint path, and a property
+    // set to the empty string would override it with one that does not exist.
+    providers.gradleProperty("prism.sdModel").orNull?.let { systemProperty("prism.sdModel", it) }
+    // The opt-in inference probe. A forked test JVM does not reliably see the invoking shell's
+    // environment here, so the documented way to run it is `-Pprism.ggufProbe=1 -Pprism.ggufModel=...`
+    // and this hands both to the test as system properties. PRISM_GGUF_* still work where the
+    // environment does reach the fork.
+    providers.gradleProperty("prism.ggufProbe").orNull?.let { systemProperty("prism.ggufProbe", it) }
+    providers.gradleProperty("prism.ggufModel").orNull?.let { systemProperty("prism.ggufModel", it) }
 }
 
 // The console harness runs through JavaExec rather than the compose run task, so it needs the

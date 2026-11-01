@@ -36,17 +36,26 @@ enum class BlendMode(val label: String) {
     COLOR_BURN("Color Burn"),
     HARD_LIGHT("Hard Light"),
     SOFT_LIGHT("Soft Light"),
+    LINEAR_BURN("Linear Burn"),
+    DARKER_COLOR("Darker Color"),
+    LIGHTER_COLOR("Lighter Color"),
+    VIVID_LIGHT("Vivid Light"),
+    LINEAR_LIGHT("Linear Light"),
+    PIN_LIGHT("Pin Light"),
+    HARD_MIX("Hard Mix"),
     DIFFERENCE("Difference"),
     EXCLUSION("Exclusion"),
     ADD("Linear Dodge (Add)"),
     SUBTRACT("Subtract"),
+    DIVIDE("Divide"),
     HUE("Hue"),
     SATURATION("Saturation"),
     COLOR("Color"),
     LUMINOSITY("Luminosity");
 
     val separable: Boolean
-        get() = this != HUE && this != SATURATION && this != COLOR && this != LUMINOSITY
+        get() = this != HUE && this != SATURATION && this != COLOR && this != LUMINOSITY &&
+            this != DARKER_COLOR && this != LIGHTER_COLOR
 
     /** Separable formula, on 0..255 channels. */
     fun channel(base: Double, blend: Double): Double = when (this) {
@@ -62,10 +71,25 @@ enum class BlendMode(val label: String) {
         HARD_LIGHT -> if (blend <= 127.5) 2 * base * blend / 255.0
         else 255.0 - 2 * (255.0 - base) * (255.0 - blend) / 255.0
         SOFT_LIGHT -> softLight(base, blend)
+        LINEAR_BURN -> maxOf(0.0, base + blend - 255.0)
+        VIVID_LIGHT -> if (blend <= 127.5) {
+            if (blend <= 0.0) 0.0 else 255.0 - minOf(255.0, (255.0 - base) * 255.0 / (blend * 2.0))
+        } else {
+            val dodge = (blend - 127.5) * 2.0
+            if (dodge >= 255.0) 255.0 else minOf(255.0, base * 255.0 / (255.0 - dodge))
+        }
+        LINEAR_LIGHT -> (base + 2.0 * blend - 255.0).coerceIn(0.0, 255.0)
+        PIN_LIGHT -> if (blend <= 127.5) {
+            minOf(base, blend * 2.0)
+        } else {
+            maxOf(base, (blend - 127.5) * 2.0)
+        }
+        HARD_MIX -> if (base + blend >= 255.0) 255.0 else 0.0
         DIFFERENCE -> abs(base - blend)
         EXCLUSION -> base + blend - 2 * base * blend / 255.0
         ADD -> minOf(255.0, base + blend)
         SUBTRACT -> maxOf(0.0, base - blend)
+        DIVIDE -> if (blend <= 0.0) 255.0 else minOf(255.0, base / blend * 255.0)
         else -> blend
     }
 
@@ -129,6 +153,13 @@ internal fun blendPixel(base: Rgba, source: Rgba, mode: BlendMode): Rgba {
         val threshold = ((source.r * 7919 + source.g * 104729 + source.b * 1299709).toLong() % 255).toInt()
         val keep = source.a * threshold / 255.0
         return source.copy(a = keep)
+    }
+
+    if (mode == BlendMode.DARKER_COLOR || mode == BlendMode.LIGHTER_COLOR) {
+        val baseLuma = mode.luma(base.r, base.g, base.b)
+        val sourceLuma = mode.luma(source.r, source.g, source.b)
+        val keepSource = if (mode == BlendMode.DARKER_COLOR) sourceLuma < baseLuma else sourceLuma > baseLuma
+        return if (keepSource) source else base.copy(a = source.a)
     }
 
     val baseLuma = mode.luma(base.r, base.g, base.b)

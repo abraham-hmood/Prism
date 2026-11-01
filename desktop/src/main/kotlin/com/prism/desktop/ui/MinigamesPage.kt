@@ -15,6 +15,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -26,6 +27,10 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.prism.core.MeshTransport
+import com.prism.desktop.DesktopMinigameAudio
+import com.prism.launcher.minigames.ArcadeGames
+import com.prism.launcher.minigames.Echo
+import com.prism.launcher.minigames.EchoSessionLock
 import com.prism.launcher.minigames.MinigameMesh
 import com.prism.launcher.minigames.MinigameStore
 
@@ -51,10 +56,20 @@ import com.prism.launcher.minigames.MinigameStore
 fun MinigamesPage() {
     val colors = LocalPrismColors.current
     var game by remember { mutableStateOf(MinigameStore.lastGame()) }
+    var echoMatch by remember { mutableStateOf<MinigameMesh.Match?>(null) }
+    var echoStarted by remember { mutableStateOf(false) }
 
     // Not re-read on every recomposition: both of these touch the transport.
     val onMesh = remember { runCatching { MinigameMesh.isAvailable() }.getOrDefault(false) }
     val peers = remember { runCatching { MeshTransport.peerCount() }.getOrDefault(0) }
+
+    // One soundtrack for the page, keyed to the cabinet that is open. It stops when the picker is
+    // showing and when this page leaves composition, so the desktop does not keep playing to an
+    // empty room.
+    DisposableEffect(game) {
+        if (game.isBlank()) DesktopMinigameAudio.stop() else DesktopMinigameAudio.start(game)
+        onDispose { DesktopMinigameAudio.stop() }
+    }
 
     fun open(id: String) {
         game = id
@@ -71,6 +86,40 @@ fun MinigamesPage() {
     }
     if (game == GAME_WAR) {
         GameFrame("Paper War", onBack = { open("") }) { PaperWarPage() }
+        return
+    }
+    if (ArcadeGames.info(game) != null) {
+        GameFrame(ArcadeGames.info(game)!!.title, onBack = { open("") }) { ArcadePage(game) }
+        return
+    }
+    if (game == GAME_DOOM) {
+        GameFrame("DOOM", onBack = { open("") }) { DoomDesktopPage { open("") } }
+        return
+    }
+    if (game == GAME_ZOMBIES) {
+        GameFrame("Zombies", onBack = { open("") }) { ZombiesDesktopPage { open("") } }
+        return
+    }
+    if (game == GAME_ECHO) {
+        if (!echoStarted) {
+            GameFrame("Echo Chamber", onBack = { open("") }) {
+                EchoChamberMenu { match ->
+                    echoMatch = match
+                    echoStarted = true
+                }
+            }
+        } else {
+            EchoChamberGame(
+                match = echoMatch,
+                options = Echo.StartOptions(
+                    difficulty = com.prism.launcher.PrismSettings.getEchoChamberDifficulty(),
+                    enemies = com.prism.launcher.PrismSettings.getEchoChamberEnemies(),
+                ),
+            ) { _, _ ->
+                echoStarted = false
+                echoMatch = null
+            }
+        }
         return
     }
 
@@ -102,6 +151,27 @@ fun MinigamesPage() {
                     )
                     Hairline()
                     GameRow(
+                        title = "Echo Chamber",
+                        detail = "A pitch-black maze. Shout to see; the hunters hear it too. " +
+                            "Best " + MinigameStore.echoBest() + ".",
+                        onOpen = { open(GAME_ECHO) },
+                    )
+                    Hairline()
+                    GameRow(
+                        title = "DOOM",
+                        detail = "A launcher should be able to run DOOM. Three floors, one seed. " +
+                            MinigameStore.arcadeBest(GAME_DOOM).let { if (it > 0) "Best " + it + "." else "No run yet." },
+                        onOpen = { open(GAME_DOOM) },
+                    )
+                    Hairline()
+                    GameRow(
+                        title = "Zombies",
+                        detail = "Wave survival with three AI survivors, or a mesh host for four. " +
+                            "Best " + MinigameStore.arcadeBest(GAME_ZOMBIES) + ".",
+                        onOpen = { open(GAME_ZOMBIES) },
+                    )
+                    Hairline()
+                    GameRow(
                         title = "Paper War",
                         detail = base?.let {
                             it.name + " — level " + it.level + ", " + it.xp + " XP, " +
@@ -110,6 +180,17 @@ fun MinigamesPage() {
                         } ?: "A base, a world of countries to invade, and a battle simulator.",
                         onOpen = { open(GAME_WAR) },
                     )
+                    ArcadeGames.ALL.forEach { cabinet ->
+                        Hairline()
+                        GameRow(
+                            title = cabinet.title,
+                            detail = cabinet.blurb + " " +
+                                MinigameStore.arcadeBest(cabinet.id).let {
+                                    if (it > 0) "Best " + it + "." else cabinet.controls + "."
+                                },
+                            onOpen = { open(cabinet.id) },
+                        )
+                    }
                 }
             }
 
@@ -185,6 +266,9 @@ fun MinigamesPage() {
 private const val GAME_PONG = "pong"
 private const val GAME_CHESS = "chess"
 private const val GAME_WAR = "war"
+private const val GAME_ECHO = "echo"
+private const val GAME_DOOM = "doom"
+private const val GAME_ZOMBIES = "zombies"
 
 @Composable
 private fun GameRow(title: String, detail: String, onOpen: () -> Unit) {
@@ -211,24 +295,43 @@ private fun GameRow(title: String, detail: String, onOpen: () -> Unit) {
 @Composable
 private fun GameFrame(label: String, onBack: () -> Unit, content: @Composable () -> Unit) {
     val colors = LocalPrismColors.current
+    // The lock is process state, not Compose state. A listener is what makes the back link change
+    // the moment a live run starts rather than on the next unrelated recomposition.
+    var locked by remember { mutableStateOf(EchoSessionLock.isActive()) }
+    DisposableEffect(Unit) {
+        val listener: (Boolean) -> Unit = { locked = it }
+        EchoSessionLock.addListener(listener)
+        onDispose { EchoSessionLock.removeListener(listener) }
+    }
     Column {
         Row(
             Modifier.fillMaxWidth().padding(start = 28.dp, top = 14.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
-                "← all games",
+                if (locked) "← finish the run to go back" else "← all games",
                 fontSize = 12.sp,
-                color = colors.faint,
-                modifier = Modifier.clickableRow(onBack).padding(4.dp),
+                color = if (locked) colors.faint.copy(alpha = 0.4f) else colors.faint,
+                modifier = Modifier
+                    .clickableRow { if (!locked) onBack() }
+                    .padding(4.dp),
             )
             Spacer(Modifier.width(10.dp))
             Text(
                 label,
                 fontSize = 10.sp,
                 fontFamily = FontFamily.Monospace,
-                color = Color(0xFF6E6E7A),
+                color = colors.faint,
             )
+            if (locked) {
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    "SESSION LOCKED",
+                    fontSize = 9.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = colors.accent,
+                )
+            }
         }
         content()
     }

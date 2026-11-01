@@ -2,6 +2,13 @@ package com.prism.launcher.messaging
 
 import com.prism.core.PrismPlatform
 import com.prism.launcher.PrismSettings
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.nio.ByteBuffer
 
@@ -35,10 +42,21 @@ object GgufInferenceService {
     private fun loadBridge(): Boolean {
         // Dependency order matters: ggml-base underpins the backends, llama links all of them.
         val dependencies = listOf("ggml-base", "ggml-cpu", "ggml", "llama")
-        val roots = System.getProperty("java.library.path").orEmpty()
-            .split(java.io.File.pathSeparator)
-            .filter { it.isNotBlank() }
-            .map { java.io.File(it) }
+        // THE PACKAGED APP'S OWN DIRECTORY IS NOT ON java.library.path. A jpackage image keeps
+        // every DLL in `app/resources` while the JVM's library path is the runtime's bin, so
+        // `System.loadLibrary("gguf_bridge")` below fails with UnsatisfiedLinkError and local
+        // inference is switched off in a process that clearly has working native code -- MEASURED
+        // in the packaged desktop build. [PlatformHost.nativeLibraryDir] resolves it from the
+        // location of Prism's own jar; it is searched first because it is the copy that shipped.
+        val roots = buildList {
+            com.prism.core.PrismPlatform.host.nativeLibraryDir()?.let { add(it) }
+            addAll(
+                System.getProperty("java.library.path").orEmpty()
+                    .split(java.io.File.pathSeparator)
+                    .filter { it.isNotBlank() }
+                    .map { java.io.File(it) },
+            )
+        }
 
         for (name in dependencies) {
             val found = roots.asSequence()
@@ -59,7 +77,18 @@ object GgufInferenceService {
         }
 
         return try {
-            System.loadLibrary("gguf_bridge")
+            // BY ABSOLUTE PATH WHEN THE DIRECTORY IS KNOWN. `System.loadLibrary` searches the
+            // executable's directory, PATH and java.library.path -- none of which is where a
+            // jpackage image puts the bridge -- so even after the dependencies above were loaded
+            // from an explicit path this one line failed and local inference was declared off.
+            val bridge = roots.asSequence()
+                .map { java.io.File(it, System.mapLibraryName("gguf_bridge")) }
+                .firstOrNull { it.isFile }
+            if (bridge != null) {
+                System.load(bridge.absolutePath)
+            } else {
+                System.loadLibrary("gguf_bridge")
+            }
 
             // Before anything asks for a backend. The CPU kernels are separate libraries now (one
             // per ARM feature set, chosen by what this phone can actually execute -- see
@@ -91,20 +120,118 @@ object GgufInferenceService {
     private var currentKvCacheMode: Int = -1
     private var currentGpuMode: Int = -1
 
+    /**
+     * When the model was last loaded or used, for [releaseIfIdle]'s grace window.
+     *
+     * Loading a model is itself a memory spike, so Android can deliver `onLowMemory` immediately
+     * after a successful load. The app used to take that as a reason to free the model it had just
+     * finished loading, and the next generation would reload it -- on the S22 that produced a
+     * 16s load, a 22s first reply, another 16s load, then an ANR. A just-used model is not idle.
+     */
+    @Volatile
+    private var lastUseMillis: Long = 0L
+
+    /** How long a loaded model is protected from idle release after it is loaded or used. */
+    private const val RECENT_USE_GRACE_MS = 60_000L
+
+    /**
+     * Extra free RAM required, beyond the weights themselves, before they are copied into RAM.
+     *
+     * Copying wins on decode speed when it is possible at all (no page faults, no dependency on the
+     * storage subsystem), but it is only possible with room to spare: the copy is anonymous memory
+     * and Android answers anonymous pressure with ZRAM, not with eviction. 384 MB covers the KV
+     * cache, compute buffers and allocator slack for a phone-sized context, and stops a model that
+     * "just fits" from being copied into a swap file it will then spend every token faulting out
+     * of.
+     */
+    private const val WEIGHTS_RESIDENCY_HEADROOM_BYTES = 384L shl 20
+
     /** Delta callback for streaming generation: invoked once per generated piece of text. */
     fun interface TokenCallback {
         fun onToken(piece: String)
+
+        /**
+         * Live counters, posted by the native engine after the prompt and every few tokens.
+         *
+         * A default method rather than a second abstract one so every existing `TokenCallback {
+         * ... }` lambda keeps compiling. The bridge looks the method up by name and skips the
+         * call when a callback does not provide it.
+         */
+        fun onStats(
+            promptTokens: Int,
+            generated: Int,
+            contextUsed: Int,
+            contextSize: Int,
+            accepted: Int,
+            proposed: Int,
+        ) = Unit
+    }
+
+    /**
+     * A snapshot of the running decode, for the conversation's context meter.
+     *
+     * Context use is what the user can act on: it is the number that explains why a long thread
+     * eventually starts dropping its oldest turns. [accepted] and [proposed] are diagnostic --
+     * they say how well the selected speculative mode is hitting.
+     */
+    data class LiveStats(
+        val promptTokens: Int = 0,
+        val generated: Int = 0,
+        val contextUsed: Int = 0,
+        val contextSize: Int = 0,
+        val accepted: Int = 0,
+        val proposed: Int = 0,
+    ) {
+        /** 0f..1f, or 0 when no model has reported a context size yet. */
+        val contextFraction: Float
+            get() = if (contextSize <= 0) 0f
+            else (contextUsed.toFloat() / contextSize).coerceIn(0f, 1f)
+    }
+
+    @Volatile
+    var liveStats: LiveStats = LiveStats()
+        private set
+
+    /** Smoothed rate for the live ticker; 0 before the first token of the turn. */
+    @Volatile
+    var liveTokensPerSecond: Double = 0.0
+        private set
+
+    fun resetLiveStats() {
+        liveStats = LiveStats()
+        liveTokensPerSecond = 0.0
     }
 
     /** Where the ggml backend libraries live. Call before any backend is used; see [loadBridge]. */
     private external fun nativeSetBackendDir(dir: String)
 
+    /**
+     * Restricts inference threads to these CPUs (bitmask of indices; 0 = no restriction).
+     *
+     * Set once per process, before a model loads: the native side builds its threadpool during the
+     * load and the affinity belongs to that pool. See [com.prism.core.PrismCpu.performanceCoreMask]
+     * for why counting threads without naming cores does not work.
+     */
+    private external fun nativeSetInferenceCpuMask(mask: Long)
+
     private external fun nativeLoadModel(
         modelPath: String, nCtx: Int, nThreads: Int, kvCacheMode: Int, gpuMode: Int,
-        forceMmapFallback: Boolean, swapBuffer: ByteBuffer?
+        forceMmapFallback: Boolean, forceNoMmap: Boolean, swapBuffer: ByteBuffer?
     ): Long
-    private external fun nativeGenerate(handle: Long, userText: String, maxTokens: Int, temperature: Float, minP: Float): String
-    private external fun nativeGenerateStreaming(handle: Long, userText: String, maxTokens: Int, temperature: Float, minP: Float, callback: TokenCallback): String
+    private external fun nativeGenerate(handle: Long, userText: String, maxTokens: Int, temperature: Float, minP: Float, mode: Int): String
+    private external fun nativeGenerateStreaming(handle: Long, userText: String, maxTokens: Int, temperature: Float, minP: Float, callback: TokenCallback, mode: Int): String
+
+    /**
+     * Generation with a GBNF grammar masking the sampler.
+     *
+     * Empty grammar behaves exactly like [nativeGenerate]. Implemented natively (see
+     * `gguf_bridge.cpp`'s `build_sampler_chain`) rather than in Kotlin because masking happens
+     * between logits and sampling, which only the engine can do.
+     */
+    private external fun nativeGenerateJson(
+        handle: Long, userText: String, maxTokens: Int, temperature: Float, minP: Float,
+        grammar: String,
+    ): String
     private external fun nativeResetConversation(handle: Long)
     private external fun nativeFreeModel(handle: Long)
     private external fun nativeHasHexagonSupport(): Boolean
@@ -218,11 +345,14 @@ object GgufInferenceService {
         return runCatching {
             val raw = if (onToken != null) {
                 val splitter = ThinkTagSplitter(onAnswer = onToken, onReasoning = null)
-                val result = nativeGenerateStreaming(handle, userText, maxTokens, 0.7f, 0.05f, TokenCallback { splitter.feed(it) })
+                val result = nativeGenerateStreaming(
+                    handle, userText, maxTokens, 0.7f, 0.05f,
+                    TokenCallback { splitter.feed(it) }, InferenceMode.STANDARD.nativeId,
+                )
                 splitter.flush()
                 result
             } else {
-                nativeGenerate(handle, userText, maxTokens, 0.7f, 0.05f)
+                nativeGenerate(handle, userText, maxTokens, 0.7f, 0.05f, InferenceMode.STANDARD.nativeId)
             }
             stripThinkTags(raw)
         }.also { inFlight.decrementAndGet() }.getOrDefault("")
@@ -241,6 +371,7 @@ object GgufInferenceService {
      */
     @Synchronized
     fun resetConversation() {
+        resetLiveStats()
         if (handle == 0L) return
         runCatching { nativeResetConversation(handle) }
             .onFailure { PrismPlatform.log.warn("GgufInferenceService", "Could not reset: ${it.message}") }
@@ -264,13 +395,63 @@ object GgufInferenceService {
         if (loadError != null) return loadError
 
         inFlight.incrementAndGet()
+        val mode = InferenceMode.fromId(PrismSettings.getInferenceMode())
         return try {
-            val result = nativeGenerate(handle, userText, 512, 0.7f, 0.05f)
+            val result = nativeGenerate(handle, userText, 512, 0.7f, 0.05f, mode.nativeId)
             val stripped = stripThinkTags(result)
             if (stripped.isBlank()) "The model returned an empty response." else stripped
         } catch (e: Exception) {
             PrismPlatform.log.error("GgufInferenceService", "Generation failed for $modelPath", e)
             "Local AI Error: ${e.message}"
+        } finally {
+            inFlight.decrementAndGet()
+        }
+    }
+
+    /**
+     * Generates one independent, grammar-constrained reply.
+     *
+     * "INDEPENDENT" IS LOAD-BEARING. `nativeGenerate` appends every call to the handle's message
+     * history, which is right for a chat and wrong for a planner: scene three's request must not
+     * see scene two's JSON as prior conversation. So the history is cleared first, and the
+     * grammar masks the sampler so the reply is syntactically a JSON object even from a model that
+     * would otherwise wrap it in prose.
+     *
+     * Returns null -- not an error string -- because every caller has a deterministic fallback. A
+     * planner that cannot complete still produces a film; a planner that throws loses the render.
+     */
+    @Synchronized
+    fun generateJson(
+        modelPath: String,
+        userText: String,
+        grammar: String,
+        maxTokens: Int = 1024,
+        temperature: Float = 0.7f,
+    ): String? {
+        if (grammar.isBlank()) return generateResponse(modelPath, userText)
+
+        val loadError = ensureLoaded(modelPath)
+        if (loadError != null) {
+            PrismPlatform.log.warn("GgufInferenceService", "Cannot generate JSON: $loadError")
+            return null
+        }
+
+        inFlight.incrementAndGet()
+        return try {
+            nativeResetConversation(handle)
+            val raw = nativeGenerateJson(handle, userText, maxTokens, temperature, 0.05f, grammar)
+            val stripped = stripThinkTags(raw).trim()
+            when {
+                stripped.isBlank() -> null
+                stripped.startsWith("Error:") -> {
+                    PrismPlatform.log.warn("GgufInferenceService", "JSON generation failed: $stripped")
+                    null
+                }
+                else -> stripped
+            }
+        } catch (e: Exception) {
+            PrismPlatform.log.error("GgufInferenceService", "JSON generation failed for $modelPath", e)
+            null
         } finally {
             inFlight.decrementAndGet()
         }
@@ -286,9 +467,11 @@ object GgufInferenceService {
     @Synchronized
     fun generateResponseStreaming(
         modelPath: String, userText: String, maxTokens: Int,
-        onToken: (String) -> Unit, onReasoning: ((String) -> Unit)? = null
+        onToken: (String) -> Unit, onReasoning: ((String) -> Unit)? = null,
+        modeOverride: InferenceMode? = null,
     ): String {
-        val loadError = ensureLoaded(modelPath)
+        val mode = modeOverride ?: InferenceMode.fromId(PrismSettings.getInferenceMode())
+        val loadError = ensureLoaded(modelPath, modeOverride = mode)
         if (loadError != null) {
             onToken(loadError)
             return loadError
@@ -301,15 +484,53 @@ object GgufInferenceService {
         // rather than one inferred from characters.
         var tokens = 0
         val startedAt = System.currentTimeMillis()
+        liveStats = LiveStats()
+        liveTokensPerSecond = 0.0
         return try {
-            val result = nativeGenerateStreaming(handle, userText, maxTokens, 0.7f, 0.05f, TokenCallback { tokens++; splitter.feed(it) })
+            val callback = object : TokenCallback {
+                override fun onToken(piece: String) {
+                    tokens++
+                    splitter.feed(piece)
+                    // THE GAP BETWEEN TOKENS IS WHERE A HOT PHONE COOLS. Decode is a full sweep of
+                    // the weights per token, so a short pause here lets the SoC fall back to a
+                    // clock it can hold instead of running flat out until the platform forces the
+                    // issue. Zero on a cool phone, so this costs nothing when nothing is wrong.
+                    val pause = com.prism.core.PrismSustain.interTokenPauseMillis()
+                    if (pause > 0L) {
+                        runCatching { Thread.sleep(pause) }
+                    }
+                }
+
+                override fun onStats(
+                    promptTokens: Int, generated: Int, contextUsed: Int,
+                    contextSize: Int, accepted: Int, proposed: Int,
+                ) {
+                    liveStats = LiveStats(
+                        promptTokens = promptTokens,
+                        generated = generated,
+                        contextUsed = contextUsed,
+                        contextSize = contextSize,
+                        accepted = accepted,
+                        proposed = proposed,
+                    )
+                    val ms = System.currentTimeMillis() - startedAt
+                    if (ms > 250 && generated > 0) {
+                        liveTokensPerSecond = generated * 1000.0 / ms
+                    }
+                }
+            }
+            val result = nativeGenerateStreaming(
+                handle, userText, maxTokens, 0.7f, 0.05f, callback, mode.nativeId,
+            )
             splitter.flush()
             val elapsed = System.currentTimeMillis() - startedAt
             if (elapsed > 0 && tokens > 0) {
                 lastTokensPerSecond = tokens * 1000.0 / elapsed
+                liveTokensPerSecond = lastTokensPerSecond
                 PrismPlatform.log.info(
                     "GgufInferenceService",
-                    "Generated $tokens tokens in $elapsed ms (${"%.1f".format(lastTokensPerSecond)} tok/s)"
+                    "Generated $tokens tokens in $elapsed ms (${"%.1f".format(lastTokensPerSecond)} tok/s, " +
+                        "mode=${mode.label})"
                 )
             }
             val stripped = stripThinkTags(result)
@@ -370,10 +591,53 @@ object GgufInferenceService {
      * Anything short by more than the full-swap threshold (or that Prism Swap's own free storage
      * can't cover) still fails, with the original message.
      */
-    private fun ensureLoaded(modelPath: String, onStage: ((String) -> Unit)? = null): String? {
+    private fun ensureLoaded(
+        modelPath: String,
+        onStage: ((String) -> Unit)? = null,
+        modeOverride: InferenceMode? = null,
+    ): String? {
         val kvCacheMode = kvCacheModeFor(PrismSettings.getKvCacheQuant())
-        val gpuMode = PrismSettings.getAiBackend()
-        if (handle != 0L && currentModelPath == modelPath && currentKvCacheMode == kvCacheMode && currentGpuMode == gpuMode) return null
+        // THE OFFLOAD BACKEND THAT PREVIOUSLY STALLED IS NOT TRIED AGAIN IN THIS PROCESS. GPU
+        // (OpenCL) and NPU drivers can hang inside their own initialization, and `llama_model_load_
+        // from_file` has no timeout -- so a driver that never returns leaves the load at "Loading
+        // model weights..." forever with no error to report. See [reportStalledLoad]: the UI calls
+        // it when a load has run for minutes, and the next attempt runs on CPU, which is what
+        // actually gets the user to a working model. Changing the backend in Settings clears it.
+        val requestedBackend = PrismSettings.getAiBackend()
+        val offloadSuspended = requestedBackend != 0 && requestedBackend == stalledBackend
+        val inferenceMode = modeOverride ?: InferenceMode.fromId(PrismSettings.getInferenceMode())
+        // 3 is the bridge's "offer every device" loader. Heterogeneous execution is the one mode
+        // whose whole purpose is splitting the graph, so it overrides a CPU-only backend
+        // preference -- otherwise picking it with the backend set to CPU would silently run
+        // exactly like Standard decoding. When no accelerator is registered the loader falls back
+        // to CPU by itself, so there is nothing unsafe about asking.
+        val gpuMode = when {
+            offloadSuspended -> 0
+            // Adreno 730 (Snapdragon 8 Gen 1) is not merely slow on ggml's OpenCL backend: it
+            // aborts inside the driver on the first decode. The abort is a native SIGABRT, so
+            // there is no exception to catch and no CPU retry -- the whole app dies. Treat the
+            // accelerator as unavailable on this SoC rather than handing it the graph.
+            isUnstableOpenClSoc() -> 0
+            inferenceMode == InferenceMode.HETERO -> 3
+            else -> requestedBackend
+        }
+        if (isUnstableOpenClSoc() && (requestedBackend != 0 || inferenceMode == InferenceMode.HETERO)) {
+            PrismPlatform.log.warn(
+                "GgufInferenceService",
+                "GPU/NPU offload disabled on ${PrismPlatform.host.deviceName()}: its OpenCL driver aborts during decode"
+            )
+        }
+        if (offloadSuspended) {
+            PrismPlatform.log.warn(
+                "GgufInferenceService",
+                "GPU/NPU offload suspended after an earlier stalled load -- loading $modelPath on CPU"
+            )
+            onStage?.invoke("Running on the CPU — GPU offload stalled on an earlier attempt…")
+        }
+        if (handle != 0L && currentModelPath == modelPath && currentKvCacheMode == kvCacheMode && currentGpuMode == gpuMode) {
+            lastUseMillis = System.currentTimeMillis()
+            return null
+        }
 
         if (handle != 0L) {
             onStage?.invoke("Freeing previous model...")
@@ -386,14 +650,65 @@ object GgufInferenceService {
         // for why 0.8 x core count was the wrong shape on a big.LITTLE phone: it lands in the little
         // cluster, and ggml synchronises its threads at every graph node, so the slowest thread sets
         // the pace of the whole graph.
-        val threads = com.prism.core.PrismCpu.inferenceThreads()
+        //
+        // ...and then through the thermal governor, which is the difference between a phone that
+        // holds 4 threads all evening and one that spikes to 4 on every message, throttles, and then
+        // spends minutes at 2 anyway. See PrismSustain for why trimming threads is the right lever
+        // before Android trims the clocks.
+        val thermalThreads = com.prism.core.PrismSustain.inferenceThreads(
+            com.prism.core.PrismCpu.inferenceThreads()
+        )
+        val threads = thermalThreads
+        if (threads < com.prism.core.PrismCpu.inferenceThreads()) {
+            PrismPlatform.log.info(
+                "GgufInferenceService",
+                "Thermal budget: ${com.prism.core.PrismCpu.inferenceThreads()} -> $threads threads " +
+                    "(${com.prism.core.PrismSustain.describe()})"
+            )
+        }
+        // ...and then actually PUT them there. The count alone does not bind anything; the mask is
+        // what stops the scheduler parking one of them on a little core.
+        if (bridgeLoaded) {
+            runCatching { nativeSetInferenceCpuMask(com.prism.core.PrismCpu.performanceCoreMask) }
+                .onFailure { PrismPlatform.log.warn("GgufInferenceService", "Could not set CPU affinity: ${it.message}") }
+        }
 
         onStage?.invoke("Checking available memory...")
         val deficit = ramDeficitBytes(modelPath)
         if (deficit == null) {
             lastLoadDegradedMode = DegradedMode.NONE
             onStage?.invoke("Loading model weights...")
-            return attemptLoad(modelPath, 2048, threads, kvCacheMode, gpuMode, forceMmapFallback = false, swapBuffer = null)
+            // DO THE WEIGHTS FIT, OR JUST THE BOOKKEEPING?
+            //
+            // [ramDeficitBytes] deliberately counts only what CANNOT be evicted (KV cache, compute
+            // buffers, runtime structures) -- the weights are mmap-able, so a model "fits" even
+            // when its file is larger than free RAM. That is the right answer for whether a load
+            // will succeed, and the WRONG answer for how to load it.
+            //
+            // Copying the weights into anonymous memory only works if there is room for them.
+            // When there is not, the copy is charged against swap: MEASURED on a Galaxy S22 with
+            // 150 MB free and a 1.1 GB Q5_K_M model, the load took MINUTES instead of ten seconds,
+            // with 84 MB of the process already in ZRAM before the load finished, and every
+            // generated token then faulted its weights back out of a compressed swap file. Mapped
+            // pages are clean and file-backed: the kernel can drop them instantly, no ZRAM write,
+            // no thrash, and the load itself is a few page-table entries.
+            //
+            // The old measurement that made "always copy" look right ("0.1 tok/s with mmap") was
+            // taken on a build compiled at -O0 -- the same 0.1 tok/s the whole engine produced, with
+            // or without mmap. See APP_CFLAGS_DEBUG in app/src/main/cpp/CMakeLists.txt.
+            val weights = runCatching { File(modelPath).length() }.getOrDefault(0L)
+            val weightsFit = availableRamBytes() > weights + WEIGHTS_RESIDENCY_HEADROOM_BYTES
+            if (!weightsFit) {
+                PrismPlatform.log.info(
+                    "GgufInferenceService",
+                    "Weights (${formatGb(weights)}GB) exceed free RAM (${formatGb(availableRamBytes())}GB) " +
+                        "-- mapping them instead of copying, so decode does not run out of swap"
+                )
+            }
+            return attemptLoad(
+                modelPath, 2048, threads, kvCacheMode, gpuMode,
+                forceMmapFallback = !weightsFit, forceNoMmap = weightsFit, swapBuffer = null,
+            )
         }
 
         val mitigationThreshold = PrismSettings.getPrismSwapMitigationThresholdBytes()
@@ -408,7 +723,10 @@ object GgufInferenceService {
                     "(mmap fallback, kvCache=$degradedKvCacheMode, nCtx=$degradedNCtx)"
             )
             onStage?.invoke("Not quite enough free RAM -- applying reduced-memory settings...")
-            val err = attemptLoad(modelPath, degradedNCtx, threads, degradedKvCacheMode, gpuMode, forceMmapFallback = true, swapBuffer = null)
+            val err = attemptLoad(
+                modelPath, degradedNCtx, threads, degradedKvCacheMode, gpuMode,
+                forceMmapFallback = true, forceNoMmap = false, swapBuffer = null,
+            )
             if (err == null) {
                 lastLoadDegradedMode = DegradedMode.MITIGATED
                 return null
@@ -433,7 +751,10 @@ object GgufInferenceService {
             // CPU only under full swap -- combining this with GPU/NPU offload isn't a case worth
             // supporting for what's already the last-resort tier.
             onStage?.invoke("Loading model weights via Prism Swap (this will be slower)...")
-            val err = attemptLoad(modelPath, 1024, threads, kvCacheMode, 0, forceMmapFallback = true, swapBuffer = swapBuffer)
+            val err = attemptLoad(
+                modelPath, 1024, threads, kvCacheMode, 0,
+                forceMmapFallback = true, forceNoMmap = false, swapBuffer = swapBuffer,
+            )
             if (err == null) {
                 lastLoadDegradedMode = DegradedMode.FULL_SWAP
                 return null
@@ -457,17 +778,108 @@ object GgufInferenceService {
     @Synchronized
     fun preload(modelPath: String, onStage: ((String) -> Unit)? = null): String? = ensureLoaded(modelPath, onStage)
 
+    /**
+     * Loads [modelPath] on a scope that outlives the page that asked for it.
+     *
+     * WHY THE ENGINE OWNS THE SCOPE. Activation used to launch this on the page's own coroutine
+     * scope, and the launcher offloads pages -- so a load still in flight when the page went away
+     * was cancelled, its completion callback never ran, and the progress sheet sat on "Loading model
+     * weights..." with nothing behind it. A native load cannot be cancelled anyway: it is one
+     * blocking JNI call, so cancelling the coroutine only ever lost the answer.
+     *
+     * [onFinish] is invoked exactly once, on the main dispatcher, with null on success or a message
+     * on failure. Nothing on this path throws -- an [Error] from native code becomes a message too,
+     * because an escaping Error is what leaves a caller waiting forever.
+     */
+    fun preloadEager(
+        modelPath: String,
+        onStage: ((String) -> Unit)? = null,
+        onFinish: ((String?) -> Unit)? = null,
+    ): Job = loadScope.launch {
+        val error = try {
+            preload(modelPath, onStage)
+        } catch (t: Throwable) {
+            if (t is CancellationException) throw t
+            PrismPlatform.log.error("GgufInferenceService", "Loading $modelPath failed", t)
+            "Error: ${t.javaClass.simpleName} while loading ${File(modelPath).name}" +
+                (t.message?.let { ": $it" } ?: "")
+        }
+        withContext(Dispatchers.Main) { onFinish?.invoke(error) }
+    }
+
+    /**
+     * The backend that stalled, or 0 (CPU, i.e. nothing to avoid).
+     *
+     * Read by [ensureLoaded] to skip the offload path that hung, and cleared by [allowGpuOffloadAgain]
+     * -- which `PrismSettings.setAiBackend` calls, so choosing a backend again is the user saying
+     * "try once more" rather than being permanently overruled by a stale suspicion.
+     */
+    @Volatile
+    private var stalledBackend: Int = 0
+
+    /** True while GPU/NPU offload is being skipped because an earlier load stalled with it on. */
+    fun gpuOffloadSuspended(): Boolean =
+        PrismSettings.getAiBackend() != 0 && PrismSettings.getAiBackend() == stalledBackend
+
+    /** Clears the stall suspicion -- see [stalledBackend]. */
+    fun allowGpuOffloadAgain() {
+        stalledBackend = 0
+    }
+
+    /**
+     * Called by the UI when a load has been running long enough that it offered to leave it in the
+     * background. Records which offload backend was in play so the NEXT attempt skips it; the load
+     * already in flight cannot be interrupted, so this is the only remedy that exists for a driver
+     * that hangs inside `llama_model_load_from_file` with no timeout of its own.
+     */
+    fun reportStalledLoad(modelPath: String) {
+        val backend = PrismSettings.getAiBackend()
+        if (backend != 0) stalledBackend = backend
+        val consequence = if (backend == 0) {
+            "the load may simply be large."
+        } else {
+            "the next attempt will run on CPU instead."
+        }
+        PrismPlatform.log.warn(
+            "GgufInferenceService",
+            "${File(modelPath).name} has been loading for minutes with backend=$backend; $consequence",
+        )
+    }
+
+    /**
+     * Loads run here rather than on a page's scope. See [preloadEager].
+     *
+     * SupervisorJob rather than a plain one, and never cancelled: a failed load must not take the
+     * engine's ability to try again with it.
+     */
+    private val loadScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     private fun attemptLoad(
         modelPath: String, nCtx: Int, threads: Int, kvCacheMode: Int, gpuMode: Int,
-        forceMmapFallback: Boolean, swapBuffer: ByteBuffer?
+        forceMmapFallback: Boolean, forceNoMmap: Boolean, swapBuffer: ByteBuffer?
     ): String? {
         PrismPlatform.log.info(
             "GgufInferenceService",
             "Loading GGUF model $modelPath (threads=$threads, kvCacheMode=$kvCacheMode, gpuMode=$gpuMode, " +
-                "forceMmapFallback=$forceMmapFallback, swap=${swapBuffer != null})"
+                "forceMmapFallback=$forceMmapFallback, forceNoMmap=$forceNoMmap, swap=${swapBuffer != null})"
         )
         val startedAt = System.currentTimeMillis()
-        val loaded = nativeLoadModel(modelPath, nCtx, threads, kvCacheMode, gpuMode, forceMmapFallback, swapBuffer)
+        val loaded = try {
+            nativeLoadModel(modelPath, nCtx, threads, kvCacheMode, gpuMode, forceMmapFallback, forceNoMmap, swapBuffer)
+        } catch (t: Throwable) {
+            // AN Error IS NOT AN Exception, and this used to let one through. UnsatisfiedLinkError
+            // (a backend library that did not unpack) and OutOfMemoryError (a failed mmap under
+            // memory pressure) both leave here as Errors, and a caller that only caught Exception
+            // never learned the load had ended -- which is exactly what a progress sheet stuck on
+            // "Loading model weights..." looks like from the outside.
+            PrismPlatform.log.error(
+                "GgufInferenceService",
+                "Native load of $modelPath threw ${t.javaClass.name}",
+                t,
+            )
+            return "Error: loading this model failed in native code " +
+                "(${t.javaClass.simpleName}${t.message?.let { ": $it" } ?: ""})."
+        }
         if (loaded == 0L) {
             return "Error: Failed to load GGUF model. It may be corrupted, quantized in an unsupported way, or use an unsupported architecture."
         }
@@ -480,7 +892,26 @@ object GgufInferenceService {
         currentModelPath = modelPath
         currentKvCacheMode = kvCacheMode
         currentGpuMode = gpuMode
+        lastUseMillis = System.currentTimeMillis()
         return null
+    }
+
+    /**
+     * Snapdragon 8 Gen 1's Adreno 730 is the one accelerator this app must not use.
+     *
+     * MEASURED on the Galaxy S22 this was developed against: selecting GPU, or Heterogeneous
+     * execution, loads the model and then aborts inside `libggml-opencl` on the first decode. The
+     * abort is a native `std::out_of_range` in the OpenCL kernel cache, so no Kotlin catch and no
+     * CPU retry can run -- the entire launcher dies. It is also slower than the CPU when it does
+     * not abort, so there is nothing to preserve by trying.
+     *
+     * Matched on the SoC rather than on a driver version because Samsung does not expose an
+     * OpenCL platform to apps at all on this build; the failure is the mobile driver generation,
+     * not one vendor's package.
+     */
+    private fun isUnstableOpenClSoc(): Boolean {
+        val soc = runCatching { PrismPlatform.host.socModel() }.getOrDefault("")
+        return soc.equals("SM8450", ignoreCase = true)
     }
 
     private fun formatGb(bytes: Long): String = "%.2f".format(bytes / (1024.0 * 1024.0 * 1024.0))
@@ -578,6 +1009,11 @@ object GgufInferenceService {
         if (isGenerating) return 0L
         synchronized(this) {
             if (handle == 0L || isGenerating) return 0L
+            // A model that was loaded or used seconds ago is not idle in any sense the user
+            // would recognise. Freeing it here is what turned a low-memory callback into a
+            // reload loop; the grace window is long enough to cover a load plus the first
+            // prompt, and short enough that a genuinely backgrounded app still gives the RAM back.
+            if (System.currentTimeMillis() - lastUseMillis < RECENT_USE_GRACE_MS) return 0L
             val size = currentModelPath?.let { runCatching { File(it).length() }.getOrDefault(0L) } ?: 0L
             nativeFreeModel(handle)
             handle = 0L

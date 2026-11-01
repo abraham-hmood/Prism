@@ -32,11 +32,24 @@ import com.prism.launcher.nora.IosUi
  * is wired to ([GgufInferenceService.preload]'s `onStage`, [LocalImageService.preload]'s
  * `onStage`, [ModelDownloadManager]'s copy-progress callback) fires from a background/IO thread.
  */
-class ModelLoadProgressDialog(context: Context, title: String = "Loading Model") {
+class ModelLoadProgressDialog(
+    context: Context,
+    title: String = "Loading Model",
+    /**
+     * Invoked when the user asks to stop watching a load that is taking a long time.
+     *
+     * THE LOAD KEEPS RUNNING -- a native load is one blocking call with no cancellation hook, so
+     * closing the sheet is the only thing "cancel" could honestly mean here. What this prevents is
+     * the worse outcome: a sheet with no exit, sitting on "Loading model weights..." while the user
+     * waits for something they cannot influence. See [update]'s `allowBackground`.
+     */
+    private val onRunInBackground: (() -> Unit)? = null,
+) {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val dialog: Dialog
     private val statusView: TextView
+    private val backgroundView: TextView
     private val progressBar: ProgressBar
 
     init {
@@ -79,6 +92,22 @@ class ModelLoadProgressDialog(context: Context, title: String = "Loading Model")
         }
         card.addView(statusView)
 
+        // Only ever shown when the caller asked for it AND supplied a handler: a control that does
+        // nothing is worse than no control.
+        backgroundView = TextView(ctx).apply {
+            text = "Run in background"
+            textSize = 14f
+            gravity = Gravity.CENTER
+            setTextColor(IosUi.accent(ctx))
+            setPadding(0, IosUi.dp(ctx, 14f), 0, 0)
+            visibility = ViewGroup.GONE
+            setOnClickListener {
+                dismiss()
+                onRunInBackground?.invoke()
+            }
+        }
+        card.addView(backgroundView)
+
         PrismFontEngine.applyToView(card)
 
         dialog = Dialog(ctx).apply {
@@ -97,10 +126,17 @@ class ModelLoadProgressDialog(context: Context, title: String = "Loading Model")
 
     /** [percent] null means indeterminate (no numeric progress for this stage -- e.g. the native
      * model-load call itself has no finer-grained signal to report); 0..100 shows a real bar,
-     * used for the byte-counted file-copy stage. */
-    fun update(status: String, percent: Int? = null) {
+     * used for the byte-counted file-copy stage.
+     *
+     * [allowBackground] shows the way out described on [onRunInBackground]. A caller turns it on once
+     * a load has run long enough that waiting on it stops being reasonable -- which is the honest
+     * signal that something (a driver that hung, a model much larger than the phone) is not going to
+     * finish in the user's patience. */
+    fun update(status: String, percent: Int? = null, allowBackground: Boolean = false) {
         mainHandler.post {
             statusView.text = status
+            backgroundView.visibility =
+                if (allowBackground && onRunInBackground != null) ViewGroup.VISIBLE else ViewGroup.GONE
             if (percent == null) {
                 progressBar.isIndeterminate = true
             } else {

@@ -31,7 +31,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.prism.core.PrismCpu
 import com.prism.launcher.PrismSettings
-import com.prism.launcher.quant.PrismQuantizer
+import com.prism.launcher.quant.QuantTarget
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -50,16 +50,25 @@ import java.io.File
  *
  * ## Why the progress bar reads the output file
  *
- * `llama_model_quantize` is one blocking native call with no progress callback. The only observable
- * evidence of progress is the destination file growing, so that is what is watched, against
- * [PrismQuantizer.estimateOutputBytes]. The estimate is derived from the SOURCE's bits per weight rather
- * than from its size -- requantising a Q4_K_M to Q2_K roughly halves it while the same target from an F16
- * cuts it by six, so a size-only guess produces a bar that finishes at 40% or runs past 100%.
+ * Both quantisers are one blocking call with no progress callback. The only observable evidence of
+ * progress is the destination file growing, so that is what is watched, against the target's own
+ * [QuantTarget.estimateOutputBytes]. For a GGUF that estimate is derived from the SOURCE's bits per
+ * weight rather than from its size -- requantising a Q4_K_M to Q2_K roughly halves it while the same
+ * target from an F16 cuts it by six, so a size-only guess produces a bar that finishes at 40% or runs
+ * past 100%. For a safetensors checkpoint it is exact, because its header already states every
+ * tensor's shape.
+ *
+ * ## Two containers, one page
+ *
+ * A `.gguf` goes through llama.cpp's quantiser; a safetensors checkpoint goes through Prism's own
+ * streaming block quantiser, which is why the level list is rebuilt from the chosen file rather than
+ * being a fixed enum. Everything else on this page -- the space check, the naming, the progress -- is
+ * the same for both, which is what [QuantTarget] is for.
  *
  * ## The low-bit levels carry their own warnings
  *
  * Binary, ternary and quaternary sit in the same list as Q8_0 and are not the same kind of thing. Each
- * says so in its own row, from [PrismQuantizer.Level.note], because a list that presented 1.13 bits per
+ * says so in its own row, from [QuantTarget.note], because a list that presented 1.13 bits per
  * weight next to 8.5 with no comment would be actively misleading.
  */
 @Composable
@@ -68,7 +77,7 @@ fun QuantizePage() {
     val scope = rememberCoroutineScope()
 
     var source by remember { mutableStateOf(PrismSettings.getLocalAiModelPath()) }
-    var level by remember { mutableStateOf(PrismQuantizer.Level.Q4_K_M) }
+    var chosenSuffix by remember { mutableStateOf("") }
     var running by remember { mutableStateOf(false) }
     var written by remember { mutableStateOf(0L) }
     var estimate by remember { mutableStateOf(0L) }
@@ -76,13 +85,19 @@ fun QuantizePage() {
     var outcomeOk by remember { mutableStateOf(false) }
 
     val sourceFile = remember(source) { File(source).takeIf { it.isFile } }
-    val available = remember { PrismQuantizer.isAvailable() }
+    // The levels THIS file can be taken to. Empty for anything that is neither a GGUF nor a
+    // safetensors checkpoint, which the button below then refuses to run.
+    val targets = remember(sourceFile) { sourceFile?.let { QuantTarget.forSource(it) } ?: emptyList() }
+    // Carried by suffix rather than by index: the two containers' lists do not line up.
+    val level = targets.firstOrNull { it.fileSuffix == chosenSuffix }
+        ?: targets.minByOrNull { kotlin.math.abs(it.bitsPerWeight - 4.85) }
+    val available = remember(sourceFile) { targets.any { it.available } }
 
-    fun destinationFor(file: File, target: PrismQuantizer.Level) = File(
+    fun destinationFor(file: File, target: QuantTarget) = File(
         file.parentFile,
         file.nameWithoutExtension
-            .replace(Regex("""(?i)[.-](Q[0-9][_A-Z0-9]*|F16|F32|BF16)"""), "") +
-            "." + target.name + ".gguf",
+            .replace(Regex("""(?i)[.-](Q[0-9][_A-Z0-9]*|F16|F32|BF16|I8|I4)"""), "") +
+            "." + target.fileSuffix + "." + target.extension,
     )
 
     PageScaffold("Quantize", "Make a model smaller, here, and carry it to the phone") {
@@ -90,14 +105,19 @@ fun QuantizePage() {
 
             SectionHeader("the quantiser")
             Card {
-                InfoRow("Native quantiser", if (available) "available" else "not available")
+                InfoRow("GGUF quantiser", if (PrismQuantizerAvailable) "available" else "not available")
+                Hairline()
+                InfoRow("safetensors quantiser", "available (built in)")
                 Hairline()
                 InfoRow("Threads", PrismCpu.inferenceThreads().toString())
             }
-            if (!available) {
+            if (level != null && !level.available) {
+                SectionFooter(level.unavailableReason)
+            }
+            if (sourceFile != null && targets.isEmpty()) {
                 SectionFooter(
-                    "gguf_bridge did not load, so there is nothing to quantise with. The Diagnostics " +
-                        "page says which libraries were found and where it looked."
+                    "This file is neither a GGUF nor a safetensors checkpoint, so there is nothing " +
+                        "here that can read it. The Diagnostics page says which libraries were found."
                 )
             }
 
@@ -129,12 +149,20 @@ fun QuantizePage() {
             SectionHeader("target")
             Card {
                 Column(Modifier.padding(16.dp)) {
-                    PrismQuantizer.Level.entries.forEach { candidate ->
-                        val active = candidate == level
+                    if (targets.isEmpty()) {
+                        Text(
+                            if (sourceFile == null) "Choose a model to see what it can be quantised to."
+                            else "No quantisation applies to this file's container.",
+                            fontSize = 12.sp,
+                            color = colors.faint,
+                        )
+                    }
+                    targets.forEach { candidate ->
+                        val active = candidate.fileSuffix == level?.fileSuffix
                         Row(
                             Modifier
                                 .fillMaxWidth()
-                                .clickableRow { level = candidate }
+                                .clickableRow { chosenSuffix = candidate.fileSuffix }
                                 .padding(vertical = 7.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
@@ -167,28 +195,31 @@ fun QuantizePage() {
             }
 
             sourceFile?.let { file ->
-                Spacer(Modifier.height(10.dp))
-                Card {
-                    InfoRow("Result", destinationFor(file, level).name, mono = true)
-                    Hairline()
-                    InfoRow(
-                        "Estimated size",
-                        (PrismQuantizer.estimateOutputBytes(file, level) / (1024 * 1024)).toString() + " MB",
-                    )
+                if (level != null) {
+                    Spacer(Modifier.height(10.dp))
+                    Card {
+                        InfoRow("Result", destinationFor(file, level).name, mono = true)
+                        Hairline()
+                        InfoRow(
+                            "Estimated size",
+                            (level.estimateOutputBytes(file) / (1024 * 1024)).toString() + " MB",
+                        )
+                    }
                 }
             }
 
             Spacer(Modifier.height(12.dp))
             Row(Modifier.padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
                 Button(
-                    enabled = available && sourceFile != null && !running,
+                    enabled = available && sourceFile != null && level != null && !running,
                     onClick = {
                         val file = sourceFile ?: return@Button
-                        val destination = destinationFor(file, level)
+                        val target = level ?: return@Button
+                        val destination = destinationFor(file, target)
                         running = true
                         outcome = ""
                         written = 0
-                        estimate = PrismQuantizer.estimateOutputBytes(file, level)
+                        estimate = target.estimateOutputBytes(file)
 
                         scope.launch {
                             // The only observable progress is the file growing; see the class comment.
@@ -199,10 +230,9 @@ fun QuantizePage() {
                                 }
                             }
                             val problem = withContext(Dispatchers.IO) {
-                                PrismQuantizer.quantize(
+                                target.quantize(
                                     source = file,
                                     destination = destination,
-                                    level = level,
                                     threads = PrismCpu.inferenceThreads(),
                                 )
                             }
@@ -211,8 +241,14 @@ fun QuantizePage() {
                             outcomeOk = problem == null
                             outcome = if (problem == null) {
                                 destination.name + " written, " +
-                                    (destination.length() / (1024 * 1024)) + " MB. It is an ordinary " +
-                                    "GGUF and loads on the phone too."
+                                    (destination.length() / (1024 * 1024)) + " MB. " +
+                                    if (target.extension == "gguf") {
+                                        "It is an ordinary GGUF and loads on the phone too."
+                                    } else {
+                                        "It is a Prism-quantised safetensors checkpoint: the scales " +
+                                            "travel in '<tensor>.scale' tensors and the header records " +
+                                            "the scheme."
+                                    }
                             } else {
                                 problem
                             }
@@ -254,13 +290,31 @@ fun QuantizePage() {
             }
 
             SectionFooter(
-                "Requantising an already-quantised model works and used to abort the whole process: " +
+                "Requantising an already-quantised GGUF works and used to abort the whole process: " +
                     "ggml asserts rather than failing when `pure` mode meets a block it cannot convert, " +
                     "and an assert is not something Kotlin can catch. The bridge now keeps llama.cpp's " +
                     "own per-tensor mixing for a quantised source and forces `pure` only from full " +
                     "precision, which is where it is safe."
             )
+            SectionFooter(
+                "A safetensors checkpoint is quantised here in Kotlin, streaming, one block of 32 " +
+                    "weights at a time -- so peak memory is a chunk rather than the model, and a " +
+                    "checkpoint larger than this machine's RAM can still be quantised. Tensors that " +
+                    "cannot be quantised (short vectors, odd last dimensions for I4, integer and FP8 " +
+                    "tables) are copied through unchanged and counted in the file's own metadata."
+            )
             Spacer(Modifier.height(28.dp))
         }
     }
+}
+
+/**
+ * Whether llama.cpp's quantiser is on this machine.
+ *
+ * Hoisted out of the composable so the check runs once per process rather than once per frame: the
+ * answer cannot change while the app is running, and [com.prism.launcher.quant.PrismQuantizer]
+ * caches the library load anyway.
+ */
+private val PrismQuantizerAvailable: Boolean by lazy {
+    com.prism.launcher.quant.PrismQuantizer.isAvailable()
 }

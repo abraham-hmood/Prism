@@ -9,6 +9,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.RadioGroup
 import android.widget.TextView
 import android.widget.Toast
 import androidx.recyclerview.widget.LinearLayoutManager
@@ -52,8 +53,12 @@ class CloudModelsActivity : PrismBaseActivity() {
 
     private fun refreshList() {
         val models = PrismSettings.getCloudModels()
-        val activeId = PrismSettings.getActiveCloudModelId()
-        adapter.submit(models, activeId)
+        // One active profile PER KIND: an image endpoint being active says nothing about which
+        // chat endpoint is active, so the list has to be told about all four.
+        val activeIds = PrismSettings.CLOUD_KINDS
+            .mapNotNull { PrismSettings.getActiveCloudModelId(it) }
+            .toSet()
+        adapter.submit(models, activeIds)
         binding.cloudModelsEmptyState.visibility = if (models.isEmpty()) View.VISIBLE else View.GONE
         binding.cloudModelsRecycler.visibility = if (models.isEmpty()) View.GONE else View.VISIBLE
     }
@@ -78,6 +83,36 @@ class CloudModelsActivity : PrismBaseActivity() {
                         else InputType.TYPE_CLASS_TEXT
         }
 
+        // WHAT THIS ENDPOINT IS FOR, asked before the credentials because it decides what Prism
+        // will send it. A profile is only ever one kind -- the same server often serves several,
+        // and that is why the user can save it more than once, once per kind.
+        val kindGroup = RadioGroup(this).apply {
+            orientation = RadioGroup.HORIZONTAL
+            setPadding(0, 0, 0, (12 * density).toInt())
+        }
+        val selectedKind = existing?.resolvedKind ?: PrismSettings.KIND_TEXT
+        PrismSettings.CLOUD_KINDS.forEachIndexed { index, kind ->
+            kindGroup.addView(
+                com.google.android.material.radiobutton.MaterialRadioButton(this).apply {
+                    id = View.generateViewId()
+                    text = PrismSettings.cloudKindLabel(kind)
+                    tag = kind
+                    isChecked = kind == selectedKind
+                    setTextColor(resolveAttr(R.attr.prismTextPrimary))
+                },
+                RadioGroup.LayoutParams(0, RadioGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    if (index > 0) marginStart = (4 * density).toInt()
+                },
+            )
+        }
+
+        val kindLabel = TextView(this).apply {
+            text = "What this model produces"
+            textSize = 12f
+            setTextColor(resolveAttr(R.attr.prismTextSecondary))
+            setPadding(0, 0, 0, (4 * density).toInt())
+        }
+
         val modelIdInput = styledInput("Model ID (e.g. gpt-4o, gemini-1.5-pro)", existing?.modelId ?: "")
         val baseUrlInput = styledInput("Base URL (must be OpenAI-compatible)", existing?.baseUrl ?: "https://api.openai.com/v1/")
         val apiKeyInput = styledInput("API Key", existing?.apiKey ?: "", masked = true)
@@ -91,6 +126,8 @@ class CloudModelsActivity : PrismBaseActivity() {
             visibility = android.view.View.GONE
         }
 
+        layout.addView(kindLabel)
+        layout.addView(kindGroup)
         layout.addView(modelIdInput)
         layout.addView(urlError)
         layout.addView(baseUrlInput)
@@ -210,18 +247,22 @@ class CloudModelsActivity : PrismBaseActivity() {
                             Toast.LENGTH_LONG,
                         ).show()
                     }
+                    val kind = (kindGroup.findViewById<View>(kindGroup.checkedRadioButtonId)?.tag
+                        as? String) ?: PrismSettings.KIND_TEXT
                     val profile = PrismSettings.CloudModelProfile(
                         id = existing?.id ?: UUID.randomUUID().toString(),
                         apiKey = apiKey,
                         baseUrl = baseUrl,
-                        modelId = modelId
+                        modelId = modelId,
+                        kind = kind,
                     )
                     PrismSettings.addCloudModel(profile)
-                    // The very first saved profile becomes active automatically -- otherwise
+                    // The first saved profile OF ITS KIND becomes active automatically -- otherwise
                     // "Add Model" would silently do nothing until the user finds a separate
-                    // activation step.
-                    if (PrismSettings.getActiveCloudModelId() == null) {
-                        PrismSettings.setActiveCloudModelId(profile.id)
+                    // activation step. Scoped to the kind so adding a music endpoint never
+                    // steals the chat selection.
+                    if (PrismSettings.getActiveCloudModelId(kind) == null) {
+                        PrismSettings.setActiveCloudModelId(kind, profile.id)
                     }
                     refreshList()
                 } else {
@@ -245,11 +286,11 @@ class CloudModelAdapter(
 ) : RecyclerView.Adapter<CloudModelAdapter.VH>() {
 
     private var items: List<PrismSettings.CloudModelProfile> = emptyList()
-    private var activeId: String? = null
+    private var activeIds: Set<String> = emptySet()
 
-    fun submit(newItems: List<PrismSettings.CloudModelProfile>, activeId: String?) {
+    fun submit(newItems: List<PrismSettings.CloudModelProfile>, activeIds: Set<String>) {
         items = newItems
-        this.activeId = activeId
+        this.activeIds = activeIds
         notifyDataSetChanged()
     }
 
@@ -261,8 +302,12 @@ class CloudModelAdapter(
     override fun onBindViewHolder(holder: VH, position: Int) {
         val model = items[position]
         holder.binding.cloudModelId.text = model.modelId
-        holder.binding.cloudModelBaseUrl.text = model.baseUrl
-        holder.binding.cloudModelActivePill.visibility = if (model.id == activeId) View.VISIBLE else View.GONE
+        // The kind leads the detail line because it is what the profile means: two rows with the
+        // same model id are two different roles.
+        holder.binding.cloudModelBaseUrl.text =
+            "${PrismSettings.cloudKindLabel(model.resolvedKind)} · ${model.baseUrl}"
+        holder.binding.cloudModelActivePill.visibility =
+            if (model.id in activeIds) View.VISIBLE else View.GONE
         holder.binding.cloudModelRoot.setOnClickListener { onClick(model) }
     }
 

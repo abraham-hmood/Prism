@@ -19,10 +19,13 @@
 
 #include <jni.h>
 #include <atomic>
+#include <cstdio>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <vector>
 
+#include "ggml-backend.h"
 #include "whisper.cpp/include/whisper.h"
 
 namespace {
@@ -30,6 +33,26 @@ namespace {
 std::mutex g_lock;
 whisper_context * g_ctx = nullptr;
 std::string g_model_path;
+
+// Where this APK's native libraries live. ggml's CPU kernels are separate shared objects on Android
+// (one per ARM feature set, selected at runtime by ggml_backend_score), and they are found by
+// scanning a directory rather than by the dynamic linker. ggml's default guesses are wrong inside
+// an Android app: the executable is /system/bin/app_process64. Without this directory the registry
+// is empty, whisper_init's CPU lookup returns null, and ggml aborts the whole process inside
+// ggml_backend_dev_backend_reg. gguf_bridge and sd_bridge already do this; dictation did not.
+std::string g_backend_dir;
+
+/** Makes sure ggml has a CPU device before whisper asks for one. Caller holds g_lock. */
+void ensure_backends() {
+    if (ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU) != nullptr) return;
+    if (!g_backend_dir.empty()) {
+        ggml_backend_load_all_from_path(g_backend_dir.c_str());
+    } else {
+        // A host build links the CPU backend into ggml itself, so this is enough there. On Android
+        // it is a fallback for a caller that forgot to set the directory, not the normal path.
+        ggml_backend_load_all();
+    }
+}
 
 // Set while a transcription is running, so a second concurrent call fails fast instead of entering
 // whisper_full on a context another thread is already inside -- which is not safe and does not report
@@ -48,6 +71,13 @@ std::string jstring_to_std(JNIEnv * env, jstring value) {
 bool ensure_context(const std::string & path) {
     if (g_ctx != nullptr && g_model_path == path) return true;
 
+    // BEFORE whisper_init, and before a model is touched: loading the model reads the CPU backend's
+    // extra buffer-type support ("CPU Extra" in whisper.cpp), which dereferences the device.
+    ensure_backends();
+    // Refuse rather than let whisper_init dereference a null CPU device. The caller reports this as
+    // "no transcription" instead of the process dying under it.
+    if (ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU) == nullptr) return false;
+
     if (g_ctx != nullptr) {
         whisper_free(g_ctx);
         g_ctx = nullptr;
@@ -59,7 +89,18 @@ bool ensure_context(const std::string & path) {
     // reasoning that keeps the llama.cpp host build CPU-only applies here.
     params.use_gpu = false;
 
-    g_ctx = whisper_init_from_file_with_params(path.c_str(), params);
+    // A C++ exception must not cross the JNI boundary: the JVM terminates the process when it
+    // does. whisper_init throws when its backend list is empty (see make_buft_list), and that is
+    // exactly the failure this bridge reports as "not available" instead.
+    try {
+        g_ctx = whisper_init_from_file_with_params(path.c_str(), params);
+    } catch (const std::exception & error) {
+        std::fprintf(stderr, "whisper_bridge: init failed: %s\n", error.what());
+        g_ctx = nullptr;
+    } catch (...) {
+        std::fprintf(stderr, "whisper_bridge: init failed with an unknown exception\n");
+        g_ctx = nullptr;
+    }
     if (g_ctx == nullptr) return false;
     g_model_path = path;
     return true;
@@ -68,6 +109,40 @@ bool ensure_context(const std::string & path) {
 } // namespace
 
 extern "C" {
+
+/**
+ * Tells ggml where the dynamically-loaded backends live. Must be called before a model is loaded on
+ * Android; see g_backend_dir.
+ */
+JNIEXPORT void JNICALL
+Java_com_prism_launcher_messaging_WhisperNative_nativeSetBackendDir(
+        JNIEnv * env, jclass, jstring directory) {
+    const std::string path = jstring_to_std(env, directory);
+    if (path.empty()) return;
+    std::lock_guard<std::mutex> guard(g_lock);
+    g_backend_dir = path;
+    ensure_backends();
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_prism_launcher_messaging_WhisperNative_nativeBackendReady(
+        JNIEnv *, jclass) {
+    std::lock_guard<std::mutex> guard(g_lock);
+    ensure_backends();
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (dev == nullptr) return JNI_FALSE;
+
+    // A DEVICE IN THE REGISTRY IS NOT YET A USABLE BACKEND. The CPU device is created from the
+    // dynamically loaded ggml-cpu variant; its init can still fail (an unsupported instruction in
+    // the chosen variant, a missing dependent library, memory pressure). whisper_init then calls
+    // ggml_backend_dev_backend_reg on a backend it could not create and aborts the process, which
+    // JNI cannot catch. Initialising and freeing one here makes that failure a false answer from
+    // a normal JNI call instead of a tombstone during a dataset import.
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    if (backend == nullptr) return JNI_FALSE;
+    ggml_backend_free(backend);
+    return JNI_TRUE;
+}
 
 JNIEXPORT jboolean JNICALL
 Java_com_prism_launcher_messaging_WhisperNative_nativeLoad(
@@ -126,7 +201,15 @@ Java_com_prism_launcher_messaging_WhisperNative_nativeTranscribe(
             // makes it look for a language called "".
             params.language = lang.empty() ? "auto" : lang.c_str();
 
-            if (whisper_full(g_ctx, params, audio.data(), static_cast<int>(audio.size())) == 0) {
+            int status = -1;
+            try {
+                status = whisper_full(g_ctx, params, audio.data(), static_cast<int>(audio.size()));
+            } catch (const std::exception & error) {
+                std::fprintf(stderr, "whisper_bridge: decode failed: %s\n", error.what());
+            } catch (...) {
+                std::fprintf(stderr, "whisper_bridge: decode failed with an unknown exception\n");
+            }
+            if (status == 0) {
                 std::string text;
                 const int segments = whisper_full_n_segments(g_ctx);
                 for (int i = 0; i < segments; ++i) {

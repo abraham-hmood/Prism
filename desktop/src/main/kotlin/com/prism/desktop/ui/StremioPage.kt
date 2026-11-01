@@ -15,6 +15,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextField
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -69,6 +70,18 @@ fun StremioPage() {
     var noteOk by remember { mutableStateOf(true) }
     var newRepo by remember { mutableStateOf("") }
     var directUrl by remember { mutableStateOf("") }
+
+    /**
+     * The add-on filter, applied to both lists.
+     *
+     * Filtering only, never a request: the installed manifests are local and the available list has
+     * already been fetched, so typing cannot start a round of network calls.
+     */
+    var query by remember { mutableStateOf("") }
+    val visibleInstalled = installed.filter { matchesQuery(it, query) }
+    val visibleAvailable = available
+        .filterNot { candidate -> installed.any { it.id == candidate.id } }
+        .filter { matchesQuery(it, query) }
 
     suspend fun reload() {
         // All of it off the UI thread: available() fetches every repository's manifest list over HTTP, and
@@ -178,6 +191,17 @@ fun StremioPage() {
                 ) { Text("Add a URL", fontSize = 13.sp) }
             }
 
+            Spacer(Modifier.height(12.dp))
+            Row(Modifier.padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                TextField(
+                    value = query,
+                    onValueChange = { query = it },
+                    singleLine = true,
+                    placeholder = { Text("Search installed and available add-ons", fontSize = 13.sp) },
+                    modifier = Modifier.weight(1f),
+                )
+            }
+
             SectionHeader("installed addons")
             Card {
                 if (installed.isEmpty()) {
@@ -190,8 +214,15 @@ fun StremioPage() {
                         lineHeight = 19.sp,
                         modifier = Modifier.padding(16.dp),
                     )
+                } else if (visibleInstalled.isEmpty()) {
+                    Text(
+                        "No installed addon matches \"" + query.trim() + "\".",
+                        fontSize = 13.sp,
+                        color = colors.muted,
+                        modifier = Modifier.padding(16.dp),
+                    )
                 } else {
-                    installed.forEachIndexed { index, addon ->
+                    visibleInstalled.forEachIndexed { index, addon ->
                         if (index > 0) Hairline()
                         AddonRow(
                             addon = addon,
@@ -245,8 +276,15 @@ fun StremioPage() {
                             color = colors.muted,
                             modifier = Modifier.padding(16.dp),
                         )
+                    } else if (visibleAvailable.isEmpty()) {
+                        Text(
+                            "No available addon matches \"" + query.trim() + "\".",
+                            fontSize = 13.sp,
+                            color = colors.muted,
+                            modifier = Modifier.padding(16.dp),
+                        )
                     } else {
-                        notInstalled.forEachIndexed { index, addon ->
+                        visibleAvailable.forEachIndexed { index, addon ->
                             if (index > 0) Hairline()
                             AddonRow(
                                 addon = addon,
@@ -284,6 +322,27 @@ fun StremioPage() {
             Spacer(Modifier.height(28.dp))
         }
     }
+}
+
+/**
+ * Whether an addon answers to what was typed.
+ *
+ * Every word has to match somewhere, and the somewhere is the whole manifest rather than the name:
+ * searching "subtitles" or "anime" is how you find the addon that does that thing when you cannot
+ * remember what it is called.
+ */
+private fun matchesQuery(addon: StremioStore.Addon, query: String): Boolean {
+    val words = query.trim().lowercase().split(Regex("\\s+")).filter { it.isNotEmpty() }
+    if (words.isEmpty()) return true
+    val haystack = buildString {
+        append(addon.name).append(' ')
+        append(addon.description).append(' ')
+        append(addon.id).append(' ')
+        addon.types.forEach { append(it).append(' ') }
+        addon.catalogs.forEach { append(it.name).append(' ').append(it.id).append(' ') }
+        addon.resources.forEach { append(it.name).append(' ') }
+    }.lowercase()
+    return words.all { haystack.contains(it) }
 }
 
 @Composable

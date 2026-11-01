@@ -7,13 +7,17 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -72,6 +76,9 @@ fun PrismSettingsPage() {
     // The shell's state is a file or a registry value, not a preference, so it is read rather than
     // remembered from the last time this page wrote it. A second Prism window, or a manual `reg
     // delete`, must show up here as it is.
+    var editingMessageApp by remember {
+        mutableStateOf<com.prism.launcher.messaging.MessagingApps.App?>(null)
+    }
     var shellState by remember {
         mutableStateOf(
             com.prism.desktop.ShellReplacement.State(
@@ -107,6 +114,8 @@ fun PrismSettingsPage() {
     // reference pointing at a dismissed composition's state.
     androidx.compose.runtime.SideEffect {
         SettingsActions.openDialog = { requested -> dialog = requested }
+        // A folder move reports back from its own thread when it finishes.
+        SettingsActions.refresh = { revision++ }
     }
 
     when (dialog) {
@@ -127,6 +136,19 @@ fun PrismSettingsPage() {
         })
         SettingsActions.Dialog.PDB -> PdbDialog(onDismiss = {
             dialog = null
+            revision++
+        })
+        SettingsActions.Dialog.UPDATE_REPOSITORIES -> UpdateCenterDialog(
+            startOnRepositories = true,
+            onDismiss = { dialog = null },
+        )
+        SettingsActions.Dialog.CHECK_FOR_UPDATES -> UpdateCenterDialog(
+            startOnRepositories = false,
+            onDismiss = { dialog = null },
+        )
+        SettingsActions.Dialog.INFERENCE_MODE_BENCH -> InferenceModeBenchmarkDialog(onDismiss = {
+            dialog = null
+            // The winning mode is already stored; rebuilding shows it in the row.
             revision++
         })
         null -> Unit
@@ -275,39 +297,94 @@ fun PrismSettingsPage() {
             Spacer(Modifier.height(18.dp))
             SectionHeader("messaging apps")
             Card {
-                com.prism.launcher.messaging.MessagingBridges.ALL.forEachIndexed { index, bridge ->
+                com.prism.launcher.messaging.MessagingApps.ALL.forEachIndexed { index, app ->
                     if (index > 0) Hairline()
                     ToggleRow(
-                        title = bridge.label,
-                        detail = bridge.note,
-                        checked = com.prism.launcher.messaging.MessagingBridges.isEnabled(bridge.id),
+                        title = app.label,
+                        detail = app.note,
+                        checked = com.prism.launcher.messaging.MessagingBridges.isEnabled(app.id),
                         onChange = { enabled ->
-                            com.prism.launcher.messaging.MessagingBridges.setEnabled(bridge.id, enabled)
+                            com.prism.launcher.messaging.MessagingBridges.setEnabled(app.id, enabled)
                             com.prism.launcher.PrismSettings.setMessagingBridgeSetupSeen(true)
                             revision++
                         },
                     )
+                    if (app.api) {
+                        Row(
+                            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                com.prism.launcher.messaging.MessagingApps.status(app.id),
+                                fontSize = 11.sp,
+                                color = if (app.configured()) colors.accent else colors.faint,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Text(
+                                if (app.configured()) "Manage keys" else "Add API key",
+                                fontSize = 12.sp,
+                                color = colors.accent,
+                                modifier = Modifier.clickableRow { editingMessageApp = app }
+                                    .padding(vertical = 6.dp, horizontal = 4.dp),
+                            )
+                        }
+                    }
                     Row(
                         Modifier.fillMaxWidth().clickableRow {
                             runCatching {
-                                java.awt.Desktop.getDesktop().browse(java.net.URI(bridge.webUrl))
+                                val target = app.webUrl.ifBlank { app.portalUrl }
+                                if (target.isNotBlank()) {
+                                    java.awt.Desktop.getDesktop().browse(java.net.URI(target))
+                                }
                             }
-                        }.padding(horizontal = 16.dp, vertical = 10.dp),
+                        }.padding(horizontal = 16.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text(
-                            "Open " + bridge.label + " in a browser",
-                            fontSize = 13.sp,
+                            if (app.api) "Where to get " + app.label + " keys"
+                            else "Open your carrier messaging app",
+                            fontSize = 12.sp,
                             color = colors.accent,
                         )
                     }
                 }
+                Hairline()
+                ToggleRow(
+                    title = "Receive WhatsApp/Messenger webhooks",
+                    detail = com.prism.launcher.messaging.MessagingWebhook.status().let { status ->
+                        if (status.running) {
+                            "Listening on port ${status.port}; Meta needs an HTTPS address in front of it"
+                        } else {
+                            "Off. WhatsApp needs this receiver for incoming messages"
+                        }
+                    },
+                    checked = com.prism.launcher.PrismSettings.getMessagingWebhookEnabled(),
+                    onChange = { enabled ->
+                        com.prism.launcher.PrismSettings.setMessagingWebhookEnabled(enabled)
+                        if (enabled) {
+                            val error = com.prism.launcher.messaging.MessagingWebhook.start()
+                            if (error.isNotBlank()) com.prism.core.PrismPlatform.log.warn("Messages", error)
+                        } else {
+                            com.prism.launcher.messaging.MessagingWebhook.stop()
+                        }
+                        revision++
+                    },
+                )
             }
             SectionFooter(
-                "Prism cannot send as these apps and does not claim to. The connection puts them in " +
-                    "Messages, opens them from here, and — on the phone — includes their " +
-                    "notifications in your message history once notification access is granted."
+                "These are the services' public APIs: WhatsApp Cloud API for a business number, " +
+                    "Messenger Platform for a Facebook Page, and signal-cli for Signal. They are not " +
+                    "your personal account's private history, and Prism labels each thread with the " +
+                    "account it actually speaks for. Keys are read from the environment first, then " +
+                    "from the field behind Add API key."
             )
+            editingMessageApp?.let { app ->
+                MessageApiKeysDialog(
+                    app,
+                    onDismiss = { editingMessageApp = null },
+                    onSaved = { revision++ },
+                )
+            }
 
 
             // Then everything the phone has, in the phone's grouping and order.
@@ -387,6 +464,18 @@ fun PrismSettingsPage() {
 @Composable
 private fun SettingRow(item: SettingsCatalog.Item, onChanged: () -> Unit) {
     val colors = LocalPrismColors.current
+    // A Choice can require confirmation (forced diffusion is the only one today). Kept here
+    // rather than in the catalog so the catalog still describes values, not dialogs.
+    var pendingChoice by remember(item) { mutableStateOf<Pair<String, String>?>(null) }
+    // A disabled row still explains itself. Hiding it would make the setting look absent from a
+    // build that has it; enabling it would let the click do nothing, which is worse than either.
+    if (!runCatching { item.enabled() }.getOrDefault(true)) {
+        Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
+            Text(item.title, fontSize = 14.sp, color = colors.faint)
+            Text(item.subtitle, fontSize = 12.sp, color = colors.faint)
+        }
+        return
+    }
     val detail = buildString {
         append(item.subtitle)
         if (item.reach == SettingsCatalog.Reach.PHONE_ACTS) {
@@ -413,7 +502,9 @@ private fun SettingRow(item: SettingsCatalog.Item, onChanged: () -> Unit) {
                 Spacer(Modifier.height(8.dp))
                 // Chips rather than a dropdown: with at most seven options there is room to show every
                 // choice, and the current one is then legible without opening anything.
-                Row {
+                // Scrolls rather than wraps: the inference-mode row alone has eight options, and
+                // a Row that overflows would push the last ones off the panel entirely.
+                Row(Modifier.horizontalScroll(rememberScrollState())) {
                     item.labels.forEachIndexed { index, label ->
                         val value = item.values.getOrElse(index) { label }
                         val active = value == current
@@ -427,7 +518,15 @@ private fun SettingRow(item: SettingsCatalog.Item, onChanged: () -> Unit) {
                                 fontSize = 12.sp,
                                 color = if (active) Color.White else Color(0xFFB9B9C4),
                                 modifier = Modifier
-                                    .clickableRow { runCatching { item.set(value) }; onChanged() }
+                                    .clickableRow {
+                                        val warning = item.warning?.invoke(value)
+                                        if (warning != null) {
+                                            pendingChoice = value to warning
+                                        } else {
+                                            runCatching { item.set(value) }
+                                            onChanged()
+                                        }
+                                    }
                                     .padding(horizontal = 11.dp, vertical = 7.dp),
                             )
                         }
@@ -592,6 +691,100 @@ private fun SettingRow(item: SettingsCatalog.Item, onChanged: () -> Unit) {
 
         is SettingsCatalog.Info -> InfoRow(item.title, runCatching { item.value() }.getOrDefault(""))
     }
+
+    pendingChoice?.let { (value, message) ->
+        AlertDialog(
+            onDismissRequest = { pendingChoice = null },
+            title = { Text(item.title, fontSize = 17.sp) },
+            text = { Text(message, fontSize = 13.sp) },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingChoice = null
+                    (item as? SettingsCatalog.Choice)?.let { runCatching { it.set(value) } }
+                    onChanged()
+                }) { Text("Enable anyway", color = colors.accent) }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingChoice = null }) { Text("Cancel") }
+            },
+        )
+    }
+}
+
+/**
+ * The fields behind one provider's API connection.
+ *
+ * A value supplied by the environment is shown but not editable. That is the difference between
+ * "this build has a token" and "the token I typed was saved but ignored", and it has to be visible
+ * before the user spends time replacing a value that will never be read.
+ */
+@Composable
+private fun MessageApiKeysDialog(
+    app: com.prism.launcher.messaging.MessagingApps.App,
+    onDismiss: () -> Unit,
+    onSaved: () -> Unit = {},
+) {
+    val colors = LocalPrismColors.current
+    var values by remember(app.id) {
+        mutableStateOf(app.keys.associate { it.id to com.prism.launcher.messaging.MessagingApps.value(app.id, it) })
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(app.label + " API keys", fontSize = 17.sp) },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                Text(app.note, fontSize = 11.sp, color = colors.faint)
+                Spacer(Modifier.height(8.dp))
+                app.keys.forEach { key ->
+                    val fromEnvironment = com.prism.launcher.messaging.MessagingApps.fromEnvironment(app.id, key)
+                    OutlinedTextField(
+                        value = values[key.id].orEmpty(),
+                        onValueChange = { changed -> values = values + (key.id to changed) },
+                        enabled = !fromEnvironment,
+                        label = { Text(key.label + if (key.required) "" else " (optional)", fontSize = 12.sp) },
+                        placeholder = { Text(key.hint, fontSize = 12.sp) },
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
+                    )
+                    if (fromEnvironment) {
+                        Text(
+                            "Set by the environment (${key.env})",
+                            fontSize = 10.sp,
+                            color = colors.faint,
+                            modifier = Modifier.padding(bottom = 4.dp),
+                        )
+                    }
+                }
+                TextButton(
+                    onClick = {
+                        runCatching {
+                            java.awt.Desktop.getDesktop().browse(java.net.URI(app.portalUrl))
+                        }
+                    },
+                ) { Text("Where to get these", color = colors.accent, fontSize = 12.sp) }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    app.keys.forEach { key ->
+                        if (!com.prism.launcher.messaging.MessagingApps.fromEnvironment(app.id, key)) {
+                            com.prism.launcher.messaging.MessagingApps.setValue(
+                                app.id, key.id, values[key.id].orEmpty(),
+                            )
+                        }
+                    }
+                    com.prism.launcher.messaging.MessagingBridges.setEnabled(app.id, true)
+                    com.prism.launcher.PrismSettings.setMessagingBridgeSetupSeen(true)
+                    onSaved()
+                    onDismiss()
+                },
+            ) { Text("Save", color = colors.accent) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+    )
 }
 
 @Composable

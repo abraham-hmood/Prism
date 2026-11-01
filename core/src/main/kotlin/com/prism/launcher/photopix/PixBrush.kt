@@ -21,6 +21,10 @@ enum class PaintMode {
     SMUDGE,
     CLONE,
     HEAL,
+    SATURATE,
+    DESATURATE,
+    COLOR_REPLACE,
+    BACKGROUND_ERASE,
 }
 
 /**
@@ -222,6 +226,37 @@ object PixBrushEngine {
                         val sampled = Rgba.of(sample(target, smudgeFromX, smudgeFromY))
                         mix(original, sampled, deposit * 0.75).packed()
                     }
+                }
+                PaintMode.SATURATE, PaintMode.DESATURATE -> {
+                    val (hue, saturation, lightness) = PixAdjustments.rgbToHsl(
+                        original.r / 255.0, original.g / 255.0, original.b / 255.0,
+                    )
+                    val target = if (mode == PaintMode.SATURATE) {
+                        (saturation + (1.0 - saturation) * deposit * 0.6).coerceIn(0.0, 1.0)
+                    } else {
+                        (saturation * (1.0 - deposit * 0.6)).coerceIn(0.0, 1.0)
+                    }
+                    val (r, g, b) = PixAdjustments.hslToRgb(hue, target, lightness)
+                    Rgba(r * 255.0, g * 255.0, b * 255.0, original.a).packed()
+                }
+                PaintMode.COLOR_REPLACE -> {
+                    val (paintHue, paintSaturation, _) = PixAdjustments.rgbToHsl(
+                        paint.r / 255.0, paint.g / 255.0, paint.b / 255.0,
+                    )
+                    val (_, _, lightness) = PixAdjustments.rgbToHsl(
+                        original.r / 255.0, original.g / 255.0, original.b / 255.0,
+                    )
+                    val (r, g, b) = PixAdjustments.hslToRgb(
+                        paintHue, (paintSaturation * 0.8 + 0.2).coerceIn(0.0, 1.0), lightness,
+                    )
+                    mix(original, Rgba(r * 255.0, g * 255.0, b * 255.0, original.a), deposit).packed()
+                }
+                PaintMode.BACKGROUND_ERASE -> {
+                    val distance = hypot(original.r - paint.r, original.g - paint.g)
+                    val distanceB = kotlin.math.abs(original.b - paint.b)
+                    if (max(distance, distanceB) < 110.0) {
+                        original.copy(a = original.a * (1 - deposit)).packed()
+                    } else original.packed()
                 }
                 PaintMode.CLONE, PaintMode.HEAL -> {
                     val sampled = Rgba.of(sample(source ?: target, (x + offsetX).toInt(), (y + offsetY).toInt()))

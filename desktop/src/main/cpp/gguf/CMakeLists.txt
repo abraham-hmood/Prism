@@ -32,6 +32,12 @@ endif()
 
 set(PRISM_CPP "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../app/src/main/cpp")
 
+# 160 rather than llama.cpp's default 64, because stable-diffusion.cpp refuses to build against a
+# ggml whose tensor-name field would truncate a model's parameter names. The field lives inside
+# ggml_tensor, so this is an ABI decision shared by every target in this project -- ggml, llama,
+# gguf_bridge and sd_bridge alike. See the same define in app/src/main/cpp/CMakeLists.txt.
+add_compile_definitions(GGML_MAX_NAME=160)
+
 # Keep the vendored build to the inference library. The examples and tools are a large fraction
 # of llama.cpp's build time and none of them are linked into the bridge.
 set(LLAMA_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
@@ -67,3 +73,11 @@ target_include_directories(gguf_bridge PRIVATE
 target_link_libraries(gguf_bridge PRIVATE llama)
 
 set_target_properties(gguf_bridge PROPERTIES OUTPUT_NAME "gguf_bridge" PREFIX "")
+
+# stable-diffusion.cpp, in the SAME project as llama.cpp so it links the same ggml. That is the
+# whole reason it is here rather than in its own CMake project: two copies of ggml in one process
+# fight over their global registries and the crash names neither library. See
+# app/src/main/cpp/sd.cmake.
+set(PRISM_GGML_SOURCE_DIR "${PRISM_CPP}/llama.cpp" CACHE PATH "" FORCE)
+include("${PRISM_CPP}/sd.cmake")
+prism_add_stable_diffusion(sd_bridge "${PRISM_CPP}/sd_bridge.cpp" ${JNI_INCLUDE_DIRS})

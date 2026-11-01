@@ -40,7 +40,7 @@ class ChessBoardView(
      * than passing `training = true` alongside a [match].
      */
     private val training: Boolean = false,
-) : View(context) {
+) : View(context), MinigameFeedback {
 
     private val density = resources.displayMetrics.density
     private val dark: Boolean
@@ -58,6 +58,19 @@ class ChessBoardView(
     private var lastMove: Chess.Move? = null
     private var thinking = false
     private var finished = false
+
+    /** Null for a draw, so the page can say so instead of inventing a loser. */
+    private var finalOutcome: Boolean? = null
+
+    override fun musicIntensity(): Float {
+        if (finished) return 0f
+        val pace = (played.size / 40f).coerceIn(0f, 0.5f)
+        val check = if (Chess.isInCheck(position, mySide)) 0.22f else 0f
+        val thinking = if (thinking) 0.08f else 0f
+        return (0.18f + pace + check + thinking).coerceIn(0f, 1f)
+    }
+
+    override fun outcome(): Boolean? = if (finished) finalOutcome else null
     private val moveList = mutableListOf<String>()
 
     /** The actual moves, in order -- what a review needs to replay the game. See [playedMoves]. */
@@ -117,6 +130,7 @@ class ChessBoardView(
                 is Chess.Outcome.Checkmate -> outcome.winner == mySide
                 else -> null
             }
+            finalOutcome = won
             won?.let { MinigameStore.recordChess(it) }
             postDelayed({ onFinished(won) }, 1_200)
         }
@@ -306,15 +320,15 @@ class ChessBoardView(
     override fun onDraw(canvas: Canvas) {
         resendIfNeeded()
 
-        PencilStyle.drawPaper(canvas, width, height, dark, density)
+        ArcadeStyle.drawBackdrop(canvas, width, height, density, ArcadeStyle.CHESS)
         val board = boardRect()
         val cell = board.width() / 8f
-        val ink = PencilStyle.pencil(2f * density, PencilStyle.graphite(dark))
+        val ink = PencilStyle.pencil(2f * density, ArcadeStyle.CHESS)
 
         PencilStyle.rect(canvas, board, ink, seed = 1, amount = 1.5f)
 
         // The dark squares are hatched rather than filled — the whole point of the style.
-        val hatchPaint = PencilStyle.pencil(1.1f * density, PencilStyle.graphiteLight(dark), alpha = 150)
+        val hatchPaint = PencilStyle.pencil(1.1f * density, ArcadeStyle.CHESS, alpha = 70)
         for (index in 0 until 64) {
             val file = Chess.fileOf(index)
             val rank = Chess.rankOf(index)
@@ -330,7 +344,7 @@ class ChessBoardView(
 
         // What just happened, circled in red.
         lastMove?.let { move ->
-            val red = PencilStyle.pencil(2f * density, PencilStyle.RED_PENCIL, alpha = 180)
+            val red = PencilStyle.pencil(2f * density, 0xFFFF2BD6.toInt(), alpha = 210)
             PencilStyle.circleAround(canvas, cellRect(move.from, board), red, seed = 61)
             PencilStyle.circleAround(canvas, cellRect(move.to, board), red, seed = 62)
         }
@@ -338,7 +352,7 @@ class ChessBoardView(
         // Training's suggestion: green, and an arrow rather than two circles, because a hint has
         // to read as "go this way" at a glance, not as two separate squares to puzzle over.
         hint?.let { move ->
-            val green = PencilStyle.pencil(2.2f * density, PencilStyle.GREEN_PENCIL, alpha = 200)
+            val green = PencilStyle.pencil(2.2f * density, 0xFF7CFF6B.toInt(), alpha = 220)
             val from = cellRect(move.from, board)
             val to = cellRect(move.to, board)
             PencilStyle.line(canvas, from.centerX(), from.centerY(), to.centerX(), to.centerY(), green, seed = 90, amount = 1.6f)
@@ -347,7 +361,7 @@ class ChessBoardView(
 
         // Where the selected piece can go.
         selected?.let { from ->
-            val blue = PencilStyle.pencil(2.4f * density, PencilStyle.BLUE_PENCIL)
+            val blue = PencilStyle.pencil(2.4f * density, 0xFF39E7FF.toInt())
             PencilStyle.rect(canvas, cellRect(from, board), blue, seed = 70, amount = 1.2f)
             legalFromSelected.map { it.to }.distinct().forEach { to ->
                 val r = cellRect(to, board)
@@ -359,7 +373,7 @@ class ChessBoardView(
                 } else {
                     canvas.drawCircle(
                         r.centerX(), r.centerY(), cell * 0.13f,
-                        PencilStyle.shading(PencilStyle.BLUE_PENCIL, alpha = 110),
+                        PencilStyle.shading(0xFF39E7FF.toInt(), alpha = 140),
                     )
                 }
             }
@@ -369,7 +383,7 @@ class ChessBoardView(
         val glyphPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             textSize = cell * 0.74f
             textAlign = Paint.Align.CENTER
-            color = PencilStyle.graphite(dark)
+            color = 0xFFEAF2FF.toInt()
         }
         for (index in 0 until 64) {
             val piece = position.pieceAt(index)
@@ -377,14 +391,14 @@ class ChessBoardView(
             val r = cellRect(index, board)
             // Black pieces are the solid glyphs, white the outlined ones — on paper, that reads
             // correctly whichever way round the theme is.
-            glyphPaint.color = if (piece > 0) PencilStyle.graphite(dark) else PencilStyle.graphite(dark)
+            glyphPaint.color = if (piece > 0) 0xFFEAF2FF.toInt() else 0xFFCDEBFF.toInt()
             canvas.drawText(
                 Chess.glyph(piece), r.centerX(), r.centerY() + cell * 0.26f, glyphPaint,
             )
         }
 
         // Coordinates down the side, small, in the margin style.
-        val coord = PencilStyle.textPaint(10f * density, dark, PencilStyle.graphiteLight(dark))
+        val coord = PencilStyle.textPaint(10f * density, dark, ArcadeStyle.MUTED)
         for (i in 0 until 8) {
             val rank = if (mySide == Chess.Colour.WHITE) 8 - i else i + 1
             canvas.drawText("$rank", board.left - 11f * density, board.top + i * cell + cell * 0.6f, coord)
@@ -393,7 +407,7 @@ class ChessBoardView(
         }
 
         if (unacknowledged != null) {
-            val note = PencilStyle.textPaint(11f * density, dark, PencilStyle.RED_PENCIL)
+            val note = PencilStyle.textPaint(11f * density, dark, 0xFFFF2BD6.toInt())
             canvas.drawText("sending your move…", board.left, board.top - 8f * density, note)
         }
 

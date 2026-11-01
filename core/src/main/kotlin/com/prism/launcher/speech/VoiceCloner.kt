@@ -115,8 +115,18 @@ object VoiceCloner {
      * overlap. 160 Hz is the customary split; anything unvoiced or degenerate falls back to female,
      * which matches the picker's own default.
      */
-    fun guessGender(profile: SpeakerProfile): KokoroVoices.Gender =
-        if (profile.pitchHz <= 0f || profile.pitchHz >= 160f) {
+    fun guessGender(profile: SpeakerProfile): KokoroVoices.Gender = guessGender(profile.pitchHz)
+
+    /**
+     * The same split for a caller that already has a median pitch from another analyser.
+     *
+     * DatasetCraft measures pitch with [VocalAnalysis] rather than [profile], and a dataset that
+     * labelled the same voice differently in two places would be worse than one that left gender
+     * blank. Keeping the threshold here means there is only one answer to "which side of 160 Hz is
+     * this voice on".
+     */
+    fun guessGender(pitchHz: Float): KokoroVoices.Gender =
+        if (pitchHz <= 0f || pitchHz >= 160f) {
             KokoroVoices.Gender.FEMALE
         } else {
             KokoroVoices.Gender.MALE

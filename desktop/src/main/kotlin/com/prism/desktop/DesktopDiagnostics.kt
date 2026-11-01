@@ -52,6 +52,7 @@ object DesktopDiagnostics {
         trusted(),
         models(),
         storage(),
+        email(),
     )
 
     /** The whole thing as text, for the clipboard and for a bug report. */
@@ -346,6 +347,46 @@ object DesktopDiagnostics {
             )
         }
         return Panel("Models", checks)
+    }
+
+    /**
+     * The mail stack, using the server's own self-check.
+     *
+     * NOTHING HERE TOUCHES THE NETWORK. The tempting extra check -- "does port 25 reach Gmail" --
+     * costs seconds and answers a question that changes with the weather; the server records its
+     * own bind results and its last forwarding probe, and those are what is reported.
+     */
+    private fun email(): Panel {
+        val checks = mutableListOf<Check>()
+        val config = runCatching { com.prism.launcher.email.EmailSettings.load() }.getOrNull()
+        if (config == null) {
+            checks += fail("Email config", "could not be read from this platform's preferences")
+            return Panel("Email", checks)
+        }
+        checks += info(
+            "Server",
+            if (config.enabled) "enabled, mode=" + config.mode.name.lowercase()
+            else "switched off in Email settings",
+        )
+        runCatching { com.prism.launcher.email.EmailServer.diagnose(config) }
+            .getOrElse {
+                checks += fail("Email server", "diagnosis threw: " + (it.message ?: it::class.java.simpleName))
+                emptyList()
+            }
+            .forEach { check -> checks += if (check.ok) ok(check.name, check.detail) else warn(check.name, check.detail) }
+        runCatching { com.prism.launcher.email.EmailClient.prismAccount() }.getOrNull()?.let { account ->
+            checks += info(
+                "Mailbox",
+                account.address + " · IMAP " + account.imapHost + ":" + account.imapPort +
+                    " · submission " + account.smtpHost + ":" + account.smtpPort,
+            )
+        }
+        val external = runCatching { com.prism.launcher.email.EmailClient.accounts() }.getOrDefault(emptyList())
+        checks += info(
+            "Other accounts",
+            if (external.isEmpty()) "none" else external.joinToString(", ") { it.address },
+        )
+        return Panel("Email", checks)
     }
 
     private fun storage(): Panel {

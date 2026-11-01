@@ -62,14 +62,10 @@ class DeleteZoneView @JvmOverloads constructor(
     private val idleBgColor = Color.parseColor("#1AFFFFFF")
     private val idleBorderColor = Color.parseColor("#40FFFFFF")
 
-    override fun onAttachedToWindow() {
-        super.onAttachedToWindow()
-        startGlowCycle()
-    }
-
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
         glowAnimator?.cancel()
+        glowAnimator = null
         fillAnimator?.cancel()
     }
 
@@ -102,11 +98,18 @@ class DeleteZoneView @JvmOverloads constructor(
         isHovering = false
         fillRadius = 0f
         fillAnimator?.cancel()
+        glowAnimator?.cancel()
+        glowAnimator = null
+        currentGlowColor = glowColors[0]
         invalidate()
     }
 
     fun onDragEntered(x: Float, y: Float) {
         isHovering = true
+        // ANIMATE ONLY WHILE THE ZONE IS ACTUALLY A TARGET. This used to start an infinite
+        // 60 fps animator whenever the view was attached, which the launcher does once and keeps
+        // for its whole life -- a permanent wakeup for a control nobody was dragging to.
+        if (glowAnimator == null) startGlowCycle()
         if (hasAnimatedFill) {
             invalidate()
             return
@@ -130,6 +133,9 @@ class DeleteZoneView @JvmOverloads constructor(
 
     fun onDragExited() {
         isHovering = false
+        glowAnimator?.cancel()
+        glowAnimator = null
+        currentGlowColor = glowColors[0]
         invalidate()
     }
 

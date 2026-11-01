@@ -55,6 +55,9 @@ class DrawerPageView(
             }
         },
         onOpenWebResult = { result -> openWebResult(result.url) },
+        onOpenPage = { entry, slot ->
+            (context as? LauncherActivity)?.openDrawerPage(entry, slot)
+        },
     )
 
     /** The inflated hierarchy. A field rather than an init-local because [scrollToLetter] needs it. */
@@ -104,6 +107,7 @@ class DrawerPageView(
     private data class LocalSearchResults(
         val query: String,
         val apps: List<DrawerItem>,
+        val pages: List<DrawerItem.Page>,
         val widgets: List<DrawerItem.Widget>,
         val notifications: List<NotificationHistory.Record>,
     )
@@ -388,7 +392,7 @@ class DrawerPageView(
         allApps = entries
         val query = binding.searchBar.text?.toString().orEmpty()
         if (query.isBlank()) {
-            adapter.submitList(groupDrawerApps(entries))
+            adapter.submitList(configuredPages() + groupDrawerApps(entries))
         } else {
             // Keep whatever the user is searching for applied to the new list, rather than
             // silently replacing their results with everything.
@@ -467,8 +471,7 @@ class DrawerPageView(
                 localSearch = null
                 webResultsQuery = ""
                 webResults = emptyList()
-                val grouped = groupDrawerApps(allApps)
-                adapter.submitList(grouped)
+                adapter.submitList(configuredPages() + groupDrawerApps(allApps))
                 return@launch
             }
             delay(150)
@@ -517,6 +520,7 @@ class DrawerPageView(
             localSearch = LocalSearchResults(
                 query = query,
                 apps = grouped,
+                pages = searchPages(query),
                 widgets = widgets,
                 notifications = notifications,
             )
@@ -555,6 +559,10 @@ class DrawerPageView(
         if (local.query != query) return
 
         val results = buildList {
+            if (local.pages.isNotEmpty()) {
+                add(DrawerItem.Section("Pages"))
+                addAll(local.pages)
+            }
             addAll(local.apps)
             if (webResultsQuery == query && webResults.isNotEmpty()) {
                 add(DrawerItem.Section("Web \u00b7 ${WebSearch.engineLabel()}"))
@@ -570,6 +578,40 @@ class DrawerPageView(
             }
         }
         adapter.submitList(results)
+    }
+
+    /**
+     * The pages already on slots, each labelled with the slot it lives on.
+     *
+     * Shown above the apps even with no query: the drawer is the one screen that can answer "what
+     * pages do I have, and where are they" without the user paging through the pager to find out.
+     */
+    private fun configuredPages(): List<DrawerItem> {
+        val pages = runCatching { PageCatalog.configured(context) }.getOrDefault(emptyList())
+        if (pages.isEmpty()) return emptyList()
+        return buildList {
+            add(DrawerItem.Section("Pages"))
+            pages.forEach { (entry, slot) -> add(DrawerItem.Page(entry, slot, true)) }
+        }
+    }
+
+    /**
+     * Every page matching [query] -- placed ones first, then the rest of what this device has.
+     *
+     * Built-ins are included rather than only slots because search should be able to answer
+     * "ModelCraft", even when the page is not currently placed; tapping such a result asks the
+     * launcher for a slot, which is the same path an unplaced built-in takes.
+     */
+    private fun searchPages(query: String): List<DrawerItem.Page> {
+        val configured = runCatching { PageCatalog.configured(context) }.getOrDefault(emptyList())
+        val slotByKey = configured.associate { (entry, slot) -> entry.key to slot }
+        return (PageCatalog.all(context) + configured.map { it.first })
+            .asSequence()
+            .filter { it.label.contains(query, ignoreCase = true) }
+            .distinctBy { it.key }
+            .sortedWith(compareBy({ slotByKey[it.key] ?: Int.MAX_VALUE }, { it.label.lowercase() }))
+            .map { DrawerItem.Page(it, slotByKey[it.key] ?: -1, slotByKey.containsKey(it.key)) }
+            .toList()
     }
 
     /** Opens a web result, preferring the browser page over any other desktop page. */

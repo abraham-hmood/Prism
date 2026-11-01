@@ -120,6 +120,34 @@ object TrustedDevices {
         ),
 
         /**
+         * Mail arriving in the Prism mailbox.
+         *
+         * A DELIVERY COPY, not a synchronised mailbox. The device that received the message owns
+         * it; the other gets the same message in its own INBOX so it can be read there. Edits made
+         * on one side do not travel back -- two independent mail stores agreeing on every flag
+         * would need a revision protocol that no other shared kind here has, and a read receipt is
+         * not worth inventing one for.
+         */
+        EMAIL(
+            "email", "Email",
+            "Mail delivered to the Prism mailbox on one device appears in the other's inbox.",
+        ),
+
+        /**
+         * Folders hosted as networked storage.
+         *
+         * The share itself is not copied. A device announces which folders it offers, the other
+         * selects one, and a key phrase shown on the host authorises the bridge. That is why this
+         * is a permission of its own rather than part of messages or clipboard: saying yes here
+         * lets another device ask for a specific folder, not read everything on this one.
+         */
+        STORAGE(
+            "storage", "Shared storage",
+            "Folders hosted on one device can be bridged to the other, after a key phrase shown " +
+                "on the host is entered.",
+        ),
+
+        /**
          * The wallet recovery phrase.
          *
          * NOT LIKE THE OTHERS, in two ways that matter. It is sent ONCE, during pairing, rather than

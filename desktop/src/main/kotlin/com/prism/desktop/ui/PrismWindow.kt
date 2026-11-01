@@ -3,8 +3,10 @@ package com.prism.desktop.ui
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -21,6 +23,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -29,7 +32,9 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.prism.launcher.PrismSettings
@@ -201,55 +206,180 @@ internal fun PageBody(
 }
 
 /**
- * A page drawn as a window in the active theme's surfaces.
+ * A page drawn as a real window: draggable, resizable and minimizable onto a hotseat.
  *
- * The "desktop around it" is the shell's own background; this only has to provide the frame. Its
- * corners, card colour, hairline and accent dot all come from [LocalPrismColors], so a windowed
- * page does not become a fourth thing to theme.
+ * The previous implementation was a full-size card with 18dp of padding around it, which only
+ * looked like a window until somebody tried to move one. This one owns its own geometry, keeps it
+ * per page for as long as the process lives, and clamps itself into the shell so a drag cannot lose
+ * a page off the edge of the display.
  *
- * IT IS THE SAME PAGE. Nothing in the body is conditional on being framed -- every page already
- * lays itself out for whatever space it is given, and a page that needed a different layout inside
- * a window would be a second implementation with two sets of bugs.
+ * Minimising removes the page from the desktop and leaves a hotseat chip at the bottom. Restoring
+ * returns it at exactly the size and place it had before, which is the part that makes it a window
+ * rather than a mode.
  */
+private class PageWindowState {
+    var x by mutableStateOf(24.dp)
+    var y by mutableStateOf(24.dp)
+    var width by mutableStateOf(760.dp)
+    var height by mutableStateOf(560.dp)
+    var minimized by mutableStateOf(false)
+    var placed by mutableStateOf(false)
+}
+
+private val pageWindowStates = mutableMapOf<PageId, PageWindowState>()
+
 @Composable
 private fun PageWindow(page: PageId, content: @Composable () -> Unit) {
     val colors = LocalPrismColors.current
-    Box(
-        Modifier
-            .fillMaxSize()
-            .padding(horizontal = 18.dp, vertical = 14.dp),
-    ) {
-        Surface(
-            color = colors.card,
-            contentColor = colors.onSurface,
-            shape = RoundedCornerShape(colors.cardRadius),
-            border = androidx.compose.foundation.BorderStroke(1.dp, colors.divider),
-            shadowElevation = 12.dp,
-            modifier = Modifier.fillMaxSize(),
-        ) {
-            Column(Modifier.fillMaxSize()) {
-                Row(
-                    Modifier.fillMaxWidth().height(34.dp).padding(horizontal = 13.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
+    val state = remember(page) { pageWindowStates.getOrPut(page) { PageWindowState() } }
+
+    BoxWithConstraints(Modifier.fillMaxSize().background(colors.background)) {
+        val maxW = maxWidth
+        val maxH = maxHeight
+        val minW = minOf(360.dp, maxW)
+        val minH = minOf(260.dp, maxH)
+
+        // First placement follows the window, and a later window resize pulls the frame back inside
+        // it rather than leaving a page hanging off the edge.
+        LaunchedEffect(maxW, maxH) {
+            if (!state.placed) {
+                state.width = (maxW * 0.78f).coerceIn(minW, maxW)
+                state.height = (maxH * 0.82f).coerceIn(minH, maxH)
+                state.x = ((maxW - state.width) / 2f).coerceAtLeast(0.dp)
+                state.y = ((maxH - state.height) / 2f - 8.dp).coerceAtLeast(0.dp)
+                state.placed = true
+            }
+            state.width = state.width.coerceIn(minW, maxW)
+            state.height = state.height.coerceIn(minH, maxH)
+            state.x = state.x.coerceIn(0.dp, (maxW - state.width).coerceAtLeast(0.dp))
+            state.y = state.y.coerceIn(0.dp, (maxH - state.height).coerceAtLeast(0.dp))
+        }
+
+        if (!state.minimized) {
+            Surface(
+                color = colors.card,
+                contentColor = colors.onSurface,
+                shape = RoundedCornerShape(colors.cardRadius),
+                border = androidx.compose.foundation.BorderStroke(1.dp, colors.divider),
+                shadowElevation = 18.dp,
+                modifier = Modifier
+                    .offset(state.x, state.y)
+                    .width(state.width)
+                    .height(state.height),
+            ) {
+                Column(Modifier.fillMaxSize()) {
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .height(34.dp)
+                            .background(colors.surface)
+                            .pointerInput(maxW) {
+                                detectDragGestures { change, drag ->
+                                    change.consume()
+                                    state.x = (state.x + drag.x.toDp())
+                                        .coerceIn(0.dp, (maxW - state.width).coerceAtLeast(0.dp))
+                                    state.y = (state.y + drag.y.toDp())
+                                        .coerceIn(0.dp, (maxH - state.height).coerceAtLeast(0.dp))
+                                }
+                            }
+                            .padding(horizontal = 13.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(
+                            Modifier
+                                .size(7.dp)
+                                .background(colors.accent, RoundedCornerShape(50)),
+                        )
+                        Spacer(Modifier.width(9.dp))
+                        Text(
+                            page.label,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = colors.onSurface,
+                            maxLines = 1,
+                        )
+                        Spacer(Modifier.weight(1f))
+                        Text(
+                            "—",
+                            fontSize = 16.sp,
+                            color = colors.muted,
+                            modifier = Modifier
+                                .clickableRow { state.minimized = true }
+                                .padding(horizontal = 9.dp, vertical = 2.dp),
+                            // The minus sits in the title bar the way a window's minimise control does.
+                        )
+                    }
+                    Box(Modifier.fillMaxWidth().height(1.dp).background(colors.divider))
+                    Box(Modifier.weight(1f).fillMaxWidth()) { content() }
+                    // The resize grip. Twelve short diagonal strokes in the corner, so it reads as a
+                    // grip without becoming a second chrome element to theme.
                     Box(
                         Modifier
-                            .size(7.dp)
-                            .background(colors.accent, RoundedCornerShape(50)),
-                    )
-                    Spacer(Modifier.width(9.dp))
-                    Text(
-                        page.label,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = colors.onSurface,
-                        maxLines = 1,
-                    )
-                    Spacer(Modifier.weight(1f))
-                    Text("window", fontSize = 10.sp, color = colors.faint)
+                            .align(Alignment.End)
+                            .size(22.dp)
+                            .pointerInput(maxW, maxH) {
+                                detectDragGestures { change, drag ->
+                                    change.consume()
+                                    state.width = (state.width + drag.x.toDp()).coerceIn(minW, maxW)
+                                    state.height = (state.height + drag.y.toDp()).coerceIn(minH, maxH)
+                                }
+                            },
+                    ) {
+                        Canvas(Modifier.fillMaxSize().padding(5.dp)) {
+                            val stroke = colors.faint.copy(alpha = 0.7f)
+                            for (i in 0..2) {
+                                val inset = size.width * (i / 3f)
+                                drawLine(
+                                    color = stroke,
+                                    start = Offset(size.width - inset, size.height),
+                                    end = Offset(size.width, size.height - inset),
+                                    strokeWidth = 1.2f,
+                                )
+                            }
+                        }
+                    }
                 }
-                Box(Modifier.fillMaxWidth().height(1.dp).background(colors.divider))
-                Box(Modifier.weight(1f).fillMaxWidth()) { content() }
+            }
+        } else {
+            // A minimised page shows the desktop, not a blank card: the page is gone from the
+            // desktop until its chip is pressed.
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text(
+                    page.label + " is on the hotseat below.",
+                    fontSize = 12.sp,
+                    color = colors.faint,
+                )
+            }
+        }
+
+        // The hotseat. Bottom-centre, above whatever the shell draws, and only present while
+        // something is minimised -- an empty hotseat strip is just another bar.
+        if (state.minimized) {
+            Row(
+                Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 18.dp)
+                    .background(colors.surface, RoundedCornerShape(14.dp))
+                    .padding(horizontal = 7.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Surface(
+                    color = colors.card,
+                    shape = RoundedCornerShape(10.dp),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, colors.divider),
+                    modifier = Modifier.clickableRow { state.minimized = false },
+                ) {
+                    Row(
+                        Modifier.padding(horizontal = 13.dp, vertical = 9.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(Modifier.size(7.dp).background(colors.accent, RoundedCornerShape(50)))
+                        Spacer(Modifier.width(8.dp))
+                        Text(page.label, fontSize = 12.sp, color = colors.onSurface)
+                        Spacer(Modifier.width(12.dp))
+                        Text("restore", fontSize = 10.sp, color = colors.accent)
+                    }
+                }
             }
         }
     }
@@ -291,6 +421,19 @@ private fun PageContent(
         PageId.MOUSE -> MousePage()
         PageId.PHOTOS -> PhotosPage()
         PageId.PHOTOPIX -> PhotoPixPage()
+        PageId.VIDEOCRAFT -> VideoCraftPage()
+        PageId.IMAGECRAFT -> ImageCraftPage()
+        PageId.AUDIOCRAFT -> AudioCraftPage()
+        PageId.MODELCRAFT -> ModelCraftPage()
+        PageId.DATASETCRAFT -> DatasetCraftPage()
+        PageId.ASSETCRAFT -> AssetCraftPage()
+        PageId.GAMECRAFT -> GameCraftPage()
+        PageId.EMAIL_SERVER -> EmailServerPage()
+        PageId.EMAIL_CLIENT -> EmailClientPage()
+        PageId.TIME_MACHINE -> TimeMachinePage()
+        PageId.JOURNAL -> JournalPage()
+        PageId.APP_STORE -> AppStorePage()
+        PageId.TASK_MANAGER -> TaskManagerPage()
         PageId.NORA_TOOLS -> NoraExtrasPage()
         PageId.NEBULA -> NebulaPage()
         PageId.TRUSTED -> TrustedDevicesPage()
@@ -321,7 +464,7 @@ private fun PageContent(
         PageId.GAME_HOST -> GameHostPage()
         PageId.VIRTUALIZATION -> VirtualizationPage()
         PageId.AETHER -> AetherPage()
-        PageId.APPS -> AppDrawerPage()
+        PageId.APPS -> AppDrawerPage(onNavigate)
         PageId.FILES -> FileExplorerPage()
         PageId.SETTINGS -> PrismSettingsPage()
         PageId.DIAGNOSTICS -> DiagnosticsPage()
@@ -358,6 +501,19 @@ private fun railSlot(page: PageId): SlotAssignment = when (page) {
     PageId.MOUSE -> SlotAssignment.Mouse
     PageId.PHOTOS -> SlotAssignment.Photos
     PageId.PHOTOPIX -> SlotAssignment.PhotoPix
+    PageId.VIDEOCRAFT -> SlotAssignment.VideoCraft
+    PageId.IMAGECRAFT -> SlotAssignment.ImageCraft
+    PageId.AUDIOCRAFT -> SlotAssignment.AudioCraft
+    PageId.EMAIL_SERVER -> SlotAssignment.EmailServer
+    PageId.EMAIL_CLIENT -> SlotAssignment.EmailClient
+    PageId.TIME_MACHINE -> SlotAssignment.TimeMachine
+    PageId.JOURNAL -> SlotAssignment.Journal
+    PageId.APP_STORE -> SlotAssignment.AppStore
+    PageId.TASK_MANAGER -> SlotAssignment.TaskManager
+    PageId.MODELCRAFT -> SlotAssignment.ModelCraft
+    PageId.DATASETCRAFT -> SlotAssignment.DatasetCraft
+    PageId.ASSETCRAFT -> SlotAssignment.AssetCraft
+    PageId.GAMECRAFT -> SlotAssignment.GameCraft
     PageId.VIRTUALIZATION -> SlotAssignment.VirtualizationOs
     else -> SlotAssignment.Default
 }
@@ -390,6 +546,19 @@ enum class PageId(
     MOUSE("Mouse", Icons.Filled.TouchApp),
     PHOTOS("Photos", Icons.Filled.PhotoLibrary),
     PHOTOPIX("PhotoPix", Icons.Filled.Brush),
+    VIDEOCRAFT("VideoCraft", Icons.Filled.Movie),
+    IMAGECRAFT("ImageCraft", Icons.Filled.AutoFixHigh),
+    AUDIOCRAFT("AudioCraft", Icons.Filled.LibraryMusic),
+    MODELCRAFT("ModelCraft", Icons.Filled.Memory),
+    DATASETCRAFT("DatasetCraft", Icons.Filled.Storage),
+    ASSETCRAFT("AssetCraft", Icons.Filled.SportsEsports),
+    GAMECRAFT("GameCraft", Icons.Filled.SportsEsports),
+    EMAIL_SERVER("Email server", Icons.Filled.Dns),
+    EMAIL_CLIENT("Email", Icons.Filled.Mail),
+    TIME_MACHINE("Time Machine", Icons.Filled.History),
+    JOURNAL("Journal", Icons.Filled.MenuBook),
+    APP_STORE("App Store", Icons.Filled.Storefront),
+    TASK_MANAGER("Task Manager", Icons.Filled.Build),
     NEBULA("Nebula", Icons.Filled.Groups),
     TRUSTED("Trusted devices", Icons.Filled.Devices),
     WALLET("Wallet", Icons.Filled.AccountBalanceWallet),

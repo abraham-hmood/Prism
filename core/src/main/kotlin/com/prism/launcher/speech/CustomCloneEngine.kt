@@ -525,17 +525,30 @@ class CustomCloneEngine internal constructor(val folder: File) : CloneEngine {
     private fun inventory(graphs: List<GraphInfo>): String =
         graphs.joinToString("; ") { it.summarize() }
 
-    private fun openSession(file: File, env: OrtEnvironment): OrtSession =
-        runCatching {
-            env.createSession(
-                file.absolutePath,
-                OrtSession.SessionOptions().apply {
-                    setIntraOpNumThreads(Runtime.getRuntime().availableProcessors().coerceIn(1, 4))
-                },
-            )
+    private fun openSession(file: File, env: OrtEnvironment): OrtSession {
+        // THE USER'S BACKEND CHOICE, APPLIED WHERE IT CAN BE. An ONNX graph is one of the two formats
+        // that can genuinely run on every one of the five phone NPUs, through the NNAPI execution
+        // provider -- but only if NPU is what the user asked for, so this is a no-op otherwise. The
+        // provider is added before the session is created because execution providers are fixed when
+        // the session is built, not per inference.
+        val options = OrtSession.SessionOptions().apply {
+            setIntraOpNumThreads(Runtime.getRuntime().availableProcessors().coerceIn(1, 4))
+        }
+        val npu = com.prism.launcher.messaging.OnnxAccelerators.applyNpu(options)
+        return runCatching {
+            env.createSession(file.absolutePath, options)
         }.getOrElse {
             throw IllegalStateException("${file.name} did not open: ${it.message ?: it.javaClass.simpleName}")
-        }.also { synchronized(lock) { sessions.add(it) } }
+        }.also {
+            if (npu) {
+                PrismPlatform.log.info(
+                    "PrismClone",
+                    "${file.name} opened with the NNAPI execution provider (NPU).",
+                )
+            }
+            synchronized(lock) { sessions.add(it) }
+        }
+    }
 
     private fun failWiring(message: String): Nothing =
         throw IllegalStateException(message)

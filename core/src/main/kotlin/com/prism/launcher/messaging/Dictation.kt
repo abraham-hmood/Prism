@@ -105,6 +105,30 @@ object Dictation {
         return if (reasons.isEmpty()) "" else reasons.joinToString("\n")
     }
 
+    /**
+     * Gets a transcription engine ready for a dataset-sized job, installing what it can.
+     *
+     * The whisper engine ships without its model because the model is 142 MB; this is where a
+     * fresh install gets one, once, the first time an import actually has transcriptions to make.
+     * It is NOT called from [available] or from any availability check: checking whether
+     * transcription works must never start a download.
+     *
+     * Returns null when an engine is ready, else the reason. Blocking; run it off the UI thread.
+     * [onStage] receives the download's progress so a waiting import can say what it is waiting
+     * for.
+     */
+    fun prepare(onStage: (String) -> Unit = {}): String? {
+        available().firstOrNull()?.let { return null }
+        val whisper = engines[WhisperCppEngine.ID] as? WhisperCppEngine
+            ?: return unavailableReason().ifBlank { "No transcription engine is available." }
+        val problem = WhisperModels.ensureModel(onStage)
+        if (problem != null) return problem
+        val availability = whisper.availability()
+        if (availability is ImageGenerator.Availability.Ready) return null
+        return (availability as? ImageGenerator.Availability.Unavailable)?.reason
+            ?: "Whisper is not ready after installing its model."
+    }
+
     data class Result(val text: String?, val engine: String, val error: String?, val millis: Long)
 
     /** Never throws; a failing engine comes back named. */

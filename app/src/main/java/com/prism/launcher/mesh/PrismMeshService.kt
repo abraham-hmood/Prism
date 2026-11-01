@@ -62,20 +62,45 @@ object PrismMeshService {
     )
 
     /**
-     * Whether this device is actually ON a meshnet right now -- the setting is enabled AND the
-     * control-plane loops are live.
+     * Whether this device is actually ON a meshnet right now.
      *
-     * Deliberately agnostic about client vs. server: a device that started the mesh is on it
-     * whether anyone else has shown up yet or not, and a device that joined someone else's is on
-     * it too. [MeshUtils.getLocalMeshIp] cannot answer this on its own, because it falls back to
-     * the plain LAN address when no tunnel interface exists, so a non-empty result there says
-     * nothing about mesh membership.
+     * THREE THINGS, NOT ONE, and the third is what this used to get wrong. The mesh toggle being on
+     * and the UDP listener being alive means the control plane is READY to find peers -- it is what
+     * every install does at startup, because discovery has to run before anyone can be found. It
+     * does not mean the device is a member of anything.
+     *
+     * Membership needs one of:
+     *  - a live peer, which is the ordinary LAN mesh;
+     *  - a Prism tunnel that is actually up, which covers a server whose listeners are bound (it is
+     *    serving the mesh even before a client connects) and a client with a server to reach.
+     *
+     * Without that distinction a phone with the mesh toggle at its default and nobody around it
+     * reported itself on the meshnet. Email then decided it was a mesh mail host, chose the mesh
+     * ports and dialled the user's chosen domain -- `prism.com:2587` -- instead of submitting to the
+     * server on this device, and every feature that gates on membership believed the same lie.
+     *
+     * [MeshUtils.getLocalMeshIp] cannot answer this on its own: it falls back to the plain LAN
+     * address when no tunnel interface exists, so a non-empty result says nothing about membership.
      */
-    fun isOnMesh(): Boolean =
-        PrismSettings.getMeshEnabled() &&
-            !controlPlaneBroken &&
-            socket?.isClosed == false &&
-            (listenerJob?.isActive == true || gossipJob?.isActive == true)
+    fun isOnMesh(): Boolean {
+        if (!PrismSettings.getMeshEnabled()) return false
+        if (controlPlaneBroken) return false
+        if (socket?.isClosed != false) return false
+        if (listenerJob?.isActive != true && gossipJob?.isActive != true) return false
+        if (getPeerCount() > 0) return true
+        // No peers: this is only a meshnet if this device is the one serving it, or is holding a
+        // tunnel to a server. Read through PrismApp because the tunnel engine owns both listeners
+        // and is the only component that knows whether they are bound.
+        //
+        // Serving is checked separately from `isPrismVpnActive`: a server role with its proxy
+        // listener bound is a working mesh endpoint even when the VpnService itself was never
+        // established, and that is precisely the "I am serving one" case.
+        val serving = runCatching {
+            PrismApp.instance.tunnelEngine.isPrismServerRunning()
+        }.getOrDefault(false)
+        if (serving) return true
+        return runCatching { PrismApp.instance.tunnelEngine.isPrismVpnActive() }.getOrDefault(false)
+    }
 
     /**
      * True when the control-plane socket is not usable, even though the jobs are still alive.
@@ -197,18 +222,25 @@ object PrismMeshService {
         
         // Peer Discovery & Gossip Task
         gossipJob = meshScope.launch {
+            // Enumerating interfaces is not free, and this loop runs for the life of the process.
+            // Thirty seconds is far longer than an address can plausibly appear or disappear and
+            // much cheaper than asking the kernel on every round.
+            var localIps = emptySet<String>()
+            var localIpsAt = 0L
             while (isActive) {
+                val now = System.currentTimeMillis()
                 sendDiscoveryBroadcast(meshPort)
 
                 val nodes = PrismSettings.getAllMeshNodes()
-                val myIps = MeshUtils.getAllLocalIps()
+                if (now - localIpsAt > 30_000L) {
+                    localIps = MeshUtils.getAllLocalIps()
+                    localIpsAt = now
+                }
                 nodes.forEach { addr ->
-                    if (!myIps.contains(addr)) {
+                    if (!localIps.contains(addr)) {
                         sendPacket(addr, meshPort, 0x01.toByte(), "{}")
                     }
                 }
-
-                val now = System.currentTimeMillis()
                 // Evict stale peers. The lease is the same one MeshCore uses, so a phone and a
                 // desktop agree on when a device has gone: this used to be five minutes here and
                 // ninety seconds there, and the phone's five is why a closed Prism still read as
@@ -251,11 +283,16 @@ object PrismMeshService {
 
                 // Speech capabilities (Kokoro and the voice-cloning encoders). Called on every
                 // gossip round and throttled inside KokoroMeshShare to once a minute, because
-                // this loop runs every 5-15 seconds. A device that has neither model says
+                // this loop runs every 20-30 seconds. A device that has neither model says
                 // nothing, and one that has either starts its HTTP listener on the first round.
                 runCatching { com.prism.launcher.speech.KokoroMeshShare.announce() }
 
-                delay(if (activePeers.isEmpty()) 5000 else 15000)
+                // IDLE IS THIRTY SECONDS, NOT FIVE. A phone with no Prism peer on the network --
+                // the ordinary case -- used to wake the Wi-Fi radio twelve times a minute, all
+                // day, for a discovery packet nobody answered. The lease is 45 seconds, so these
+                // intervals still keep a live peer alive; they only slow how quickly a new one is
+                // found, and Discover in the mesh page broadcasts immediately anyway.
+                delay(if (activePeers.isEmpty()) 30_000L else 20_000L)
             }
         }
     }
@@ -563,6 +600,15 @@ object PrismMeshService {
                 }, "sms-relay-ingest").start()
             }
 
+            // PRISM RCS. The envelope is sealed with the wallet, so a peer that cannot open it is
+            // simply not the owner; the parse and the store both happen off the dispatch thread
+            // because MessagingStore rewrites a JSON file.
+            com.prism.launcher.messaging.RcsChat.OPCODE_RCS -> {
+                Thread({
+                    com.prism.launcher.messaging.RcsChat.onPacket(payload)
+                }, "rcs-ingest").start()
+            }
+
             // The Science page. Cosmic-ray hits are high-rate and must not block the
             // dispatch thread; the rest are rare enough to handle inline.
             com.prism.launcher.science.MeshScience.OPCODE_COSMIC_HIT ->
@@ -594,6 +640,13 @@ object PrismMeshService {
                 com.prism.launcher.minigames.MinigameMesh.onCountry(peerIp, payload)
             com.prism.launcher.minigames.MinigameMesh.OPCODE_BATTLE ->
                 com.prism.launcher.minigames.MinigameMesh.onBattle(peerIp, payload)
+
+            // GeoTag writes its gallery to preferences, so it goes off the dispatch thread too.
+            com.prism.launcher.minigames.GeoTagNet.OPCODE -> {
+                Thread({
+                    com.prism.launcher.minigames.GeoTagNet.receive(peerIp, payload)
+                }, "geotag-receive").start()
+            }
 
             // Writes to preferences, so off the dispatch thread like the others that do.
             com.prism.launcher.minigames.MinigameMesh.OPCODE_STRIKE -> {

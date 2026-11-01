@@ -25,6 +25,10 @@ import com.prism.launcher.PrismSettings
 import com.prism.launcher.messaging.MeshModels
 import com.prism.launcher.messaging.GgufInferenceService
 import com.prism.launcher.messaging.ModelDiscoveryService
+import com.prism.launcher.messaging.ModelRegistry
+import com.prism.launcher.messaging.OllamaDiscoveryService
+import com.prism.launcher.messaging.OllamaGgufDownloads
+import com.prism.launcher.videocraft.VideoCraftModels
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -59,6 +63,9 @@ fun ModelsPage() {
     var installed by remember { mutableStateOf(PrismSettings.getImportedModels()) }
     var activeText by remember { mutableStateOf(PrismSettings.getLocalAiModelPath()) }
     var activeImage by remember { mutableStateOf(PrismSettings.getLocalImageModelPath()) }
+    var activeAudioGen by remember { mutableStateOf(PrismSettings.getLocalAudioGenModelPath()) }
+    var activeInterpolation by remember { mutableStateOf(PrismSettings.getLocalInterpolationModelPath()) }
+    var activeSpeech by remember { mutableStateOf(PrismSettings.getLocalAudioModelPath()) }
     var cakeChatActive by remember { mutableStateOf(PrismSettings.getUseCakeChat()) }
     var cakeChatTrained by remember {
         mutableStateOf(DesktopCakeChat.state() == DesktopCakeChat.State.TRAINED)
@@ -78,8 +85,34 @@ fun ModelsPage() {
             kotlinx.coroutines.delay(3_000)
         }
     }
+    // Ollama servers on this network, and the conversions of their models into GGUFs. Scanned on
+    // entering the page because a server can have been started or stopped since the last visit.
+    var ollamaServers by remember { mutableStateOf<List<OllamaDiscoveryService.OllamaServer>>(emptyList()) }
+    var ollamaScanning by remember { mutableStateOf(false) }
+    var ollamaScanned by remember { mutableStateOf(false) }
+    var ollamaScanRevision by remember { mutableStateOf(0) }
+    var ollamaMenuFor by remember { mutableStateOf<String?>(null) }
+    val ollamaTasks by OllamaGgufDownloads.tasks.collectAsState()
+
+    LaunchedEffect(ollamaScanRevision) {
+        ollamaScanning = true
+        ollamaServers = withContext(Dispatchers.IO) { OllamaDiscoveryService.scan() }
+        ollamaScanning = false
+        ollamaScanned = true
+    }
+
+    // A CONVERSION THAT FINISHED IS A NEW MODEL, so the list above has to be re-read. Keyed by the
+    // number of finished conversions rather than the task list itself: the list changes on every
+    // progress tick, and reconciling the models folder ten times a second is not a refresh. The
+    // effect itself sits below `reload`, which is a local function and has to be declared first.
+    var convertedCount by remember { mutableStateOf(0) }
+
     var confirmDelete by remember { mutableStateOf<PrismSettings.ImportedModel?>(null) }
     var importPath by remember { mutableStateOf("") }
+    var importType by remember { mutableStateOf(PrismSettings.MODEL_TYPE_IMAGE) }
+    // The store category picks what a download is registered as. An ONNX file can be an image
+    // generator or a frame interpolator, and the extension does not say which.
+    var storeCategory by remember { mutableStateOf("text") }
 
     // Store state.
     var query by remember { mutableStateOf("gguf") }
@@ -100,10 +133,45 @@ fun ModelsPage() {
         installed = PrismSettings.getImportedModels()
         activeText = PrismSettings.getLocalAiModelPath()
         activeImage = PrismSettings.getLocalImageModelPath()
+        activeAudioGen = PrismSettings.getLocalAudioGenModelPath()
+        activeInterpolation = PrismSettings.getLocalInterpolationModelPath()
+        activeSpeech = PrismSettings.getLocalAudioModelPath()
         cakeChatActive = PrismSettings.getUseCakeChat()
         // Re-read rather than cached: training or importing a bundle happens on the CakeChat page,
         // so this list has to notice a model that was not there when it was first drawn.
         cakeChatTrained = DesktopCakeChat.state() == DesktopCakeChat.State.TRAINED
+    }
+
+    LaunchedEffect(ollamaTasks.count { it.state == OllamaGgufDownloads.State.DONE }) {
+        val done = ollamaTasks.count { it.state == OllamaGgufDownloads.State.DONE }
+        if (done != convertedCount) {
+            convertedCount = done
+            reload()
+            status = ollamaTasks.lastOrNull { it.state == OllamaGgufDownloads.State.DONE }?.note
+        }
+    }
+
+    fun activate(model: PrismSettings.ImportedModel) {
+        if (!File(model.path).isFile) {
+            status = "That file is gone; remove it or re-download."
+            return
+        }
+        when (model.type) {
+            PrismSettings.MODEL_TYPE_IMAGE -> PrismSettings.setLocalImageModelPath(model.path)
+            PrismSettings.MODEL_TYPE_AUDIO_GEN -> PrismSettings.setLocalAudioGenModelPath(model.path)
+            PrismSettings.MODEL_TYPE_INTERPOLATION ->
+                PrismSettings.setLocalInterpolationModelPath(model.path)
+            PrismSettings.MODEL_TYPE_AUDIO -> {
+                PrismSettings.setLocalAudioModelPath(model.path)
+                com.prism.launcher.speech.PrismSpeaker.invalidate()
+            }
+            else -> {
+                PrismSettings.setLocalAiModelPath(model.path)
+                PrismSettings.setUseCakeChat(false)
+            }
+        }
+        status = "${model.displayName} is now the active ${typeLabel(model.type).lowercase()} model"
+        reload()
     }
 
     /**
@@ -113,13 +181,11 @@ fun ModelsPage() {
      * pressed. A `.bin` from HuggingFace may be either; a mislabelled model fails much later and
      * much less legibly than it does here.
      */
-    fun import(file: File, preferredName: String? = null) {
+    fun import(file: File, type: String, preferredName: String? = null) {
         if (!file.isFile) {
             status = "${file.name} is not a file"
             return
         }
-        val isGguf = GgufInferenceService.isGgufFile(file.absolutePath)
-        val type = if (isGguf) PrismSettings.MODEL_TYPE_TEXT else PrismSettings.MODEL_TYPE_IMAGE
         PrismSettings.addImportedModel(
             PrismSettings.ImportedModel(
                 path = file.absolutePath,
@@ -127,7 +193,7 @@ fun ModelsPage() {
                 type = type,
             )
         )
-        status = "Imported ${file.name} as ${if (isGguf) "TEXT" else "IMAGE"}"
+        status = "Imported ${file.name} as ${typeLabel(type)}"
         reload()
     }
 
@@ -135,85 +201,76 @@ fun ModelsPage() {
         Column(Modifier.verticalScroll(rememberScrollState())) {
 
             // ── Installed (Phase 33) ──────────────────────────────────────────────────────
-            SectionHeader("INSTALLED")
-            Card {
-                if (installed.isEmpty()) {
-                    Text(
-                        "No models imported yet.",
-                        fontSize = 12.sp, color = colors.faint,
-                        modifier = Modifier.padding(16.dp),
-                    )
-                }
-                installed.forEachIndexed { i, model ->
-                    if (i > 0) Hairline()
-                    val isText = model.type == PrismSettings.MODEL_TYPE_TEXT
-                    val active = if (isText) model.path == activeText else model.path == activeImage
-                    val exists = remember(model.path, installed) { File(model.path).isFile }
+            val textModels = installed.filter { it.type == PrismSettings.MODEL_TYPE_TEXT }
+            val imageModels = installed.filter { it.type == PrismSettings.MODEL_TYPE_IMAGE }
+            val audioGenModels = installed.filter { it.type == PrismSettings.MODEL_TYPE_AUDIO_GEN }
+            val interpolationModels =
+                installed.filter { it.type == PrismSettings.MODEL_TYPE_INTERPOLATION }
+            val speechModels = installed.filter { it.type == PrismSettings.MODEL_TYPE_AUDIO }
 
-                    Row(
-                        Modifier.fillMaxWidth()
-                            .clickableRow {
-                                if (!exists) {
-                                    status = "That file is gone; remove it or re-download."
-                                    return@clickableRow
-                                }
-                                if (isText) {
-                                    PrismSettings.setLocalAiModelPath(model.path)
-                                    // Or this would appear to do nothing: CakeChat is checked
-                                    // first among local engines, so it has to be released when a
-                                    // GGUF model is chosen instead.
-                                    PrismSettings.setUseCakeChat(false)
-                                } else {
-                                    PrismSettings.setLocalImageModelPath(model.path)
-                                }
-                                status = "${model.displayName} is now the active " +
-                                    (if (isText) "text" else "image") + " model"
-                                reload()
-                            }
-                            .padding(horizontal = 16.dp, vertical = 11.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Icon(
-                            if (active) Icons.Filled.RadioButtonChecked
-                            else Icons.Filled.RadioButtonUnchecked,
-                            null,
-                            tint = if (active) colors.accent else colors.faint,
-                            modifier = Modifier.size(16.dp),
-                        )
-                        Spacer(Modifier.width(11.dp))
-                        Column(Modifier.weight(1f)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    model.displayName,
-                                    fontSize = 14.sp,
-                                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
-                                    maxLines = 1, overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier.weight(1f, fill = false),
-                                )
-                                Spacer(Modifier.width(8.dp))
-                                TypePill(isText)
-                                if (!exists) {
-                                    Spacer(Modifier.width(6.dp))
-                                    MissingPill()
-                                }
-                            }
-                            Text(
-                                model.path,
-                                fontSize = 10.sp, color = colors.faint,
-                                maxLines = 1, overflow = TextOverflow.Ellipsis,
-                            )
-                        }
-                        Icon(
-                            Icons.Filled.Delete, "Remove",
-                            tint = colors.faint,
-                            modifier = Modifier.size(15.dp).clickableRow { confirmDelete = model },
-                        )
-                    }
-                }
-            }
+            ModelSection(
+                title = "TEXT MODELS",
+                models = textModels,
+                activePath = activeText,
+                media = emptyList(),
+                emptyText = "No text models imported yet.",
+                onActivate = ::activate,
+                onDelete = { confirmDelete = it },
+            )
+            ModelSection(
+                title = "IMAGE MODELS",
+                models = imageModels,
+                activePath = activeImage,
+                media = VideoCraftModels.entries(VideoCraftModels.Kind.IMAGE)
+                    .filter { it.builtIn || it.cloud },
+                emptyText = "No image models imported yet.",
+                onActivate = ::activate,
+                onDelete = { confirmDelete = it },
+            )
+            ModelSection(
+                title = "AUDIO GENERATION MODELS",
+                models = audioGenModels,
+                activePath = activeAudioGen,
+                media = VideoCraftModels.entries(VideoCraftModels.Kind.AUDIO_GEN)
+                    .filter { it.builtIn || it.cloud },
+                emptyText = "No audio generators imported yet.",
+                onActivate = ::activate,
+                onDelete = { confirmDelete = it },
+            )
+            ModelSection(
+                title = "FRAME INTERPOLATION MODELS",
+                models = interpolationModels,
+                activePath = activeInterpolation,
+                media = VideoCraftModels.entries(VideoCraftModels.Kind.INTERPOLATION)
+                    .filter { it.builtIn || it.cloud },
+                emptyText = "No frame interpolation models imported yet.",
+                onActivate = ::activate,
+                onDelete = { confirmDelete = it },
+            )
+            ModelSection(
+                title = "SPEECH MODELS",
+                models = speechModels,
+                activePath = activeSpeech,
+                media = if (com.prism.launcher.speech.KokoroInstall.isModelInstalled()) {
+                    listOf(
+                        VideoCraftModels.Entry(
+                            id = VideoCraftModels.KOKORO_ID,
+                            displayName = "Kokoro-82M",
+                            kind = VideoCraftModels.Kind.SPEECH,
+                            detail = "Built-in speech engine · installed",
+                            thePath = "",
+                            builtIn = true,
+                        ),
+                    )
+                } else emptyList(),
+                emptyText = "No speech models imported yet. Kokoro can be installed from its settings page.",
+                onActivate = ::activate,
+                onDelete = { confirmDelete = it },
+            )
             SectionFooter(
-                "Click a model to make it active. Text and image models are tracked separately, " +
-                    "so activating one does not deactivate the other."
+                "Every family has its own active model. VideoCraft needs one active image generator, " +
+                    "audio generator, frame interpolator, text model and speech engine; image, audio " +
+                    "and interpolation models can be local or the cloud endpoint."
             )
 
             Spacer(Modifier.height(14.dp))
@@ -306,6 +363,167 @@ fun ModelsPage() {
 
             Spacer(Modifier.height(14.dp))
 
+            // ── Ollama on the network ─────────────────────────────────────────────────────
+            //
+            // LISTED HERE RATHER THAN ONLY IN CLOUD AI because the decision is the same one this
+            // page is about: which model answers, and whether its weights can live on this machine.
+            // Left-click uses the server's model as-is; RIGHT-CLICK fetches the weights from Ollama's
+            // registry and saves them here as a GGUF, which is the only way a model that lives on
+            // another machine's disk becomes a file this one can load.
+            SectionHeader("OLLAMA ON YOUR NETWORK")
+            Card {
+                Row(
+                    Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        when {
+                            ollamaScanning -> "Scanning the local network\u2026"
+                            ollamaScanned && ollamaServers.isEmpty() -> "No Ollama server answered"
+                            else -> ollamaServers.sumOf { it.models.size }.toString() + " model" +
+                                (if (ollamaServers.sumOf { it.models.size } == 1) "" else "s") +
+                                " on " + ollamaServers.size + " server" +
+                                (if (ollamaServers.size == 1) "" else "s")
+                        },
+                        fontSize = 12.sp,
+                        color = colors.faint,
+                        modifier = Modifier.weight(1f),
+                    )
+                    if (ollamaScanning) {
+                        CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                    } else {
+                        TextButton(onClick = { ollamaScanRevision++ }) { Text("Rescan") }
+                    }
+                }
+
+                if (ollamaScanned && ollamaServers.isEmpty()) {
+                    Hairline()
+                    Text(
+                        "Start Ollama (it listens on port 11434) and rescan. Servers on the same " +
+                            "WiFi are found automatically, including one running on this machine.",
+                        fontSize = 12.sp,
+                        color = colors.faint,
+                        modifier = Modifier.padding(16.dp),
+                    )
+                }
+
+                ollamaServers.forEach { server ->
+                    server.models.forEach { modelName ->
+                        val key = server.host + ":" + server.port + "/" + modelName
+                        val task = ollamaTasks.firstOrNull { it.model == modelName }
+                        val active = PrismSettings.getAiMode() == PrismSettings.AI_MODE_LOCAL_CLOUD &&
+                            PrismSettings.getSelectedOllamaEndpoint()?.let {
+                                it.host == server.host && it.port == server.port && it.model == modelName
+                            } == true
+                        Hairline()
+                        Box {
+                            Column(
+                                Modifier.fillMaxWidth()
+                                    .rightClickable { ollamaMenuFor = key }
+                                    .clickableRow {
+                                        PrismSettings.clearSelectedP2pModel()
+                                        PrismSettings.setSelectedOllamaEndpoint(
+                                            PrismSettings.OllamaEndpoint(server.host, server.port, modelName)
+                                        )
+                                        PrismSettings.setAiMode(PrismSettings.AI_MODE_LOCAL_CLOUD)
+                                        status = modelName + " on " + server.host +
+                                            " will now answer in Prism"
+                                    }
+                                    .padding(horizontal = 16.dp, vertical = 11.dp),
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        modelName,
+                                        fontSize = 14.sp,
+                                        fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    if (active) Text("active", fontSize = 11.sp, color = colors.accent)
+                                }
+                                Text(
+                                    when {
+                                        task != null && task.isRunning ->
+                                            server.host + ":" + server.port + " \u00b7 converting " +
+                                                (task.fraction * 100).toInt() + "%"
+                                        task != null && task.state == OllamaGgufDownloads.State.DONE ->
+                                            server.host + ":" + server.port + " \u00b7 saved as GGUF"
+                                        task != null && task.state == OllamaGgufDownloads.State.FAILED ->
+                                            task.note
+                                        else -> server.host + ":" + server.port +
+                                            " \u00b7 right-click to save the weights as GGUF"
+                                    },
+                                    fontSize = 10.sp,
+                                    color = if (task?.state == OllamaGgufDownloads.State.FAILED)
+                                        Color(0xFFE57373) else colors.faint,
+                                )
+                                if (task != null && task.isRunning) {
+                                    Spacer(Modifier.height(5.dp))
+                                    if (task.total > 0L) {
+                                        LinearProgressIndicator(
+                                            progress = { task.fraction },
+                                            modifier = Modifier.fillMaxWidth(),
+                                        )
+                                    } else {
+                                        LinearProgressIndicator(Modifier.fillMaxWidth())
+                                    }
+                                }
+                            }
+
+                            DropdownMenu(
+                                expanded = ollamaMenuFor == key,
+                                onDismissRequest = { ollamaMenuFor = null },
+                            ) {
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            if (task != null && task.isRunning)
+                                                "Converting\u2026 " + (task.fraction * 100).toInt() + "%"
+                                            else "Download & convert to GGUF",
+                                            fontSize = 13.sp,
+                                        )
+                                    },
+                                    enabled = task?.isRunning != true,
+                                    onClick = {
+                                        ollamaMenuFor = null
+                                        status = if (OllamaGgufDownloads.start(modelName))
+                                            "Fetching " + modelName +
+                                                " from Ollama; it will be saved as a GGUF text model"
+                                        else modelName + " is already being converted"
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Use it from this server", fontSize = 13.sp) },
+                                    onClick = {
+                                        ollamaMenuFor = null
+                                        PrismSettings.clearSelectedP2pModel()
+                                        PrismSettings.setSelectedOllamaEndpoint(
+                                            PrismSettings.OllamaEndpoint(server.host, server.port, modelName)
+                                        )
+                                        PrismSettings.setAiMode(PrismSettings.AI_MODE_LOCAL_CLOUD)
+                                        status = modelName + " on " + server.host +
+                                            " will now answer in Prism"
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            SectionFooter(
+                "A model an Ollama server lists lives in that server's own blob store -- there is no " +
+                    "file to import. Downloading one reads its published weights instead: the " +
+                    "manifest from ollama.com, or the GGUF from Hugging Face when the name starts " +
+                    "hf.co/. The sha256 the publisher names is checked as the bytes arrive, and what " +
+                    "is written out is a plain .gguf -- the same weights, without Ollama's packaging " +
+                    "-- which is what the local text engine reads. It is then imported as a text " +
+                    "model and appears in the list above. A model made locally with `ollama create` " +
+                    "is not published anywhere and cannot be fetched this way."
+            )
+
+            Spacer(Modifier.height(14.dp))
+
             SectionHeader("CAKECHAT")
             Card {
                 // SELECTABLE ONLY ONCE TRAINED. Until then there is nothing to answer with, and a
@@ -372,22 +590,48 @@ fun ModelsPage() {
 
             Spacer(Modifier.height(14.dp))
 
-            SectionHeader("IMPORT A FILE")
+            SectionHeader("IMPORT LOCAL MODELS")
             Card {
-                Row(
-                    Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    CommittingField(importPath, modifier = Modifier.weight(1f)) { importPath = it }
-                    TextButton(
-                        enabled = importPath.isNotBlank(),
-                        onClick = { import(File(importPath.trim())); importPath = "" },
-                    ) { Text("Import") }
+                Column(Modifier.padding(12.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        listOf(
+                            "Text" to PrismSettings.MODEL_TYPE_TEXT,
+                            "Image" to PrismSettings.MODEL_TYPE_IMAGE,
+                            "Audio gen" to PrismSettings.MODEL_TYPE_AUDIO_GEN,
+                            "Frames" to PrismSettings.MODEL_TYPE_INTERPOLATION,
+                            "Speech" to PrismSettings.MODEL_TYPE_AUDIO,
+                        ).forEach { (label, type) ->
+                            OutlinedButton(
+                                onClick = { importType = type },
+                                modifier = Modifier.padding(end = 5.dp),
+                            ) {
+                                Text(
+                                    label,
+                                    fontSize = 11.sp,
+                                    color = if (type == importType) colors.accent else colors.onSurface,
+                                )
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        CommittingField(importPath, modifier = Modifier.weight(1f)) { importPath = it }
+                        TextButton(
+                            enabled = importPath.isNotBlank(),
+                            onClick = {
+                                import(File(importPath.trim()), importType)
+                                importPath = ""
+                            },
+                        ) { Text("Import as ${typeLabel(importType)}") }
+                    }
                 }
             }
             SectionFooter(
-                "The type is read from the file's header, not its name -- a GGUF file is a text " +
-                    "model whatever it is called."
+                "Image, audio and frame interpolation models can be imported here, as GGUF, " +
+                    "safetensors, ONNX or a MediaPipe .task bundle. The file is registered under the " +
+                    "family you picked \u2014 text generation reads GGUF, image generation reads GGUF " +
+                    "or safetensors, and a format an engine cannot open is stored and flagged " +
+                    "rather than silently activated."
             )
 
             status?.let {
@@ -455,6 +699,29 @@ fun ModelsPage() {
                     Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    listOf(
+                        "Text" to "text",
+                        "Image" to "generative",
+                        "Audio" to "audio",
+                        "Interpolation" to "interpolation",
+                        "All" to "all",
+                    ).forEach { (label, category) ->
+                        OutlinedButton(
+                            onClick = { storeCategory = category },
+                            modifier = Modifier.padding(end = 5.dp),
+                        ) {
+                            Text(
+                                label,
+                                fontSize = 11.sp,
+                                color = if (storeCategory == category) colors.accent else colors.onSurface,
+                            )
+                        }
+                    }
+                }
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
                     CommittingField(query, modifier = Modifier.weight(1f)) { query = it }
                     if (searching) {
                         CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
@@ -465,7 +732,16 @@ fun ModelsPage() {
                             scope.launch {
                                 results = try {
                                     withContext(Dispatchers.IO) {
-                                        ModelDiscoveryService.discoverAll(query.ifBlank { "gguf" })
+                                        val term = if (query.isBlank()) {
+                                            when (storeCategory) {
+                                                "audio" -> "text to speech onnx"
+                                                "interpolation" -> "frame interpolation onnx"
+                                                "generative" -> "stable diffusion"
+                                                "text" -> "gguf"
+                                                else -> "onnx"
+                                            }
+                                        } else query
+                                        ModelDiscoveryService.discoverAll(term, storeCategory)
                                     }
                                 } catch (e: Exception) {
                                     PrismPlatform.log.error("Prism/models", "Search failed", e)
@@ -499,8 +775,11 @@ fun ModelsPage() {
                                 // Through ModelRegistry, so the store, the mesh and the reconcile scan
                                 // all agree on one folder. This page deciding for itself is how the two
                                 // diverged in the first place.
-                                val dir = com.prism.launcher.messaging.ModelRegistry.directory()
+                                val dir = ModelRegistry.directory()
                                 val target = File(dir, model.downloadUrl.substringAfterLast('/'))
+                                // Recorded before enqueue: completion is on another thread and
+                                // an ONNX extension cannot distinguish image from interpolation.
+                                storeType(storeCategory)?.let { ModelRegistry.expect(target, it) }
                                 PrismPlatform.downloader.enqueue(model.name, model.downloadUrl, target)
                                 downloads = PrismPlatform.downloader.active()
                                 status = "Downloading ${model.name}"
@@ -518,8 +797,20 @@ fun ModelsPage() {
 
                 if (results.isEmpty() && !searching) {
                     Text(
-                        "Search HuggingFace and GitHub for models. GGUF files run locally " +
-                            "through llama.cpp.",
+                        when (storeCategory) {
+                            "audio" -> "Search HuggingFace and GitHub for audio models. ONNX and " +
+                                "safetensors exports can be imported into the audio family."
+                            "interpolation" -> "Search for frame interpolation models. ONNX RIFE-style " +
+                                "exports work with Prism Flow as the fallback."
+                            "generative" -> "Search HuggingFace and GitHub for image models. " +
+                                "GGUF and safetensors checkpoints both run through " +
+                                "stable-diffusion.cpp; a download is filed under this filter, not " +
+                                "by its extension."
+                            else -> "Search HuggingFace and GitHub for models. GGUF files run locally " +
+                                "through llama.cpp, safetensors and GGUF image checkpoints through " +
+                                "stable-diffusion.cpp, and everything else is imported into its own " +
+                                "list under the filter it was found with."
+                        },
                         fontSize = 12.sp, color = colors.faint,
                         modifier = Modifier.padding(16.dp),
                     )
@@ -589,16 +880,161 @@ private suspend fun watchForDisplay(target: File, onDone: () -> Unit) {
 }
 
 @Composable
-private fun TypePill(isText: Boolean) {
+private fun ModelSection(
+    title: String,
+    models: List<PrismSettings.ImportedModel>,
+    activePath: String,
+    media: List<VideoCraftModels.Entry>,
+    emptyText: String,
+    onActivate: (PrismSettings.ImportedModel) -> Unit,
+    onDelete: (PrismSettings.ImportedModel) -> Unit,
+) {
+    val colors = LocalPrismColors.current
+    SectionHeader(title)
+    Card {
+        if (models.isEmpty() && media.isEmpty()) {
+            Text(
+                emptyText,
+                fontSize = 12.sp, color = colors.faint,
+                modifier = Modifier.padding(16.dp),
+            )
+        }
+        var row = 0
+        models.forEach { model ->
+            if (row++ > 0) Hairline()
+            InstalledModelRow(
+                model = model,
+                active = model.path == activePath,
+                onActivate = { onActivate(model) },
+                onDelete = { onDelete(model) },
+            )
+        }
+        media.forEach { entry ->
+            if (row++ > 0) Hairline()
+            MediaModelRow(entry)
+        }
+    }
+}
+
+@Composable
+private fun InstalledModelRow(
+    model: PrismSettings.ImportedModel,
+    active: Boolean,
+    onActivate: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    val colors = LocalPrismColors.current
+    val exists = File(model.path).isFile
+    Row(
+        Modifier.fillMaxWidth()
+            .clickableRow {
+                if (exists) onActivate()
+            }
+            .padding(horizontal = 16.dp, vertical = 11.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            if (active) Icons.Filled.RadioButtonChecked
+            else Icons.Filled.RadioButtonUnchecked,
+            null,
+            tint = if (active) colors.accent else colors.faint,
+            modifier = Modifier.size(16.dp),
+        )
+        Spacer(Modifier.width(11.dp))
+        Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    model.displayName,
+                    fontSize = 14.sp,
+                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                Spacer(Modifier.width(8.dp))
+                TypePill(model.type)
+                if (!exists) {
+                    Spacer(Modifier.width(6.dp))
+                    MissingPill()
+                }
+            }
+            Text(
+                model.path,
+                fontSize = 10.sp, color = colors.faint,
+                maxLines = 1, overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Icon(
+            Icons.Filled.Delete, "Remove",
+            tint = colors.faint,
+            modifier = Modifier.size(15.dp).clickableRow(onDelete),
+        )
+    }
+}
+
+@Composable
+private fun MediaModelRow(entry: VideoCraftModels.Entry) {
+    val colors = LocalPrismColors.current
+    var active by remember(entry.kind, entry.id) {
+        mutableStateOf(VideoCraftModels.isActive(entry.kind, entry.id))
+    }
+    Row(
+        Modifier.fillMaxWidth()
+            .clickableRow {
+                VideoCraftModels.activate(entry.kind, entry)
+                active = VideoCraftModels.isActive(entry.kind, entry.id)
+            }
+            .padding(horizontal = 16.dp, vertical = 11.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            if (active) Icons.Filled.RadioButtonChecked
+            else Icons.Filled.RadioButtonUnchecked,
+            null,
+            tint = if (active) colors.accent else colors.faint,
+            modifier = Modifier.size(16.dp),
+        )
+        Spacer(Modifier.width(11.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                entry.displayName,
+                fontSize = 14.sp,
+                fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+            )
+            Text(entry.detail, fontSize = 10.sp, color = colors.faint)
+        }
+        if (active) Text("active", fontSize = 11.sp, color = colors.accent)
+    }
+}
+
+private fun typeLabel(type: String): String = when (type) {
+    PrismSettings.MODEL_TYPE_IMAGE -> "Image"
+    PrismSettings.MODEL_TYPE_AUDIO_GEN -> "Audio"
+    PrismSettings.MODEL_TYPE_INTERPOLATION -> "Frames"
+    PrismSettings.MODEL_TYPE_AUDIO -> "Speech"
+    else -> "Text"
+}
+
+private fun storeType(category: String): String? = when (category) {
+    "text" -> PrismSettings.MODEL_TYPE_TEXT
+    "generative" -> PrismSettings.MODEL_TYPE_IMAGE
+    "audio" -> PrismSettings.MODEL_TYPE_AUDIO_GEN
+    "interpolation" -> PrismSettings.MODEL_TYPE_INTERPOLATION
+    else -> null
+}
+
+@Composable
+private fun TypePill(type: String) {
+    val label = typeLabel(type).uppercase()
+    val blue = type == PrismSettings.MODEL_TYPE_TEXT
     Surface(
-        color = if (isText) Color(0x332F6FEB) else Color(0x33B36FEB),
+        color = if (blue) Color(0x332F6FEB) else Color(0x33B36FEB),
         shape = RoundedCornerShape(5.dp),
     ) {
         Text(
-            if (isText) "TEXT" else "IMAGE",
+            label,
             fontSize = 8.sp,
             letterSpacing = 0.8.sp,
-            color = if (isText) Color(0xFF8FB4FF) else Color(0xFFD0A8FF),
+            color = if (blue) Color(0xFF8FB4FF) else Color(0xFFD0A8FF),
             modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp),
         )
     }

@@ -35,6 +35,29 @@
             android:noHistory="true"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
+        <!--
+            Renders the active checkpoint on a backend named in the intent and reports ms per step.
+            "Image generation feels slow" needs to become a number before it can be fixed, and the
+            only place that number exists is the device the render runs on.
+        -->
+        <activity
+            android:name=".diffusion.DiffusionBenchActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!--
+            Measures real GGUF decode throughput for one or every inference mode on this phone.
+            Same reason as the diffusion probe: the only place the number exists is the device.
+        -->
+        <activity
+            android:name=".messaging.GgufBenchActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
     </application>
 
 </manifest>

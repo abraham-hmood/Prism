@@ -16,11 +16,23 @@ class ShakeDetector(context: Context, private val onShake: () -> Unit) : SensorE
     private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
     private val accelerometer = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
 
+    /**
+     * Whether this device can detect a shake at all.
+     *
+     * A TV or a headless box has no accelerometer, and a screen whose only exit is a gesture the
+     * hardware cannot make is a trap. Callers that lock something behind a shake must offer another
+     * way out when this is false.
+     */
+    val isAvailable: Boolean get() = accelerometer != null
+
     private var lastShakeTime = 0L
 
     fun start() {
         accelerometer?.let {
-            sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+            // UI rate, not GAME rate. A shake is a large, slow gesture; sampling at 50 Hz for
+            // every moment the launcher is open costs battery and buys nothing a 16 Hz sample
+            // cannot detect.
+            sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
         }
     }
 

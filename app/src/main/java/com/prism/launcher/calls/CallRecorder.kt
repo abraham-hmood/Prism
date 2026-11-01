@@ -44,23 +44,37 @@ class CallRecorder(
     private var sampleRate = SAMPLE_RATE
 
     @Volatile private var running = false
+    @Volatile private var peak = 0
 
     fun start(): Start {
         val dir = CallRecordings.root(context) ?: return Start(false, "Recordings folder is unavailable.")
         val file = File(dir, "rec-${System.currentTimeMillis()}-${sanitize(number)}.part")
-        val rate = SAMPLE_RATE
-        val buffer = AudioRecord.getMinBufferSize(
+
+        // Voice audio is 16 kHz. Asking for a rate the source cannot provide used to make
+        // getMinBufferSize fail and the whole feature report "this device cannot record"; the
+        // fallback keeps a CD-rate device working without making every other one pay for it.
+        var rate = SAMPLE_RATE
+        var buffer = AudioRecord.getMinBufferSize(
             rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
+        if (buffer <= 0) {
+            rate = FALLBACK_RATE
+            buffer = AudioRecord.getMinBufferSize(
+                rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+            )
+        }
         if (buffer <= 0) return Start(false, "This device cannot open a call recorder.")
 
         val sources = listOf(
             MediaRecorder.AudioSource.VOICE_CALL to "both sides",
             MediaRecorder.AudioSource.VOICE_COMMUNICATION to "call audio (this side on most devices)",
+            MediaRecorder.AudioSource.VOICE_RECOGNITION to "call audio (this side)",
+            MediaRecorder.AudioSource.UNPROCESSED to "microphone only (unprocessed)",
             MediaRecorder.AudioSource.MIC to "microphone only",
         )
         var opened: AudioRecord? = null
         var openedLabel = ""
+        var initial = ByteArray(0)
         for ((source, label) in sources) {
             val attempt = runCatching {
                 AudioRecord(
@@ -76,19 +90,34 @@ class CallRecorder(
                 // source and only refuse when it starts. Start here so a refusal can fall through
                 // to the microphone rather than crashing the call screen.
                 if (runCatching { attempt.startRecording() }.isSuccess) {
-                    opened = attempt
-                    openedLabel = label
-                    break
+                    // STARTING IS NOT AUDIO EITHER. During a carrier call Android will happily
+                    // hand back a source that is digitally silent because the telephony stack
+                    // owns the input; the old code chose that source, recorded zeros and then
+                    // discarded the file, which looked exactly like the button doing nothing.
+                    // Listen briefly to each source and keep the first one that has a signal.
+                    val probed = runCatching { probe(attempt) }.getOrDefault(ByteArray(0) to false)
+                    if (probed.second) {
+                        opened = attempt
+                        openedLabel = label
+                        initial = probed.first
+                        break
+                    }
                 }
             }
+            runCatching { attempt?.stop() }
             runCatching { attempt?.release() }
         }
         val active = opened
         if (active == null) {
-            return Start(false, "Android refused every call-audio source for this call.")
+            return Start(
+                false,
+                "This device returns silence for every call-audio source Android allows. " +
+                    "Carrier call recording is blocked here; voice notes still record normally.",
+            )
         }
 
         val stream = runCatching { FileOutputStream(file) }.getOrElse {
+            runCatching { active.stop() }
             runCatching { active.release() }
             return Start(false, "Could not create the recording file.")
         }
@@ -101,6 +130,7 @@ class CallRecorder(
         // Placeholder header. The sizes are written for real when the recording stops, which is
         // the only time they are known and also what keeps a killed recording from looking valid.
         stream.write(wavHeader(0, rate))
+        if (initial.isNotEmpty()) stream.write(initial)
         stream.flush()
 
         running = true
@@ -109,16 +139,63 @@ class CallRecorder(
             val frame = ByteArray(FRAME_BYTES)
             while (running) {
                 val read = runCatching { active.read(frame, 0, frame.size) }.getOrDefault(-1)
-                if (read <= 0) {
+                if (read < 0) {
+                    // A dead object will keep answering the same way. Spinning on it at full tilt
+                    // is how a recorder that captured nothing also made the phone hot.
                     if (!running) break
+                    Thread.sleep(20L)
                     continue
                 }
+                if (read == 0) {
+                    if (!running) break
+                    Thread.sleep(10L)
+                    continue
+                }
+                peak = maxOf(peak, peakOf(frame, read))
                 runCatching { stream.write(frame, 0, read) }
             }
         }, "prism-call-recorder").apply { isDaemon = true; start() }
 
         PrismLogger.logInfo(TAG, "Call recording started ($openedLabel)")
         return Start(true)
+    }
+
+    /**
+     * Listens briefly to a started source, so a silently-muted one can be rejected.
+     *
+     * The bytes heard here are returned, not thrown away: they are the beginning of the recording.
+     */
+    private fun probe(active: AudioRecord): Pair<ByteArray, Boolean> {
+        val chunk = ByteArray(FRAME_BYTES)
+        val collected = java.io.ByteArrayOutputStream()
+        val deadline = android.os.SystemClock.elapsedRealtime() + PROBE_MS
+        var signal = false
+        while (android.os.SystemClock.elapsedRealtime() < deadline) {
+            val read = active.read(chunk, 0, chunk.size, AudioRecord.READ_NON_BLOCKING)
+            if (read > 0) {
+                collected.write(chunk, 0, read)
+                if (peakOf(chunk, read) > SILENCE_FLOOR) {
+                    signal = true
+                    break
+                }
+            } else {
+                runCatching { Thread.sleep(15L) }
+            }
+        }
+        return collected.toByteArray() to signal
+    }
+
+    private fun peakOf(bytes: ByteArray, length: Int): Int {
+        var highest = 0
+        var index = 0
+        while (index + 1 < length) {
+            val sample = (((bytes[index + 1].toInt() shl 8) or
+                (bytes[index].toInt() and 0xFF)).toShort()).toInt()
+            val magnitude = kotlin.math.abs(sample)
+            if (magnitude > highest) highest = magnitude
+            index += 2
+        }
+        return highest
     }
 
     fun stop(): CallRecordings.Recording? {
@@ -136,7 +213,8 @@ class CallRecorder(
         val part = partFile ?: return null
         partFile = null
         val dataBytes = (part.length() - WAV_HEADER).coerceAtLeast(0L).toInt()
-        if (dataBytes < MIN_BYTES) {
+        if (dataBytes < MIN_BYTES || peak <= SILENCE_FLOOR) {
+            // Do not save a file that is only digital silence and call it a recording.
             runCatching { part.delete() }
             return null
         }
@@ -203,10 +281,17 @@ class CallRecorder(
 
     private companion object {
         const val TAG = "PrismCallRecorder"
-        const val SAMPLE_RATE = 44_100
+        const val SAMPLE_RATE = 16_000
+        const val FALLBACK_RATE = 44_100
         const val FRAME_BYTES = 4_096
         const val WAV_HEADER = 44
         const val MIN_BYTES = 1_600
+
+        /** Long enough to meet speech or line noise, short enough not to lose a sentence. */
+        const val PROBE_MS = 1_200L
+
+        /** Anything above this is a real signal; a muted source returns exact zeros. */
+        const val SILENCE_FLOOR = 2
     }
 }
 

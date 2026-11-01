@@ -12,9 +12,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import com.prism.launcher.PrismSettings
-import com.prism.launcher.messaging.GgufInferenceService
 import com.prism.launcher.nora.IosUi
-import com.prism.launcher.quant.PrismQuantizer.Level
 import java.io.File
 
 /**
@@ -68,6 +66,18 @@ class QuantizationView(context: Context) : FrameLayout(context) {
     /** Paths currently drawn as radio buttons; null until the first build. See [refreshModelsInner]. */
     private var renderedPaths: List<String>? = null
 
+    /**
+     * The levels drawn right now, and which model they were drawn for.
+     *
+     * The list DEPENDS ON THE MODEL, which is the change safetensors support brought: a GGUF offers
+     * llama.cpp's levels and a safetensors checkpoint offers block levels, so switching the model
+     * above has to rebuild these. [levelSource] is the model path they belong to, so a refresh from
+     * a layout pass does not rebuild them under the user's finger -- the same reason
+     * [renderedPaths] exists.
+     */
+    private var levels: List<QuantTarget> = emptyList()
+    private var levelSource: String? = null
+
     /** The finished model from the last successful run, for [exportButton]. */
     private var exportable: File? = null
 
@@ -84,7 +94,8 @@ class QuantizationView(context: Context) : FrameLayout(context) {
 
         column.addView(IosUi.sectionHeader(context, "LOCAL MODEL"))
         emptyText.apply {
-            text = "No local GGUF models found. Quantising reads a GGUF file, so import one first."
+            text = "No model here can be quantised yet. Quantising reads a GGUF or a safetensors " +
+                "checkpoint, so import one of those first."
             textSize = 14f
             setTextColor(IosUi.secondaryLabel(context))
             setPadding(IosUi.dp(context, 16f), IosUi.dp(context, 12f), IosUi.dp(context, 16f), IosUi.dp(context, 12f))
@@ -155,7 +166,6 @@ class QuantizationView(context: Context) : FrameLayout(context) {
 
         modelGroup.setOnCheckedChangeListener { _, _ -> onSelectionChanged() }
 
-        buildLevels()
         refreshModels()
     }
 
@@ -185,17 +195,13 @@ class QuantizationView(context: Context) : FrameLayout(context) {
     private fun refreshModelsInner() {
         val checkedPath = models.getOrNull(modelGroup.checkedIndex(MODEL_ID_BASE))?.path
 
-        // GGUF ONLY, DECIDED BY THE FILE'S MAGIC BYTES, not by its name.
-        //
-        // The quantiser is llama.cpp's, so a GGUF is the only thing it can read, and the imported
-        // list is not all GGUF -- it also holds diffusion weights. But filtering on a `.gguf`
-        // extension was wrong and emptied this list: imports keep whatever name the source had, and
-        // plenty of perfectly good models arrive without the extension. The first four bytes are
-        // "GGUF" whatever the file is called, which is why GgufInferenceService already checks them
-        // before loading anything.
-        val next = modelSource().filter { model ->
-            File(model.path).isFile && GgufInferenceService.isGgufFile(model.path)
-        }
+        // DECIDED BY THE FILE'S CONTENTS, not by its name -- and now by two containers rather than
+        // one. The GGUF quantiser is llama.cpp's, so a GGUF is the only thing IT can read; the
+        // safetensors quantiser reads its own container in Kotlin, which is what this list was
+        // missing (diffusion checkpoints, TTS checkpoints and every trainer export live there, and
+        // none of them could be quantised at all). Filtering on an extension would have been wrong
+        // for the same reason it was wrong before: imports keep whatever name the source had.
+        val next = modelSource().filter { model -> QuantTarget.isQuantisable(model.path) }
 
         // NOTHING TO DO IF NOTHING CHANGED, and that is a correctness guard rather than an
         // optimisation. Rebuilding the radio buttons schedules a layout pass, and this is called
@@ -229,30 +235,56 @@ class QuantizationView(context: Context) : FrameLayout(context) {
             models.isNotEmpty() -> modelGroup.check(MODEL_ID_BASE)
         }
 
+        buildLevelsFor(models.getOrNull(modelGroup.checkedIndex(MODEL_ID_BASE)))
         updateRunButton()
     }
 
-    private fun buildLevels() {
-        Level.entries.forEachIndexed { index, level ->
+    /**
+     * Redraws the level list for [model].
+     *
+     * The chosen level is carried across the rebuild by its FILE SUFFIX rather than by its index,
+     * because the two containers' lists do not line up: index 6 is Q6_K for a GGUF and nothing at all
+     * for a safetensors file, and keeping the index would silently change what the user selected.
+     */
+    private fun buildLevelsFor(model: PrismSettings.ImportedModel?) {
+        val path = model?.path
+        if (path == levelSource) return
+        val previous = levels.getOrNull(levelGroup.checkedIndex(LEVEL_ID_BASE))?.fileSuffix
+        levelSource = path
+        levels = if (path == null) emptyList() else QuantTarget.forSource(File(path))
+        levelGroup.removeAllViews()
+        levels.forEachIndexed { index, target ->
             levelGroup.addView(
                 radio(
                     id = LEVEL_ID_BASE + index,
-                    title = level.label,
+                    title = target.label +
+                        if (target.available) "" else " · unavailable",
                     detail = buildString {
-                        append(String.format(java.util.Locale.US, "~%.2f bits/weight", level.bitsPerWeight))
-                        if (level.note.isNotBlank()) append(" · ").append(level.note)
+                        append(String.format(java.util.Locale.US, "~%.2f bits/weight", target.bitsPerWeight))
+                        val explanation = if (target.available) target.note else target.unavailableReason
+                        if (explanation.isNotBlank()) append(" · ").append(explanation)
                     },
                 )
             )
         }
-        levelGroup.check(LEVEL_ID_BASE + Level.Q4_K_M.ordinal)
+        val restored = levels.indexOfFirst { it.fileSuffix == previous }
+        val fallback = levels.indices.minByOrNull { kotlin.math.abs(levels[it].bitsPerWeight - DEFAULT_BITS) }
+        when {
+            restored >= 0 -> levelGroup.check(LEVEL_ID_BASE + restored)
+            // The nearest thing to 4-bit: Q4_K_M's 4.85 for a GGUF, I4's 4.5 for safetensors. Both
+            // are the level a user starting from nothing wants, and neither list has to know the
+            // other's names.
+            fallback != null -> levelGroup.check(LEVEL_ID_BASE + fallback)
+        }
     }
 
     /**
      * Re-renders when the chosen model changes, so the export button names what it will actually
-     * write rather than whatever was selected when the view was built.
+     * write rather than whatever was selected when the view was built -- and so the level list
+     * belongs to the model above it.
      */
     private fun onSelectionChanged() {
+        buildLevelsFor(models.getOrNull(modelGroup.checkedIndex(MODEL_ID_BASE)))
         render(QuantizationService.state.value)
     }
 
@@ -304,7 +336,7 @@ class QuantizationView(context: Context) : FrameLayout(context) {
      * was going.
      */
     fun render(state: QuantizationService.State) {
-        runButton.isEnabled = !state.running && models.isNotEmpty()
+        runButton.isEnabled = !state.running && models.isNotEmpty() && levels.isNotEmpty()
         runButton.alpha = if (runButton.isEnabled) 1f else 0.4f
         runButton.text = if (state.running) "Quantising…" else "Quantise"
 
@@ -314,11 +346,11 @@ class QuantizationView(context: Context) : FrameLayout(context) {
 
         statusText.text = when {
             state.running ->
-                "${state.modelName} → ${state.level?.fileSuffix} · ${state.percent}%" +
+                "${state.modelName} → ${state.target?.fileSuffix} · ${state.percent}%" +
                     if (state.bytesWritten > 0) " (${formatSize(state.bytesWritten)} written)" else ""
             state.error != null -> "Last run failed: ${state.error}"
             state.finished && state.outputPath != null ->
-                "${state.modelName} → ${state.level?.fileSuffix} finished and was added to your models."
+                "${state.modelName} → ${state.target?.fileSuffix} finished and was added to your models."
             else -> ""
         }
         statusText.visibility = if (statusText.text.isNullOrBlank()) View.GONE else View.VISIBLE
@@ -341,7 +373,9 @@ class QuantizationView(context: Context) : FrameLayout(context) {
     }
 
     private fun updateRunButton() {
-        runButton.isEnabled = models.isNotEmpty()
+        // A model with no applicable level must not leave a live button behind: that is a run that
+        // could only fail, offered as though it could work.
+        runButton.isEnabled = models.isNotEmpty() && levels.isNotEmpty()
         runButton.alpha = if (runButton.isEnabled) 1f else 0.4f
     }
 
@@ -351,18 +385,22 @@ class QuantizationView(context: Context) : FrameLayout(context) {
             Toast.makeText(context, "Choose a model first", Toast.LENGTH_SHORT).show()
             return
         }
-        val level = Level.entries.getOrNull(levelGroup.checkedIndex(LEVEL_ID_BASE))
-        if (level == null) {
+        val target = levels.getOrNull(levelGroup.checkedIndex(LEVEL_ID_BASE))
+        if (target == null) {
             Toast.makeText(context, "Choose a quantisation first", Toast.LENGTH_SHORT).show()
             return
         }
-        if (!PrismQuantizer.isAvailable()) {
-            Toast.makeText(context, "The native quantiser is unavailable on this device", Toast.LENGTH_LONG).show()
+        if (!target.available) {
+            // Names WHICH quantiser is missing rather than saying "unavailable on this device",
+            // because with two of them the reason is now specific to the level that was chosen.
+            Toast.makeText(context, target.unavailableReason, Toast.LENGTH_LONG).show()
             return
         }
 
-        QuantizationService.start(context, File(model.path), level)
-        Toast.makeText(context, "Quantising ${model.displayName} to ${level.fileSuffix}…", Toast.LENGTH_SHORT).show()
+        QuantizationService.start(context, File(model.path), target)
+        Toast.makeText(
+            context, "Quantising ${model.displayName} to ${target.fileSuffix}…", Toast.LENGTH_SHORT,
+        ).show()
     }
 
     /**
@@ -381,6 +419,9 @@ class QuantizationView(context: Context) : FrameLayout(context) {
         const val TAG = "PrismQuantView"
         const val MODEL_ID_BASE = 0x51_00_00
         const val LEVEL_ID_BASE = 0x52_00_00
+
+        /** What a level list defaults to when nothing has been chosen yet. See [buildLevelsFor]. */
+        const val DEFAULT_BITS = 4.85
     }
 
     private fun formatSize(bytes: Long): String = when {

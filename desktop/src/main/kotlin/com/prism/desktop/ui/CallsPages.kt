@@ -82,6 +82,7 @@ import com.prism.launcher.maps.MapGeo
 import com.prism.launcher.maps.MapPlace
 import com.prism.launcher.maps.MapServices
 import com.prism.launcher.maps.MapStore
+import com.prism.launcher.minigames.GeoTagStore
 import com.prism.launcher.trusted.TrustedDevices
 import com.prism.launcher.trusted.TrustedLocations
 import kotlinx.coroutines.Dispatchers
@@ -134,17 +135,17 @@ fun DialerPage() {
     var note by remember { mutableStateOf("") }
 
     DisposableEffect(Unit) {
-        val listener: (MeshCalls.Call?) -> Unit = { call = it }
-        val invite: (MeshCalls.Call) -> Unit = { call = it }
-        val previousState = MeshCalls.onState
-        val previousInvite = MeshCalls.onIncoming
-        MeshCalls.onState = listener
-        // A page has to be able to RECEIVE while it is open; without this the invite sat in
-        // pendingInvite with nothing on screen to answer it.
-        MeshCalls.onIncoming = invite
+        // LISTENERS, not assignments. This page used to claim MeshCalls.onIncoming for itself and
+        // hand back a captured lambda on the way out, which could leave the window's banner
+        // detached after the dialer had been opened once. Registering and removing only this
+        // observer keeps the banner and this page both watching the engine.
+        val listener: (MeshCalls.Call?) -> Unit = { current -> call = current }
+        val invite: (MeshCalls.Call) -> Unit = { current -> call = current }
+        MeshCalls.addStateListener(listener)
+        MeshCalls.addIncomingListener(invite)
         onDispose {
-            if (MeshCalls.onState === listener) MeshCalls.onState = previousState
-            if (MeshCalls.onIncoming === invite) MeshCalls.onIncoming = previousInvite
+            MeshCalls.removeStateListener(listener)
+            MeshCalls.removeIncomingListener(invite)
         }
     }
 
@@ -743,6 +744,7 @@ fun MapsPage() {
     var fixes by remember { mutableStateOf<List<TrustedLocations.Fix>>(emptyList()) }
     var trusted by remember { mutableStateOf<List<TrustedDevices.Trust>>(emptyList()) }
     var favorites by remember { mutableStateOf<List<MapPlace>>(emptyList()) }
+    var geoTagPins by remember { mutableStateOf<List<MapPlace>>(emptyList()) }
     var place by remember { mutableStateOf(DesktopLocations.position()) }
 
     var centre by remember { mutableStateOf(LatLon(20.0, 0.0)) }
@@ -785,6 +787,20 @@ fun MapsPage() {
         fixes = loaded.first
         trusted = loaded.second
         favorites = loaded.third
+        // Tags arrive by mesh or are stored by an Android device sharing this data directory.
+        geoTagPins = withContext(Dispatchers.IO) {
+            runCatching {
+                GeoTagStore.places().map { tag ->
+                    MapPlace(
+                        id = "geotag-" + tag.id,
+                        name = GeoTagStore.artwork(tag.artId)?.title ?: "GeoTag piece",
+                        address = tag.author,
+                        lat = tag.lat,
+                        lon = tag.lng,
+                    )
+                }
+            }.getOrDefault(emptyList())
+        }
         place = DesktopLocations.position()
     }
 
@@ -993,6 +1009,7 @@ fun MapsPage() {
                 fixes = fixes,
                 trusted = trusted,
                 favorites = favorites,
+                geoTagPins = geoTagPins,
                 selectedPlace = selectedPlace,
                 current = place?.let { LatLon(it.latitude, it.longitude) },
                 route = route?.points.orEmpty(),
@@ -1247,6 +1264,7 @@ private fun MapCanvas(
     fixes: List<TrustedLocations.Fix>,
     trusted: List<TrustedDevices.Trust>,
     favorites: List<MapPlace>,
+    geoTagPins: List<MapPlace>,
     selectedPlace: MapPlace?,
     current: LatLon?,
     route: List<LatLon>,
@@ -1397,6 +1415,14 @@ private fun MapCanvas(
                 val point = Offset(sx(favorite.lon), sy(favorite.lat))
                 drawCircle(Color(0xFFFFD60A), 8f, point)
                 drawCircle(Color(0xFF231C00), 3f, point)
+            }
+
+            // GeoTag walls: a distinct magenta ring, so a tagged wall is never read as a favourite.
+            geoTagPins.forEach { pin ->
+                val point = Offset(sx(pin.lon), sy(pin.lat))
+                drawCircle(Color(0xFFFF4FD8), 8f, point)
+                drawCircle(Color.White, 5f, point)
+                drawCircle(Color(0xFFFF4FD8), 2.5f, point)
             }
 
             selectedPlace?.let { chosen ->

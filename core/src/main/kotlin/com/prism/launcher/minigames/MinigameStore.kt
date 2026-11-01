@@ -33,7 +33,10 @@ object MinigameStore {
     private const val KEY_LAST_GAME = "last_game_v1"
     private const val KEY_SEEN_OPENING = "seen_opening_raid_v1"
     private const val KEY_MINESWEEPER_RECORD = "minesweeper_record_v1"
+    private const val KEY_ECHO_RECORD = "echo_record_v1"
+    private const val KEY_ECHO_BEST = "echo_best_v1"
     private const val KEY_PINBALL_BEST = "pinball_best_v1"
+    private const val KEY_ARCADE_BEST = "arcade_best_v1_"
     private const val KEY_CHESS_RECORD = "chess_record_v1"
     private const val KEY_PONG_RECORD = "pong_record_v1"
     private const val KEY_CHESS_DIFFICULTY = "chess_difficulty_v1"
@@ -464,12 +467,30 @@ object MinigameStore {
 
     fun recordMinesweeper(won: Boolean) = bumpRecord(KEY_MINESWEEPER_RECORD, won)
 
+    /** Echo Chamber escapes, and the best score across them. */
+    fun echoRecord(): Pair<Int, Int> = recordOf(KEY_ECHO_RECORD)
+
+    fun echoBest(): Int = prefs().getInt(KEY_ECHO_BEST, 0)
+
+    fun recordEcho(won: Boolean, score: Int) {
+        bumpRecord(KEY_ECHO_RECORD, won)
+        if (score > echoBest()) prefs().edit().putInt(KEY_ECHO_BEST, score).apply()
+    }
+
     /** The highest pinball score this device has seen. */
     fun pinballBest(): Int = prefs().getInt(KEY_PINBALL_BEST, 0)
 
     fun recordPinball(score: Int) {
         if (score <= pinballBest()) return
         prefs().edit().putInt(KEY_PINBALL_BEST, score).apply()
+    }
+
+    /** Best score for one of the short arcade games, keyed by its stable id. */
+    fun arcadeBest(id: String): Int = prefs().getInt(KEY_ARCADE_BEST + id, 0)
+
+    fun recordArcade(id: String, score: Int) {
+        if (score <= arcadeBest(id)) return
+        prefs().edit().putInt(KEY_ARCADE_BEST + id, score).apply()
     }
 
     private fun recordOf(key: String): Pair<Int, Int> {

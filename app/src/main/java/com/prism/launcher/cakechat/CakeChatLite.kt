@@ -6,6 +6,7 @@ import java.io.File
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.nnapi.NnApiDelegate
 
 /**
  * A trained CakeChat running on TFLite, without TensorFlow or Python.
@@ -66,6 +67,52 @@ class CakeChatLite private constructor(
             "cakechat_encoder.tflite", "cakechat_decoder.tflite", CakeChatVocabulary.META_NAME,
         )
 
+        /**
+         * The NNAPI delegate, held for as long as the interpreters it was added to.
+         *
+         * TFLite does not take ownership of a delegate: it is a native allocation that has to be
+         * closed after the interpreters are, and dropping the only reference would leak it for the
+         * life of the process. One is kept here and replaced only when a new pair of interpreters is
+         * built for it.
+         */
+        @Volatile
+        private var nnapiDelegate: NnApiDelegate? = null
+
+        /**
+         * Adds the NPU to [options] when -- and only when -- the user's backend is NPU.
+         *
+         * Returns whether it was added. Every way this can decline is a case where adding it would
+         * have been a lie or a waste: the user chose CPU or GPU, this Android has no NNAPI runtime,
+         * or the delegate failed to construct. The reason is logged either way, so a phone that
+         * should have an NPU and did not get one says so in the log rather than silently running on
+         * the CPU.
+         */
+        private fun addNpuDelegate(options: Interpreter.Options): Boolean {
+            if (!com.prism.launcher.messaging.AiBackend.npuChosen()) return false
+
+            val capability = com.prism.launcher.messaging.AndroidNpuReporter.capability()
+            val plan = capability.planFor(com.prism.launcher.messaging.NpuSupport.Workload.TEXT_TFLITE)
+            if (!plan.reachable) {
+                PrismLogger.logInfo(
+                    TAG,
+                    "NNAPI not added: " + plan.reason.ifBlank { "no NPU path for a TFLite graph" },
+                )
+                return false
+            }
+
+            return runCatching {
+                runCatching { nnapiDelegate?.close() }
+                val delegate = NnApiDelegate()
+                nnapiDelegate = delegate
+                options.addDelegate(delegate)
+                PrismLogger.logInfo(TAG, "NNAPI delegate added (${capability.displayName})")
+                true
+            }.getOrElse {
+                PrismLogger.logError(TAG, "NNAPI delegate failed to construct; using the CPU", it)
+                false
+            }
+        }
+
         fun isAvailable(context: Context): Boolean = missing(context).isEmpty()
 
         /**
@@ -116,8 +163,21 @@ class CakeChatLite private constructor(
                     numThreads = threads
                     setUseXNNPACK(true)
                 }
+
+                // THE NPU, ONLY WHEN IT WAS CHOSEN. A TFLite graph is one of the two formats that can
+                // genuinely run on every one of the five phone NPs -- that is what NNAPI exists for --
+                // and the delegate is added before the interpreters are built because execution
+                // providers are fixed at construction time. With any other backend this is skipped
+                // entirely: the CPU/XNNPACK options above stay exactly as they were.
+                val npu = addNpuDelegate(options)
+
                 val encoder = Interpreter(map(File(dir, "cakechat_encoder.tflite")), options)
                 val decoder = Interpreter(map(File(dir, "cakechat_decoder.tflite")), options)
+                PrismLogger.logInfo(
+                    "CakeChatLite",
+                    if (npu) "Interpreters created with the NNAPI (NPU) delegate"
+                    else "Interpreters created on the CPU (XNNPACK)",
+                )
 
                 fun indexOf(interpreter: Interpreter, fragment: String): Int {
                     for (i in 0 until interpreter.inputTensorCount) {

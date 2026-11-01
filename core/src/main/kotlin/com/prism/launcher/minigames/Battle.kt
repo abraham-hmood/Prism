@@ -126,6 +126,8 @@ object Battle {
     data class Fighter(
         val index: Int,
         val squad: Int,
+        /** How many real soldiers this figure stands for. See [MAX_FIGHTERS]. */
+        val strength: Int = 1,
         var x: Double,
         var y: Double,
         var hitPoints: Int,
@@ -145,6 +147,7 @@ object Battle {
         var orbitRadius: Double = 0.0,
         var orbitAngle: Double = 0.0,
     ) {
+        val represented: Int get() = strength
         val alive: Boolean get() = hitPoints > 0
         val weapon: WeaponCatalog.Weapon get() = WeaponCatalog.byId(weaponId) ?: WeaponCatalog.STARTER
     }
@@ -157,6 +160,29 @@ object Battle {
         val weaponId: String,
         var cooldown: Int = 0,
     ) {
+        val weapon: WeaponCatalog.Weapon get() = WeaponCatalog.byId(weaponId) ?: WeaponCatalog.STARTER
+    }
+
+    /**
+     * A garrison soldier who has come out of the barracks to fight.
+     *
+     * The old model put the defenders inside their buildings as fixed [Emplacement]s, which made
+     * an invasion look like an empty base shooting back. These are actual bodies: they leave their
+     * posts, close on the nearest attacker, and shoot. Like attackers they are grouped when a
+     * country has thousands of soldiers, so a large garrison does not cost thousands of objects.
+     */
+    data class Guard(
+        val index: Int,
+        var x: Double,
+        var y: Double,
+        val strength: Int,
+        var hitPoints: Int,
+        val maxHitPoints: Int,
+        val weaponId: String,
+        var cooldown: Int = 0,
+        var target: Int = -1,
+    ) {
+        val alive: Boolean get() = hitPoints > 0
         val weapon: WeaponCatalog.Weapon get() = WeaponCatalog.byId(weaponId) ?: WeaponCatalog.STARTER
     }
 
@@ -177,8 +203,12 @@ object Battle {
         /** The order [Frame.buildingHp] is in. */
         val buildingIds: List<String>,
         val maxFighterHp: Int,
+        /** The sortieing garrison, if this raid has one. Empty for the old static-garrison battle. */
+        val guardWeaponIds: List<String> = emptyList(),
+        val maxGuardHp: Int = 1,
     ) {
         val size: Int get() = squads.size
+        val guardCount: Int get() = guardWeaponIds.size
 
         fun weaponOf(index: Int): WeaponCatalog.Weapon =
             WeaponCatalog.byId(weaponIds.getOrNull(index) ?: "") ?: WeaponCatalog.STARTER
@@ -197,12 +227,19 @@ object Battle {
         val fighterHp: IntArray,
         val buildingHp: IntArray,
         val shots: List<Shot>,
+        /** x then y per defender, in [Cast.guardWeaponIds] order. Empty when none sortied. */
+        val guardPositions: FloatArray = FloatArray(0),
+        val guardHp: IntArray = IntArray(0),
     ) {
         fun x(index: Int): Float = positions[index * 2]
         fun y(index: Int): Float = positions[index * 2 + 1]
+        fun gx(index: Int): Float = guardPositions[index * 2]
+        fun gy(index: Int): Float = guardPositions[index * 2 + 1]
         fun alive(index: Int): Boolean = fighterHp[index] > 0
+        fun guardAlive(index: Int): Boolean = guardHp.getOrNull(index)?.let { it > 0 } == true
         fun standing(index: Int): Boolean = buildingHp[index] > 0
         fun aliveCount(): Int = fighterHp.count { it > 0 }
+        fun guardCount(): Int = guardHp.count { it > 0 }
         fun destroyedCount(): Int = buildingHp.count { it <= 0 }
     }
 
@@ -267,6 +304,20 @@ object Battle {
     /** The most tracers a single frame carries. Past this they overlap and cannot be told apart. */
     private const val MAX_SHOTS_PER_FRAME = 240
 
+    /**
+     * The most figures one side ever simulates or draws.
+     *
+     * A five-thousand-soldier invasion used to create five thousand Fighter objects, step every
+     * one of them ten times a second, and then draw them all. The player sees a hundred figures on
+     * a phone screen at once; everything past that is invisible work. Above this many soldiers each
+     * figure represents a whole file of them, with the hit points and the damage to match, so the
+     * battle results are the same size while the work is bounded.
+     */
+    private const val MAX_FIGHTERS = 400
+
+    /** The most garrison figures that sortie. Same reasoning as [MAX_FIGHTERS]. */
+    private const val MAX_GUARDS = 48
+
     fun simulate(
         defender: PaperBase,
         attackerLevel: Int,
@@ -290,6 +341,12 @@ object Battle {
          * army it always did.
          */
         attackerMilitaryBonus: Double = 1.0,
+        /**
+         * Whether the defending garrison comes out to fight. Off by default so the older,
+         * deterministic tests still describe the battle they were written against; the game itself
+         * always turns it on.
+         */
+        defenderSortie: Boolean = false,
     ): Playback {
         val rng = Rng(seed)
         // Whatever this defender's own plot has grown to. A country that has expanded its
@@ -303,7 +360,11 @@ object Battle {
         val destroyed = mutableSetOf<String>()
 
         val squads = 4
-        val fighters = ArrayList<Fighter>(attackerSoldiers)
+        // See MAX_FIGHTERS. The army is represented by at most that many figures; each one carries
+        // the strength (and therefore the hit points and damage) of everybody it stands for.
+        val group = ((attackerSoldiers + MAX_FIGHTERS - 1) / MAX_FIGHTERS).coerceAtLeast(1)
+        val figureCount = ((attackerSoldiers + group - 1) / group).coerceAtLeast(0)
+        val fighters = ArrayList<Fighter>(figureCount)
         val weapon = WeaponCatalog.byId(attackerWeaponId) ?: WeaponCatalog.STARTER
         val fighterHp = ((40 + attackerLevel * 7) * attackerMilitaryBonus).toInt().coerceAtLeast(1)
 
@@ -322,8 +383,11 @@ object Battle {
             support.forEach { vehicle -> repeat(perDetachment) { crews.add(vehicle) } }
         }
 
-        repeat(attackerSoldiers) { i ->
-            val mine = crews.getOrNull(i) ?: weapon
+        repeat(figureCount) { i ->
+            val strength = (attackerSoldiers - i * group).coerceAtMost(group)
+            // The crew index follows the original soldier index, so detachments stay at the front
+            // of the line and are still spread across all four squads.
+            val mine = crews.getOrNull(i * group) ?: weapon
             val squad = i % squads
             // One squad per edge, so the four order buttons map onto four places a player can see.
             val along = rng.nextDouble() * (fieldSize - 4) + 2
@@ -335,11 +399,11 @@ object Battle {
             }
             fighters.add(
                 Fighter(
-                    index = i, squad = squad, x = sx, y = sy,
+                    index = i, squad = squad, strength = strength, x = sx, y = sy,
                     // A crew is harder to kill than the soldier it replaces, which is most of why
                     // anybody builds one.
-                    hitPoints = (fighterHp * mine.crewSurvivability).toInt(),
-                    maxHitPoints = (fighterHp * mine.crewSurvivability).toInt(),
+                    hitPoints = (fighterHp * mine.crewSurvivability * strength).toInt(),
+                    maxHitPoints = (fighterHp * mine.crewSurvivability * strength).toInt(),
                     weaponId = mine.id,
                     // A staggered first shot. With every cooldown starting at zero, eighty soldiers
                     // fire on the same tick and the fight is decided before anybody has moved.
@@ -348,7 +412,8 @@ object Battle {
             )
         }
 
-        val emplacements = buildEmplacements(defender)
+        val emplacements = buildEmplacements(defender, includeGarrison = !defenderSortie)
+        val guards = if (defenderSortie) buildSortie(defender) else emptyList()
         val ordersByTick = orders.groupBy { it.atTick }
         val frames = ArrayList<Frame>()
 
@@ -395,11 +460,15 @@ object Battle {
             // Attackers act, in index order, so the simulation is reproducible.
             fighters.forEach { f ->
                 if (!f.alive) return@forEach
-                stepAttacker(f, targets, targetGrid, hp, destroyed, shots, rng, fieldSize)
+                stepAttacker(f, targets, targetGrid, guards, hp, destroyed, shots, rng, fieldSize)
             }
 
             fighterGrid.clear()
             fighters.forEachIndexed { index, f -> if (f.alive) fighterGrid.add(f.x, f.y, index) }
+
+            // The defenders sortie: they leave their posts, close on the nearest attacker, and
+            // shoot. A garrison that never moved was the thing that made an invasion look staged.
+            guards.forEach { g -> if (g.alive) stepGuard(g, fighters, shots, rng, fieldSize) }
 
             // Defences answer. Same reason for the fixed order.
             emplacements.forEach { e ->
@@ -453,11 +522,20 @@ object Battle {
                 positions[index * 2 + 1] = f.y.toFloat()
                 fighterHp[index] = f.hitPoints
             }
+            val guardPositions = FloatArray(guards.size * 2)
+            val guardHp = IntArray(guards.size)
+            guards.forEachIndexed { index, g ->
+                guardPositions[index * 2] = g.x.toFloat()
+                guardPositions[index * 2 + 1] = g.y.toFloat()
+                guardHp[index] = g.hitPoints
+            }
             frames.add(
                 Frame(
                     tick = tick,
                     positions = positions,
                     fighterHp = fighterHp,
+                    guardPositions = guardPositions,
+                    guardHp = guardHp,
                     buildingHp = IntArray(buildingOrder.size) { i ->
                         val id = buildingOrder[i]
                         if (id in destroyed) 0 else (hp[id] ?: 0)
@@ -490,6 +568,8 @@ object Battle {
                 weaponIds = fighters.map { it.weaponId },
                 buildingIds = buildingOrder,
                 maxFighterHp = fighterHp,
+                guardWeaponIds = guards.map { it.weaponId },
+                maxGuardHp = guards.maxOfOrNull { it.maxHitPoints } ?: 1,
             ),
             frames = frames,
             result = result,
@@ -503,6 +583,7 @@ object Battle {
         f: Fighter,
         targets: List<PlacedBuilding>,
         grid: Grid,
+        guards: List<Guard>,
         hp: MutableMap<String, Int>,
         destroyed: Set<String>,
         shots: MutableList<Shot>,
@@ -510,6 +591,31 @@ object Battle {
         fieldSize: Int,
     ) {
         if (f.cooldown > 0) f.cooldown--
+
+        // A soldier standing in front of you is the thing you shoot at, not the building behind
+        // them. Without this the garrison could fire into an army that never shot back.
+        val reachNow = effectiveRange(f.weapon)
+        var inReach: Guard? = null
+        var closest = reachNow
+        guards.forEach { g ->
+            if (g.alive) {
+                val d = hypot(g.x - f.x, g.y - f.y)
+                if (d <= closest) {
+                    closest = d
+                    inReach = g
+                }
+            }
+        }
+        if (inReach != null) {
+            if (f.cooldown <= 0) {
+                val dealt = (f.weapon.damage * f.strength * (0.9 + rng.nextDouble() * 0.2))
+                    .toInt().coerceAtLeast(1)
+                inReach.hitPoints -= dealt
+                shots.add(Shot(f.x, f.y, inReach.x, inReach.y, fromAttacker = true, splash = 0))
+                f.cooldown = f.weapon.cooldownTicks
+            }
+            return
+        }
 
         val current = f.targetId?.let { id -> targets.firstOrNull { it.id == id } }
         val target = current ?: pickTarget(f, targets, grid, destroyed)?.also {
@@ -696,7 +802,10 @@ object Battle {
     }
 
     /** Defences, plus the garrison, as things that shoot. */
-    private fun buildEmplacements(defender: PaperBase): List<Emplacement> {
+    private fun buildEmplacements(
+        defender: PaperBase,
+        includeGarrison: Boolean = true,
+    ): List<Emplacement> {
         val garrisonWeapon = defender.garrisonWeapon().id
         val list = ArrayList<Emplacement>()
 
@@ -727,7 +836,7 @@ object Battle {
                 }
             ).ifEmpty { listOfNotNull(defender.townHall) }
 
-        if (posts.isNotEmpty() && defender.soldiers > 0) {
+        if (includeGarrison && posts.isNotEmpty() && defender.soldiers > 0) {
             repeat(defender.soldiers.coerceAtMost(60)) { i ->
                 val post = posts[i % posts.size]
                 list.add(
@@ -742,6 +851,93 @@ object Battle {
             }
         }
         return list
+    }
+
+    /**
+     * The defenders, out of their barracks and on the field.
+     *
+     * A country with five thousand soldiers cannot put five thousand figures on a phone, so the
+     * same file-grouping the attackers use applies here. Each guard stands for a file of them, and
+     * a file fights and dies as one.
+     */
+    private fun buildSortie(defender: PaperBase): List<Guard> {
+        if (defender.soldiers <= 0) return emptyList()
+        val group = ((defender.soldiers + MAX_GUARDS - 1) / MAX_GUARDS).coerceAtLeast(1)
+        val count = ((defender.soldiers + group - 1) / group).coerceAtLeast(0)
+        val posts = defender.standing.filter {
+            it.type?.category == BuildingCatalog.Category.MILITARY || it.type?.isDefensive == true
+        }.ifEmpty {
+            defender.standing.filter { it.type?.category != BuildingCatalog.Category.MILITARY }
+        }.ifEmpty { listOfNotNull(defender.townHall) }
+        if (posts.isEmpty()) return emptyList()
+
+        val weapon = defender.garrisonWeapon()
+        val baseHp = (30 + defender.level * 6).coerceAtLeast(20)
+        val stagger = Rng(Rng.seedOf("sortie", defender.name, defender.soldiers))
+        return (0 until count).map { i ->
+            val post = posts[i % posts.size]
+            val strength = (defender.soldiers - i * group).coerceAtMost(group)
+            Guard(
+                index = i,
+                x = post.centreX() + ((i % 3) - 1) * 0.8,
+                y = post.centreY() + ((i / 3 % 3) - 1) * 0.8,
+                strength = strength,
+                hitPoints = baseHp * strength,
+                maxHitPoints = baseHp * strength,
+                weaponId = weapon.id,
+                cooldown = stagger.nextInt((weapon.cooldownTicks + 1).coerceAtLeast(2)),
+            )
+        }
+    }
+
+    /** One garrison soldier's turn: find an attacker, close on them, then shoot. */
+    private fun stepGuard(
+        g: Guard,
+        attackers: List<Fighter>,
+        shots: MutableList<Shot>,
+        rng: Rng,
+        fieldSize: Int,
+    ) {
+        if (g.cooldown > 0) g.cooldown--
+        var target: Fighter? = g.target.takeIf { attackers.getOrNull(it)?.alive == true }
+            ?.let { attackers[it] }
+        if (target == null) {
+            var best = 16.0
+            attackers.forEach { f ->
+                if (f.alive) {
+                    val d = hypot(f.x - g.x, f.y - g.y)
+                    if (d <= best) {
+                        best = d
+                        target = f
+                    }
+                }
+            }
+            g.target = target?.index ?: -1
+        }
+        val chosen = target ?: return
+
+        val dist = hypot(chosen.x - g.x, chosen.y - g.y)
+        val reach = effectiveRange(g.weapon)
+        if (dist > reach) {
+            moveToward(g, chosen.x, chosen.y, speed = 0.13, fieldSize = fieldSize)
+            return
+        }
+        if (g.cooldown > 0) return
+
+        val dealt = (g.weapon.damage * g.strength * (0.9 + rng.nextDouble() * 0.2))
+            .toInt().coerceAtLeast(1)
+        chosen.hitPoints -= dealt
+        shots.add(Shot(g.x, g.y, chosen.x, chosen.y, fromAttacker = false, splash = g.weapon.splash))
+        g.cooldown = g.weapon.cooldownTicks
+    }
+
+    private fun moveToward(g: Guard, tx: Double, ty: Double, speed: Double, fieldSize: Int) {
+        val dx = tx - g.x
+        val dy = ty - g.y
+        val d = hypot(dx, dy)
+        if (d < 1e-6) return
+        g.x = (g.x + dx / d * speed).coerceIn(0.0, fieldSize.toDouble())
+        g.y = (g.y + dy / d * speed).coerceIn(0.0, fieldSize.toDouble())
     }
 
     // -- Scoring --------------------------------------------------------------
@@ -786,7 +982,7 @@ object Battle {
         }
         val won = stars >= 1
 
-        val attackersLost = fighters.count { !it.alive }
+        val attackersLost = fighters.filter { !it.alive }.sumOf { it.represented }
         val defenderLevel = defender.level
         val stake = 40L + defenderLevel * 9L
 
@@ -809,8 +1005,8 @@ object Battle {
             won = won,
             destructionPercent = percent,
             townHallDown = townHallDown,
-            attackersLost = attackersLost,
-            attackersSent = fighters.size,
+            attackersLost = attackersLost.coerceAtMost(fighters.sumOf { it.represented }),
+            attackersSent = fighters.sumOf { it.represented },
             ticks = ticks,
             buildingDamage = damage,
             xpForAttacker = xpAttacker,

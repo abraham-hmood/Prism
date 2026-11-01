@@ -271,12 +271,14 @@ class MousePageView(context: Context) : LinearLayout(context) {
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
+        // UI rate: a pointer follows the hand, not individual sensor noise, and the touchpad is
+        // the one page where two sensors used to be sampled at 50 Hz the whole time it was open.
         gravitySensor?.let {
-            sensorManager?.registerListener(sensorListener, it, SensorManager.SENSOR_DELAY_GAME)
+            sensorManager?.registerListener(sensorListener, it, SensorManager.SENSOR_DELAY_UI)
         }
         if (!usingRawAccelerometer) {
             linearSensor?.let {
-                sensorManager?.registerListener(sensorListener, it, SensorManager.SENSOR_DELAY_GAME)
+                sensorManager?.registerListener(sensorListener, it, SensorManager.SENSOR_DELAY_UI)
             }
         }
         refresh()

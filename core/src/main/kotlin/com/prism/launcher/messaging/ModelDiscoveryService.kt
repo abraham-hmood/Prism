@@ -28,6 +28,7 @@ object ModelDiscoveryService {
 
     private val providers = listOf(
         HuggingFaceProvider(),
+        CivitaiProvider(),
         GitHubProvider(),
         GoogleAIProvider()
     )
@@ -65,11 +66,18 @@ object ModelDiscoveryService {
                 "generative" -> "text-to-image"
                 "enhancement" -> "image-to-image"
                 "vision" -> "image-classification"
+                "audio" -> "text-to-speech"
+                // HuggingFace has no frame-interpolation pipeline tag; the search term does the
+                // work, and the file filter below keeps only ONNX exports.
+                "interpolation" -> ""
                 else -> ""
             }
+            // An empty box means "browse", but an unfiltered browse is useless for a category
+            // with no pipeline tag. Interpolation gets a standing term instead.
+            val term = if (query.isBlank() && category == "interpolation") "frame interpolation" else query
             
             val tagParam = if (pipelineTag.isNotEmpty()) "&pipeline_tag=$pipelineTag" else ""
-            val searchUrl = "https://huggingface.co/api/models?search=$query$tagParam&limit=10"
+            val searchUrl = "https://huggingface.co/api/models?search=$term$tagParam&limit=10"
             
             try {
                 val response = com.prism.core.Urls.of(searchUrl).openConnection().getInputStream().bufferedReader().use { it.readText() }
@@ -103,7 +111,14 @@ object ModelDiscoveryService {
                 for (i in 0 until tree.length()) {
                     val item = tree.getJSONObject(i)
                     val path = item.getString("path")
-                    if (path.endsWith(".task") || path.endsWith(".tflite") || path.endsWith(".gguf")) {
+                    // SAFETENSORS IS LISTED FOR EVERY CATEGORY. It is Hugging Face's default
+                    // container, so filtering it out hid most of the models people actually
+                    // publish -- and stable-diffusion.cpp reads it directly, which makes it the
+                    // best format Prism has for image checkpoints.
+                    if (path.endsWith(".task") || path.endsWith(".tflite") ||
+                        path.endsWith(".gguf") || path.endsWith(".onnx") ||
+                        path.endsWith(".safetensors")
+                    ) {
                         files.add(path to item.optLong("size", 0L))
                     }
                 }
@@ -139,8 +154,13 @@ object ModelDiscoveryService {
 
         override suspend fun search(query: String, category: String): List<DiscoveredModel> {
             val results = mutableListOf<DiscoveredModel>()
+            val suffix = when (category) {
+                "audio" -> "text to speech onnx"
+                "interpolation" -> "frame interpolation onnx"
+                else -> "gguf"
+            }
             val searchUrl = "https://api.github.com/search/repositories?q=" +
-                java.net.URLEncoder.encode("$query gguf", "UTF-8") + "&per_page=6&sort=stars"
+                java.net.URLEncoder.encode("$query $suffix", "UTF-8") + "&per_page=6&sort=stars"
 
             val repos = runCatching { getJson(searchUrl).optJSONArray("items") }.getOrNull() ?: return results
             for (i in 0 until minOf(repos.length(), 6)) {
@@ -171,7 +191,8 @@ object ModelDiscoveryService {
                 val asset = assets.optJSONObject(i) ?: continue
                 val name = asset.optString("name")
                 if (!name.endsWith(".gguf", true) && !name.endsWith(".task", true) &&
-                    !name.endsWith(".tflite", true)
+                    !name.endsWith(".tflite", true) && !name.endsWith(".onnx", true) &&
+                    !name.endsWith(".safetensors", true)
                 ) continue
                 val url = asset.optString("browser_download_url").takeIf { it.isNotBlank() } ?: continue
                 return Triple(name, url, asset.optLong("size", 0L))
@@ -212,6 +233,159 @@ object ModelDiscoveryService {
                 }
             }
             return official
+        }
+    }
+
+    /**
+     * Civitai, through its public v1 API.
+     *
+     * ## Why it belongs in the store at all
+     *
+     * It is where the checkpoints people actually run for image generation live -- the SDXL and
+     * SD1.5 finetunes, the LoRAs and the upscalers -- and stable-diffusion.cpp reads its
+     * `.safetensors` files as they are, so a model found here needs no conversion to be drawn
+     * with. Without this source the store's Image tab could only offer Hugging Face repositories
+     * that happen to be packaged for on-device use, which is almost none of them.
+     *
+     * ## What it does NOT have, and will not pretend to
+     *
+     * Civitai has no text-generation, speech or frame-interpolation catalogue. ``types`` is its
+     * own taxonomy (Checkpoint, LORA, Upscaler, Controlnet, VAE, ...), and there is nothing to
+     * map a language model or a RIFE export onto. Asking it for those categories returns an empty
+     * list rather than a pile of unrelated image models under the wrong tab: a result the user
+     * cannot install is worse than no result.
+     *
+     * ## The download URL is a redirect
+     *
+     * `https://civitai.com/api/download/models/<versionId>` answers 302 to the file on the CDN, and
+     * that is the form this returns even when a version carries its own `downloadUrl` -- both are
+     * the same redirect, and the id form is the one that survives the API changing its mind about
+     * the field. The downloader follows redirects (see [com.prism.core.Downloader]), and Android's
+     * DownloadManager does so on its own.
+     *
+     * NSFW CONTENT IS FILTERED OUT at the API level (`nsfw=false`). This is a model store inside a
+     * launcher, not an art browser, and a search that silently returns explicit material to someone
+     * typing "portrait" is not a search they asked for.
+     */
+    class CivitaiProvider : DiscoveryProvider {
+
+        private val client = okhttp3.OkHttpClient.Builder()
+            .callTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+
+        /** Civitai's own type names for each store category; null means it has no catalogue here. */
+        private fun typesFor(category: String): List<String>? = when (category) {
+            "generative" -> listOf("Checkpoint", "LORA")
+            "enhancement" -> listOf("Upscaler", "Controlnet")
+            // "all" is the store's default tab: checkpoints are what people come for.
+            "all" -> listOf("Checkpoint")
+            else -> null
+        }
+
+        override suspend fun search(query: String, category: String): List<DiscoveredModel> {
+            val types = typesFor(category) ?: return emptyList()
+            val limit = 12
+            val url = buildString {
+                append("https://civitai.com/api/v1/models?limit=").append(limit)
+                append("&nsfw=false")
+                append("&types=").append(types.joinToString(","))
+                if (query.isNotBlank()) {
+                    append("&query=").append(java.net.URLEncoder.encode(query, "UTF-8"))
+                }
+            }
+            val body = runCatching { get(url) }.getOrElse {
+                PrismPlatform.log.warn("Civitai", "Search failed: ${it.message}")
+                return emptyList()
+            }
+            return parse(body, category, limit)
+        }
+
+        private fun get(url: String): String {
+            val request = okhttp3.Request.Builder().url(url)
+                .header("Accept", "application/json")
+                .header("User-Agent", "Prism-Launcher")
+                .build()
+            return client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    throw IllegalStateException("Civitai answered ${response.code} for $url")
+                }
+                response.body?.string().orEmpty()
+            }
+        }
+
+        /**
+         * The API's answer to a list of models, separated from the request so the mapping is
+         * testable without a network.
+         *
+         * ONE ENTRY PER FILE, not per model version: a checkpoint published as fp16 and fp32 is two
+         * downloads of different sizes, and the store's card has one size label. The first version
+         * only -- "latest" is what the site shows first, and older version hashes are not something
+         * an on-device store should be offering next to it.
+         */
+        internal fun parse(body: String, category: String, limit: Int = 12): List<DiscoveredModel> {
+            val out = mutableListOf<DiscoveredModel>()
+            val items = runCatching { JSONObject(body).optJSONArray("items") }.getOrNull()
+                ?: return out
+            for (i in 0 until minOf(items.length(), limit)) {
+                val model = items.optJSONObject(i) ?: continue
+                val modelName = model.optString("name").takeIf { it.isNotBlank() } ?: continue
+                val modelId = model.optLong("id", 0L)
+                val version = model.optJSONArray("modelVersions")?.optJSONObject(0) ?: continue
+                val versionId = version.optLong("id", 0L)
+                val versionName = version.optString("name").ifBlank { "v$versionId" }
+                val baseModel = version.optString("baseModel")
+
+                val files = mutableListOf<Triple<String, String, Long>>()
+                val fileArray = version.optJSONArray("files")
+                if (fileArray != null) {
+                    for (f in 0 until fileArray.length()) {
+                        val file = fileArray.optJSONObject(f) ?: continue
+                        val name = file.optString("name")
+                        val download = file.optString("downloadUrl")
+                        // A VERSION USUALLY SHIPS ITS VAE NEXT TO THE CHECKPOINT, as a second
+                        // `.safetensors` with the same id and `?type=VAE` appended. It ends in the
+                        // right extension, so filtering on the name alone offered it as a second
+                        // card that would have installed a VAE into the image slot. The `type`
+                        // field is the only thing that tells them apart.
+                        val kind = file.optString("type").ifBlank { "Model" }
+                        if (!kind.equals("Model", ignoreCase = true) &&
+                            !kind.equals("Archive", ignoreCase = true)
+                        ) continue
+                        if (!isCheckpointName(name)) continue
+                        val bytes = (file.optDouble("sizeKB", 0.0) * 1024).toLong()
+                        if (download.isNotBlank()) files.add(Triple(name, download, bytes))
+                    }
+                }
+                // A version with no usable file entry still has the canonical redirect, and no
+                // size to show -- better a card that downloads than a model that cannot be had.
+                if (files.isEmpty() && versionId > 0) {
+                    files.add(Triple("$modelName.safetensors", "https://civitai.com/api/download/models/$versionId", 0L))
+                }
+
+                files.forEach { (fileName, download, bytes) ->
+                    out.add(
+                        DiscoveredModel(
+                            name = "$modelName — $versionName (${fileName.substringAfterLast("/")})" +
+                                if (baseModel.isNotBlank()) " · $baseModel" else "",
+                            repoId = "civitai:$modelId",
+                            downloadUrl = download,
+                            sizeLabel = formatSize(bytes),
+                            source = "Civitai",
+                            category = category,
+                        )
+                    )
+                }
+            }
+            return out
+        }
+
+        /** A checkpoint, not the preview image or a training config that sits beside it. */
+        private fun isCheckpointName(name: String): Boolean {
+            val lower = name.lowercase()
+            if (lower.endsWith(".safetensors") || lower.endsWith(".ckpt")) return true
+            // Civitai publishes LoRAs and small models as a .zip or .pt often enough that hiding
+            // them would make the tab look empty; the store's type is decided on inspection anyway.
+            return lower.endsWith(".pt") || lower.endsWith(".zip")
         }
     }
 

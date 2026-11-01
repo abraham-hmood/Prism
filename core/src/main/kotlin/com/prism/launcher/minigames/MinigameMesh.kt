@@ -46,6 +46,8 @@ object MinigameMesh {
 
     const val GAME_PONG = "pong"
     const val GAME_CHESS = "chess"
+    const val GAME_ECHO = "echo"
+    const val GAME_CHUTES = "chutes"
 
     /** How long a peer's announcement is believed. Three gossip rounds. */
     private const val PEER_TTL_MS = 45_000L
@@ -182,7 +184,30 @@ object MinigameMesh {
      * also stops seeking immediately, so a third peer arriving a moment later gets nothing rather
      * than a second match.
      */
+    /**
+     * A hook for a game with more than two players.
+     *
+     * The seek/accept protocol below is deliberately a two-player handshake: one asker, one
+     * accepter. Zombies needs a host with up to three joiners, so it reads the same packets before
+     * the two-player path consumes them and speaks its own prefixed payload. When nobody installs
+     * one of these, behaviour is exactly as it was.
+     */
+    private var rawSeekListener: ((String, String) -> Unit)? = null
+    private var rawAcceptListener: ((String, String) -> Unit)? = null
+    private var rawMoveListener: ((String, String) -> Unit)? = null
+
+    fun setRawListeners(
+        seek: ((String, String) -> Unit)? = null,
+        accept: ((String, String) -> Unit)? = null,
+        move: ((String, String) -> Unit)? = null,
+    ) {
+        rawSeekListener = seek
+        rawAcceptListener = accept
+        rawMoveListener = move
+    }
+
     fun onSeek(peerIp: String, payload: String) {
+        rawSeekListener?.invoke(peerIp, payload)
         val want = seeking ?: return
         if (payload != want) return
 
@@ -197,6 +222,7 @@ object MinigameMesh {
     }
 
     fun onAccept(peerIp: String, payload: String) {
+        rawAcceptListener?.invoke(peerIp, payload)
         val want = seeking ?: return
         val parts = payload.split("|")
         if (parts.getOrNull(0) != want) return
@@ -232,6 +258,7 @@ object MinigameMesh {
     }
 
     fun onMove(peerIp: String, payload: String) {
+        rawMoveListener?.invoke(peerIp, payload)
         moveListener?.invoke(peerIp, payload)
     }
 

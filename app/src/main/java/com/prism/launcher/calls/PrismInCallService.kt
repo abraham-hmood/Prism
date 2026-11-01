@@ -231,6 +231,21 @@ object PrismTelecom {
         publish()
     }
 
+    /**
+     * Plays one dialpad digit into a carrier call.
+     *
+     * `playDtmfTone` is Telecom's own path, so the network hears the same tone an in-call dialpad
+     * would produce -- including on an IVR, which is the entire reason the button exists.
+     */
+    fun sendDtmf(digit: String) {
+        val char = digit.firstOrNull() ?: return
+        val call = calls.firstOrNull { it.state == Call.STATE_ACTIVE } ?: return
+        runCatching {
+            call.playDtmfTone(char)
+            main.postDelayed({ runCatching { call.stopDtmfTone() } }, 160L)
+        }.onFailure { PrismLogger.logWarning(TAG, "Could not send DTMF: ${it.message}") }
+    }
+
     fun bringCallToForeground() {
         val snapshot = snapshot() ?: return
         val context = appContext ?: return

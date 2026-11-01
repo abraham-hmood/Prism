@@ -76,6 +76,10 @@ object MeshTransport {
     var banNode: (String) -> Boolean = { MeshCore.banNode(it) }
 
     /** Sends to one peer. */
+    /** Hand a packet to a relay peer when this device cannot reach the target directly. */
+    var relayToPeer: (targetIp: String, opcode: Byte, payload: String, ttl: Int) -> Boolean =
+        { targetIp, opcode, payload, ttl -> MeshCore.relayToPeer(targetIp, opcode, payload, ttl) }
+
     var sendToPeer: (peerIp: String, opcode: Byte, payload: String) -> Unit =
         { peerIp, opcode, payload -> MeshCore.sendToPeer(peerIp, opcode, payload) }
 

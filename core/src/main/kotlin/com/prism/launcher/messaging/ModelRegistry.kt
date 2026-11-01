@@ -39,6 +39,25 @@ object ModelRegistry {
 
     private const val TAG = "PrismModels"
 
+    /**
+     * The type a finished download should be registered as, keyed by destination path.
+     *
+     * A file extension cannot tell an ONNX image generator from an ONNX frame interpolator, and
+     * it cannot tell a diffusion GGUF from a language model's GGUF either -- so the store records
+     * what the user was browsing for before the download starts, and registration consumes it.
+     *
+     * PERSISTED, not a field in memory. A multi-gigabyte download outlives the process that
+     * started it on both platforms: desktop's downloader reports completion to a callback in a
+     * later session, and Android's DownloadManager broadcasts to a receiver that may be started
+     * fresh. Either way the in-memory version was gone by then, and the fallback filed the model
+     * by inspection -- which is how SD-Turbo ended up in the Text list. See
+     * [PrismSettings.setPendingModelType].
+     */
+    fun expect(file: File, type: String) {
+        if (file.absolutePath.isBlank() || type.isBlank()) return
+        PrismSettings.setPendingModelType(file.absolutePath, type)
+    }
+
     /** Extensions worth looking at. Anything else in the folder is somebody's own business. */
     private val EXTENSIONS = setOf("gguf", "bin", "onnx", "safetensors", "task", "pskn")
 
@@ -69,27 +88,61 @@ object ModelRegistry {
     private fun legacyDirectory(): File = File(PrismPlatform.host.dataDir(), "models")
 
     /**
-     * Records a model, deciding its type by INSPECTING it.
+     * Records a model, deciding its type by INSPECTING it when nobody said.
      *
-     * Not by extension and not by which button was pressed: a `.bin` from HuggingFace may be either a text
-     * model or an image one, and a mislabelled entry fails much later and much less legibly than it does
-     * here. Idempotent -- `addImportedModel` replaces any entry with the same path.
+     * Not by extension and not by which button was pressed: a `.bin` from HuggingFace may be
+     * either a text model or an image one, and a mislabelled entry fails much later and much less
+     * legibly than it does here. Idempotent -- `addImportedModel` replaces any entry with the same
+     * path.
+     *
+     * [type] wins when the caller knows (a store download knows the filter it was found under),
+     * then the recorded pending type -- which is the same answer arriving from another process --
+     * and only then inspection.
      */
-    fun install(file: File, displayName: String? = null): Boolean {
+    fun install(file: File, displayName: String? = null, type: String? = null): Boolean {
         if (!file.isFile || file.length() == 0L) {
             PrismPlatform.log.warn(TAG, "Not registering " + file.name + ": it is not a finished file")
             return false
         }
-        val isGguf = runCatching { GgufInferenceService.isGgufFile(file.absolutePath) }.getOrDefault(false)
+        val resolved = type
+            ?: PrismSettings.takePendingModelType(file.absolutePath)
+            ?: inferType(file)
         PrismSettings.addImportedModel(
             PrismSettings.ImportedModel(
                 path = file.absolutePath,
                 displayName = displayName ?: file.nameWithoutExtension,
-                type = if (isGguf) PrismSettings.MODEL_TYPE_TEXT else PrismSettings.MODEL_TYPE_IMAGE,
+                type = resolved,
             )
         )
-        PrismPlatform.log.info(TAG, "Registered " + file.name + " (" + (file.length() / (1024 * 1024)) + " MB)")
+        PrismPlatform.log.info(
+            TAG,
+            "Registered " + file.name + " as " + resolved + " (" + (file.length() / (1024 * 1024)) + " MB)",
+        )
         return true
+    }
+
+    /**
+     * The type of an untyped file, by reading it.
+     *
+     * THE GGUF CASE IS WHY THIS IS NOT A LOOKUP TABLE. `isGguf` used to decide TEXT, which is the
+     * bug that put SD-Turbo in the text list: stable-diffusion.cpp reads GGUF as well, and its
+     * checkpoints are not language models. [ModelFormat.ggufFamily] reads the tensor names and
+     * tells them apart; safetensors is the diffusion container, so it is an image model unless a
+     * caller says otherwise.
+     */
+    fun inferType(file: File): String {
+        val extension = file.extension.lowercase()
+        if (extension == "safetensors") return PrismSettings.MODEL_TYPE_IMAGE
+        if (extension != "gguf" && !runCatching {
+                GgufInferenceService.isGgufFile(file.absolutePath)
+            }.getOrDefault(false)
+        ) {
+            return PrismSettings.MODEL_TYPE_IMAGE
+        }
+        return when (ModelFormat.ggufFamily(file)) {
+            ModelFormat.GgufFamily.DIFFUSION -> PrismSettings.MODEL_TYPE_IMAGE
+            else -> PrismSettings.MODEL_TYPE_TEXT
+        }
     }
 
     /**
@@ -134,10 +187,27 @@ object ModelRegistry {
         val missing = recorded.filterNot { File(it.path).isFile }
         missing.forEach { PrismSettings.removeImportedModel(it.path) }
 
-        if (added > 0 || missing.isNotEmpty()) {
+        // REPAIRING A WRONG TYPE, not just avoiding new ones. An entry recorded as TEXT that is a
+        // diffusion checkpoint on disk was filed by the old "every GGUF is text" rule, and it is
+        // wrong in the direction that breaks something: the image slot it belongs in looks empty
+        // while the text list offers a model that cannot answer. Re-tagging costs a header read per
+        // entry and means an existing install fixes itself on the next visit to the Models page
+        // instead of needing a delete and a re-download.
+        var retyped = 0
+        recorded.filter { it.type == PrismSettings.MODEL_TYPE_TEXT }.forEach { entry ->
+            val file = File(entry.path)
+            if (!file.isFile) return@forEach
+            if (file.extension.lowercase() != "gguf") return@forEach
+            if (ModelFormat.ggufFamily(file) != ModelFormat.GgufFamily.DIFFUSION) return@forEach
+            PrismSettings.addImportedModel(entry.copy(type = PrismSettings.MODEL_TYPE_IMAGE))
+            retyped++
+        }
+
+        if (added > 0 || missing.isNotEmpty() || retyped > 0) {
             PrismPlatform.log.info(
                 TAG,
-                "Reconciled models: " + added + " added, " + missing.size + " dropped as missing",
+                "Reconciled models: " + added + " added, " + missing.size + " dropped as missing, " +
+                    retyped + " re-tagged as image models",
             )
         }
         return added to missing.size

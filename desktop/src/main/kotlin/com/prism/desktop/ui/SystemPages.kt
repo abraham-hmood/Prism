@@ -10,6 +10,7 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -22,6 +23,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -53,7 +55,7 @@ import java.io.File
  * the Start Menu -- and only *replacing the home screen* is Android-specific.
  */
 @Composable
-fun AppDrawerPage() {
+fun AppDrawerPage(onNavigate: (PageId) -> Unit = {}) {
     val scope = rememberCoroutineScope()
     val catalog = remember { defaultAppCatalog() }
     var apps by remember { mutableStateOf<List<AppEntry>>(emptyList()) }
@@ -101,6 +103,26 @@ fun AppDrawerPage() {
         map
     }
 
+    // The pages currently on slots, plus every page this build can show once the user searches.
+    // Deliberately independent of the installed-app list: a page is not an app, and hiding it in
+    // the apps grid would make it look like one.
+    // Read here, in composition: a composition local read is composable, so it cannot happen
+    // inside the tiles' click handlers.
+    val slotOpener = LocalSlotOpener.current
+    val pageStrip = remember(query) {
+        val configured = runCatching { DesktopPageCatalog.configured() }.getOrDefault(emptyList())
+        val slotByKey = configured.associate { (entry, slot) -> entry.key to slot }
+        val source = if (query.isBlank()) {
+            configured.map { it.first }
+        } else {
+            (DesktopPageCatalog.all() + configured.map { it.first })
+                .distinctBy { it.key }
+                .filter { it.label.contains(query, ignoreCase = true) }
+                .sortedWith(compareBy({ slotByKey[it.key] ?: Int.MAX_VALUE }, { it.label.lowercase() }))
+        }
+        source.map { entry -> entry to slotByKey[entry.key] }
+    }
+
     PageScaffold("Apps", if (loading) "Scanning…" else "${apps.size} installed") {
         CommittingField(query, modifier = Modifier.fillMaxWidth()) { query = it }
         Spacer(Modifier.height(14.dp))
@@ -137,6 +159,25 @@ fun AppDrawerPage() {
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
+                if (pageStrip.isNotEmpty()) {
+                    item(span = { GridItemSpan(maxLineSpan) }, key = "prism-pages") {
+                        Column {
+                            SectionHeader("pages on prism")
+                            Row(
+                                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            ) {
+                                pageStrip.forEach { (entry, slot) ->
+                                    PageTile(entry, slot) {
+                                        if (slotOpener != null) slotOpener(entry.assignment)
+                                        else entry.pageId?.let(onNavigate)
+                                    }
+                                }
+                            }
+                            Spacer(Modifier.height(8.dp))
+                        }
+                    }
+                }
                 items(filtered, key = { "local:" + it.id }) { app ->
                     // Icons load lazily and are cached by id. Decoding every icon up front on a
                     // machine with 300 applications would stall the first frame for seconds.
@@ -198,6 +239,51 @@ fun AppDrawerPage() {
         SectionFooter(
             "Press and hold an app, drag it to the edge of the window to change page, and drop " +
                 "it on the desktop."
+        )
+    }
+}
+
+/**
+ * One page in the drawer's page strip.
+ *
+ * The slot badge is the information an app tile never has: the same page can sit on different
+ * slots on two devices, and a page with no number is available here but not currently placed.
+ */
+@Composable
+private fun PageTile(entry: DesktopPageEntry, slot: Int?, onClick: () -> Unit) {
+    val colors = LocalPrismColors.current
+    Column(
+        Modifier.clickableRow(onClick).width(78.dp).padding(vertical = 6.dp, horizontal = 2.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Box(
+            Modifier.size(48.dp).background(colors.accent.copy(alpha = if (slot != null) 0.26f else 0.12f), RoundedCornerShape(12.dp)),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(entry.icon, null, tint = colors.accent, modifier = Modifier.size(24.dp))
+            if (slot != null) {
+                Box(
+                    Modifier.align(Alignment.TopEnd).padding(3.dp).size(15.dp)
+                        .background(colors.accent, RoundedCornerShape(50)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        "${slot + 1}",
+                        fontSize = 8.sp,
+                        color = colors.background,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.height(5.dp))
+        Text(
+            entry.label,
+            fontSize = 10.sp,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.Center,
+            color = if (slot != null) colors.onSurface else colors.muted,
         )
     }
 }

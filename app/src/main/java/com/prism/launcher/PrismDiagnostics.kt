@@ -28,6 +28,8 @@ object PrismDiagnostics {
         searchEngine()
         browser(context)
         network()
+        email()
+        storage(context)
         PrismLogger.logInfo(TAG, "===== end of diagnostics =====")
     }
 
@@ -166,6 +168,113 @@ object PrismDiagnostics {
 
         safely("Proxy port") {
             emit(Status.INFO, "Mesh site port", probe("127.0.0.1", 8080))
+        }
+    }
+
+    // -- Email --------------------------------------------------------------------------------
+
+    /**
+     * The mail stack, in the place a user is told to look.
+     *
+     * Every failure here used to be a toast that said "TLS is unavailable" and vanished; the
+     * server could be down with no record of why. These checks are the same ones the server runs
+     * on itself, printed where they survive -- including which directory the CA was written to,
+     * which port each listener actually bound, and whether the router forward answers.
+     */
+    private fun email() {
+        PrismLogger.logInfo(TAG, "--- Email ---")
+        val config = try {
+            com.prism.launcher.email.EmailSettings.load()
+        } catch (e: Throwable) {
+            emit(Status.FAIL, "Email config", "could not be read: ${e.message}")
+            return
+        }
+        emit(
+            if (config.enabled) Status.OK else Status.INFO, "Email server",
+            if (config.enabled) "enabled, mode=${config.mode.name.lowercase()}"
+            else "switched off in Email settings",
+        )
+        val checks = runCatching { com.prism.launcher.email.EmailServer.diagnose(config) }
+            .getOrElse {
+                listOf(
+                    com.prism.launcher.email.EmailServer.Diagnosis(
+                        "Email server", "diagnosis threw ${it.javaClass.simpleName}: ${it.message}", false,
+                    )
+                )
+            }
+        for (check in checks) {
+            emit(if (check.ok) Status.OK else Status.WARN, check.name, check.detail)
+        }
+
+        val account = runCatching { com.prism.launcher.email.EmailClient.prismAccount() }.getOrNull()
+        if (account != null) {
+            emit(
+                Status.INFO, "Email client",
+                "Prism mailbox ${account.address}, IMAP ${account.imapHost}:${account.imapPort}, " +
+                    "submission ${account.smtpHost}:${account.smtpPort}",
+            )
+        }
+        val external = runCatching { com.prism.launcher.email.EmailClient.accounts() }.getOrDefault(emptyList())
+        emit(
+            Status.INFO, "External accounts",
+            if (external.isEmpty()) "none configured"
+            else external.joinToString(", ") { it.address + " (" + it.provider + ")" },
+        )
+
+        // The outbound path is the half a user cannot see. Port 25 blocked by an ISP is the
+        // normal state of a home connection, and it is the reason a mailbox can receive over the
+        // mesh and still not answer a Gmail address.
+        safely("Outbound mail") {
+            val reachable = com.prism.launcher.email.EmailDns.outbound25Reachable()
+            emit(
+                if (reachable || config.relayHost.isNotBlank()) Status.OK else Status.WARN, "Outbound mail",
+                when {
+                    config.relayHost.isNotBlank() ->
+                        "relaying through ${config.relayHost}:${config.relayPort}"
+                    reachable -> "port 25 reaches the internet; direct delivery is possible"
+                    else -> "port 25 is blocked. Sending to non-Prism addresses needs a relay, or a " +
+                        "third-party account such as Gmail in the client"
+                },
+            )
+        }
+        safely("Public address") {
+            val ip = com.prism.launcher.email.EmailDns.publicIp()
+            val public = ip.isNotBlank() && com.prism.launcher.email.EmailDns.isPublicIp(ip)
+            emit(
+                if (public) Status.OK else Status.WARN, "Public address",
+                when {
+                    ip.isBlank() -> "not known -- no internet connection, or every lookup failed"
+                    public -> ip
+                    else -> "$ip (private or carrier NAT, so the internet cannot reach it)"
+                },
+            )
+        }
+    }
+
+    // -- Storage ------------------------------------------------------------------------------–
+
+    /**
+     * Removable media, and whether Prism is allowed to do anything with it.
+     *
+     * A Format button that does nothing has at least five possible causes: no root, no system
+     * permission, a volume Android never mounted, a mkfs binary the build does not ship, or a block
+     * device that could not be resolved. This prints each of them separately, plus the last
+     * operation's commands, so the reason is a sentence rather than a greyed-out button.
+     */
+    private fun storage(context: Context) {
+        PrismLogger.logInfo(TAG, "--- Storage ---")
+        val lines = runCatching { com.prism.launcher.files.StorageAdmin.diagnose(context) }
+            .getOrElse { listOf("storage checks threw ${it.javaClass.simpleName}: ${it.message}") }
+        for (line in lines) {
+            val name = line.substringBefore(':').trim().ifBlank { "Storage" }
+            val detail = line.substringAfter(':', "").trim().ifBlank { line.trim() }
+            val status = when {
+                line.startsWith("privilege: none") -> Status.WARN
+                line.contains("tools missing: none") -> Status.OK
+                line.startsWith("format=") -> Status.INFO
+                else -> Status.INFO
+            }
+            emit(status, name, detail)
         }
     }
 

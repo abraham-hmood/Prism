@@ -108,8 +108,22 @@ object PrismCrawler {
             val title = extractTitle(html).ifBlank { url }
             val text = htmlToText(html)
             val links = extractLinks(html, url)
+            // Anchor text is collected from the LINKING page and later attached to the target by
+            // the index. It is the closest thing a crawl has to human judgement about a page: a
+            // link labelled "port forwarding guide" says more than the target's own title often
+            // does. Keywords extracted here are why BM25F has an anchor field at all.
+            val anchors = extractAnchorText(html, url)
 
-            pages.add(PrismSearchIndex.Page(url, title, text, links, description = extractDescription(html)))
+            pages.add(
+                PrismSearchIndex.Page(
+                    url = url,
+                    title = title,
+                    text = text,
+                    outLinks = links,
+                    description = extractDescription(html),
+                    anchors = anchors,
+                )
+            )
             onProgress(pages.size, queue.size, url)
 
             for (link in links) {
@@ -251,6 +265,35 @@ object PrismCrawler {
             if (cleaned.isNotEmpty()) return cleaned.take(400)
         }
         return ""
+    }
+
+    /**
+     * The visible text of every link, keyed by its absolute target.
+     *
+     * Both attribute orders are handled by matching the whole `<a ...>...</a>` element rather than
+     * assuming `href` comes first -- real pages write it either way, and a pattern that assumes one
+     * silently produces no anchors for the other. Nested markup is stripped, entities decoded, and
+     * the longest label wins when a page links the same target twice (a nav link says "Home" while
+     * the body link says "the complete guide to home networking").
+     */
+    fun extractAnchorText(html: String, baseUrl: String): Map<String, String> {
+        val out = LinkedHashMap<String, String>()
+        for (match in Regex("(?is)<a\\s([^>]*)>(.*?)</a>").findAll(html)) {
+            val attrs = match.groupValues[1]
+            val hrefMatch = Regex("(?is)href\\s*=\\s*[\"']([^\"']+)[\"']").find(attrs) ?: continue
+            val href = hrefMatch.groupValues[1].trim()
+            if (href.isEmpty() || href.startsWith("javascript:") || href.startsWith("mailto:")) continue
+            val absolute = absolutize(href, baseUrl) ?: continue
+            if (!absolute.startsWith("http")) continue
+            val label = decodeEntities(match.groupValues[2].replace(Regex("(?is)<[^>]+>"), " "))
+                .replace(Regex("\\s+"), " ")
+                .trim()
+            if (label.isEmpty() || label.length > 160) continue
+            val key = PrismSearchIndex.normalize(absolute)
+            val previous = out[key]
+            if (previous == null || label.length > previous.length) out[key] = label
+        }
+        return out
     }
 
     /** Absolute http(s) hrefs found in [html], resolved against [baseUrl]. */

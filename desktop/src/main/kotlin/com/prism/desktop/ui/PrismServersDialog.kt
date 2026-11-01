@@ -81,6 +81,8 @@ fun PrismServersDialog(onDismiss: () -> Unit) {
     var outcomeOk by remember { mutableStateOf(false) }
     var menuFor by remember { mutableStateOf<String?>(null) }
     var confirmDelete by remember { mutableStateOf<PrismSettings.PrismServer?>(null) }
+    val bridgeMode = PrismSettings.isPrismBridgeRole()
+    var bridgeBusy by remember { mutableStateOf(false) }
     var nearbyNodes by remember { mutableStateOf(emptyList<com.prism.core.MeshTransport.Node>()) }
     var scanningNearby by remember { mutableStateOf(true) }
     var nearbyScanGeneration by remember { mutableStateOf(0) }
@@ -114,11 +116,34 @@ fun PrismServersDialog(onDismiss: () -> Unit) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("Prism meshnet servers", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.weight(1f))
+                    if (bridgeMode) {
+                        OutlinedButton(
+                            enabled = !bridgeBusy,
+                            onClick = {
+                                bridgeBusy = true
+                                scope.launch {
+                                    val links = withContext(Dispatchers.IO) {
+                                        com.prism.launcher.vpn.FleetBridge.refresh()
+                                    }
+                                    outcome = com.prism.launcher.vpn.FleetBridge.describe()
+                                    outcomeOk = links.any { it.reachable }
+                                    bridgeBusy = false
+                                    reload()
+                                }
+                            },
+                        ) { Text(if (bridgeBusy) "Bridging..." else "Refresh bridge", fontSize = 12.sp) }
+                        Spacer(Modifier.width(8.dp))
+                    }
                     Button(onClick = { adding = true }) { Text("+ Add Prism Server", fontSize = 12.sp) }
                 }
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    "Click one to connect and make it active. Right-click for edit and delete.",
+                    if (bridgeMode) {
+                        "Click one to connect. Right-click a server to include it in the bridge; " +
+                            "every included server's P2P DNS, hosted sites, mirrors and Lyke videos join this device."
+                    } else {
+                        "Click one to connect and make it active. Right-click for edit and delete."
+                    },
                     fontSize = 12.sp,
                     color = colors.faint,
                 )
@@ -190,6 +215,8 @@ fun PrismServersDialog(onDismiss: () -> Unit) {
                                             strokeWidth = 2.dp,
                                             modifier = Modifier.size(14.dp),
                                         )
+                                    } else if (server.isBridged) {
+                                        Text("bridged", fontSize = 11.sp, color = colors.accent)
                                     } else if (server.isActive) {
                                         Text("active", fontSize = 11.sp, color = colors.accent)
                                     }
@@ -220,6 +247,22 @@ fun PrismServersDialog(onDismiss: () -> Unit) {
                                             }
                                         },
                                     )
+                                    if (bridgeMode) {
+                                        DropdownMenuItem(
+                                            text = {
+                                                Text(
+                                                    if (server.isBridged) "Remove from bridge"
+                                                    else "Include in bridge",
+                                                    fontSize = 13.sp,
+                                                )
+                                            },
+                                            onClick = {
+                                                menuFor = null
+                                                PrismSettings.setServerBridged(server.id, !server.isBridged)
+                                                reload()
+                                            },
+                                        )
+                                    }
                                     DropdownMenuItem(
                                         text = {
                                             Text("Delete", fontSize = 13.sp, color = Color(0xFFFF6B6B))

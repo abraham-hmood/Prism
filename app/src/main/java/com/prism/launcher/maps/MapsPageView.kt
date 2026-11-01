@@ -28,6 +28,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.graphics.drawable.DrawableCompat
 import com.prism.launcher.PrismLogger
 import com.prism.launcher.R
+import com.prism.launcher.minigames.GeoTagStore
 import com.prism.launcher.nora.IosUi
 import com.prism.launcher.trusted.PrismLocations
 import com.prism.launcher.trusted.TrustedDevices
@@ -303,6 +304,19 @@ class MapsPageView(context: Context) : LinearLayout(context) {
         map.fixes = fixes
         map.trusted = trusted
         map.favorites = MapStore.favorites()
+        // GeoTag's walls are a map layer, not a second kind of favourite: magenta diamonds, drawn
+        // under the selected place so a tap still opens the ordinary place card.
+        map.geoTagPins = runCatching { GeoTagStore.places() }.getOrDefault(emptyList()).map { tag ->
+            MapPoi(
+                id = "geotag-" + tag.id,
+                name = runCatching { GeoTagStore.artwork(tag.artId)?.title }.getOrNull()
+                    ?: "GeoTag piece",
+                address = tag.author,
+                lat = tag.lat,
+                lon = tag.lng,
+                category = PoiCategory.OTHER,
+            )
+        }
         map.selectedPlace = selected
         if (!map.hasCenter) {
             val own = runCatching { PrismLocations.latestFix(context) }.getOrNull()

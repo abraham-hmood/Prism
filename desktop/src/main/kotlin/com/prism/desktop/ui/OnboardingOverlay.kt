@@ -32,7 +32,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import com.prism.desktop.DesktopTour
+import com.prism.launcher.PrismSettings
 import com.prism.launcher.onboarding.OnboardingTour
 
 /**
@@ -60,6 +63,17 @@ fun OnboardingOverlay(onDone: () -> Unit) {
     val colors = LocalPrismColors.current
     val steps = remember { OnboardingTour.walk(DesktopTour.SECTIONS) }
     var index by remember { mutableStateOf(0) }
+
+    // THE ACCOUNT COMES BEFORE THE TOUR AND CANNOT BE SKIPPED. The mail client signs in with this
+    // username and password, so a tour that let somebody past it would leave them with a mailbox
+    // they cannot open and no explanation. The phone's tour has the same gate.
+    var hasAccount by remember {
+        mutableStateOf(PrismSettings.getLykeProfileConfirmed() && PrismSettings.hasLykePassword())
+    }
+    if (!hasAccount) {
+        LykeAccountGate { hasAccount = true }
+        return
+    }
 
     if (steps.isEmpty()) {
         onDone()
@@ -155,6 +169,102 @@ fun OnboardingOverlay(onDone: () -> Unit) {
                         Text(if (last) "Finish" else "Next", fontSize = 13.sp)
                     }
                 }
+            }
+        }
+    }
+}
+
+/**
+ * The first-run account form, shown before the tour.
+ *
+ * A small screen rather than a step in the tour because the tour's Skip is on every page and this
+ * cannot be skipped. The validation is deliberately the server's own: three characters, a dot or
+ * dash or underscore allowed, and a password of eight, which is the floor EmailSecurity enforces.
+ */
+@Composable
+private fun LykeAccountGate(onReady: () -> Unit) {
+    val colors = LocalPrismColors.current
+    var name by remember { mutableStateOf(PrismSettings.getLykeUserName()) }
+    var password by remember { mutableStateOf("") }
+    var confirm by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf("") }
+
+    Box(
+        Modifier.fillMaxSize().background(Color(0xE60B0B10)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Surface(
+            color = colors.surface,
+            shape = RoundedCornerShape(16.dp),
+            modifier = Modifier.widthIn(max = 560.dp).padding(24.dp),
+        ) {
+            Column(Modifier.padding(26.dp)) {
+                Text("YOUR PRISM ACCOUNT", fontSize = 10.sp, color = colors.accent)
+                Spacer(Modifier.height(14.dp))
+                Text("Create the account your mail lives on", fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Prism can serve your mail itself. The address is this username at your mail " +
+                        "domain, and the client signs in with this password. The same name is your " +
+                        "Lyke name.\n\n" +
+                        "The password is encrypted with your wallet phrase, so another device with " +
+                        "the same wallet can read it back -- and so can anyone holding that phrase.",
+                    fontSize = 13.sp,
+                    color = colors.muted,
+                    lineHeight = 20.sp,
+                    modifier = Modifier.heightIn(max = 220.dp).verticalScroll(rememberScrollState()),
+                )
+                Spacer(Modifier.height(16.dp))
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("Username", fontSize = 12.sp) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    label = { Text("Password", fontSize = 12.sp) },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = confirm,
+                    onValueChange = { confirm = it },
+                    label = { Text("Confirm password", fontSize = 12.sp) },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                if (error.isNotBlank()) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(error, fontSize = 12.sp, color = Color(0xFFFF6B6B))
+                }
+                Spacer(Modifier.height(16.dp))
+                Button(
+                    onClick = {
+                        val clean = name.trim()
+                        error = when {
+                            clean.length < 3 -> "A username needs at least three characters."
+                            !clean.matches(Regex("[A-Za-z0-9._-]+")) ->
+                                "Usernames can use letters, numbers, dots, dashes and underscores."
+                            password.length < 8 -> "The password needs at least eight characters."
+                            password != confirm -> "The two passwords do not match."
+                            else -> ""
+                        }
+                        if (error.isBlank()) {
+                            PrismSettings.setLykeUserName(clean)
+                            PrismSettings.setLykePassword(password)
+                            PrismSettings.setLykeProfileConfirmed(true)
+                            onReady()
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Create my account", fontSize = 13.sp) }
             }
         }
     }

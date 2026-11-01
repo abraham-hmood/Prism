@@ -1,0 +1,10 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- A speech bubble with a voicemail waveform inside: leaving a message, not placing a call. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M4,3h16a2,2 0 0,1 2,2v10a2,2 0 0,1 -2,2h-8.2l-4.3,3.8a0.8,0.8 0 0,1 -1.5,-0.6V17H4a2,2 0 0,1 -2,-2V5a2,2 0 0,1 2,-2zM5,9h1.6v4H5zM8.2,7h1.6v8H8.2zM11.4,5h1.6v12h-1.6zM14.6,7h1.6v8h-1.6zM17.8,9H19v4h-1.2z" />
+</vector>

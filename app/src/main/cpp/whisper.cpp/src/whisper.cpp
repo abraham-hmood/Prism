@@ -178,7 +178,25 @@ static bool ggml_graph_compute_helper(
                         void * abort_callback_data) {
     ggml_backend_ptr backend { ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr) };
 
-    auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
+    // PRISM: a backend that failed to initialise used to reach ggml_backend_dev_backend_reg
+    // with a null device, which is a GGML_ASSERT -- a SIGABRT the JVM cannot catch. Whisper is
+    // used during dataset imports, so that abort took the launcher down rather than reporting
+    // "no transcription". Returning false makes it an ordinary failed decode.
+    if (!backend) {
+        WHISPER_LOG_ERROR("%s: failed to initialise the CPU backend\n", __func__);
+        return false;
+    }
+    ggml_backend_dev_t device = ggml_backend_get_device(backend.get());
+    if (device == nullptr) {
+        WHISPER_LOG_ERROR("%s: CPU backend has no device\n", __func__);
+        return false;
+    }
+
+    auto * reg = ggml_backend_dev_backend_reg(device);
+    if (reg == nullptr) {
+        WHISPER_LOG_ERROR("%s: CPU backend has no registry\n", __func__);
+        return false;
+    }
 
     auto * set_abort_callback_fn = (ggml_backend_set_abort_callback_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_abort_callback");
     if (set_abort_callback_fn) {
@@ -1398,7 +1416,16 @@ static buft_list_t make_buft_list(whisper_context_params & params) {
 
     // CPU Extra
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    // PRISM: make a missing CPU device a reported failure rather than a GGML_ASSERT. The caller
+    // (whisper_init_state) turns the exception into a null context, and the JNI bridge catches
+    // it; before this guard the same situation aborted the whole process during model loading.
+    if (cpu_dev == nullptr) {
+        throw std::runtime_error("whisper: no CPU backend device is loaded");
+    }
     auto * cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
+    if (cpu_reg == nullptr) {
+        throw std::runtime_error("whisper: CPU backend has no registry");
+    }
     auto get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
         ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_dev_get_extra_bufts");
     if (get_extra_bufts_fn) {

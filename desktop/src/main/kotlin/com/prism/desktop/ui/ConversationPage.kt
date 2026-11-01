@@ -1,5 +1,6 @@
 package com.prism.desktop.ui
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -41,21 +42,28 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.prism.desktop.DesktopMicrophone
 import com.prism.launcher.AppDatabase
+import com.prism.launcher.PrismSettings
 import com.prism.launcher.messaging.AiMessageEntity
 import com.prism.launcher.messaging.Dictation
+import com.prism.launcher.messaging.GgufInferenceService
 import com.prism.launcher.messaging.SamConversation
 import com.prism.launcher.messaging.Vision
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.awt.FileDialog
 import java.awt.Frame
 import java.io.File
+import java.text.NumberFormat
+import kotlin.math.roundToInt
 
 /**
  * A conversation with Sam. PHASE 37.
@@ -108,7 +116,37 @@ fun ConversationPage() {
     var search by remember { mutableStateOf("") }
     var searchHits by remember { mutableStateOf<List<AiMessageEntity>>(emptyList()) }
 
+    // Sam's decode readout. The same three numbers the phone shows above the composer: how much of
+    // the model's context window this conversation has consumed, the token count itself, and the
+    // live decode rate. Only meaningful on a local model -- a cloud or mesh answer has no context
+    // window on this machine to meter.
+    var contextFraction by remember { mutableStateOf(0f) }
+    var contextTokens by remember { mutableStateOf(0) }
+    var contextWindow by remember { mutableStateOf(0) }
+    var tokenRate by remember { mutableStateOf(0.0) }
+    val metered = remember {
+        runCatching {
+            PrismSettings.getAiMode() == PrismSettings.AI_MODE_LOCAL &&
+                PrismSettings.hasActiveLocalModel()
+        }.getOrDefault(false)
+    }
+
     val listState = rememberLazyListState()
+
+    LaunchedEffect(streaming, metered) {
+        if (!metered) return@LaunchedEffect
+        while (true) {
+            val stats = GgufInferenceService.liveStats
+            contextFraction = stats.contextFraction
+            contextTokens = stats.contextUsed
+            contextWindow = stats.contextSize
+            // The live value, not lastTokensPerSecond: that one is only written when the turn
+            // ends, which would make the ticker sit at zero for the whole reply and then jump.
+            tokenRate = GgufInferenceService.liveTokensPerSecond
+            if (!streaming) break
+            delay(250L)
+        }
+    }
 
     suspend fun reload() {
         val loaded = withContext(Dispatchers.IO) {
@@ -155,6 +193,12 @@ fun ConversationPage() {
         partial = ""
         thinking = ""
         status = null
+        if (metered) {
+            GgufInferenceService.resetLiveStats()
+            contextFraction = 0f
+            contextTokens = 0
+            tokenRate = 0.0
+        }
 
         scope.launch {
             val dao = withContext(Dispatchers.IO) {
@@ -346,6 +390,16 @@ fun ConversationPage() {
                 )
             }
 
+            if (metered) {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    SamMeter(contextFraction, contextTokens, tokenRate, contextWindow, colors)
+                }
+            }
+
             attachment?.let { file ->
                 Row(
                     Modifier.fillMaxWidth().padding(horizontal = 16.dp),
@@ -409,6 +463,80 @@ fun ConversationPage() {
 
 /** How much of a reasoning trace to show. It can run to thousands of tokens; the tail is the useful end. */
 private const val THINKING_TAIL = 600
+
+/**
+ * The corner readout on Sam's thread: context ring, tokens spent, live decode rate.
+ *
+ * One ring rather than a progress bar because the three numbers belong together and the ring is
+ * the only one that needs a colour. Amber past 75% and red past 90%, the same thresholds the phone
+ * uses, because running out of context is the failure the user can still avoid by starting a new
+ * thread.
+ */
+@Composable
+private fun SamMeter(
+    fraction: Float,
+    tokens: Int,
+    rate: Double,
+    window: Int,
+    colors: PrismColors,
+) {
+    val safe = fraction.coerceIn(0f, 1f)
+    val ringColor = when {
+        safe >= 0.9f -> Color(0xFFFF5A5A)
+        safe >= 0.75f -> Color(0xFFFFC24D)
+        else -> colors.accent
+    }
+    Row(
+        Modifier
+            .clip(RoundedCornerShape(20.dp))
+            .background(colors.background)
+            .padding(horizontal = 10.dp, vertical = 5.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(Modifier.size(30.dp), contentAlignment = Alignment.Center) {
+            Canvas(Modifier.fillMaxSize()) {
+                val stroke = 3.dp.toPx()
+                drawArc(
+                    color = colors.faint.copy(alpha = 0.25f),
+                    startAngle = -90f,
+                    sweepAngle = 360f,
+                    useCenter = false,
+                    style = Stroke(width = stroke, cap = StrokeCap.Round),
+                )
+                if (safe > 0f) {
+                    drawArc(
+                        color = ringColor,
+                        startAngle = -90f,
+                        sweepAngle = 360f * safe,
+                        useCenter = false,
+                        style = Stroke(width = stroke, cap = StrokeCap.Round),
+                    )
+                }
+            }
+            Text(
+                "${(safe * 100).roundToInt()}%",
+                fontSize = 9.sp,
+                fontWeight = FontWeight.Bold,
+                color = colors.onSurface,
+            )
+        }
+        Spacer(Modifier.width(8.dp))
+        Column {
+            Text(
+                "${NumberFormat.getIntegerInstance().format(tokens)} tok" +
+                    if (window > 0) " / ${NumberFormat.getIntegerInstance().format(window)}" else "",
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+                color = colors.onSurface,
+            )
+            Text(
+                if (rate > 0.0) "%.1f tok/s".format(rate) else "— tok/s",
+                fontSize = 9.sp,
+                color = colors.faint,
+            )
+        }
+    }
+}
 
 @Composable
 private fun Bubble(

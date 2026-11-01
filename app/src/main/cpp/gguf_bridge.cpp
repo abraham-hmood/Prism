@@ -56,9 +56,78 @@ struct GgufContext {
     std::vector<llama_chat_message> messages;
     std::vector<char> formatted;
     int prev_len = 0;
+
+    /**
+     * Every token this conversation has seen, prompt and generated.
+     *
+     * Speculative and block-parallel decoding both need a cheap source of candidate tokens;
+     * the conversation itself is the only one that is always available, needs no second model
+     * and cannot disagree with the tokenizer. Capped when appended so a long session does not
+     * grow it without bound -- only the recent tail is ever matched against.
+     */
+    std::vector<llama_token> history;
+
+    /** The last block a block-parallel mode accepted, reused as its own next draft. */
+    std::vector<llama_token> last_block;
+
+    /**
+     * The persistent worker pool this context decodes with, owned here.
+     *
+     * WITHOUT ONE, EVERY TOKEN SPAWNS AND JOINS FOUR THREADS. ggml-cpu's ggml_graph_compute()
+     * builds a "disposable threadpool" when the caller has not attached one (see the
+     * disposable_threadpool branch in ggml-cpu.c) -- pthread_create x n_threads at the top of every
+     * graph, pthread_join x n_threads at the bottom. For prompt processing that is amortised over
+     * hundreds of tokens; for DECODE, where one graph produces one token, it is a thread lifecycle
+     * per token, and it is paid on the critical path.
+     *
+     * It is also the only way to choose WHICH CORES those threads run on. A disposable pool is
+     * created with default affinity, so the scheduler is free to put a decoding thread on a
+     * 1.8 GHz Cortex-A510 while the others wait for it at the next barrier -- one slow core sets
+     * the pace of every graph node. MEASURED on a Galaxy S22 with SmolLM2-135M Q4_K_M, 64 tokens:
+     *
+     *     1 thread   42.1 tok/s     4 threads  31.9 tok/s     6 threads  12.3 tok/s
+     *
+     * More threads made it SLOWER, which is the signature of that barrier waiting on little cores.
+     */
+    ggml_threadpool* threadpool = nullptr;
 };
 
 bool g_backend_initialized = false;
+
+/**
+ * CPUs inference threads may run on, as a bitmask of CPU indices; 0 means "no restriction".
+ *
+ * Supplied by Kotlin (PrismCpu) because Android exposes the core layout through sysfs, which the
+ * Java side already reads to decide how many threads to ask for. Pinning needs the INDICES, not the
+ * count: the four fastest cores on a Snapdragon 8 Gen 1 are 4,5,6,7, and a mask of "four threads"
+ * without them would still allow the scheduler to pick the little cluster.
+ */
+int64_t g_inference_cpu_mask = 0;
+
+/**
+ * ggml's threadpool entry points, looked up at runtime.
+ *
+ * THEY ARE NOT LINKABLE SYMBOLS. This build sets GGML_BACKEND_DL, so ggml-cpu is one of several
+ * dlopen()ed backend libraries (one per ARM feature set -- see CMakeLists.txt) rather than code
+ * linked into this .so. ggml-cpu.cpp publishes these through the backend registry's proc-address
+ * table precisely for this case, which is the supported way in; linking directly fails with
+ * "undefined symbol: ggml_threadpool_new".
+ */
+struct ggml_threadpool * (*g_threadpool_new)(struct ggml_threadpool_params *) = nullptr;
+void (*g_threadpool_free)(struct ggml_threadpool *) = nullptr;
+
+bool ensure_threadpool_fns() {
+    if (g_threadpool_new != nullptr && g_threadpool_free != nullptr) return true;
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (dev == nullptr) return false;
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) return false;
+    g_threadpool_new = reinterpret_cast<decltype(g_threadpool_new)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new"));
+    g_threadpool_free = reinterpret_cast<decltype(g_threadpool_free)>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free"));
+    return g_threadpool_new != nullptr && g_threadpool_free != nullptr;
+}
 
 // Where the backend .so files are: the app's native library directory, handed down from Kotlin.
 //
@@ -157,15 +226,424 @@ void free_messages(std::vector<llama_chat_message>& messages) {
 // llama.rn (used by OGAM) uses. Prism's chain previously had only min_p + temp, with no
 // repetition penalty at all — a strong contributor to degenerate/repetitive output on
 // small, heavily-quantized models.
-llama_sampler* build_sampler_chain(float minP, float temperature) {
+llama_sampler* build_sampler_chain(float minP, float temperature,
+                                   const llama_vocab* vocab = nullptr,
+                                   const char* grammar = nullptr) {
     llama_sampler* sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
     llama_sampler_chain_add(sampler, llama_sampler_init_penalties(64, 1.1f, 0.0f, 0.0f));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_k(40));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.95f, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_min_p(minP, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
+    // Grammar BEFORE the distribution sampler: it masks logits to tokens the grammar can accept,
+    // then dist samples from what remains. Adding it after dist would have no effect at all.
+    if (grammar != nullptr && *grammar != '\0' && vocab != nullptr) {
+        llama_sampler* g = llama_sampler_init_grammar(vocab, grammar, "root");
+        if (g != nullptr) llama_sampler_chain_add(sampler, g);
+    }
     llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
     return sampler;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Inference modes.
+//
+// Every one of these is a different way of spending a fixed budget of model passes. Nothing here
+// changes the model: a mode either proposes tokens that one batched decode can verify, or refines
+// a whole block in parallel instead of decoding it one token at a time.
+//
+// THE SHARED PRIMITIVE is [decode_tokens] with logits for every position. A normal AR decode
+// throws away every logit except the last one; keeping them all is what makes verification and
+// block refinement possible in one weight sweep, which is the entire reason these modes can be
+// faster than the sequential loop on a memory-bandwidth-bound phone.
+//
+// WHAT IS DELIBERATELY *NOT* CLAIMED. Prism does not ship a second draft model, an EAGLE head or
+// a learned parallel head, so the modes that would normally use one fall back to proposals made
+// from the conversation itself. That is still speculative decoding -- the proposals are simply
+// cheaper and less accurate -- and the UI says so rather than implying a model component that is
+// not there. Greedy verification is used for every parallel path, which means these modes trade
+// sampling variety for speed; the mode descriptions state that too.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+enum NativeInferenceMode {
+    IM_NORMAL = 0,
+    IM_FORCED_DIFFUSION = 1,
+    IM_SPECULATIVE = 2,
+    IM_LOOKAHEAD = 3,
+    IM_SELF_SPECULATIVE = 4,
+    IM_BLOCK_PARALLEL = 5,
+    IM_RECURRENT_DEPTH = 6,
+    IM_HETERO = 7,
+};
+
+struct GenStats {
+    int prompt_tokens = 0;
+    int generated = 0;
+    int accepted = 0;
+    int proposed = 0;
+};
+
+/** One past the highest occupied position in sequence 0; 0 when the cache is empty. */
+int seq_past(llama_context* ctx) {
+    const int max = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+    return max < 0 ? 0 : max + 1;
+}
+
+/**
+ * Makes room for [need] more positions by dropping the oldest half of the cache.
+ *
+ * The same policy the sequential loop has always used: keep the recent conversation rather than
+ * resetting it. Returns false only when the context is too small to shift at all, which the caller
+ * reports as a context overflow rather than looping forever.
+ */
+bool ensure_room(GgufContext* gguf, int& n_past, int need) {
+    const int n_ctx = static_cast<int>(llama_n_ctx(gguf->ctx));
+    while (n_past + need > n_ctx) {
+        const int n_discard = n_past / 2;
+        if (n_discard <= 0) return false;
+        llama_memory_t mem = llama_get_memory(gguf->ctx);
+        llama_memory_seq_rm(mem, 0, 0, n_discard);
+        llama_memory_seq_add(mem, 0, n_discard, n_past, -n_discard);
+        n_past -= n_discard;
+    }
+    return true;
+}
+
+/** Decode [n] tokens at [n_past]. With [all_logits], every position keeps its logits. */
+bool decode_tokens(llama_context* ctx, const llama_token* tokens, int n, int n_past, bool all_logits) {
+    if (n <= 0) return false;
+    llama_batch batch = llama_batch_init(n, 0, 1);
+    for (int i = 0; i < n; i++) {
+        batch.token[i] = tokens[i];
+        batch.pos[i] = n_past + i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i] = (all_logits || i == n - 1) ? 1 : 0;
+    }
+    batch.n_tokens = n;
+    const int rc = llama_decode(ctx, batch);
+    llama_batch_free(batch);
+    if (rc != 0) LOGE("llama_decode(batch=%d) failed, ret = %d", n, rc);
+    return rc == 0;
+}
+
+/** The model's own top choice at position [idx], or -1 if the logits are unavailable. */
+llama_token argmax_at(llama_context* ctx, const llama_vocab* vocab, int idx) {
+    const float* logits = llama_get_logits_ith(ctx, idx);
+    if (logits == nullptr) return -1;
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    int best = 0;
+    for (int i = 1; i < n_vocab; i++) {
+        if (logits[i] > logits[best]) best = i;
+    }
+    return static_cast<llama_token>(best);
+}
+
+bool emit_piece(JNIEnv* env, const llama_vocab* vocab, llama_token token,
+                std::string& response, int& generated,
+                jobject callback, jmethodID onTokenMid) {
+    char buf[256];
+    const int n = llama_token_to_piece(vocab, token, buf, sizeof(buf), 0, true);
+    if (n < 0) {
+        LOGE("Failed to convert token to piece");
+        return false;
+    }
+    response.append(buf, n);
+    if (callback != nullptr && onTokenMid != nullptr) {
+        jstring jpiece = env->NewStringUTF(std::string(buf, n).c_str());
+        env->CallVoidMethod(callback, onTokenMid, jpiece);
+        env->DeleteLocalRef(jpiece);
+    }
+    generated++;
+    return true;
+}
+
+void post_stats(JNIEnv* env, GgufContext* gguf, jobject callback, jmethodID onStatsMid,
+                const GenStats& stats) {
+    if (callback == nullptr || onStatsMid == nullptr) return;
+    env->CallVoidMethod(callback, onStatsMid,
+                        stats.prompt_tokens, stats.generated,
+                        seq_past(gguf->ctx), static_cast<int>(llama_n_ctx(gguf->ctx)),
+                        stats.accepted, stats.proposed);
+}
+
+/**
+ * Longest recent suffix of [h] that occurred earlier, continuing with what followed it.
+ *
+ * This is the proposal source for prompt-lookup speculation: code, quoted passages, lists and
+ * repeated phrasing all contain their own draft. Bounded to the last 256 tokens on both sides so
+ * the search is O(256 * 8) per proposal rather than O(n^2).
+ */
+int ngram_proposal(const std::vector<llama_token>& h, int max_out, std::vector<llama_token>& out) {
+    out.clear();
+    const int n = static_cast<int>(h.size());
+    // Four tokens, not eight. Prompt lookup earns its keep on short, repeated phrasing
+    // ("the sea is vast and..."), and an eight-token suffix almost never recurs in ordinary
+    // prose, so the verifier ran without anything to verify. A false proposal costs one batched
+    // decode that ends at the first mismatch, which is cheap; a missed one costs the whole mode.
+    const int suffix = 4;
+    if (n < suffix + 1 || max_out <= 0) return 0;
+
+    const int earliest = std::max(0, n - 256);
+    for (int start = n - suffix - 1; start >= earliest; start--) {
+        bool match = true;
+        for (int i = 0; i < suffix; i++) {
+            if (h[start + i] != h[n - suffix + i]) { match = false; break; }
+        }
+        if (!match) continue;
+        const int from = start + suffix;
+        for (int i = 0; i < max_out && from + i < n; i++) out.push_back(h[from + i]);
+        return static_cast<int>(out.size());
+    }
+    return 0;
+}
+
+/**
+ * Speculative/lookahead verification.
+ *
+ * One batched decode of a sampled anchor plus up to eight proposed continuations. Every proposal
+ * that matches the model's own top choice at its position is accepted; the first mismatch ends
+ * the run and its tail is dropped from the KV cache. The next token is sampled from the logits at
+ * the last kept position, so no work is repeated.
+ */
+bool run_speculative(JNIEnv* env, GgufContext* gguf, const llama_vocab* vocab,
+                     int maxTokens, std::string& response, int& n_past, GenStats& stats,
+                     jobject callback, jmethodID onTokenMid, jmethodID onStatsMid) {
+    llama_token pending = -1;
+
+    while (maxTokens <= 0 || stats.generated < maxTokens) {
+        if (!ensure_room(gguf, n_past, 1)) return false;
+
+        llama_token anchor = pending;
+        pending = -1;
+        if (anchor < 0) anchor = llama_sampler_sample(gguf->sampler, gguf->ctx, -1);
+        if (llama_vocab_is_eog(vocab, anchor)) break;
+
+        std::vector<llama_token> proposal;
+        ngram_proposal(gguf->history, 8, proposal);
+
+        const int room = static_cast<int>(llama_n_ctx(gguf->ctx)) - n_past - 1;
+        if (static_cast<int>(proposal.size()) > room) proposal.resize(std::max(0, room));
+
+        if (!proposal.empty()) {
+            std::vector<llama_token> batch;
+            batch.reserve(proposal.size() + 1);
+            batch.push_back(anchor);
+            batch.insert(batch.end(), proposal.begin(), proposal.end());
+
+            if (decode_tokens(gguf->ctx, batch.data(), static_cast<int>(batch.size()), n_past, true)) {
+                int accepted = 0;
+                bool eog_matched = false;
+                for (size_t i = 0; i < proposal.size(); i++) {
+                    const llama_token predicted = argmax_at(gguf->ctx, vocab, static_cast<int>(i));
+                    if (predicted != proposal[i]) break;
+                    // An end-of-generation token terminates the reply but is never part of it.
+                    // Decoding it into the cache and then not emitting it would leave a token the
+                    // next turn's chat template knows nothing about.
+                    if (llama_vocab_is_eog(vocab, proposal[i])) { eog_matched = true; break; }
+                    accepted++;
+                }
+
+                // Never accept more than the caller asked for. Emitting past maxTokens used to
+                // leave the KV cache holding tokens the response does not contain, which the next
+                // turn then could not reconcile with the chat template.
+                if (maxTokens > 0) {
+                    const int allowed = maxTokens - stats.generated - 1; // minus the anchor
+                    if (allowed < 0) accepted = 0;
+                    else if (accepted > allowed) accepted = allowed;
+                }
+
+                const int keep = n_past + 1 + accepted;
+                const int total = n_past + 1 + static_cast<int>(proposal.size());
+                if (keep < total) {
+                    llama_memory_seq_rm(llama_get_memory(gguf->ctx), 0, keep, total);
+                }
+
+                stats.proposed += static_cast<int>(proposal.size());
+                stats.accepted += accepted;
+
+                if (!emit_piece(env, vocab, anchor, response, stats.generated, callback, onTokenMid)) return false;
+                gguf->history.push_back(anchor);
+
+                bool stop = eog_matched;
+                for (int i = 0; i < accepted; i++) {
+                    if (maxTokens > 0 && stats.generated >= maxTokens) { stop = true; break; }
+                    const llama_token tok = proposal[i];
+                    llama_sampler_accept(gguf->sampler, tok);
+                    if (!emit_piece(env, vocab, tok, response, stats.generated, callback, onTokenMid)) return false;
+                    gguf->history.push_back(tok);
+                }
+
+                n_past = keep;
+                if (stop) break;
+
+                const int next_index = std::max(0, accepted);
+                pending = llama_sampler_sample(gguf->sampler, gguf->ctx, next_index);
+                if ((stats.generated & 7) == 0) post_stats(env, gguf, callback, onStatsMid, stats);
+                if (maxTokens > 0 && stats.generated >= maxTokens) break;
+                continue;
+            }
+        }
+
+        // No usable proposal: decode the anchor alone, exactly like the sequential path.
+        if (!decode_tokens(gguf->ctx, &anchor, 1, n_past, false)) return false;
+        n_past++;
+        if (!emit_piece(env, vocab, anchor, response, stats.generated, callback, onTokenMid)) return false;
+        gguf->history.push_back(anchor);
+        pending = llama_sampler_sample(gguf->sampler, gguf->ctx, -1);
+        if ((stats.generated & 7) == 0) post_stats(env, gguf, callback, onStatsMid, stats);
+    }
+    return true;
+}
+
+/**
+ * Block-parallel denoising.
+ *
+ * A block of guesses is decoded in ONE pass; each position's top choice then rewrites the token
+ * after it, and the block is decoded again. Positions that stop changing are a fixed point of
+ * greedy decoding given the prefix before them, so the longest stable prefix is accepted and the
+ * unstable tail is dropped from the cache. The first token is a real sample from the model, which
+ * is what keeps the block from drifting away from the conversation.
+ *
+ * [require_convergence] is the difference between the aggressive modes and recurrent-depth: when
+ * set, a block that has not fully stabilised contributes only its first token, trading throughput
+ * for output that is guaranteed to be the sequential greedy continuation.
+ */
+bool run_block(JNIEnv* env, GgufContext* gguf, const llama_vocab* vocab,
+               int maxTokens, int mode, std::string& response, int& n_past, GenStats& stats,
+               jobject callback, jmethodID onTokenMid, jmethodID onStatsMid) {
+    int block_size = 16;
+    int rounds = 6;
+    bool require_convergence = false;
+    bool use_self_draft = false;
+
+    switch (mode) {
+        // Rounds scale inversely with block width on purpose: a 32-token pass already costs more
+        // arithmetic than a single-token one, and eight of them would make a mode that is supposed
+        // to be faster slower than the loop it replaces.
+        case IM_FORCED_DIFFUSION: block_size = 16; rounds = 6; break;
+        case IM_LOOKAHEAD:        block_size = 16; rounds = 4; break;
+        case IM_SELF_SPECULATIVE: block_size = 8;  rounds = 3; use_self_draft = true; break;
+        case IM_BLOCK_PARALLEL:   block_size = 32; rounds = 3; break;
+        case IM_RECURRENT_DEPTH:  block_size = 8;  rounds = 10; require_convergence = true; break;
+        default: break;
+    }
+
+    llama_token pending = -1;
+
+    while (maxTokens <= 0 || stats.generated < maxTokens) {
+        int block_len = block_size;
+        const int remaining = maxTokens > 0 ? maxTokens - stats.generated : block_size;
+        block_len = std::min(block_len, std::max(1, remaining));
+        block_len = std::min(block_len, static_cast<int>(llama_n_ctx(gguf->ctx)) / 2);
+        if (block_len < 2) block_len = 2;
+        if (!ensure_room(gguf, n_past, block_len)) return false;
+
+        llama_token anchor = pending;
+        pending = -1;
+        if (anchor < 0) anchor = llama_sampler_sample(gguf->sampler, gguf->ctx, -1);
+        if (llama_vocab_is_eog(vocab, anchor)) break;
+
+        std::vector<llama_token> block(block_len);
+        block[0] = anchor;
+
+        std::vector<llama_token> proposal;
+        if (use_self_draft && static_cast<int>(gguf->last_block.size()) >= block_len - 1) {
+            proposal.assign(gguf->last_block.begin(), gguf->last_block.begin() + (block_len - 1));
+        } else {
+            ngram_proposal(gguf->history, block_len - 1, proposal);
+        }
+
+        if (static_cast<int>(proposal.size()) >= block_len - 1) {
+            for (int i = 1; i < block_len; i++) block[i] = proposal[i - 1];
+        } else {
+            // No textual draft: seed every position with the model's current top choice. The
+            // refinement passes then propagate the real continuation through the block.
+            const llama_token seed = argmax_at(gguf->ctx, vocab, -1);
+            for (int i = 1; i < block_len; i++) block[i] = seed;
+            if (seed < 0) return false;
+        }
+
+        int stable = 0;
+        bool decoded = false;
+
+        for (int round = 0; round < rounds; round++) {
+            // The previous round's guesses occupy exactly these positions. Re-decoding over them
+            // is not an overwrite: llama.cpp requires consecutive positions after the cache's high
+            // water mark and rejects the batch outright, which is why every round after the first
+            // used to fail and the block never stabilised. Remove the guesses first; the final
+            // round's cache is then the prefix we accept.
+            if (round > 0) {
+                llama_memory_seq_rm(llama_get_memory(gguf->ctx), 0, n_past, n_past + block_len);
+            }
+            if (!decode_tokens(gguf->ctx, block.data(), block_len, n_past, true)) break;
+            decoded = true;
+
+            std::vector<llama_token> next(block_len);
+            next[0] = block[0];
+            for (int i = 1; i < block_len; i++) {
+                const llama_token predicted = argmax_at(gguf->ctx, vocab, i - 1);
+                if (predicted < 0) return false;
+                next[i] = predicted;
+            }
+
+            stable = 0;
+            while (stable < block_len && next[stable] == block[stable]) stable++;
+            block = next;
+            if (stable == block_len) break;
+        }
+
+        if (!decoded) return false;
+
+        int accepted = require_convergence ? (stable == block_len ? block_len : 1) : stable;
+        if (accepted < 1) accepted = 1;
+        if (accepted > block_len) accepted = block_len;
+        if (maxTokens > 0) accepted = std::min(accepted, maxTokens - stats.generated);
+        // The same rule as the speculative path: an EOG terminates the reply and must not stay in
+        // the cache, because the chat template will not contain it on the next turn.
+        for (int i = 0; i < accepted; i++) {
+            if (llama_vocab_is_eog(vocab, block[i])) { accepted = i; break; }
+        }
+        if (accepted < 1) {
+            // Nothing is being emitted, so the guesses must not stay in the cache either: the next
+            // turn reads its position from the cache, not from this loop's local counter.
+            llama_memory_seq_rm(llama_get_memory(gguf->ctx), 0, n_past, n_past + block_len);
+            break;
+        }
+
+        // A block that never stabilised still has a valid sampled first token; everything after
+        // it would be a guess, so it is dropped rather than shown to the user.
+        const int keep = n_past + accepted;
+        const int total = n_past + block_len;
+        if (keep < total) {
+            llama_memory_seq_rm(llama_get_memory(gguf->ctx), 0, keep, total);
+        }
+
+        stats.accepted += std::max(0, accepted - 1);
+        stats.proposed += std::max(0, block_len - 1);
+
+        bool stop = false;
+        for (int i = 0; i < accepted; i++) {
+            const llama_token tok = block[i];
+            if (llama_vocab_is_eog(vocab, tok)) { stop = true; break; }
+            if (i > 0) llama_sampler_accept(gguf->sampler, tok);
+            if (!emit_piece(env, vocab, tok, response, stats.generated, callback, onTokenMid)) return false;
+            gguf->history.push_back(tok);
+            if (maxTokens > 0 && stats.generated >= maxTokens) { stop = true; break; }
+        }
+
+        if (accepted > 1) {
+            gguf->last_block.assign(block.begin(), block.begin() + accepted);
+        }
+
+        n_past = keep;
+        if (stop) break;
+
+        pending = llama_sampler_sample(gguf->sampler, gguf->ctx, accepted - 1);
+        post_stats(env, gguf, callback, onStatsMid, stats);
+    }
+
+    return true;
 }
 
 // Shared by nativeGenerate/nativeGenerateStreaming. When callback is non-null,
@@ -173,15 +651,20 @@ llama_sampler* build_sampler_chain(float minP, float temperature) {
 // either way the full response text is returned at the end.
 std::string run_generation(JNIEnv* env, GgufContext* gguf, const std::string& userText,
                             jint maxTokens, jfloat temperature, jfloat minP,
-                            jobject callback, jmethodID onTokenMid) {
+                            jobject callback, jmethodID onTokenMid, jmethodID onStatsMid,
+                            int mode, const char* grammar = nullptr) {
 
     const llama_vocab* vocab = llama_model_get_vocab(gguf->model);
+
+    // A grammar constrains the sampler, not the verifier: greedy acceptance would step around the
+    // grammar entirely, so grammar-bound calls stay on the sequential path.
+    if (grammar != nullptr && *grammar != '\0') mode = IM_NORMAL;
 
     // Rebuild the sampler chain per call so temperature/min-p can vary per request.
     if (gguf->sampler) {
         llama_sampler_free(gguf->sampler);
     }
-    gguf->sampler = build_sampler_chain(minP, temperature);
+    gguf->sampler = build_sampler_chain(minP, temperature, vocab, grammar);
 
     const char* tmpl = llama_model_chat_template(gguf->model, /* name */ nullptr);
 
@@ -214,66 +697,82 @@ std::string run_generation(JNIEnv* env, GgufContext* gguf, const std::string& us
     }
 
     std::string response;
-    llama_batch batch = llama_batch_get_one(prompt_tokens.data(), static_cast<int32_t>(prompt_tokens.size()));
-    llama_token new_token_id;
+    int n_past = seq_past(gguf->ctx);
 
-    int generated = 0;
+    // Reset the perf counters so the numbers logged at the end of this call describe THIS call --
+    // they otherwise accumulate from context creation, which folds the warm-up and the model load
+    // into whatever the user is looking at now.
+    llama_perf_context_reset(gguf->ctx);
+
     bool hard_reset = false;
+    if (!ensure_room(gguf, n_past, static_cast<int>(prompt_tokens.size()))) {
+        hard_reset = true;
+    } else if (!decode_tokens(gguf->ctx, prompt_tokens.data(), static_cast<int>(prompt_tokens.size()), n_past, false)) {
+        // Drop the half-formed turn rather than leaving a user message in the history with no
+        // reply after it; the next call would otherwise send that prompt a second time.
+        hard_reset = true;
+        response = "Error: The model could not process this prompt (decode failed).";
+    }
 
-    while (true) {
-        const uint32_t n_ctx = llama_n_ctx(gguf->ctx);
-        llama_memory_t mem = llama_get_memory(gguf->ctx);
-        const int n_ctx_used = llama_memory_seq_pos_max(mem, 0) + 1;
+    n_past += static_cast<int>(prompt_tokens.size());
 
-        if (n_ctx_used + batch.n_tokens > static_cast<int>(n_ctx)) {
-            // Context full — common mid-generation with long reasoning traces. Shift the
-            // oldest half of the cache out and keep going instead of wiping the whole
-            // conversation (mirrors llama.cpp's own context-shift behavior, which OGAM/
-            // llama.rn enable by default; Prism previously hard-reset here).
-            const int n_keep = 0;
-            const int n_discard = (n_ctx_used - n_keep) / 2;
-            if (n_discard <= 0) {
-                // Pathological case (tiny context) — shifting can't free room.
-                hard_reset = true;
-                break;
+    // The proposal source. Capped: only the recent tail is ever matched, and an unbounded
+    // transcript would slowly turn every conversation into a memory leak.
+    gguf->history.insert(gguf->history.end(), prompt_tokens.begin(), prompt_tokens.end());
+    if (gguf->history.size() > 1024) {
+        gguf->history.erase(gguf->history.begin(), gguf->history.end() - 1024);
+    }
+
+    GenStats stats;
+    stats.prompt_tokens = static_cast<int>(prompt_tokens.size());
+    post_stats(env, gguf, callback, onStatsMid, stats);
+
+    if (!hard_reset) {
+        if (mode == IM_NORMAL || mode == IM_HETERO) {
+            llama_token new_token_id;
+            while (true) {
+                if (!ensure_room(gguf, n_past, 1)) {
+                    // Pathological case (tiny context) — shifting can't free room.
+                    hard_reset = true;
+                    break;
+                }
+
+                new_token_id = llama_sampler_sample(gguf->sampler, gguf->ctx, -1);
+                if (llama_vocab_is_eog(vocab, new_token_id)) break;
+                if (!emit_piece(env, vocab, new_token_id, response, stats.generated, callback, onTokenMid)) break;
+                gguf->history.push_back(new_token_id);
+
+                if (!decode_tokens(gguf->ctx, &new_token_id, 1, n_past, false)) break;
+                n_past++;
+
+                if (maxTokens > 0 && stats.generated >= maxTokens) break;
+                if ((stats.generated & 7) == 0) post_stats(env, gguf, callback, onStatsMid, stats);
             }
-            llama_memory_seq_rm(mem, 0, n_keep, n_keep + n_discard);
-            llama_memory_seq_add(mem, 0, n_keep + n_discard, n_ctx_used, -n_discard);
-        }
-
-        const int ret = llama_decode(gguf->ctx, batch);
-        if (ret != 0) {
-            LOGE("llama_decode failed, ret = %d", ret);
-            break;
-        }
-
-        new_token_id = llama_sampler_sample(gguf->sampler, gguf->ctx, -1);
-
-        if (llama_vocab_is_eog(vocab, new_token_id)) {
-            break;
-        }
-
-        char buf[256];
-        const int n = llama_token_to_piece(vocab, new_token_id, buf, sizeof(buf), 0, true);
-        if (n < 0) {
-            LOGE("Failed to convert token to piece");
-            break;
-        }
-        response.append(buf, n);
-
-        if (callback != nullptr) {
-            jstring jpiece = env->NewStringUTF(std::string(buf, n).c_str());
-            env->CallVoidMethod(callback, onTokenMid, jpiece);
-            env->DeleteLocalRef(jpiece);
-        }
-
-        batch = llama_batch_get_one(&new_token_id, 1);
-
-        generated++;
-        if (maxTokens > 0 && generated >= maxTokens) {
-            break;
+        } else if (mode == IM_SPECULATIVE) {
+            if (!run_speculative(env, gguf, vocab, maxTokens, response, n_past, stats, callback, onTokenMid, onStatsMid)) {
+                if (response.empty()) response = "Error: Speculative decoding failed.";
+            }
+        } else {
+            if (!run_block(env, gguf, vocab, maxTokens, mode, response, n_past, stats, callback, onTokenMid, onStatsMid)) {
+                if (response.empty()) response = "Error: Parallel decoding failed.";
+            }
         }
     }
+
+    post_stats(env, gguf, callback, onStatsMid, stats);
+
+    // llama.cpp's OWN TIMERS, not the wall clock around the JNI call.
+    //
+    // The difference is the whole diagnosis. A phone measured 17 tok/s on a 135M model, where the
+    // weights are 105 MB and reading them once per token is under 3 ms at this device's memory
+    // bandwidth -- so the missing 55 ms could be in the graph or in everything AROUND it (JNI, the
+    // sampler, the Kotlin callback). t_eval_ms is the graph alone: if it is small, the engine is
+    // fine and the overhead is Prism's; if it is the whole time, the kernels are the problem. Both
+    // numbers used to be invisible, which made "why is this slow" unanswerable.
+    const llama_perf_context_data perf = llama_perf_context(gguf->ctx);
+    LOGI("perf: prompt=%.1fms/%d tok eval=%.1fms/%d tok (%.2f tok/s in llama) total=%.1fms",
+         perf.t_p_eval_ms, perf.n_p_eval, perf.t_eval_ms, perf.n_eval,
+         perf.t_eval_ms > 0.0 ? perf.n_eval * 1000.0 / perf.t_eval_ms : 0.0, perf.t_load_ms);
 
     if (hard_reset) {
         // Last resort (context too small for even a single shift) — clear everything so
@@ -845,6 +1344,20 @@ void ensure_prism_swap_registered() {
  * process while models come and go, and because the RPC server path starts a backend without ever
  * loading a model locally.
  */
+/**
+ * Sets the CPUs inference threads may run on (bitmask of CPU indices), for every later load.
+ *
+ * A plain setter rather than a load parameter because the mask describes the MACHINE, not the
+ * model: the same phone will pin every model it loads, and the value only has to change if the
+ * core layout does. 0 disables pinning.
+ */
+extern "C" JNIEXPORT void JNICALL
+Java_com_prism_launcher_messaging_GgufInferenceService_nativeSetInferenceCpuMask(
+        JNIEnv* /* env */, jobject /* thiz */, jlong mask) {
+    g_inference_cpu_mask = mask;
+    LOGI("inference cpu mask: 0x%llx", static_cast<unsigned long long>(mask));
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_prism_launcher_messaging_GgufInferenceService_nativeSetBackendDir(
         JNIEnv* env, jobject /* thiz */, jstring jDir) {
@@ -860,7 +1373,7 @@ Java_com_prism_launcher_messaging_GgufInferenceService_nativeSetBackendDir(
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_prism_launcher_messaging_GgufInferenceService_nativeLoadModel(
         JNIEnv* env, jobject /* thiz */, jstring jModelPath, jint nCtx, jint nThreads, jint kvCacheMode, jint gpuMode,
-        jboolean forceMmapFallback, jobject swapBuffer) {
+        jboolean forceMmapFallback, jboolean forceNoMmap, jobject swapBuffer) {
 
     ensure_backend_init();
 
@@ -893,6 +1406,32 @@ Java_com_prism_launcher_messaging_GgufInferenceService_nativeLoadModel(
         } else {
             LOGE("Prism Swap buffer invalid (GetDirectBufferAddress failed) -- falling back to CPU/RAM");
         }
+    } else if (gpuMode == 3) {
+        // Heterogeneous / phase-aware execution: hand ggml EVERY device this build knows about --
+        // accelerators first, then the CPU. llama.cpp places as many layers as fit on the
+        // accelerators and keeps the remainder on the CPU, and ggml's scheduler splits individual
+        // graph nodes across whichever devices have the op. That is a genuine per-phase split
+        // rather than a claim that one phone can run three copies of the model.
+        static ggml_backend_dev_t all_devices[16];
+        size_t count = 0;
+        for (int pass = 0; pass < 2 && count < 15; pass++) {
+            for (size_t i = 0; i < ggml_backend_dev_count() && count < 15; i++) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (!dev) continue;
+                const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+                const bool accelerator = type == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                                         type == GGML_BACKEND_DEVICE_TYPE_ACCEL;
+                if ((pass == 0) == accelerator) all_devices[count++] = dev;
+            }
+        }
+        all_devices[count] = nullptr;
+        if (count > 1) {
+            model_params.devices = all_devices;
+            model_params.n_gpu_layers = 999;
+            LOGI("Heterogeneous execution: %zu device(s) offered to ggml", count);
+        } else {
+            model_params.n_gpu_layers = 0;
+        }
     } else if (gpuMode == 2) {
         // gpuMode: 0=CPU, 1=GPU (OpenCL, any available device), 2=NPU (Hexagon specifically —
         // restrict offload to just that device so picking "NPU" doesn't silently fall through to
@@ -916,7 +1455,15 @@ Java_com_prism_launcher_messaging_GgufInferenceService_nativeLoadModel(
     // a full in-RAM copy for NEON perf (is_repackable_quant) -- under this fallback the weight
     // data is read straight from the GGUF file's own mmap instead, evictable under memory
     // pressure like any other mapped file, at the cost of that NEON repacking speedup.
-    model_params.use_mmap = forceMmapFallback || !is_repackable_quant(modelPath);
+    //
+    // forceNoMmap IS THE OPPOSITE TRADE AND IS WHAT THE NORMAL (FITS-IN-RAM) LOAD USES. mmap is
+    // right when the model does not fit, but on Android the model file usually lives on
+    // /storage/emulated/0, which is FUSE. A mmap-backed decode then faults every weight page
+    // through FUSE on first use -- measured at 0.1 tok/s on a Galaxy S22 with a 1.1 GB Q5_K_M
+    // model, against the same file read into anonymous RAM. Copying the weights costs a few
+    // seconds at load and is what makes steady-state decode depend on the phone's DRAM instead
+    // of on a userspace filesystem.
+    model_params.use_mmap = forceMmapFallback || (!forceNoMmap && !is_repackable_quant(modelPath));
 
     llama_model* model = llama_model_load_from_file(modelPath.c_str(), model_params);
     if (!model && swapBuffer == nullptr && gpuMode != 0) {
@@ -968,6 +1515,39 @@ Java_com_prism_launcher_messaging_GgufInferenceService_nativeLoadModel(
     gguf->ctx = ctx;
     gguf->sampler = sampler;
     gguf->formatted.resize(ctx_params.n_ctx);
+
+    // Persistent, pinned worker pool -- see GgufContext::threadpool for what this replaces.
+    //
+    // cpumask is per-CPU (indexed by CPU number), not per-thread, and applies to every worker the
+    // pool creates. strict_cpu stays false: each worker may run on any of the chosen cores, which
+    // avoids pinning the pool to a core the UI thread also needs. Only the little cores are
+    // excluded, and that is the whole point.
+    if (g_inference_cpu_mask != 0) {
+        ggml_threadpool_params ttp = ggml_threadpool_params_default(ctx_params.n_threads);
+        // poll stays at its default of 0. Spinning instead of sleeping on the futex is the usual
+        // fix for wake latency, but on a phone it buys that latency with heat, and this device
+        // throttles its big cores from 3.0 GHz to under 2.0 GHz within a minute of sustained load
+        // -- so a spin that helps one token can cost more than it saves across a reply. Left
+        // unset until there is a measurement that survives the thermal noise.
+        int pinned = 0;
+        for (int cpu = 0; cpu < GGML_MAX_N_THREADS && cpu < 64; ++cpu) {
+            if (((g_inference_cpu_mask >> cpu) & 1LL) != 0) {
+                ttp.cpumask[cpu] = true;
+                ++pinned;
+            }
+        }
+        if (pinned > 0) {
+            ggml_threadpool* tp = ensure_threadpool_fns() ? g_threadpool_new(&ttp) : nullptr;
+            if (tp != nullptr) {
+                llama_attach_threadpool(ctx, tp, tp);
+                gguf->threadpool = tp;
+                LOGI("persistent threadpool: %d thread(s) on %d performance core(s) (mask 0x%llx)",
+                     ttp.n_threads, pinned, static_cast<unsigned long long>(g_inference_cpu_mask));
+            } else {
+                LOGE("ggml_threadpool_new failed -- falling back to a pool per decode");
+            }
+        }
+    }
 
     LOGI("Loaded GGUF model: %s (ctx=%u, threads=%d)", modelPath.c_str(), ctx_params.n_ctx, ctx_params.n_threads);
 
@@ -1199,7 +1779,7 @@ Java_com_prism_launcher_messaging_GgufInferenceService_nativeLoadModelDistribute
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_prism_launcher_messaging_GgufInferenceService_nativeGenerate(
         JNIEnv* env, jobject /* thiz */, jlong handle, jstring jUserText,
-        jint maxTokens, jfloat temperature, jfloat minP) {
+        jint maxTokens, jfloat temperature, jfloat minP, jint mode) {
 
     auto* gguf = reinterpret_cast<GgufContext*>(handle);
     if (!gguf || !gguf->model || !gguf->ctx) {
@@ -1210,14 +1790,16 @@ Java_com_prism_launcher_messaging_GgufInferenceService_nativeGenerate(
     std::string userText(userTextChars);
     env->ReleaseStringUTFChars(jUserText, userTextChars);
 
-    std::string response = run_generation(env, gguf, userText, maxTokens, temperature, minP, nullptr, nullptr);
+    std::string response = run_generation(
+            env, gguf, userText, maxTokens, temperature, minP,
+            nullptr, nullptr, nullptr, mode);
     return env->NewStringUTF(response.c_str());
 }
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_prism_launcher_messaging_GgufInferenceService_nativeGenerateStreaming(
         JNIEnv* env, jobject /* thiz */, jlong handle, jstring jUserText,
-        jint maxTokens, jfloat temperature, jfloat minP, jobject callback) {
+        jint maxTokens, jfloat temperature, jfloat minP, jobject callback, jint mode) {
 
     auto* gguf = reinterpret_cast<GgufContext*>(handle);
     if (!gguf || !gguf->model || !gguf->ctx) {
@@ -1230,9 +1812,38 @@ Java_com_prism_launcher_messaging_GgufInferenceService_nativeGenerateStreaming(
 
     jclass callbackClass = env->GetObjectClass(callback);
     jmethodID onTokenMid = env->GetMethodID(callbackClass, "onToken", "(Ljava/lang/String;)V");
+    jmethodID onStatsMid = env->GetMethodID(callbackClass, "onStats", "(IIIIII)V");
     env->DeleteLocalRef(callbackClass);
 
-    std::string response = run_generation(env, gguf, userText, maxTokens, temperature, minP, callback, onTokenMid);
+    std::string response = run_generation(
+            env, gguf, userText, maxTokens, temperature, minP,
+            callback, onTokenMid, onStatsMid, mode);
+    return env->NewStringUTF(response.c_str());
+}
+
+// Grammar-constrained generation, used by VideoCraft's planner. The grammar is GBNF and the root
+// symbol is always "root"; an empty grammar falls back to ordinary sampling.
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_prism_launcher_messaging_GgufInferenceService_nativeGenerateJson(
+        JNIEnv* env, jobject /* thiz */, jlong handle, jstring jUserText,
+        jint maxTokens, jfloat temperature, jfloat minP, jstring jGrammar) {
+
+    auto* gguf = reinterpret_cast<GgufContext*>(handle);
+    if (!gguf || !gguf->model || !gguf->ctx) {
+        return env->NewStringUTF("Error: Model not loaded.");
+    }
+
+    const char* userTextChars = env->GetStringUTFChars(jUserText, nullptr);
+    std::string userText(userTextChars);
+    env->ReleaseStringUTFChars(jUserText, userTextChars);
+
+    const char* grammarChars = env->GetStringUTFChars(jGrammar, nullptr);
+    std::string grammar(grammarChars);
+    env->ReleaseStringUTFChars(jGrammar, grammarChars);
+
+    std::string response = run_generation(
+            env, gguf, userText, maxTokens, temperature, minP,
+            nullptr, nullptr, nullptr, IM_NORMAL, grammar.c_str());
     return env->NewStringUTF(response.c_str());
 }
 
@@ -1254,6 +1865,8 @@ Java_com_prism_launcher_messaging_GgufInferenceService_nativeResetConversation(
 
     free_messages(gguf->messages);
     gguf->prev_len = 0;
+    gguf->history.clear();
+    gguf->last_block.clear();
     if (gguf->ctx) llama_memory_clear(llama_get_memory(gguf->ctx), true);
 }
 
@@ -1266,7 +1879,11 @@ Java_com_prism_launcher_messaging_GgufInferenceService_nativeFreeModel(
 
     free_messages(gguf->messages);
     if (gguf->sampler) llama_sampler_free(gguf->sampler);
+    // DETACH FIRST. llama_free only clears the context's pointers; the pool outlives it, and the
+    // context must not be left holding a threadpool that has already been destroyed.
+    if (gguf->ctx && gguf->threadpool) llama_detach_threadpool(gguf->ctx);
     if (gguf->ctx) llama_free(gguf->ctx);
+    if (gguf->threadpool && g_threadpool_free != nullptr) g_threadpool_free(gguf->threadpool);
     if (gguf->model) llama_model_free(gguf->model);
     delete gguf;
 

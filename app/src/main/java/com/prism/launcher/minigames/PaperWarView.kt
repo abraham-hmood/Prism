@@ -27,10 +27,11 @@ import android.widget.TextView
  * step on the way in, so a player who comes back the next day finds their buildings standing rather
  * than a timer that was paused out of politeness.
  */
-class PaperWarView(context: Context) : FrameLayout(context), TopInsetAware {
+class PaperWarView(context: Context) : FrameLayout(context), TopInsetAware, MinigameFeedback {
 
     private val handler = Handler(Looper.getMainLooper())
     private val worldSeed = MinigameStore.worldSeed()
+    private val neon: Boolean by lazy { PaperUi.isNeon(context) }
 
     /** How often a raid is even considered. See [maybeRaid]. */
     private val RAID_CHECK_MS = 90_000L
@@ -57,6 +58,16 @@ class PaperWarView(context: Context) : FrameLayout(context), TopInsetAware {
 
     private var running = false
 
+    /**
+     * Empire building has no single win or loss, so only the tempo follows the page: a raid being
+     * played back is the hot part, and the construction ticks are the quiet part.
+     */
+    override fun musicIntensity(): Float = when {
+        battleView != null -> 0.82f
+        pendingRaidReport != null -> 0.55f
+        else -> 0.30f
+    }
+
     private val ticker = object : Runnable {
         override fun run() {
             if (!running) return
@@ -66,7 +77,10 @@ class PaperWarView(context: Context) : FrameLayout(context), TopInsetAware {
     }
 
     init {
-        setBackgroundColor(PencilStyle.paper(PaperUi.isDark(context)))
+        setBackgroundColor(
+            if (neon) PencilStyle.neonPaper(PaperUi.isDark(context))
+            else PencilStyle.paper(PaperUi.isDark(context)),
+        )
         buildBaseScreen()
     }
 
@@ -418,8 +432,15 @@ class PaperWarView(context: Context) : FrameLayout(context), TopInsetAware {
         val box = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
         }
-        header = PaperUi.heading(context, "")
-        subHeader = PaperUi.note(context, "")
+        header = PaperUi.heading(context, "").apply {
+            if (neon) {
+                setTextColor(PencilStyle.NEON_CYAN)
+                setShadowLayer(10f, 0f, 0f, PencilStyle.NEON_CYAN)
+            }
+        }
+        subHeader = PaperUi.note(context, "").apply {
+            if (neon) setTextColor(PencilStyle.NEON_MAGENTA)
+        }
         box.addView(header)
         box.addView(subHeader)
         headerBox = box
@@ -442,7 +463,12 @@ class PaperWarView(context: Context) : FrameLayout(context), TopInsetAware {
         }
         fun action(glyph: PaperUi.Glyph, label: String, onTap: () -> Unit) {
             actions.addView(
-                PaperUi.GlyphButton(context, glyph, label = label).apply {
+                PaperUi.GlyphButton(
+                    context,
+                    glyph,
+                    colour = if (neon) PencilStyle.NEON_CYAN else null,
+                    label = label,
+                ).apply {
                     setOnClickListener { onTap() }
                 },
                 LinearLayout.LayoutParams(PaperUi.dp(context, 58f), PaperUi.dp(context, 56f)),
@@ -456,11 +482,20 @@ class PaperWarView(context: Context) : FrameLayout(context), TopInsetAware {
         bottom.addView(actions, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 
         val inbox = PaperUi.GlyphButton(
-            context, PaperUi.Glyph.INBOX, badge = { MinigameStore.unansweredCount() }, label = "Inbox",
+            context,
+            PaperUi.Glyph.INBOX,
+            colour = if (neon) PencilStyle.NEON_MAGENTA else null,
+            badge = { MinigameStore.unansweredCount() },
+            label = "Inbox",
         ).apply { setOnClickListener { showInbox() } }
         bottom.addView(inbox, LinearLayout.LayoutParams(PaperUi.dp(context, 56f), PaperUi.dp(context, 56f)))
 
-        val map = PaperUi.GlyphButton(context, PaperUi.Glyph.MAP, label = "World").apply {
+        val map = PaperUi.GlyphButton(
+            context,
+            PaperUi.Glyph.MAP,
+            colour = if (neon) PencilStyle.NEON_CYAN else null,
+            label = "World",
+        ).apply {
             setOnClickListener { showWorldMap() }
         }
         bottom.addView(map, LinearLayout.LayoutParams(PaperUi.dp(context, 56f), PaperUi.dp(context, 56f)).apply {
@@ -507,14 +542,23 @@ class PaperWarView(context: Context) : FrameLayout(context), TopInsetAware {
         )
 
         bar.addView(
-            PaperUi.button(context, "Cancel", seed = 8801) { cancelPlacement() },
+            PaperUi.button(
+                context,
+                "Cancel",
+                colour = if (neon) PencilStyle.NEON_MAGENTA else null,
+                seed = 8801,
+            ) { cancelPlacement() },
             LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
             ),
         )
         bar.addView(
             PaperUi.button(
-                context, "Place", colour = PencilStyle.GREEN_PENCIL, filled = true, seed = 8802,
+                context,
+                "Place",
+                colour = if (neon) PencilStyle.NEON_GREEN else PencilStyle.GREEN_PENCIL,
+                filled = true,
+                seed = 8802,
             ) { baseView.confirmPlacement() },
             LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -2113,6 +2157,7 @@ class PaperWarView(context: Context) : FrameLayout(context), TopInsetAware {
             seed = Rng.seedOf("raid", attacker.id, seedOffset),
             attackerSupportIds = WorldMap.aiDetachments(attacker.level),
             attackerMilitaryBonus = militaryBonus,
+            defenderSortie = true,
         ).let { it.frames to it.result }
 
         pendingRaidReport = attacker.name to result

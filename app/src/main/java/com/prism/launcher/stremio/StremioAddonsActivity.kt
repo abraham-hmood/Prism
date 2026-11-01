@@ -37,9 +37,22 @@ class StremioAddonsActivity : PrismBaseActivity() {
     private val tabs by lazy { IosSegmentedControl(this) }
     private val list by lazy { LinearLayout(this) }
     private val busy by lazy { ProgressBar(this) }
+    private val search by lazy { android.widget.EditText(this) }
+
+    /** What the search box currently says. Filtering, not fetching -- see [matches]. */
+    private var query: String = ""
 
     /** Cached so switching back to Available does not re-fetch every repository. */
     private var available: List<StremioStore.Addon>? = null
+
+    /**
+     * Whether a fetch for [available] is already in flight.
+     *
+     * Without this, every keystroke in the search box on the Available tab would start another
+     * thread and another round of repository requests: the tab has no list until the first fetch
+     * answers, and a text watcher re-renders on each letter.
+     */
+    private var fetchingAvailable = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -80,6 +93,33 @@ class StremioAddonsActivity : PrismBaseActivity() {
             LinearLayout.LayoutParams.MATCH_PARENT, IosUi.dp(this, 34f)
         ).apply { setMargins(pad, IosUi.dp(this@StremioAddonsActivity, 12f), pad, 0) })
 
+        // SEARCHES BOTH TABS, and deliberately not through the network. Everything this screen
+        // lists is already in hand once a tab has loaded -- the installed manifests are stored
+        // locally and the available ones come from the repositories in one request -- so filtering
+        // is instant and works on a plane. The hint says "installed" because that is the list a
+        // search most often starts from.
+        search.apply {
+            hint = "Search installed add-ons"
+            textSize = 15f
+            setSingleLine(true)
+            setTextColor(IosUi.label(this@StremioAddonsActivity))
+            setHintTextColor(IosUi.tertiaryLabel(this@StremioAddonsActivity))
+            background = IosUi.fieldBackground(this@StremioAddonsActivity)
+            val p = IosUi.dp(this@StremioAddonsActivity, 12f)
+            setPadding(p, p, p, p)
+            addTextChangedListener(object : android.text.TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                override fun afterTextChanged(s: android.text.Editable?) {
+                    query = s?.toString().orEmpty()
+                    render(tabs.selectedIndex)
+                }
+            })
+        }
+        root.addView(search, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { setMargins(pad, IosUi.dp(this@StremioAddonsActivity, 12f), pad, 0) })
+
         busy.visibility = View.GONE
         root.addView(busy, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
@@ -98,7 +138,89 @@ class StremioAddonsActivity : PrismBaseActivity() {
     }
 
     private fun render(tab: Int) {
+        // A QUERY SEARCHES EVERYTHING, not just the tab in front of it. "Which add-on does this"
+        // is a question about the whole world of add-ons; answering it one tab at a time would
+        // make the user guess whether the thing they are looking for is already installed before
+        // they can find out whether it exists.
+        if (query.isNotBlank()) {
+            search.hint = "Search installed and available add-ons"
+            renderSearchResults()
+            return
+        }
+        search.hint = if (tab == 0) "Search installed add-ons" else "Search available add-ons"
         if (tab == 0) renderInstalled() else renderAvailable()
+    }
+
+    /** Installed matches, then matches from the repositories, in one list. */
+    private fun renderSearchResults() {
+        list.removeAllViews()
+        busy.visibility = View.GONE
+
+        val installed = StremioStore.installed().filter(::matches)
+        list.addView(sectionLabel("Installed"))
+        if (installed.isEmpty()) {
+            list.addView(emptyNote("No installed add-on matches \"${query.trim()}\"."))
+        } else {
+            installed.forEach { list.addView(card(it, installed = true)) }
+        }
+
+        list.addView(sectionLabel("Available"))
+        if (StremioStore.repositories().isEmpty()) {
+            list.addView(emptyNote(
+                "No repositories configured, so there is nothing available to search."
+            ))
+            return
+        }
+
+        val cached = available
+        if (cached == null) {
+            // The repositories have not been asked yet in this visit. Ask, and this screen
+            // re-renders when the answer arrives -- the installed half is already useful.
+            list.addView(emptyNote("Searching available add-ons…"))
+            loadAvailable()
+            return
+        }
+
+        val found = cached.filter(::matches)
+        if (found.isEmpty()) {
+            list.addView(emptyNote("No available add-on matches \"${query.trim()}\"."))
+        } else {
+            found.forEach { list.addView(card(it, installed = false)) }
+        }
+    }
+
+    private fun sectionLabel(text: String): View = TextView(this).apply {
+        this.text = text.uppercase()
+        textSize = 11f
+        letterSpacing = 0.06f
+        setTextColor(IosUi.tertiaryLabel(this@StremioAddonsActivity))
+        setPadding(IosUi.dp(this@StremioAddonsActivity, 4f), IosUi.dp(this@StremioAddonsActivity, 12f), 0, IosUi.dp(this@StremioAddonsActivity, 6f))
+    }
+
+    /**
+     * Whether an add-on answers to what was typed.
+     *
+     * Matched against everything a person could plausibly be searching for: the name, the
+     * description, the catalogs it offers and the resources it serves. Searching only the name
+     * would miss "subtitles" when the add-on is called OpenSubtitles v3 -- the version suffix is
+     * in the name but not always in the obvious form -- and typing "stream" meaning "which of
+     * these can actually play something" is a perfectly reasonable thing to do.
+     *
+     * EVERY WORD HAS TO MATCH, in any field, which is how search boxes are expected to behave:
+     * "anime stream" narrows rather than widening back out to every add-on that mentions either.
+     */
+    private fun matches(addon: StremioStore.Addon): Boolean {
+        val words = query.trim().lowercase().split(Regex("\\s+")).filter { it.isNotEmpty() }
+        if (words.isEmpty()) return true
+        val haystack = buildString {
+            append(addon.name).append(' ')
+            append(addon.description).append(' ')
+            append(addon.id).append(' ')
+            addon.types.forEach { append(it).append(' ') }
+            addon.catalogs.forEach { append(it.name).append(' ').append(it.id).append(' ') }
+            addon.resources.forEach { append(it.name).append(' ') }
+        }.lowercase()
+        return words.all { haystack.contains(it) }
     }
 
     /**
@@ -161,15 +283,21 @@ class StremioAddonsActivity : PrismBaseActivity() {
     private fun renderInstalled() {
         list.removeAllViews()
         busy.visibility = View.GONE
-        val addons = StremioStore.installed()
+        val all = StremioStore.installed()
+        val addons = all.filter(::matches)
 
-        if (addons.isEmpty()) {
+        if (all.isEmpty()) {
             list.addView(emptyNote(
                 "Nothing installed.\n\nThree ways to change that: tap + and paste an add-on's " +
                     "manifest URL; open Browse and add Stremio's public community catalogue; or " +
                     "tap Install on any add-on's own website and choose Prism.\n\nNo account is " +
                     "involved in any of them — a Stremio add-on is just a web address."
             ))
+            return
+        }
+
+        if (addons.isEmpty()) {
+            list.addView(emptyNote("No installed add-on matches \"${query.trim()}\"."))
             return
         }
 
@@ -211,26 +339,48 @@ class StremioAddonsActivity : PrismBaseActivity() {
             return
         }
 
-        busy.visibility = View.VISIBLE
         list.addView(emptyNote("Asking the repositories…"))
+        loadAvailable()
+    }
+
+    /**
+     * Fetches the repository list once per visit, whichever screen asked first.
+     *
+     * Both the Available tab and a search need it; keeping the in-flight guard and the cache here
+     * is what stops each keystroke from starting another round of requests.
+     */
+    private fun loadAvailable() {
+        if (available != null || fetchingAvailable) return
+        if (StremioStore.repositories().isEmpty()) return
+
+        fetchingAvailable = true
+        busy.visibility = View.VISIBLE
 
         Thread({
             val found = StremioStore.available()
             runOnUiThread {
+                fetchingAvailable = false
                 busy.visibility = View.GONE
                 available = found
-                if (tabs.selectedIndex == 1) showAvailable(found)
+                // Re-render whatever is on screen: the tab, or a combined search that was waiting
+                // for exactly this list.
+                render(tabs.selectedIndex)
             }
         }, "stremio-available").apply { isDaemon = true; start() }
     }
 
-    private fun showAvailable(addons: List<StremioStore.Addon>) {
+    private fun showAvailable(all: List<StremioStore.Addon>) {
         list.removeAllViews()
-        if (addons.isEmpty()) {
+        val addons = all.filter(::matches)
+        if (all.isEmpty()) {
             list.addView(emptyNote(
                 "Nothing new. Either the repositories returned no add-ons, or everything they " +
                     "list is already installed."
             ))
+            return
+        }
+        if (addons.isEmpty()) {
+            list.addView(emptyNote("No available add-on matches \"${query.trim()}\"."))
             return
         }
         addons.forEach { addon -> list.addView(card(addon, installed = false)) }
@@ -308,7 +458,9 @@ class StremioAddonsActivity : PrismBaseActivity() {
                     setOnClickListener {
                         StremioStore.uninstall(addon.id)
                         available = null            // it belongs back in the available list
-                        renderInstalled()
+                        // Through render(), not renderInstalled(): a remove made from a combined
+                        // search must redraw the combined search, not replace it with one tab.
+                        render(tabs.selectedIndex)
                         toast("${addon.name} removed")
                     }
                 }

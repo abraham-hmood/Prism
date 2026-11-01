@@ -31,7 +31,7 @@ class PongView(
     private val difficulty: Pong.Difficulty,
     private val match: MinigameMesh.Match?,
     private val onFinished: (won: Boolean) -> Unit,
-) : View(context) {
+) : View(context), MinigameFeedback {
 
     private val density = resources.displayMetrics.density
     private val dark: Boolean
@@ -70,6 +70,15 @@ class PongView(
         super.onDetachedFromWindow()
         running = false
         MinigameMesh.stopListening()
+    }
+
+    override fun outcome(): Boolean? =
+        if (Pong.isOver(state)) Pong.winner(state) == mySide else null
+
+    override fun musicIntensity(): Float {
+        val points = state.leftScore + state.rightScore
+        val closeness = 1f - (kotlin.math.abs(state.leftScore - state.rightScore) / 9f)
+        return (0.25f + points / 14f * 0.45f + closeness / 4f).coerceIn(0f, 0.95f)
     }
 
     // -- Input ----------------------------------------------------------------
@@ -151,14 +160,14 @@ class PongView(
     override fun onDraw(canvas: Canvas) {
         if (running) advance()
 
-        PencilStyle.drawPaper(canvas, width, height, dark, density)
+        ArcadeStyle.drawBackdrop(canvas, width, height, density, ArcadeStyle.PONG)
         val court = courtRect()
         val scale = court.width() / Pong.WIDTH
-        val ink = PencilStyle.pencil(2.2f * density, PencilStyle.graphite(dark))
+        val ink = PencilStyle.pencil(2.2f * density, ArcadeStyle.PONG)
 
         // The court: a box, and a dashed centre line drawn as a column of short strokes.
         PencilStyle.rect(canvas, court, ink, seed = 1, amount = 1.4f)
-        val dash = PencilStyle.pencil(1.8f * density, PencilStyle.graphiteLight(dark), alpha = 170)
+        val dash = PencilStyle.pencil(1.8f * density, 0xFF2E7E96.toInt(), alpha = 200)
         var y = court.top + 10f * density
         var i = 0L
         while (y < court.bottom - 10f * density) {
@@ -188,6 +197,7 @@ class PongView(
         // The score, written above the court.
         val scorePaint = PencilStyle.textPaint(30f * density, dark).apply {
             textAlign = Paint.Align.CENTER
+            color = 0xFFE6FBFF.toInt()
         }
         PencilStyle.writtenText(
             canvas,
@@ -195,7 +205,7 @@ class PongView(
             court.centerX(), court.top - 14f * density, scorePaint, seed = 5,
         )
 
-        val label = PencilStyle.textPaint(12f * density, dark, PencilStyle.graphiteLight(dark))
+        val label = PencilStyle.textPaint(12f * density, dark, ArcadeStyle.MUTED)
         val who = if (match != null) "vs. a player on the mesh" else "vs. ${difficulty.label}"
         PencilStyle.writtenText(canvas, who, court.left, court.bottom + 20f * density, label, seed = 6)
         PencilStyle.writtenText(
@@ -204,7 +214,7 @@ class PongView(
         )
 
         if (state.serveDelay > 0 && !Pong.isOver(state)) {
-            val ready = PencilStyle.textPaint(16f * density, dark, PencilStyle.RED_PENCIL).apply {
+            val ready = PencilStyle.textPaint(16f * density, dark, ArcadeStyle.PINBALL).apply {
                 textAlign = Paint.Align.CENTER
             }
             PencilStyle.writtenText(
@@ -214,7 +224,7 @@ class PongView(
 
         if (Pong.isOver(state)) {
             val won = Pong.winner(state) == mySide
-            val banner = PencilStyle.textPaint(26f * density, dark, if (won) PencilStyle.GREEN_PENCIL else PencilStyle.RED_PENCIL)
+            val banner = PencilStyle.textPaint(26f * density, dark, if (won) 0xFF7CFF6B.toInt() else ArcadeStyle.PINBALL)
                 .apply { textAlign = Paint.Align.CENTER }
             val text = if (won) "you win" else "you lose"
             PencilStyle.writtenText(canvas, text, court.centerX(), court.centerY(), banner, seed = 9)
@@ -222,7 +232,7 @@ class PongView(
                 court.centerX() - 70f * density, court.centerY() - 26f * density,
                 court.centerX() + 70f * density, court.centerY() + 10f * density,
             )
-            PencilStyle.circleAround(canvas, bounds, PencilStyle.pencil(2f * density, if (won) PencilStyle.GREEN_PENCIL else PencilStyle.RED_PENCIL), seed = 10)
+            PencilStyle.circleAround(canvas, bounds, PencilStyle.pencil(2f * density, if (won) 0xFF7CFF6B.toInt() else ArcadeStyle.PINBALL), seed = 10)
         }
 
         if (running) postInvalidateOnAnimation()
@@ -241,7 +251,7 @@ class PongView(
         )
         val mine = side == mySide
         val paint = if (mine) {
-            PencilStyle.pencil(2.4f * density, PencilStyle.BLUE_PENCIL)
+            PencilStyle.pencil(2.4f * density, ArcadeStyle.PINBALL)
         } else {
             ink
         }

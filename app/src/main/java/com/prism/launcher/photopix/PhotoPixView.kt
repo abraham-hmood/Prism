@@ -72,8 +72,17 @@ class PhotoPixView(
         ERASER("▱", "Eraser", true),
         GRADIENT("▤", "Gradient", false),
         BLUR("◍", "Blur", true),
+        SMUDGE("≈", "Smudge", true),
+        SHARPEN("⌃", "Sharpen", true),
         DODGE("◐", "Dodge", true),
         BURN("◑", "Burn", true),
+        SPONGE("◒", "Sponge", true),
+        SATURATE("◓", "Saturate", true),
+        DESATURATE("◔", "Desaturate", true),
+        COLOR_REPLACE("◕", "Color replacement", true),
+        BG_ERASER("▨", "Background eraser", true),
+        MAGIC_ERASER("✧", "Magic eraser", false),
+        PENCIL("✎", "Pencil", true),
         PEN("✎", "Pen", false),
         TYPE("T", "Type", false),
         PATH_SELECT("⬚", "Path select", false),
@@ -163,6 +172,7 @@ class PhotoPixView(
         top.addView(glyphButton("◍", "Filters") { PhotoPixPanels.filters(this) })
         top.addView(glyphButton("⛶", "Image") { PhotoPixPanels.image(this) })
         top.addView(glyphButton("⇪", "Export") { PhotoPixPanels.export(this) })
+        top.addView(glyphButton("☰", "More panels") { PhotoPixPanels.more(this) })
         root.addView(top, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
         ))
@@ -299,8 +309,15 @@ class PhotoPixView(
         Tool.BLUR -> PaintMode.BLUR
         Tool.HEAL -> PaintMode.HEAL
         Tool.CLONE -> PaintMode.CLONE
+        Tool.SMUDGE -> PaintMode.SMUDGE
+        Tool.SHARPEN -> PaintMode.SHARPEN
         Tool.DODGE -> PaintMode.DODGE
         Tool.BURN -> PaintMode.BURN
+        Tool.SPONGE -> PaintMode.SPONGE
+        Tool.SATURATE -> PaintMode.SATURATE
+        Tool.DESATURATE -> PaintMode.DESATURATE
+        Tool.COLOR_REPLACE -> PaintMode.COLOR_REPLACE
+        Tool.BG_ERASER -> PaintMode.BACKGROUND_ERASE
         else -> PaintMode.PAINT
     }
 
@@ -315,7 +332,9 @@ class PhotoPixView(
         })
 
         when (tool) {
-            Tool.BRUSH, Tool.ERASER, Tool.BLUR, Tool.DODGE, Tool.BURN, Tool.HEAL, Tool.CLONE -> {
+            Tool.BRUSH, Tool.PENCIL, Tool.ERASER, Tool.BLUR, Tool.SMUDGE, Tool.SHARPEN,
+            Tool.DODGE, Tool.BURN, Tool.SPONGE, Tool.SATURATE, Tool.DESATURATE,
+            Tool.COLOR_REPLACE, Tool.BG_ERASER, Tool.HEAL, Tool.CLONE -> {
                 options.addView(slider("Size", 1, 300, brush.size.toInt()) { value ->
                     brush = brush.copy(size = value.toDouble())
                 })
@@ -662,8 +681,9 @@ class PhotoPixView(
         when (gesture) {
             Gesture.PAINT -> {
                 snapshot(tool.label)
+                val paintColor = if (tool == Tool.BG_ERASER) backgroundColor else foregroundColor
                 PixBrushEngine.stroke(
-                    document, points, paintMode, brush, foregroundColor,
+                    document, points, paintMode, brush, paintColor,
                     cloneSource = cloneSource,
                 )
             }
@@ -760,6 +780,17 @@ class PhotoPixView(
             }
             Tool.TYPE -> promptText()
             Tool.ZOOM -> canvas.zoomBy(2f)
+            Tool.MAGIC_ERASER -> {
+                val layer = document.activeLayer
+                val localX = x.toInt() - layer.offsetX
+                val localY = y.toInt() - layer.offsetY
+                if (localX in 0 until layer.image.width && localY in 0 until layer.image.height) {
+                    val wand = PixSelection.wand(layer.image, localX, localY, tolerance, contiguous = true)
+                    snapshot("Magic eraser")
+                    document.eraseSelection(wand)
+                    afterDocumentChange()
+                }
+            }
             else -> Unit
         }
     }

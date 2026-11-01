@@ -86,11 +86,25 @@ class WirelessDisplaysActivity : PrismBaseActivity() {
         }
     }
 
+    /**
+     * Televisions found by SSDP, and the routes Android can negotiate to them.
+     *
+     * Held here rather than inside the render loop because a scan costs up to three seconds of
+     * socket traffic: the UI redraws every three seconds, and scanning on that cadence would keep
+     * a thread permanently in `receive`.
+     */
+    private var televisions: List<TvDiscovery.Tv> = emptyList()
+    private var tvRoutes: List<AndroidTvRoutes.Route> = emptyList()
+    private var miracastSinks: List<MiracastDiscovery.Sink> = emptyList()
+    @Volatile private var tvScanning = false
+
     private val handler = Handler(Looper.getMainLooper())
     private val ticker = object : Runnable {
         override fun run() {
             render()
-            handler.postDelayed(this, 1_500L)
+            // The list only changes when a beacon arrives, and beacons are a ten-second
+            // cadence now. Rebuilding the whole list every 1.5 seconds was pure UI work.
+            handler.postDelayed(this, 3_000L)
         }
     }
 
@@ -119,12 +133,49 @@ class WirelessDisplaysActivity : PrismBaseActivity() {
                 render()
             }
         }
+
+        // The TV list is independent of the Prism beacon: a Samsung set answers SSDP long before
+        // anything has negotiated a Miracast link, and waiting for Android's cast settings to run
+        // is exactly the step this page exists to remove.
+        startTvScan()
+    }
+
+    /**
+     * Scans, publishes, waits, repeats -- while this page is open.
+     *
+     * A daemon thread rather than a coroutine because the rest of this activity is plain Android
+     * views and Handler-based; the flag is volatile so `onDestroy` can stop it without joining.
+     * The 12-second gap is longer than the 2.8-second scan so a TV cannot be discovered twice in a
+     * row and the Wi-Fi radio is not asked to send SSDP continuously.
+     */
+    private fun startTvScan() {
+        if (tvScanning) return
+        tvScanning = true
+        Thread({
+            try {
+                while (tvScanning) {
+                    val found = runCatching { TvDiscovery.scan(2_800) }.getOrDefault(emptyList())
+                    val routes = runCatching { AndroidTvRoutes.routes(this) }.getOrDefault(emptyList())
+                    val sinks = runCatching { MiracastDiscovery.discover(this) }.getOrDefault(emptyList())
+                    runOnUiThread {
+                        if (isFinishing || isDestroyed) return@runOnUiThread
+                        televisions = found
+                        tvRoutes = routes
+                        miracastSinks = sinks
+                        render()
+                    }
+                    try { Thread.sleep(12_000L) } catch (e: InterruptedException) { break }
+                }
+            } finally {
+                tvScanning = false
+            }
+        }, "prism-tv-discovery").apply { isDaemon = true }.start()
     }
 
     override fun onResume() {
         super.onResume()
         render()
-        handler.postDelayed(ticker, 1_500L)
+        handler.postDelayed(ticker, 3_000L)
     }
 
     override fun onPause() {
@@ -133,6 +184,7 @@ class WirelessDisplaysActivity : PrismBaseActivity() {
     }
 
     override fun onDestroy() {
+        tvScanning = false
         // Only clear callbacks still pointing at this instance: a challenge that arrived while
         // the screen was closing must not keep a reference to a destroyed activity.
         if (WirelessDisplay.onChallenge != null) WirelessDisplay.onChallenge = null
@@ -313,6 +365,9 @@ class WirelessDisplaysActivity : PrismBaseActivity() {
         val connected = WirelessDisplay.isConnected()
         val displays = WirelessDisplay.displays()
         val screens = SystemDisplays.screens(this)
+        val televisionsFound = televisions
+        val routesFound = tvRoutes
+        val sinksFound = miracastSinks
         // Read the pairing list ONCE per refresh rather than once per display row: this redraw
         // happens every 1.5 seconds, and a disk read per row is a stutter nobody would connect to
         // a list that only polls for beacons.
@@ -334,8 +389,10 @@ class WirelessDisplaysActivity : PrismBaseActivity() {
             connected && extend -> "Showing " + WirelessDisplay.connectedTo() + "'s next page here."
             connected -> "Showing " + WirelessDisplay.connectedTo() + "'s screen here."
             WirelessDisplay.isAwaitingCode() -> "Waiting for the code on " + WirelessDisplay.connectedTo() + "…"
-            displays.isEmpty() && screens.isEmpty() -> "Looking for displays on this network…"
+            displays.isEmpty() && screens.isEmpty() && televisionsFound.isEmpty() && sinksFound.isEmpty() ->
+                "Looking for displays on this network…"
             else -> displays.size.toString() + " Prism device(s) · " +
+                (televisionsFound.size + sinksFound.size).toString() + " television(s) · " +
                 screens.size.toString() + " system display(s)."
         }
         disconnect.visibility = if (connected) View.VISIBLE else View.GONE
@@ -357,6 +414,57 @@ class WirelessDisplaysActivity : PrismBaseActivity() {
         displays.forEach { display ->
             val isCurrent = connected && WirelessDisplay.connectedTo() == display.name
             list.addView(card(display, isCurrent, display.fingerprint in trustedFingerprints))
+        }
+
+        // MIRACAST SETS FOUND THROUGH WI-FI DIRECT. A Samsung H-series is the case that matters:
+        // it appears in Android's cast sheet but answers none of the SSDP targets above, so SSDP
+        // alone reports "nothing here" while the TV is sitting on the same Wi-Fi.
+        if (sinksFound.isNotEmpty()) {
+            list.addView(sectionLabel("WI-FI DISPLAY (MIRACAST)"))
+            sinksFound.forEach { sink ->
+                val known = televisionsFound.any { namesOverlap(it.name, sink.name) }
+                if (!known) {
+                    list.addView(
+                        televisionCard(
+                            TvDiscovery.Tv(
+                                name = sink.name,
+                                host = sink.address,
+                                manufacturer = "Wi-Fi Direct",
+                                model = "",
+                                location = "",
+                                services = setOf("Miracast"),
+                            )
+                        )
+                    )
+                }
+            }
+        }
+
+        // TELEVISIONS. SSDP names and MediaRouter names are different spellings of the same set,
+        // so a route whose name shares no distinctive token with a discovered TV is listed in its
+        // own right rather than hidden behind a match that does not exist.
+        val tvNames = televisionsFound.map { it.name.lowercase() }.toMutableSet()
+        val extraRoutes = routesFound.filter { route ->
+            val name = route.name.lowercase()
+            tvNames.none { tv -> namesOverlap(tv, name) }
+        }
+        if (televisionsFound.isNotEmpty() || extraRoutes.isNotEmpty()) {
+            list.addView(sectionLabel("TELEVISIONS"))
+            televisionsFound.forEach { tv -> list.addView(televisionCard(tv)) }
+            extraRoutes.forEach { route ->
+                list.addView(
+                    televisionCard(
+                        TvDiscovery.Tv(
+                            name = route.name,
+                            host = "",
+                            manufacturer = route.description,
+                            model = "",
+                            location = "",
+                            services = if (route.television) setOf("Miracast") else emptySet(),
+                        )
+                    )
+                )
+            }
         }
 
         // A system display is local and needs no verification. Each one gets its own controller,
@@ -443,6 +551,122 @@ class WirelessDisplaysActivity : PrismBaseActivity() {
             setPadding(0, 0, 0, dp(10f))
             addView(card)
         }
+    }
+
+    private fun sectionLabel(value: String): TextView = TextView(this).apply {
+        text = value
+        textSize = 10f
+        letterSpacing = 0.12f
+        setTextColor(IosUi.tertiaryLabel(this@WirelessDisplaysActivity))
+        setPadding(0, dp(12f), 0, dp(6f))
+    }
+
+    /**
+     * One television.
+     *
+     * The card says which dialect answered, because that decides what happens on tap: DIAL and
+     * Miracast sets can be started through the media router, while a bare DLNA renderer may only
+     * be listed. Showing the difference is the honest alternative to a button that silently does
+     * nothing on some sets.
+     */
+    private fun televisionCard(tv: TvDiscovery.Tv): View {
+        val route = tvRoutes.firstOrNull { namesOverlap(it.name, tv.name) }
+        val ready = route?.ready == true
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14f), dp(12f), dp(14f), dp(12f))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = dp(14f).toFloat()
+                setColor(Color.parseColor("#0FFFFFFF"))
+                setStroke(dp(1f), Color.parseColor("#22FFFFFF"))
+            }
+            isClickable = true
+            setOnClickListener { openTelevision(tv, route) }
+        }
+        card.addView(TextView(this).apply {
+            text = tv.name
+            textSize = 15f
+            setTextColor(IosUi.label(this@WirelessDisplaysActivity))
+        })
+        card.addView(TextView(this).apply {
+            text = listOfNotNull(
+                tv.detail.takeIf { it.isNotBlank() },
+                tv.dialect,
+                tv.host.takeIf { it.isNotBlank() },
+                when {
+                    ready -> "ready to mirror"
+                    route?.connecting == true -> "connecting…"
+                    route != null -> "tap to connect"
+                    else -> "not offering a mirror route yet"
+                },
+            ).joinToString(" · ")
+            textSize = 11f
+            setTextColor(IosUi.tertiaryLabel(this@WirelessDisplaysActivity))
+            setPadding(0, dp(3f), 0, dp(6f))
+        })
+        card.addView(TextView(this).apply {
+            text = if (ready) "Mirror here  ›" else "Ask the TV to connect  ›"
+            textSize = 12f
+            setTextColor(IosUi.accent(this@WirelessDisplaysActivity))
+            setPadding(0, dp(2f), 0, 0)
+        })
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, 0, dp(10f))
+            addView(card)
+        }
+    }
+
+    /**
+     * Opens a TV, connecting it first when Android has not already done so.
+     *
+     * The presentation display only exists after the route is selected, and the selection is
+     * asynchronous. Rather than blocking the UI thread, this asks for the connection and then
+     * re-checks once after four seconds: by then a Wi-Fi Display negotiation has either produced a
+     * display (opened here) or has not (the card's next refresh says so).
+     */
+    private fun openTelevision(tv: TvDiscovery.Tv, route: AndroidTvRoutes.Route?) {
+        fun screenFor(id: Int?): SystemDisplays.Screen? {
+            val screens = SystemDisplays.screens(this)
+            return screens.firstOrNull { id != null && it.id == id }
+                ?: screens.firstOrNull { namesOverlap(it.name, tv.name) }
+        }
+
+        val open = screenFor(route?.displayId)
+        if (open != null) {
+            startActivity(SystemDisplayActivity.intent(this, open))
+            return
+        }
+
+        // A Wi-Fi Direct sink has no MediaRouter route yet: the link itself has to be formed.
+        val miracast = tv.services.any { it.equals("Miracast", ignoreCase = true) } && route == null
+        val settle = if (miracast) {
+            MiracastDiscovery.connect(this, tv.host) { message ->
+                runOnUiThread {
+                    if (!isFinishing && !isDestroyed) {
+                        status.text = message
+                        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+            8_000L
+        } else {
+            val message = AndroidTvRoutes.connect(this, tv.name)
+            status.text = message
+            Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+            4_000L
+        }
+        handler.postDelayed({
+            if (isFinishing || isDestroyed) return@postDelayed
+            tvRoutes = runCatching { AndroidTvRoutes.routes(this) }.getOrDefault(tvRoutes)
+            val connected = screenFor(AndroidTvRoutes.displayId(this, tv.name))
+                ?: screenFor(null)
+            if (connected != null) {
+                startActivity(SystemDisplayActivity.intent(this, connected))
+            } else {
+                render()
+            }
+        }, settle)
     }
 
     private fun systemCard(screen: SystemDisplays.Screen): View {
@@ -559,6 +783,13 @@ class WirelessDisplaysActivity : PrismBaseActivity() {
             onNegative = { WirelessDisplay.disconnect() },
             customView = input,
         )
+    }
+
+    /** Cheap name matching: shared distinctive tokens, not equality. */
+    private fun namesOverlap(a: String, b: String): Boolean {
+        val left = a.lowercase().split(Regex("[^a-z0-9]+")).filter { it.length >= 3 }.toSet()
+        val right = b.lowercase().split(Regex("[^a-z0-9]+")).filter { it.length >= 3 }.toSet()
+        return left.any { it in right }
     }
 
     companion object {

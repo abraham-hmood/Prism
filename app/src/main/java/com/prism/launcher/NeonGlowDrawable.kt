@@ -41,6 +41,17 @@ class NeonGlowDrawable(
 
     private val rectF = RectF()
 
+    // BLUR FILTERS ONCE, NOT ON EVERY DRAW. These are immutable and were being constructed (and
+    // garbage collected) each time a bordered control painted, which is the kind of allocation
+    // that turns a scrolling list of neon cards into visible jank.
+    private val ambientBlur = BlurMaskFilter(24f, BlurMaskFilter.Blur.OUTER)
+    private val coreBlur = BlurMaskFilter(10f, BlurMaskFilter.Blur.OUTER)
+
+    init {
+        ambientPaint.maskFilter = ambientBlur
+        glowPaint.maskFilter = coreBlur
+    }
+
     override fun draw(canvas: Canvas) {
         val bounds = bounds
         val padding = 20f // Margin for the glow to breathe
@@ -53,12 +64,10 @@ class NeonGlowDrawable(
 
         // 1. Ambient Halo (Wide and soft)
         ambientPaint.color = Color.argb(80, Color.red(color), Color.green(color), Color.blue(color))
-        ambientPaint.maskFilter = BlurMaskFilter(24f, BlurMaskFilter.Blur.OUTER)
         canvas.drawRoundRect(rectF, cornerRadius, cornerRadius, ambientPaint)
 
         // 2. Core Glow (Intense)
         glowPaint.color = color
-        glowPaint.maskFilter = BlurMaskFilter(10f, BlurMaskFilter.Blur.OUTER)
         canvas.drawRoundRect(rectF, cornerRadius, cornerRadius, glowPaint)
 
         // 3. Sharp Inner Stroke

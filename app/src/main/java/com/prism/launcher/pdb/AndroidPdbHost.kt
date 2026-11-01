@@ -8,7 +8,6 @@ import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
-import android.os.Environment
 import android.provider.Settings
 import androidx.core.content.FileProvider
 import java.io.File
@@ -38,8 +37,7 @@ class AndroidPdbHost(private val context: Context) : PdbHost {
 
     override fun incomingDir(): File = File(app.filesDir, "pdb/incoming").apply { mkdirs() }
 
-    override fun documentsDir(): File =
-        File(Environment.getExternalStorageDirectory(), "Prism").apply { mkdirs() }
+    override fun documentsDir(): File = com.prism.core.PrismPlatform.host.documentsDir()
 
     override fun install(file: File, options: List<String>): PdbInstallResult {
         if (PdbInstall.classify(file) != PdbInstall.Kind.APK) {

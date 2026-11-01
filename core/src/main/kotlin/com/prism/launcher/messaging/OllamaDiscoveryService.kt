@@ -36,8 +36,16 @@ object OllamaDiscoveryService {
      * unused, exactly as it was in MeshUtils itself.
      */
     suspend fun scan(): List<OllamaServer> = withContext(Dispatchers.IO) {
+        // LOOPBACK FIRST, and never only. A daemon installed beside Prism listens on 127.0.0.1,
+        // which the subnet sweep below never reaches -- it sweeps 1..254 of the private subnet,
+        // and `subnetBaseOf` refuses the loopback address outright. Without this line, a desktop
+        // running Ollama and Prism on one machine reported no servers at all, which is the most
+        // common arrangement there is.
+        val loopback = probe("127.0.0.1")
+
         val localIp = MeshUtils.getLocalMeshIp()
-        val subnetBase = subnetBaseOf(localIp) ?: return@withContext emptyList()
+        val subnetBase = subnetBaseOf(localIp)
+            ?: return@withContext listOfNotNull(loopback)
 
         val semaphore = Semaphore(CONCURRENCY)
         val jobs = (1..254).map { host ->
@@ -48,7 +56,7 @@ object OllamaDiscoveryService {
                 }
             }
         }
-        jobs.awaitAll().filterNotNull()
+        listOfNotNull(loopback) + jobs.awaitAll().filterNotNull()
     }
 
     /** Only sweep private, non-loopback IPv4 subnets — never a public/unknown address. */

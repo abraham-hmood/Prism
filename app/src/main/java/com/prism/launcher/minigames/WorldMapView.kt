@@ -41,6 +41,7 @@ class WorldMapView(
 
     private val density = resources.displayMetrics.density
     private val dark: Boolean get() = PaperUi.isDark(context)
+    private val neon: Boolean by lazy { PaperUi.isNeon(context) }
 
     /** The seed the whole world hangs off, and the player's own level. Both set by the host. */
     var worldSeed: Long = 0
@@ -192,10 +193,13 @@ class WorldMapView(
     // -- Drawing --------------------------------------------------------------
 
     override fun onDraw(canvas: Canvas) {
-        PencilStyle.drawPaper(canvas, width, height, dark, density)
+        PencilStyle.drawPaper(canvas, width, height, dark, density, neon = neon)
         if (width == 0 || height == 0) return
 
-        val ink = PencilStyle.pencil(2f * density, PencilStyle.graphite(dark))
+        val ink = PencilStyle.pencil(
+            2f * density,
+            if (neon) PencilStyle.NEON_CYAN else PencilStyle.graphite(dark),
+        )
         val view = viewport()
 
         // Generated on the way past and not kept. See the class comment.
@@ -222,13 +226,13 @@ class WorldMapView(
             val colour = when {
                 // A province is drawn in its owner's ink, not its own. The blue of the player's
                 // empire spreading across the map is the point of taking countries.
-                heldBy == WorldMap.PLAYER_ID -> PencilStyle.BLUE_PENCIL
-                heldBy != null -> PencilStyle.graphite(dark)
-                country.owner == WorldMap.Owner.PLAYER -> PencilStyle.BLUE_PENCIL
-                country.relation == WorldMap.Relation.ALLIED -> PencilStyle.GREEN_PENCIL
-                country.relation == WorldMap.Relation.HOSTILE -> PencilStyle.RED_PENCIL
-                country.owner == WorldMap.Owner.PEER -> PencilStyle.graphite(dark)
-                else -> PencilStyle.graphiteLight(dark)
+                heldBy == WorldMap.PLAYER_ID -> if (neon) PencilStyle.NEON_CYAN else PencilStyle.BLUE_PENCIL
+                heldBy != null -> if (neon) PencilStyle.NEON_MAGENTA else PencilStyle.graphite(dark)
+                country.owner == WorldMap.Owner.PLAYER -> if (neon) PencilStyle.NEON_CYAN else PencilStyle.BLUE_PENCIL
+                country.relation == WorldMap.Relation.ALLIED -> if (neon) PencilStyle.NEON_GREEN else PencilStyle.GREEN_PENCIL
+                country.relation == WorldMap.Relation.HOSTILE -> if (neon) PencilStyle.NEON_MAGENTA else PencilStyle.RED_PENCIL
+                country.owner == WorldMap.Owner.PEER -> if (neon) PencilStyle.NEON_VIOLET else PencilStyle.graphite(dark)
+                else -> if (neon) PencilStyle.NEON_BLUE else PencilStyle.graphiteLight(dark)
             }
             val cx = screenX(country.centreX)
             val cy = screenY(country.centreY)
@@ -264,7 +268,11 @@ class WorldMapView(
                 PencilStyle.fillPolygon(canvas, points, PencilStyle.shading(colour, alpha = 34))
                 PencilStyle.polygon(
                     canvas, points,
-                    PencilStyle.pencil(1.1f * density, PencilStyle.graphiteLight(dark), alpha = 70),
+                    PencilStyle.pencil(
+                        1.1f * density,
+                        if (neon) PencilStyle.NEON_BLUE else PencilStyle.graphiteLight(dark),
+                        alpha = 70,
+                    ),
                     country.id.hashCode().toLong() + 5, 2.0f,
                 )
                 PencilStyle.polygon(canvas, points, outlinePaint, country.id.hashCode().toLong(), 2.6f)
@@ -280,7 +288,11 @@ class WorldMapView(
                     textAlign = Paint.Align.CENTER
                 }
                 PencilStyle.writtenText(canvas, country.name, cx, cy - 2f * density, namePaint, country.id.hashCode().toLong())
-                val ownerPaint = PencilStyle.textPaint(9f * density, dark, PencilStyle.graphiteLight(dark)).apply {
+                val ownerPaint = PencilStyle.textPaint(
+                    9f * density,
+                    dark,
+                    if (neon) PencilStyle.NEON_BLUE else PencilStyle.graphiteLight(dark),
+                ).apply {
                     textAlign = Paint.Align.CENTER
                 }
                 canvas.drawText(
@@ -292,7 +304,11 @@ class WorldMapView(
                     textAlign = Paint.Align.CENTER
                 }
                 PencilStyle.writtenText(canvas, country.name, cx, cy - 2f * density, namePaint, country.id.hashCode().toLong())
-                val levelPaint = PencilStyle.textPaint(9.5f * density, dark, PencilStyle.graphiteLight(dark)).apply {
+                val levelPaint = PencilStyle.textPaint(
+                    9.5f * density,
+                    dark,
+                    if (neon) PencilStyle.NEON_BLUE else PencilStyle.graphiteLight(dark),
+                ).apply {
                     textAlign = Paint.Align.CENTER
                 }
                 canvas.drawText("lvl ${country.level}", cx, cy + 11f * density, levelPaint)
@@ -330,7 +346,11 @@ class WorldMapView(
         }
 
         if (caption.isNotBlank()) {
-            val captionPaint = PencilStyle.textPaint(12f * density, dark, PencilStyle.graphiteLight(dark))
+            val captionPaint = PencilStyle.textPaint(
+                12f * density,
+                dark,
+                if (neon) PencilStyle.NEON_MAGENTA else PencilStyle.graphiteLight(dark),
+            )
             PencilStyle.writtenText(
                 canvas, caption, 56f * density, height - 18f * density, captionPaint, seed = 12,
             )
@@ -456,7 +476,11 @@ class WorldMapView(
      */
     private fun drawSea(canvas: Canvas, view: WorldChunks.View) {
         if (scale < 3.2f * density) return
-        val wave = PencilStyle.pencil(1.2f * density, PencilStyle.rule(dark), alpha = 150)
+        val wave = PencilStyle.pencil(
+            1.2f * density,
+            if (neon) PencilStyle.NEON_BLUE else PencilStyle.rule(dark),
+            alpha = 150,
+        )
         val step = 11.0
         var wy = kotlin.math.floor(view.top / step) * step
         while (wy < view.bottom) {
@@ -479,7 +503,14 @@ class WorldMapView(
         val cx = width - 46f * density
         val cy = 56f * density
         val r = 18f * density
-        canvas.drawCircle(cx, cy, r, PencilStyle.pencil(1.6f * density, PencilStyle.graphiteLight(dark), alpha = 170))
+        canvas.drawCircle(
+            cx, cy, r,
+            PencilStyle.pencil(
+                1.6f * density,
+                if (neon) PencilStyle.NEON_CYAN else PencilStyle.graphiteLight(dark),
+                alpha = 170,
+            ),
+        )
         PencilStyle.line(canvas, cx, cy + r * 0.8f, cx, cy - r * 0.9f, ink, 55, 0.8f)
         val n = PencilStyle.textPaint(11f * density, dark).apply { textAlign = Paint.Align.CENTER }
         canvas.drawText("N", cx, cy - r - 4f * density, n)

@@ -123,6 +123,15 @@ object TrustedSharing {
             }
         }
 
+        // Mail another of the user's devices received. Filed into this device's own inbox, not shown
+        // in a separate "shared" tab: a message from a colleague is the same message whichever of
+        // the user's machines accepted it, and a second inbox would split one conversation in two.
+        TrustedDevices.consume(TrustedDevices.Kind.EMAIL) { received ->
+            if (com.prism.launcher.email.EmailStore.importShared(received.body)) {
+                PrismPlatform.log.info(TAG, "Mail from " + received.fromName)
+            }
+        }
+
         // INCOMING. The source is rewritten to name the device it came from, which is the one piece of
         // information the sender cannot supply: on the sending device the source is the site or the app,
         // and here the useful fact is also WHICH of your machines saw it.
@@ -202,6 +211,25 @@ object TrustedSharing {
         if (TrustedDevices.Kind.MESSAGES in device.outgoing) {
             runCatching { TrustedMessages.backfill(device.fingerprint) }
         }
+
+        if (TrustedDevices.Kind.EMAIL in device.outgoing) {
+            // NEWEST FIRST, and bounded. A newly paired laptop should have the mail the user is
+            // about to talk about, not an archive that takes minutes to cross the mesh.
+            val recent = runCatching {
+                com.prism.launcher.email.EmailStore.messages(folder = "INBOX")
+                    .take(EMAIL_BACKFILL)
+            }.getOrDefault(emptyList())
+            var sent = 0
+            recent.forEach { message ->
+                if (TrustedDevices.shareWith(
+                        device.fingerprint,
+                        TrustedDevices.Kind.EMAIL,
+                        com.prism.launcher.email.EmailStore.toShareJson(message),
+                    )
+                ) sent++
+            }
+            if (sent > 0) PrismPlatform.log.info(TAG, "Sent $sent messages to " + device.name)
+        }
     }
 
     /**
@@ -215,6 +243,9 @@ object TrustedSharing {
 
     /** How many clipboard entries a new pairing sends. */
     private const val CLIPBOARD_BACKFILL = 50
+
+    /** How many recent messages a pairing copies. Newest first; the archive stays on its device. */
+    private const val EMAIL_BACKFILL = 25
 
     /**
      * Records text this device copied and shares it.

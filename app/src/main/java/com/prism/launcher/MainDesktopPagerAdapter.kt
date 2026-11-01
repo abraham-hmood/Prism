@@ -1,14 +1,10 @@
 package com.prism.launcher
 
 import android.content.ComponentName
-import android.graphics.drawable.GradientDrawable
-import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
-import android.widget.LinearLayout
 import android.widget.TextView
-import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.RecyclerView
 import com.prism.launcher.browser.BrowserPageView
 import com.prism.launcher.files.FileExplorerPageView
@@ -41,6 +37,8 @@ class MainDesktopPagerAdapter(
         val next = com.prism.launcher.PrismSettings.getWindowedPages()
         if (next == windowed) return false
         windowed = next
+        // Minimised slots belong to the frame that no longer exists in the other mode.
+        if (!next) minimized.clear()
         notifyDataSetChanged()
         return true
     }
@@ -62,12 +60,49 @@ class MainDesktopPagerAdapter(
         return PageHolder(container)
     }
 
+    /**
+     * Attached holders by slot, for the page offloader.
+     *
+     * Only ATTACHED ones: a recycled holder has already dropped its view (see [onViewRecycled]), so
+     * it holds nothing worth reclaiming and remembering it would keep the holder itself alive.
+     */
+    private val attached = HashMap<Int, PageHolder>()
+
+    /** Windows the user put on the hotseat. Kept by slot so a rebind does not resurrect them. */
+    private val minimized = HashSet<Int>()
+
+    fun isWindowMinimized(slot: Int): Boolean = slot in minimized
+
+    fun noteWindowMinimized(slot: Int) { minimized.add(slot) }
+
+    /**
+     * Puts a minimised window back.
+     *
+     * The holder may not be attached if the pager is on another page, in which case the slot is
+     * removed from [minimized] and [onBindViewHolder] will show it when the pager arrives. Calling
+     * this for an unattached slot is therefore useful rather than a no-op.
+     */
+    fun restoreWindow(slot: Int) {
+        minimized.remove(slot)
+        val wrapper = attached[slot]?.container?.getChildAt(0) as? PageWindowView ?: return
+        wrapper.visibility = View.VISIBLE
+        wrapper.restore()
+    }
+
     override fun onBindViewHolder(holder: PageHolder, position: Int) {
         val assignment = assignments[position]
         val key = cacheKey(position, assignment)
-        if (holder.boundKey == key && holder.container.childCount > 0) return
+        attached[position] = holder
+        holder.slot = position
+        if (holder.boundKey == key && holder.container.childCount > 0) {
+            // A page that is being rebuilt after an offload must drop its thumbnail, or the stale
+            // screenshot would sit under the new page for ever.
+            com.prism.launcher.offload.PageOffload.forget(position)
+            return
+        }
         holder.boundKey = key
         holder.container.removeAllViews()
+        com.prism.launcher.offload.PageOffload.forget(position)
         val page = buildPage(holder.container.context, position, assignment)
         val laidOut = if (windowed) {
             windowFrame(
@@ -75,9 +110,13 @@ class MainDesktopPagerAdapter(
                 pageLabel(assignment),
                 position + 1,
                 page,
+                position,
             )
         } else {
             page
+        }
+        if (laidOut is PageWindowView && position in minimized) {
+            laidOut.visibility = View.GONE
         }
         holder.container.addView(
             laidOut,
@@ -105,69 +144,10 @@ class MainDesktopPagerAdapter(
         title: String,
         number: Int,
         content: View,
-    ): View {
-        val theme = com.prism.launcher.theme.PrismThemes.active()
-        val mode = if (com.prism.launcher.nora.IosUi.isDark(ctx)) theme.dark else theme.light
-        val palette = mode.palette
-        val density = ctx.resources.displayMetrics.density
-        fun dp(value: Float) = (value * density).toInt()
-
-        val outer = FrameLayout(ctx)
-        outer.setPadding(dp(14f), dp(10f), dp(14f), dp(18f))
-
-        val window = LinearLayout(ctx).apply {
-            orientation = LinearLayout.VERTICAL
-            clipToOutline = true
-            elevation = dp(9f).toFloat()
-            background = GradientDrawable().apply {
-                // The card colour, not the page background: a window sits ON something.
-                setColor(palette.card.toInt())
-                cornerRadius = dp(mode.shape.card.toFloat()).toFloat()
-                setStroke(dp(1f), palette.divider.toInt())
-            }
-        }
-
-        val bar = LinearLayout(ctx).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(14f), 0, dp(10f), 0)
-        }
-        bar.addView(View(ctx).apply {
-            background = GradientDrawable().apply {
-                setColor(palette.accent.toInt())
-                cornerRadius = dp(3f).toFloat()
-            }
-        }, LinearLayout.LayoutParams(dp(7f), dp(7f)))
-        bar.addView(TextView(ctx).apply {
-            text = title
-            textSize = 11f
-            paint.isFakeBoldText = true
-            setTextColor(palette.text.toInt())
-            setPadding(dp(9f), 0, 0, 0)
-            maxLines = 1
-            ellipsize = android.text.TextUtils.TruncateAt.END
-        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        bar.addView(TextView(ctx).apply {
-            // Which page of the pager this window is. Decoration would be a lie if it looked like
-            // a control, so it is a count and nothing else.
-            text = number.toString()
-            textSize = 10f
-            setTextColor(palette.faint.toInt())
-        })
-        window.addView(bar, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            dp(34f),
-        ))
-        window.addView(content, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            0,
-            1f,
-        ))
-        outer.addView(window, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT,
-            FrameLayout.LayoutParams.MATCH_PARENT,
-        ))
-        return outer
+        slot: Int,
+    ): View = PageWindowView(ctx, title, number, content) {
+        minimized.add(slot)
+        activity.onPageWindowMinimized(slot, title)
     }
 
     /** The name of what a slot shows, for the window's title bar. */
@@ -196,12 +176,89 @@ class MainDesktopPagerAdapter(
         SlotAssignment.Mouse -> "Mouse"
         SlotAssignment.Photos -> "Photos"
         SlotAssignment.PhotoPix -> "PhotoPix"
+        SlotAssignment.VideoCraft -> "VideoCraft"
+        SlotAssignment.ImageCraft -> "ImageCraft"
+        SlotAssignment.AudioCraft -> "AudioCraft"
+        SlotAssignment.ModelCraft -> "ModelCraft"
+        SlotAssignment.DatasetCraft -> "DatasetCraft"
+        SlotAssignment.AssetCraft -> "AssetCraft"
+        SlotAssignment.GameCraft -> "GameCraft"
+        SlotAssignment.EmailServer -> "Email server"
+        SlotAssignment.EmailClient -> "Email"
+        SlotAssignment.TimeMachine -> "Time Machine"
+        SlotAssignment.Journal -> "Journal"
+        SlotAssignment.AppStore -> "App Store"
+        SlotAssignment.TaskManager -> "Task Manager"
     }
 
     override fun onViewRecycled(holder: PageHolder) {
         holder.container.removeAllViews()
         holder.boundKey = null
+        if (holder.slot >= 0) {
+            attached.remove(holder.slot)
+            com.prism.launcher.offload.PageOffload.forget(holder.slot)
+        }
+        holder.slot = -1
         super.onViewRecycled(holder)
+    }
+
+    /**
+     * Releases a page that is not the current one, keeping only a thumbnail in Prism Swap.
+     *
+     * THE BUSY CHECK COMES FIRST. A page that reports background work -- a render, a download, a
+     * video that is still decoding -- keeps its view no matter what the toggle says: the memory is
+     * recoverable, the work is not.
+     */
+    fun offloadIfIdle(position: Int): Boolean {
+        if (position == bindingSource()) return false
+        val holder = attached[position] ?: return false
+        if (com.prism.launcher.offload.PageOffload.isOffloaded(position)) return false
+        val page = holder.container.getChildAt(0) ?: return false
+        val busy = page as? com.prism.launcher.offload.BusyPage
+        if (busy != null && busy.hasBackgroundWork()) return false
+        if (!com.prism.launcher.offload.PageOffload.stashView(position, page)) return false
+        holder.container.removeAllViews()
+        holder.boundKey = null
+        // The thumbnail goes in the container so a swipe toward the page shows the last thing it
+        // looked like rather than a hole; the real view is rebuilt as it comes into range.
+        com.prism.launcher.offload.PageOffload.thumbnail(position)?.let { thumb ->
+            holder.container.addView(
+                android.widget.ImageView(holder.container.context).apply {
+                    scaleType = android.widget.ImageView.ScaleType.FIT_XY
+                    setImageBitmap(thumb)
+                },
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                ),
+            )
+        }
+        return true
+    }
+
+    /** The page ViewPager2 is showing, which must never be offloaded. */
+    var currentPosition: Int = 0
+
+    private fun bindingSource(): Int = currentPosition
+
+    /** Rebinds every offloaded slot near [current], so it is real again before it can be seen. */
+    fun restoreAround(current: Int, radius: Int = 2) {
+        for (slot in (current - radius)..(current + radius)) {
+            if (slot < 0 || slot >= assignments.size) continue
+            if (!com.prism.launcher.offload.PageOffload.isOffloaded(slot)) continue
+            attached[slot]?.boundKey = null
+            notifyItemChanged(slot)
+        }
+    }
+
+    /** Offloads every attached page except the current one. Returns how many were released. */
+    fun offloadInactive(): Int {
+        var released = 0
+        for (position in attached.keys.toList()) {
+            if (position == currentPosition) continue
+            if (offloadIfIdle(position)) released++
+        }
+        return released
     }
 
     private fun buildPage(ctx: android.content.Context, position: Int, assignment: SlotAssignment): View {
@@ -257,6 +314,21 @@ class MainDesktopPagerAdapter(
             SlotAssignment.Mouse -> com.prism.launcher.mouse.MousePageView(activity)
             SlotAssignment.Photos -> com.prism.launcher.photos.PhotosPageView(activity)
             SlotAssignment.PhotoPix -> com.prism.launcher.photopix.PhotoPixPageView(activity)
+            SlotAssignment.VideoCraft -> com.prism.launcher.videocraft.VideoCraftPageView(activity)
+            SlotAssignment.ImageCraft -> com.prism.launcher.imagecraft.ImageCraftPageView(activity)
+            SlotAssignment.AudioCraft -> com.prism.launcher.audiocraft.AudioCraftPageView(activity)
+            SlotAssignment.ModelCraft -> com.prism.launcher.modelcraft.ModelCraftPageView(activity)
+            SlotAssignment.DatasetCraft -> com.prism.launcher.datasetcraft.DatasetCraftPageView(activity)
+            SlotAssignment.AssetCraft -> com.prism.launcher.assetcraft.AssetCraftPageView(activity)
+            SlotAssignment.GameCraft -> com.prism.launcher.gamecraft.GameCraftPageView(activity)
+
+            SlotAssignment.EmailServer -> com.prism.launcher.email.EmailServerPageView(activity)
+            SlotAssignment.EmailClient -> com.prism.launcher.email.EmailClientPageView(activity)
+
+            SlotAssignment.TimeMachine -> com.prism.launcher.timemachine.TimeMachinePageView(activity)
+            SlotAssignment.Journal -> com.prism.launcher.journal.JournalPageView(activity)
+            SlotAssignment.AppStore -> com.prism.launcher.appstore.AppStorePageView(activity)
+            SlotAssignment.TaskManager -> com.prism.launcher.taskmanager.TaskManagerPageView(activity)
 
             SlotAssignment.ModelStore -> ModelStorePageView(activity)
 
@@ -295,5 +367,6 @@ class MainDesktopPagerAdapter(
 
     class PageHolder(val container: FrameLayout) : RecyclerView.ViewHolder(container) {
         var boundKey: String? = null
+        var slot: Int = -1
     }
 }

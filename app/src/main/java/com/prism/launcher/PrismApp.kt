@@ -59,6 +59,10 @@ class PrismApp : Application(), ComponentCallbacks2 {
     /** Last appearance each non-base screen was drawn with; see the lifecycle callback. */
     private val themedActivityKeys = java.util.WeakHashMap<android.app.Activity, String>()
 
+    /** Key phrases waiting for a screen. A challenge that arrives in the background is not lost. */
+    private val storageChallenges = java.util.ArrayDeque<com.prism.launcher.trusted.TrustedStorageBridge.Challenge>()
+    private var storageChallengeDialog: androidx.appcompat.app.AlertDialog? = null
+
     /**
      * Applies the chosen theme to EVERY screen, not only the ones built on `PrismBaseActivity`.
      *
@@ -85,6 +89,13 @@ class PrismApp : Application(), ComponentCallbacks2 {
 
             override fun onActivityResumed(activity: android.app.Activity) {
                 runCatching { com.prism.launcher.theme.ThemeSkin.apply(activity) }
+                // A trusted device may have asked to bridge a folder while Prism was in the
+                // background. The phrase has to be read off THIS screen, so it is shown as soon as
+                // one exists rather than being dropped.
+                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
+                    { drainStorageChallenges() },
+                    350,
+                )
             }
 
             override fun onActivityStarted(activity: android.app.Activity) = Unit
@@ -95,12 +106,76 @@ class PrismApp : Application(), ComponentCallbacks2 {
         })
     }
 
+    /**
+     * Shows a trusted storage key phrase, or queues it until a screen is resumed.
+     *
+     * The phrase is the host's half of the proof: the person requesting the bridge has to type what
+     * is displayed here. A dialog rather than a notification, because the string must be readable
+     * and copyable while the other device is being operated.
+     */
+    fun presentStorageChallenge(challenge: com.prism.launcher.trusted.TrustedStorageBridge.Challenge) {
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            storageChallenges.addLast(challenge)
+            drainStorageChallenges()
+        }
+    }
+
+    private fun drainStorageChallenges() {
+        if (storageChallengeDialog?.isShowing == true) return
+        val activity = recentActivity()?.takeIf { !it.isFinishing && !it.isDestroyed } ?: return
+        if (!isScreenVisible()) return
+
+        var challenge: com.prism.launcher.trusted.TrustedStorageBridge.Challenge? = null
+        while (!storageChallenges.isEmpty()) {
+            val next = storageChallenges.removeFirst()
+            if (next.expiresAt > System.currentTimeMillis()) {
+                challenge = next
+                break
+            }
+        }
+        val shown = challenge ?: return
+        com.prism.launcher.trusted.TrustedStorageBridge.acknowledgeShown(shown)
+
+        val names = shown.shareNames.joinToString(", ").ifBlank { "a folder" }
+        val dialog = PrismDialogFactory.show(
+            activity,
+            "Trusted storage request",
+            "${shown.requesterName} wants to bridge: $names.\n\n" +
+                "Key phrase:\n${shown.phrase}\n\n" +
+                "Type that phrase on ${shown.requesterName}'s screen. It expires in two minutes.",
+            positiveText = "Done",
+            negativeText = null,
+        )
+        storageChallengeDialog = dialog
+        dialog.setOnDismissListener {
+            storageChallengeDialog = null
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
+                { drainStorageChallenges() },
+                180,
+            )
+        }
+    }
+
+    /** A Toast needs a Looper; every caller of this is on a download thread. */
+    private fun toastOnMain(message: String, length: Int = android.widget.Toast.LENGTH_SHORT) {
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            runCatching { android.widget.Toast.makeText(this, message, length).show() }
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         instance = this
 
         // Initialize Terminal Diagnostics & Crash Interceptor
         PrismLogger.init(this)
+
+        // HEAT AND MEMORY, FROM THE PLATFORM RATHER THAN FROM A SETTING. Every process that can run
+        // inference needs its own copy of this state (the :aether process loads models too), which
+        // is why it starts here instead of in onCreateMainProcess. Registered before anything can
+        // start a generation, so the first decode is already governed and not full tilt for one
+        // poll interval.
+        com.prism.launcher.platform.AndroidThermalGovernor.start(this)
 
         installThemeCoverage()
 
@@ -122,6 +197,18 @@ class PrismApp : Application(), ComponentCallbacks2 {
             audio = com.prism.launcher.speech.AndroidAudioSink(),
             main = com.prism.launcher.speech.AndroidMainThread
         )
+
+        // HOSTED FOLDERS ARE SERVED, NOT MERELY REMEMBERED. A share the user started yesterday must
+        // answer today without opening Files first, so every saved host is rebound at process
+        // start. On a background thread because enumerating interfaces and binding sockets has no
+        // business on the main thread of a launcher.
+        Thread({ com.prism.launcher.storage.HostedStorageServer.sync() }, "prism-host-sync").apply {
+            isDaemon = true
+        }.start()
+
+        // MP3 AND THE REST. Datasets are frequently mp3, flac or m4a; MediaExtractor/MediaCodec
+        // decode whatever the phone already plays, and the shared WAV reader still covers wav.
+        com.prism.launcher.speech.AndroidAudioDecoding.install()
 
         // The system voice underneath whatever the settings chose. A factory rather than an instance
         // because TextToSpeech takes a Context and is slow to initialise -- PrismSpeaker builds it on
@@ -159,6 +246,62 @@ class PrismApp : Application(), ComponentCallbacks2 {
         com.prism.launcher.messaging.ImageGeneration.register(
             com.prism.launcher.messaging.NoraImageGenerator()
         )
+        // Real local diffusion, when this ABI has the native library. It registers even when the
+        // bridge is missing so the Models page can say why rather than quietly offering less.
+        com.prism.launcher.messaging.ImageGeneration.register(
+            com.prism.launcher.diffusion.LocalDiffusionGenerator()
+        )
+        // The images this user trained themselves, in ModelCraft. Registered after the checkpoint
+        // engines because it is not a fallback for them: it is a distinct route, selected when the
+        // active local image path is a ModelCraft artifact folder (which training writes there).
+        com.prism.launcher.messaging.ImageGeneration.register(
+            com.prism.launcher.modelcraft.ModelCraftImageGenerator()
+        )
+        // And the MediaPipe route for `.task` bundles, which stable-diffusion.cpp cannot open.
+        // Both are installed because both formats are already in users' model folders.
+        com.prism.launcher.videocraft.AndroidVideoCraftMediaPipe.install(this)
+
+        // THE NEURAL ACCELERATOR, ASKED ONCE AND NAMED EVERYWHERE. The reporter is what makes "NPU"
+        // a real choice in the picker rather than a label: it answers whether an NPU path exists on
+        // this device, which formats it can take, and what the missing piece is when it cannot. The
+        // GGUF probe is separate because llama.cpp's Hexagon backend is a build-time question on top
+        // of the hardware one.
+        com.prism.launcher.messaging.AiBackend.reporter =
+            com.prism.launcher.messaging.AndroidNpuReporter
+        com.prism.launcher.messaging.AiBackend.ggufNpuProbe = {
+            runCatching { com.prism.launcher.messaging.GgufInferenceService.hasHexagonSupport() }
+                .getOrDefault(false)
+        }
+        // NNAPI is added to ONNX sessions here and nowhere else: `addNnapi` exists only in the
+        // Android artifact, and the desktop must never try it. Applied by OnnxAccelerators only when
+        // the user's backend is NPU.
+        com.prism.launcher.messaging.OnnxAccelerators.nnapi = { options ->
+            options.addNnapi()
+            true
+        }
+
+        // The two text routes only Android has -- a MediaPipe .task bundle and CakeChat -- offered to
+        // the portable facade so ImageCraft and VideoCraft can use whichever model is active.
+        com.prism.launcher.messaging.PrismText.appEngine =
+            com.prism.launcher.messaging.AndroidTextEngine(this)
+
+        // The MediaPipe route as a selectable image engine, so a `.task` bundle draws ImageCraft's
+        // pictures the same way it draws VideoCraft's frames.
+        com.prism.launcher.messaging.ImageGeneration.register(
+            com.prism.launcher.messaging.MediaPipeImageGenerator(this)
+        )
+
+        // WHERE AN IMAGECRAFT PICTURE GOES. MediaStore, so the gallery and Prism's own Photos page
+        // find it; a file in the app's directory would be an image the user cannot see. The
+        // completion callback posts the notification for a run that nothing else is watching, and
+        // creates the channel up front so that post is never the one dropped for a missing channel.
+        com.prism.launcher.imagecraft.ImageCraftService.ensureChannel(this)
+        com.prism.launcher.messaging.ImageCraft.sink = com.prism.launcher.messaging.ImageCraft.PlatformSink { image ->
+            com.prism.launcher.messaging.AndroidImageCraftSink.save(this, image)
+        }
+        com.prism.launcher.messaging.ImageCraft.onFinished = { state ->
+            com.prism.launcher.imagecraft.ImageCraftService.notifyFinished(this, state)
+        }
         com.prism.launcher.messaging.Vision.register(
             com.prism.launcher.messaging.CloudVisionEngine()
         )
@@ -173,6 +316,10 @@ class PrismApp : Application(), ComponentCallbacks2 {
         com.prism.launcher.messaging.Dictation.register(
             com.prism.launcher.messaging.CloudTranscriptionEngine()
         )
+        // The per-clip language column of a speech dataset is read by transcribing the clip, and this
+        // is where the engine that does it comes from. Installed here rather than in the speech code
+        // so a build without dictation leaves the column empty instead of pretending.
+        com.prism.launcher.speech.LanguageId.installFromDictation()
 
         // The PrismCoin node's own chain figures, for WalletNetwork. A hook because the node takes a
         // Context for its storage and is not portable yet -- see WalletNetwork.localChainStats.
@@ -390,6 +537,10 @@ class PrismApp : Application(), ComponentCallbacks2 {
             }
         }
         com.prism.launcher.display.WirelessDisplay.install()
+        // Discovery beacons are for a person choosing a display, so they follow the screen. The
+        // receiver is registered here rather than in the display page because the beacon loop
+        // starts with the process, not with that page.
+        installScreenWatcher()
 
         // MESH CALLS, MESHVOICE AND THE DIALER. Installed here so a call can arrive before the
         // user has opened any screen: the audio device, the incoming-call notification and the
@@ -413,6 +564,14 @@ class PrismApp : Application(), ComponentCallbacks2 {
         // Browser history, both directions, from :core -- the store is portable, so the bridge is too and
         // neither platform writes its own copy of the payload shape.
         com.prism.launcher.trusted.TrustedSharing.install()
+
+        // Hosted folders and the trusted-device bridge. Installed here rather than when the Files
+        // page opens, because a request can arrive before the user has opened Files and the phrase
+        // has to be able to reach a screen.
+        com.prism.launcher.trusted.TrustedStorageBridge.install()
+        com.prism.launcher.trusted.TrustedStorageBridge.presentChallenge = { challenge ->
+            presentStorageChallenge(challenge)
+        }
 
         // Models other devices host. Android's own mesh service collects those announcements, so the
         // portable registry reads across rather than listening a second time on the same port.
@@ -552,6 +711,11 @@ class PrismApp : Application(), ComponentCallbacks2 {
                 if (activity is LauncherActivity) {
                     recentLauncherActivity = java.lang.ref.WeakReference(activity)
                 }
+                // Now that a resumed screen is recorded, a storage phrase queued in the background
+                // can be shown. The post lets the activity finish laying out first.
+                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    drainStorageChallenges()
+                }
                 if (activity !is PrismBaseActivity && com.prism.launcher.theme.ThemeSkin.isThemeable(activity)) {
                     com.prism.launcher.theme.ThemeSkin.apply(activity)
                 }
@@ -650,10 +814,77 @@ class PrismApp : Application(), ComponentCallbacks2 {
         // Prism's own search engine: a loopback listener plus the crawl schedule. Starting it here
         // rather than lazily from the browser means a scheduled crawl still happens when the user
         // never opens a search page, which is the point of scheduling it at all.
+        // A crawl is hundreds of requests and a parse of every page. On a phone that is not work
+        // to do on battery -- and not work to start on a phone that is already warm, which is what
+        // the monitor's governor adds: charging, cool, not in battery saver, and not short of
+        // memory, because a crawl that allocates into a low-memory process is a crawl that gets the
+        // launcher killed halfway. The index is still served immediately either way.
+        com.prism.launcher.search.PrismSearchServer.crawlAllowed = {
+            isCharging() && com.prism.core.PrismSustain.backgroundWorkAllowed()
+        }
         com.prism.launcher.search.PrismSearchServer.start()
         // Without a local DNS record, "prism.com" resolves on the public internet and the browser
         // lands on a stranger's website instead of the search engine.
         com.prism.launcher.search.PrismSearchHost.claimDomain(this)
+
+        // TEXT ALERTS FOR MAIL. The address list is :core's; sending a text needs the radio, so the
+        // one hook is installed here. Nothing is sent unless the user added a number under the
+        // client's Text alerts, and a missing SEND_SMS grant is logged rather than silently
+        // pretending the alert went out.
+        com.prism.launcher.email.EmailSms.onForward = { address, phone, message ->
+            if (androidx.core.content.ContextCompat.checkSelfPermission(
+                    this, android.Manifest.permission.SEND_SMS,
+                ) != android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) {
+                com.prism.launcher.PrismLogger.logWarning(
+                    "PrismMail",
+                    "Text alert for $address was not sent: SEND_SMS is not granted.",
+                )
+            } else {
+                runCatching {
+                    val sms = getSystemService(android.telephony.SmsManager::class.java)
+                        ?: android.telephony.SmsManager.getDefault()
+                    val body = "Mail from " + message.fromName.ifBlank { address } +
+                        ": " + message.subject.ifBlank { "(no subject)" } +
+                        " — " + message.preview(80)
+                    sms.divideMessage(body).forEach { part ->
+                        sms.sendTextMessage(phone, null, part, null, null)
+                    }
+                }.onFailure {
+                    com.prism.launcher.PrismLogger.logWarning(
+                        "PrismMail", "Text alert to $phone failed: ${it.message}",
+                    )
+                }
+            }
+        }
+
+        // THE MAIL SERVER IS A SERVICE, NOT A PAGE. Starting it only when the dashboard is opened
+        // would mean mail is refused until somebody looks at it, which defeats a mail server. The
+        // settings flag is the switch; this honours it at boot.
+        runCatching {
+            var mail = com.prism.launcher.email.EmailSettings.load()
+            // The public address IS the mail domain on the internet, so it is resolved before the
+            // client is opened. Waiting for the server dashboard to be visited would leave the
+            // client showing the mesh name while it was sending over the public internet.
+            if (!mail.onMesh && mail.publicAddress.isBlank()) {
+                val ip = com.prism.launcher.email.EmailDns.publicIp()
+                if (ip.isNotBlank()) {
+                    mail = mail.copy(publicAddress = ip)
+                    mail.save()
+                }
+            }
+            if (mail.enabled) {
+                com.prism.launcher.email.EmailMaintenance.start()
+                Thread {
+                    val error = com.prism.launcher.email.EmailServer.start(mail)
+                    if (error.isNotBlank()) {
+                        com.prism.launcher.PrismLogger.logWarning("PrismMail", error)
+                    }
+                }.apply { isDaemon = true; name = "prism-mail-start" }.start()
+            }
+        }.onFailure {
+            com.prism.launcher.PrismLogger.logWarning("PrismMail", "Could not start mail: ${it.message}")
+        }
 
         // generate_image: running a diffusion model and writing into MediaStore both need a real
         // Android Context, same reasoning as the handlers above. AgenticBuiltinTools already
@@ -746,8 +977,47 @@ class PrismApp : Application(), ComponentCallbacks2 {
             RECEIVER_EXPORTED
         )
 
+        // OLLAMA MODELS TURNED INTO GGUF. These cannot go through DownloadManager: the request is
+        // a registry manifest then a checksum-verified blob, and the result has to be written under
+        // a name and type the models list trusts. The reporter lives here, rather than in the Models
+        // page, so progress is in the shade while the user is elsewhere and a failure stays there
+        // after they have stopped watching -- the same reasoning as the mesh transfer notifier.
+        // Once a second, not once per 200ms progress report: the bar in the shade cannot show more
+        // than that, and a notification redraw five times a second is work the system throttles
+        // anyway.
+        var lastNotifiedAt = 0L
+        com.prism.launcher.messaging.OllamaGgufDownloads.onProgress = { task ->
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (now - lastNotifiedAt >= 1_000L) {
+                lastNotifiedAt = now
+                ModelDownloadNotifier.onProgress(this, task.model, task.done, task.total)
+            }
+        }
+        com.prism.launcher.messaging.OllamaGgufDownloads.onFinished = { task ->
+            when (task.state) {
+                com.prism.launcher.messaging.OllamaGgufDownloads.State.DONE -> {
+                    ModelDownloadNotifier.onComplete(this, task.model)
+                    toastOnMain(task.note.ifBlank { task.model + " was imported" })
+                }
+                com.prism.launcher.messaging.OllamaGgufDownloads.State.FAILED -> {
+                    ModelDownloadNotifier.onFailed(this, task.model, task.note)
+                    toastOnMain(task.model + ": " + task.note, android.widget.Toast.LENGTH_LONG)
+                }
+                else -> Unit
+            }
+        }
+
         // Decentralized Mesh Components
         com.prism.launcher.browser.P2pDnsManager.init(this)
+        // The receive half of the message APIs. Off until the user enables it, but started here
+        // rather than only while the Messages page is open: a webhook that sleeps when the screen
+        // is closed loses exactly the messages a messenger is supposed to keep.
+        runCatching { com.prism.launcher.messaging.MessagingWebhook.startIfEnabled() }
+            .onFailure { PrismLogger.logWarning("Messages", "Could not start the message webhook: ${it.message}") }
+        // RCS travels on this device's own mesh dispatch (the opcode case in PrismMeshService).
+        // install() registers the same handler with MeshCore so a desktop peer can receive it too.
+        runCatching { com.prism.launcher.messaging.RcsChat.install() }
+            .onFailure { PrismLogger.logWarning("Messages", "Could not install RCS: ${it.message}") }
         // Anything a killed mirror crawl left staged is removed before a new crawl can mistake it
         // for a complete site.
         com.prism.launcher.browser.PrismMirrorManager.cleanupInterrupted()
@@ -815,6 +1085,44 @@ class PrismApp : Application(), ComponentCallbacks2 {
                 .onFailure { PrismLogger.logError("ModelShop", "Could not re-announce listings", it) }
         }
     }
+
+    /** Keeps the wireless-display beacon in step with the screen without waking the radio for nothing. */
+    private fun installScreenWatcher() {
+        com.prism.launcher.display.WirelessDisplay.setScreenOn(isScreenOn())
+        runCatching {
+            registerReceiver(
+                object : android.content.BroadcastReceiver() {
+                    override fun onReceive(context: android.content.Context?, intent: android.content.Intent?) {
+                        when (intent?.action) {
+                            android.content.Intent.ACTION_SCREEN_ON ->
+                                com.prism.launcher.display.WirelessDisplay.setScreenOn(true)
+                            android.content.Intent.ACTION_SCREEN_OFF ->
+                                com.prism.launcher.display.WirelessDisplay.setScreenOn(false)
+                        }
+                    }
+                },
+                android.content.IntentFilter().apply {
+                    addAction(android.content.Intent.ACTION_SCREEN_ON)
+                    addAction(android.content.Intent.ACTION_SCREEN_OFF)
+                },
+            )
+        }.onFailure {
+            PrismLogger.logWarning("PrismApp", "Could not watch the screen for display discovery: ${it.message}")
+        }
+    }
+
+    private fun isScreenOn(): Boolean = runCatching {
+        (getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager).isInteractive
+    }.getOrDefault(true)
+
+    private fun isCharging(): Boolean = runCatching {
+        val status = registerReceiver(
+            null,
+            android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED),
+        )?.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1) ?: -1
+        status == android.os.BatteryManager.BATTERY_STATUS_CHARGING ||
+            status == android.os.BatteryManager.BATTERY_STATUS_FULL
+    }.getOrDefault(true)
 
     /**
      * Releases or cancels model purchases whose holding period has elapsed.
@@ -973,7 +1281,17 @@ class PrismApp : Application(), ComponentCallbacks2 {
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
 
+        // Tell the governor before anything is released: this is what stops a preload, a crawl or
+        // a training step from starting while the release below is still in flight. See
+        // AndroidThermalGovernor.noteTrim for the level-to-pressure mapping.
+        com.prism.launcher.platform.AndroidThermalGovernor.noteTrim(level, this)
+
         if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
+            // RUNNING_LOW IS ALREADY A SYSTEM-WIDE EMERGENCY, not a nudge about this process: the
+            // launcher is in the foreground and Android is saying the rest of the machine is short.
+            // The model is the largest cache there is, so it goes back -- after a short delay, so a
+            // reply being read is not interrupted and the reload does not happen mid-sentence.
+            schedulePressureRelease()
             IconPackEngine.trimCache()
             // The icon-pack cache this used to trim alone is a map of component name to drawable
             // NAME -- strings, worth kilobytes. The two below are what actually occupy space: decoded
@@ -1012,6 +1330,25 @@ class PrismApp : Application(), ComponentCallbacks2 {
     private fun scheduleDeferredRelease() {
         deferredReleaseHandler.removeCallbacks(deferredRelease)
         deferredReleaseHandler.postDelayed(deferredRelease, UI_HIDDEN_RELEASE_DELAY_MS)
+    }
+
+    /**
+     * Releases the models shortly after the system reports that memory is low.
+     *
+     * A SEPARATE RUNNABLE FROM [deferredRelease] ON PURPOSE. That one is cancelled whenever any UI
+     * comes back, which is right for "the user left the app" and wrong here: the pressure is about
+     * the whole machine, not about whether this window is visible, so returning to the chat must not
+     * call off the release. Fifteen seconds is long enough for the answer on screen to be finished
+     * reading and short enough to matter to the system.
+     */
+    private val pressureRelease = Runnable {
+        PrismLogger.logInfo("PrismApp", "System memory is low — releasing the resident models")
+        releaseModels()
+    }
+
+    private fun schedulePressureRelease() {
+        deferredReleaseHandler.removeCallbacks(pressureRelease)
+        deferredReleaseHandler.postDelayed(pressureRelease, MEMORY_PRESSURE_RELEASE_DELAY_MS)
     }
 
     /** Called when any UI comes back, so a quick trip to another app costs nothing. */
@@ -1064,6 +1401,14 @@ class PrismApp : Application(), ComponentCallbacks2 {
          * that. See [onTrimMemory] for why releasing on the signal itself was so costly.
          */
         private const val UI_HIDDEN_RELEASE_DELAY_MS = 5 * 60 * 1000L
+
+        /**
+         * How long after `TRIM_MEMORY_RUNNING_LOW` the models are released.
+         *
+         * Short, because the signal is about the machine rather than about this window. See
+         * [pressureRelease].
+         */
+        private const val MEMORY_PRESSURE_RELEASE_DELAY_MS = 15_000L
 
         fun get(app: android.app.Application) = (app as PrismApp).tunnelEngine
     }

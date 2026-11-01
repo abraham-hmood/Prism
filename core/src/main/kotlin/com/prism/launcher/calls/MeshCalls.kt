@@ -104,6 +104,23 @@ object MeshCalls {
     @Volatile
     var pstnDialer: ((number: String) -> Unit)? = null
 
+    /**
+     * Listeners, not a slot.
+     *
+     * THIS WAS A SINGLE `var` AND THAT WAS THE BUG. The window-wide banner, the dialer page and
+     * the call screen each assigned themselves to [onState]/[onIncoming], so whichever was
+     * created last was the only screen that ever heard about a call -- and disposing a page put
+     * back whatever lambda it had captured, which could belong to an activity that no longer
+     * existed. A phone call arriving while the desktop showed any other page therefore rang into
+     * a replaced listener. Every observer now registers itself and removes itself, and no feature
+     * can silently unplug another.
+     *
+     * The two `var`s below remain for compatibility with callers that only need one observer; both
+     * the property and every registered listener are called.
+     */
+    private val stateListeners = java.util.concurrent.CopyOnWriteArrayList<(Call?) -> Unit>()
+    private val incomingListeners = java.util.concurrent.CopyOnWriteArrayList<(Call) -> Unit>()
+
     /** Notified on every state change, on a background thread. */
     @Volatile
     var onState: ((Call?) -> Unit)? = null
@@ -111,6 +128,63 @@ object MeshCalls {
     /** An invite arrived. The UI must answer with [accept] or [decline]. */
     @Volatile
     var onIncoming: ((Call) -> Unit)? = null
+
+    fun addStateListener(listener: (Call?) -> Unit) {
+        if (!stateListeners.contains(listener)) stateListeners.add(listener)
+    }
+
+    fun removeStateListener(listener: (Call?) -> Unit) {
+        stateListeners.remove(listener)
+    }
+
+    fun addIncomingListener(listener: (Call) -> Unit) {
+        if (!incomingListeners.contains(listener)) incomingListeners.add(listener)
+    }
+
+    fun removeIncomingListener(listener: (Call) -> Unit) {
+        incomingListeners.remove(listener)
+    }
+
+    /**
+     * Something arrived that this device could not act on, with the reason to show the user.
+     *
+     * A locked wallet, or a sealed packet whose key is missing, used to produce only a log line.
+     * The caller heard ringing and the receiver showed nothing at all, which is indistinguishable
+     * from a broken mesh. This hook lets the platform say "a call arrived and here is why it could
+     * not be shown".
+     */
+    @Volatile
+    var onUndeliverableInvite: ((reason: String) -> Unit)? = null
+
+    /**
+     * Every decoded frame, with true for this side and false for the peer.
+     *
+     * The call already owns the microphone and the playback track. A recorder or a live
+     * transcriber that opened its own `AudioRecord` competed with that capture and usually got
+     * silence -- which is exactly why call recording appeared to do nothing. Taps read the same
+     * frames the call is carrying, so both work without a second capture session.
+     */
+    private val audioTaps = java.util.concurrent.CopyOnWriteArrayList<(ByteArray, Boolean) -> Unit>()
+
+    fun addAudioTap(tap: (ByteArray, Boolean) -> Unit) {
+        if (!audioTaps.contains(tap)) audioTaps.add(tap)
+    }
+
+    fun removeAudioTap(tap: (ByteArray, Boolean) -> Unit) {
+        audioTaps.remove(tap)
+    }
+
+    /** A DTMF digit the peer pressed, for the in-call dialpad. */
+    @Volatile
+    var onDtmf: ((String) -> Unit)? = null
+
+    /** Sends one dialpad digit over an active call. */
+    fun sendDtmf(digit: String) {
+        val call = active ?: return
+        if (call.state != State.ACTIVE || digit.isBlank()) return
+        val body = JSONObject().apply { put("t", "dtmf"); put("d", digit.take(1)) }
+        signal(call, body)
+    }
 
     @Volatile
     var active: Call? = null
@@ -319,10 +393,10 @@ object MeshCalls {
             // sealed invitation without a log line, so the caller rang and the receiver showed
             // nothing at all -- which reads as "this machine cannot receive calls". The packet
             // genuinely cannot be opened, so the only honest fix is to say why and surface it.
-            lastError = "An encrypted call arrived from ${TrustedDevices.byIp(peerIp)?.name ?: peerIp}, " +
-                "but this device's wallet is locked. Unlock it on the Wallet page."
-            PrismPlatform.log.warn(TAG, lastError!!)
-            onState?.invoke(active)
+            undeliverable(
+                "An encrypted call arrived from ${TrustedDevices.byIp(peerIp)?.name ?: peerIp}, " +
+                    "but this device's wallet is locked. Unlock it on the Wallet page.",
+            )
             return
         }
 
@@ -361,9 +435,10 @@ object MeshCalls {
             // the key is derived from the seed -- and without this line that case looked exactly
             // like a call that never arrived.
             if (key == null && !payload.trim().startsWith("{")) {
-                lastError = "A call arrived from $peerIp but its wallet key is unavailable on this " +
-                    "device. Unlock the wallet to receive encrypted calls."
-                PrismPlatform.log.warn(TAG, lastError!!)
+                undeliverable(
+                    "A call arrived from $peerIp but its wallet key is unavailable on this " +
+                        "device. Unlock the wallet to receive encrypted calls.",
+                )
             }
             return
         }
@@ -400,7 +475,7 @@ object MeshCalls {
                 active = call
                 activeSince = System.currentTimeMillis()
                 callKey = key
-                onIncoming?.invoke(call)
+                notifyIncoming(call)
                 notify(call)
                 // Ringing has to expire on its own. A machine whose page was not open has nobody to
                 // answer, and without this the invitation stayed pending and blocked the line.
@@ -413,6 +488,12 @@ object MeshCalls {
                 val call = active ?: return
                 if (call.peerIp != peerIp) return
                 startAudio(call)
+            }
+            "dtmf" -> {
+                val call = active ?: return
+                if (call.peerIp != peerIp) return
+                val digit = json.optString("d").take(1)
+                if (digit.isNotBlank()) onDtmf?.invoke(digit)
             }
             "decline", "busy", "end" -> {
                 val call = active ?: return
@@ -480,6 +561,7 @@ object MeshCalls {
             call.plainFrames += 1
             Base64.getEncoder().encodeToString(frame)
         }
+        for (tap in audioTaps) runCatching { tap(frame, true) }
         MeshTransport.sendToPeer(call.peerIp, OPCODE_AUDIO, payload)
     }
 
@@ -492,6 +574,7 @@ object MeshCalls {
             CloudVault.open(raw, key) ?: return
         } else raw
         if (frame.size > 4096) return
+        for (tap in audioTaps) runCatching { tap(frame, false) }
         audio?.write(frame)
     }
 
@@ -567,6 +650,26 @@ object MeshCalls {
 
     private fun notify(call: Call?) {
         onState?.invoke(call)
+        for (listener in stateListeners) {
+            runCatching { listener(call) }
+                .onFailure { PrismPlatform.log.warn(TAG, "A call state listener threw: ${it.message}") }
+        }
+    }
+
+    private fun notifyIncoming(call: Call) {
+        onIncoming?.invoke(call)
+        for (listener in incomingListeners) {
+            runCatching { listener(call) }
+                .onFailure { PrismPlatform.log.warn(TAG, "An incoming call listener threw: ${it.message}") }
+        }
+    }
+
+    /** Reports an invitation this device received but could not present. */
+    private fun undeliverable(reason: String) {
+        lastError = reason
+        PrismPlatform.log.warn(TAG, reason)
+        runCatching { onUndeliverableInvite?.invoke(reason) }
+        notify(active)
     }
 
     private fun localName(): String = runCatching { PrismPlatform.host.deviceName() }.getOrDefault("Prism")

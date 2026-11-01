@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Full screen: four corner brackets opening outwards.
+
+  Drawn as four separate corner paths rather than a rounded rectangle with gaps, because the
+  brackets are what makes the control read as "expand" at 24dp where the gap between them is only a
+  couple of pixels.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M5,10H3V5h5v2H5V10z M19,10h2V5h-5v2h3V10z M16,19v-2h3v-3h2v5H16z M8,19H3v-5h2v3h3V19z" />
+</vector>

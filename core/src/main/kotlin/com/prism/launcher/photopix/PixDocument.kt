@@ -26,6 +26,15 @@ class PixLayer(
     /** A fill layer is replaced by [fillColor] on export; used by solid/gradient fills. */
     var fillColor: Int? = null,
     var locked: Boolean = false,
+    /** Per-pixel layer mask, exactly the size of [image]. 255 reveals, 0 hides. */
+    var mask: ByteArray? = null,
+    var maskEnabled: Boolean = true,
+    var maskDensity: Double = 1.0,
+    var maskFeather: Int = 0,
+    /** Layer effects rendered from the layer's alpha at flatten time. */
+    var style: PixLayerStyle? = null,
+    /** Blends into the layer below instead of the composite, when that layer is a group in future. */
+    var clipping: Boolean = false,
 ) {
     fun copyOf(): PixLayer = PixLayer(
         id = id,
@@ -38,7 +47,43 @@ class PixLayer(
         offsetY = offsetY,
         fillColor = fillColor,
         locked = locked,
+        mask = mask?.copyOf(),
+        maskEnabled = maskEnabled,
+        maskDensity = maskDensity,
+        maskFeather = maskFeather,
+        style = style?.copyOf(),
+        clipping = clipping,
     )
+
+    /**
+     * The layer's pixels with its mask applied, before effects.
+     *
+     * Density scales the mask rather than replacing it, which is what lets a user soften a mask
+     * without losing the shape they painted. Feather is evaluated here so every renderer -- the
+     * canvas, an export, a merge -- sees the same edge.
+     */
+    fun maskedImage(): PrismImage {
+        val maskBytes = mask
+        if (maskBytes == null || !maskEnabled) return image
+        var effective = maskBytes
+        if (maskFeather > 0) {
+            effective = PixSelection(image.width, image.height, maskBytes.copyOf())
+                .feathered(maskFeather).mask
+        }
+        val out = image.copy()
+        val density = maskDensity.coerceIn(0.0, 1.0)
+        for (i in out.pixels.indices) {
+            val coverage = ((effective[i].toInt() and 0xFF) / 255.0 * density).coerceIn(0.0, 1.0)
+            if (coverage >= 1.0) continue
+            val px = out.pixels[i]
+            val alpha = (((px ushr 24) and 0xFF) * coverage).toInt().coerceIn(0, 255)
+            out.pixels[i] = (px and 0x00FFFFFF) or (alpha shl 24)
+        }
+        return out
+    }
+
+    /** The image the document composites: mask first, then the layer style. */
+    fun renderedImage(): PrismImage = PixLayerStyles.render(maskedImage(), style)
 }
 
 /**
@@ -94,11 +139,12 @@ class PixDocument(
         for (layer in layers) {
             if (!layer.visible || layer.opacity <= 0.0) continue
             val fill = layer.fillColor
+            val rendered = layer.renderedImage()
             if (fill != null) {
-                val solid = PrismImage(layer.image.width, layer.image.height, IntArray(layer.image.pixels.size) { fill })
+                val solid = PrismImage(rendered.width, rendered.height, IntArray(rendered.pixels.size) { fill })
                 PixImageOps.draw(canvas, solid, layer.offsetX, layer.offsetY, layer.blend, layer.opacity)
             } else {
-                PixImageOps.draw(canvas, layer.image, layer.offsetX, layer.offsetY, layer.blend, layer.opacity)
+                PixImageOps.draw(canvas, rendered, layer.offsetX, layer.offsetY, layer.blend, layer.opacity)
             }
         }
         return canvas
@@ -145,13 +191,15 @@ class PixDocument(
             activeIndex -= 1
             return true
         }
-        val merged = lower.image.copy()
+        val merged = lower.renderedImage()
         PixImageOps.draw(
-            merged, upper.image,
+            merged, upper.renderedImage(),
             upper.offsetX - lower.offsetX, upper.offsetY - lower.offsetY,
             upper.blend, upper.opacity,
         )
         lower.image = merged
+        lower.mask = null
+        lower.style = null
         layers.removeAt(activeIndex)
         activeIndex -= 1
         return true
@@ -183,11 +231,16 @@ class PixDocument(
         val sx = w.toDouble() / width
         val sy = h.toDouble() / height
         for (layer in layers) {
+            val oldWidth = layer.image.width
+            val oldHeight = layer.image.height
             layer.image = PixImageOps.scaled(
                 layer.image,
                 max(1, ceil(layer.image.width * sx).toInt()),
                 max(1, ceil(layer.image.height * sy).toInt()),
             )
+            layer.mask = layer.mask?.let {
+                PixSelection(oldWidth, oldHeight, it).scaled(layer.image.width, layer.image.height).mask
+            }
             layer.offsetX = (layer.offsetX * sx).toInt()
             layer.offsetY = (layer.offsetY * sy).toInt()
         }
@@ -205,7 +258,12 @@ class PixDocument(
         val dx = ((w - width) * anchorX).toInt()
         val dy = ((h - height) * anchorY).toInt()
         for (layer in layers) {
+            val oldWidth = layer.image.width
+            val oldHeight = layer.image.height
             layer.image = PixImageOps.padded(layer.image, w, h, layer.offsetX + dx, layer.offsetY + dy, fill)
+            layer.mask = layer.mask?.let {
+                PixSelection(oldWidth, oldHeight, it).padded(w, h, dx, dy).mask
+            }
             layer.offsetX = 0
             layer.offsetY = 0
         }
@@ -225,6 +283,20 @@ class PixDocument(
             val layerY = layer.offsetY - y0
             val combined = PrismImage.blank(cw, ch, 0)
             PixImageOps.draw(combined, layer.image, layerX, layerY)
+            val oldMask = layer.mask
+            if (oldMask != null) {
+                val oldWidth = layer.image.width
+                val oldHeight = layer.image.height
+                val out = ByteArray(cw * ch)
+                for (yy in 0 until ch) for (xx in 0 until cw) {
+                    val sx = xx - layerX
+                    val sy = yy - layerY
+                    if (sx in 0 until oldWidth && sy in 0 until oldHeight) {
+                        out[yy * cw + xx] = oldMask[sy * oldWidth + sx]
+                    }
+                }
+                layer.mask = out
+            }
             layer.image = combined
             layer.offsetX = 0
             layer.offsetY = 0
@@ -237,7 +309,12 @@ class PixDocument(
     /** Rotates the whole document a quarter turn clockwise or anticlockwise. */
     fun rotateCanvas(clockwise: Boolean) {
         for (layer in layers) {
+            val oldWidth = layer.image.width
+            val oldHeight = layer.image.height
             layer.image = PixImageOps.rotate90(layer.image, clockwise)
+            layer.mask = layer.mask?.let {
+                PixSelection(oldWidth, oldHeight, it).rotate90(clockwise).mask
+            }
             layer.offsetX = 0
             layer.offsetY = 0
         }
@@ -249,7 +326,13 @@ class PixDocument(
 
     fun flipCanvas(horizontal: Boolean) {
         for (layer in layers) {
+            val oldWidth = layer.image.width
+            val oldHeight = layer.image.height
             layer.image = if (horizontal) PixImageOps.flipHorizontal(layer.image) else PixImageOps.flipVertical(layer.image)
+            layer.mask = layer.mask?.let {
+                val selection = PixSelection(oldWidth, oldHeight, it)
+                (if (horizontal) selection.flipHorizontal() else selection.flipVertical()).mask
+            }
         }
         selection = selection?.let { if (horizontal) it.flipHorizontal() else it.flipVertical() }
     }
@@ -269,6 +352,38 @@ class PixDocument(
             if (selectionForLayer == null) result
             else blendThroughSelection(layer.image, result, selectionForLayer)
         }
+    }
+
+    /**
+     * Applies a transform that may change the layer's pixel dimensions.
+     *
+     * A mask stops matching when the pixels are resampled, so it is dropped rather than stretched;
+     * the alternative silently moves every painted edge. The layer's centre stays on the canvas.
+     */
+    fun applyGeometryToActive(transform: (PrismImage) -> PrismImage) {
+        val layer = activeLayer
+        val before = layer.image
+        val result = transform(before)
+        layer.image = result
+        layer.mask = null
+        layer.offsetX -= (result.width - before.width) / 2
+        layer.offsetY -= (result.height - before.height) / 2
+    }
+
+    /** Erases through [selection] (the document's own when null), leaving feathered edges. */
+    fun eraseSelection(selection: PixSelection? = this.selection) {
+        val layer = activeLayer
+        val local = selection ?: return
+        val layerSelection = selectionFor(layer) ?: local
+        val changed = layer.image.copy()
+        for (i in changed.pixels.indices) {
+            val coverage = layerSelection.coverage(i % changed.width, i / changed.width)
+            if (coverage <= 0.0) continue
+            val alpha = ((changed.pixels[i] ushr 24) and 0xFF) * (1.0 - coverage)
+            changed.pixels[i] = (changed.pixels[i] and 0x00FFFFFF) or
+                (alpha.toInt().coerceIn(0, 255) shl 24)
+        }
+        layer.image = changed
     }
 
     /** The document's selection expressed in [layer]'s own coordinates. */
@@ -320,6 +435,64 @@ class PixDocument(
             ).packed()
         }
         layer.image = changed
+    }
+
+    // ── Masks and layer styles ────────────────────────────────────────────
+
+    /**
+     * Turns the current selection into a layer mask.
+     *
+     * [reveal] is the Layer > Layer Mask > Reveal Selection command; false is Hide Selection, which
+     * stores the inverse so the selected area disappears.
+     */
+    fun addMaskFromSelection(reveal: Boolean = true): Boolean {
+        val layer = activeLayer
+        val local = selectionFor(layer) ?: return false
+        val mask = ByteArray(layer.image.width * layer.image.height)
+        for (i in mask.indices) {
+            val coverage = local.coverage(i % local.width, i / local.width)
+            mask[i] = ((if (reveal) coverage else 1.0 - coverage) * 255).toInt().coerceIn(0, 255).toByte()
+        }
+        layer.mask = mask
+        layer.maskEnabled = true
+        return true
+    }
+
+    fun deleteMask(): Boolean {
+        val layer = activeLayer
+        if (layer.mask == null) return false
+        layer.mask = null
+        return true
+    }
+
+    /** Bakes the mask into the pixels and removes it. */
+    fun applyMask(): Boolean {
+        val layer = activeLayer
+        if (layer.mask == null) return false
+        layer.image = layer.maskedImage()
+        layer.mask = null
+        return true
+    }
+
+    fun toggleMask(): Boolean {
+        val layer = activeLayer
+        if (layer.mask == null) return false
+        layer.maskEnabled = !layer.maskEnabled
+        return true
+    }
+
+    fun addLayerEffect(type: PixEffectType): Boolean {
+        val layer = activeLayer
+        val style = layer.style ?: PixLayerStyle().also { layer.style = it }
+        style.add(type)
+        return true
+    }
+
+    fun clearLayerStyle(): Boolean {
+        val layer = activeLayer
+        if (layer.style == null) return false
+        layer.style = null
+        return true
     }
 
     /**
@@ -407,6 +580,7 @@ class PixDocument(
     ) {
         /** Roughly how much heap this snapshot holds, for the history's budget. */
         fun bytes(): Long = layers.sumOf { (it.image.pixels.size * 4).toLong() } +
+            layers.sumOf { (it.mask?.size?.toLong() ?: 0L) } +
             (selection?.mask?.size?.toLong() ?: 0L)
     }
 

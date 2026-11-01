@@ -1,7 +1,6 @@
 package com.prism.launcher.messaging
 
 import com.prism.core.PrismPlatform
-import com.prism.launcher.PrismSettings
 import java.io.File
 
 /**
@@ -56,7 +55,54 @@ internal object WhisperNative {
             PrismPlatform.log.info("PrismWhisper", "whisper_bridge not loaded: $loadError")
             false
         }
-        if (loaded) PrismPlatform.log.info("PrismWhisper", "whisper_bridge loaded")
+        if (loaded) {
+            // ggml's backends are separate shared objects in an Android build, and ggml finds them
+            // by scanning a directory. Only the platform knows where the APK put them; without this
+            // the registry is empty and whisper_init aborts inside ggml rather than returning null.
+            //
+            // The host can be wrong about it on desktop: the JVM was launched with
+            // -Djava.library.path pointing at build/nativeLibs, but JvmHost only recognises a
+            // "resources" folder beside its own jar. Falling back to the directory the bridge was
+            // actually loaded from is what lets ggml find the CPU backend there instead of reporting
+            // a device it cannot initialise.
+            val dir = runCatching { PrismPlatform.host.nativeLibraryDir() }.getOrNull()
+                ?: libraryRoots().firstOrNull { root ->
+                    File(root, System.mapLibraryName("whisper_bridge")).isFile
+                }
+            if (dir != null) {
+                runCatching { nativeSetBackendDir(dir.absolutePath) }
+                    .onFailure {
+                        loadError = it.message ?: it::class.simpleName.orEmpty()
+                        loaded = false
+                        PrismPlatform.log.error(
+                            "PrismWhisper",
+                            "Could not initialise ggml backends from ${dir.absolutePath}",
+                            it,
+                        )
+                    }
+            }
+            // THE REGISTRY IS NOT THE SAME THING AS A WORKING CPU BACKEND. whisper_init asks for
+            // the CPU device and then dereferences its backend registry; when that device exists
+            // but cannot be initialised, ggml aborts the whole process inside whisper_init. That
+            // abort is a SIGABRT in native code and cannot be caught in Kotlin, so the only safe
+            // place to discover it is here, before whisper_init is ever called. The native test
+            // initialises and frees one CPU backend; a false answer means transcription is
+            // reported as unavailable instead of taking the launcher down during an import.
+            if (loaded) {
+                val ready = runCatching { nativeBackendReady() }.getOrDefault(false)
+                if (!ready) {
+                    loaded = false
+                    loadError = "ggml could not initialise a CPU backend on this device"
+                    PrismPlatform.log.error(
+                        "PrismWhisper",
+                        "The ggml CPU backend did not initialise; whisper is unavailable " +
+                            "instead of crashing during transcription",
+                        null,
+                    )
+                }
+            }
+            if (loaded) PrismPlatform.log.info("PrismWhisper", "whisper_bridge loaded")
+        }
         return loaded
     }
 
@@ -78,6 +124,17 @@ internal object WhisperNative {
         val fromHost = runCatching { PrismPlatform.host.nativeLibraryDir() }.getOrNull()
         return if (fromHost != null) listOf(fromHost) + fromPath else fromPath
     }
+
+    /** Where the APK's native libraries were unpacked, for ggml's backend scanner. */
+    external fun nativeSetBackendDir(directory: String)
+
+    /**
+     * Whether a CPU backend can actually be created, not merely found in the registry.
+     *
+     * Called once while loading the library. See [ensureLoaded] for why this has to happen before
+     * whisper_init: that call aborts the process when the backend cannot be created.
+     */
+    external fun nativeBackendReady(): Boolean
 
     external fun nativeLoad(modelPath: String): Boolean
 
@@ -117,7 +174,7 @@ internal object WhisperNative {
  */
 class WhisperCppEngine : TranscriptionEngine {
 
-    override val id = "whisper"
+    override val id = ID
     override val label = "Whisper (on-device)"
     override val description =
         "whisper.cpp running locally. Free per use, works offline, and transcribes identically on " +
@@ -131,15 +188,13 @@ class WhisperCppEngine : TranscriptionEngine {
                     ". On desktop, build it with the buildWhisper Gradle task."
             )
         }
-        val path = PrismSettings.getWhisperModelPath()
-        if (path.isBlank()) {
+        val path = WhisperModels.modelPath()
+        if (path == null) {
             return ImageGenerator.Availability.Unavailable(
-                "No whisper model chosen. Point Prism at a ggml whisper model — ggml-base.en.bin is " +
-                    "about 150 MB and enough for dictation."
+                "No whisper model is installed yet. Auto-transcription downloads " +
+                    "${WhisperModels.DEFAULT_LABEL} the first time a dataset needs words, or you can " +
+                    "choose your own ggml model in Settings."
             )
-        }
-        if (!File(path).isFile) {
-            return ImageGenerator.Availability.Unavailable("The chosen whisper model is missing: $path")
         }
         return ImageGenerator.Availability.Ready
     }
@@ -151,8 +206,7 @@ class WhisperCppEngine : TranscriptionEngine {
         onStage: ((String) -> Unit)?,
     ): String? {
         if (!WhisperNative.ensureLoaded()) return null
-        val model = PrismSettings.getWhisperModelPath()
-        if (model.isBlank() || !File(model).isFile) return null
+        val model = WhisperModels.modelPath() ?: return null
 
         // Resampling is NOT done here. whisper wants 16 kHz and every recorder in Prism captures at it;
         // a clip at another rate would transcribe as gibberish rather than fail, so it is refused.
@@ -206,6 +260,10 @@ class WhisperCppEngine : TranscriptionEngine {
     }
 
     companion object {
+
+        /** The registry id, shared with [WhisperModels]' installer so the two cannot drift. */
+        const val ID = "whisper"
+
         /**
          * The model files whisper.cpp publishes, smallest first.
          *

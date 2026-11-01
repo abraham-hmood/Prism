@@ -41,10 +41,22 @@ object SettingsActions {
     var navigate: ((PageId) -> Unit)? = null
 
     /** Dialogs a settings row can ask the page to show. */
-    enum class Dialog { PRISM_SERVERS, PRISM_NODES, SPEECH_MODEL, WIRELESS_DISPLAYS, PDB }
+    enum class Dialog {
+        PRISM_SERVERS, PRISM_NODES, SPEECH_MODEL, WIRELESS_DISPLAYS, PDB,
+        UPDATE_REPOSITORIES, CHECK_FOR_UPDATES, INFERENCE_MODE_BENCH,
+    }
 
     /** Installed by the settings page, which is what can host a dialog. */
     var openDialog: ((Dialog) -> Unit)? = null
+
+    /**
+     * Asks the settings page to rebuild its rows after work that finished in the background.
+     *
+     * A folder move is measured in minutes and cannot hold the UI thread, so its result arrives
+     * after [perform] has already returned. Without this the path row would still show the old
+     * folder until the page was left and reopened.
+     */
+    var refresh: (() -> Unit)? = null
 
     /** Carries out [target], returning what the row should say afterwards. */
     fun perform(target: Target): String = when (target) {
@@ -78,6 +90,65 @@ object SettingsActions {
         Target.OPEN_WALLET -> go(PageId.WALLET, "Opened the wallet.")
         Target.OPEN_MINING -> go(PageId.WALLET_EXTRAS, "Opened mining and the wallet extras.")
         Target.OPEN_DATASETS -> go(PageId.NORA_TRAIN, "Opened training, which is where datasets are managed.")
+
+        Target.OPEN_EMAIL_SERVER -> go(PageId.EMAIL_SERVER, "Opened the mail server dashboard.")
+        Target.OPEN_EMAIL_CLIENT -> go(PageId.EMAIL_CLIENT, "Opened the mail client.")
+
+        // A dialog rather than a page: the repository list and the release check are one task and
+        // the settings row is the only entry point on this build.
+        Target.UPDATE_REPOSITORIES -> {
+            openDialog?.invoke(Dialog.UPDATE_REPOSITORIES)
+            ""
+        }
+        Target.CHECK_FOR_UPDATES -> {
+            openDialog?.invoke(Dialog.CHECK_FOR_UPDATES)
+            ""
+        }
+
+        // A dialog rather than a sentence: the smoke test takes seconds to a minute and the user
+        // needs to see which mode is running, not a frozen row.
+        Target.AUTO_SELECT_INFERENCE_MODE -> {
+            openDialog?.invoke(Dialog.INFERENCE_MODE_BENCH)
+            ""
+        }
+
+        // THE CHECKS BELONG TO THE ROW, NOT TO A DIALOG. Each one is a probe of the network this
+        // machine is on and returns one sentence, which is exactly what a settings row can show.
+        Target.EMAIL_CHECK_PORTS -> {
+            val ports = runCatching { com.prism.launcher.email.EmailServer.status(
+                com.prism.launcher.email.EmailSettings.load(),
+            ) }.getOrNull()
+            if (ports == null) {
+                "Could not read the mail settings."
+            } else {
+                ports.services.joinToString(" · ") { service ->
+                    service.name + " " + service.port + ": " + if (service.running) "listening" else "not listening"
+                }
+            }
+        }
+
+        Target.EMAIL_BACKUP -> runCatching {
+            val file = com.prism.launcher.email.EmailStore.backup()
+            if (file == null) "The mailbox could not be backed up; the log says why."
+            else "Backed up to " + file.absolutePath
+        }.getOrElse { "Could not back up the mailbox: " + it.message }
+
+        Target.EMAIL_REPUTATION -> runCatching {
+            val ip = com.prism.launcher.email.EmailDns.publicIp()
+            if (ip.isBlank()) "No public address could be found."
+            else {
+                val status = com.prism.launcher.email.EmailDns.blocklistStatus(ip)
+                status.detail.ifBlank {
+                    if (status.listed) ip + " is listed."
+                    else ip + " is not on any blocklist Prism checks."
+                }
+            }
+        }.getOrElse { "Could not ask the blocklists: " + it.message }
+
+        Target.EMAIL_CLEAR_LOG -> {
+            com.prism.launcher.email.EmailServer.clearLog()
+            "Cleared."
+        }
 
         // ── Things that happen here and now ────────────────────────────────
         Target.REBUILD_INDEX -> runCatching {
@@ -193,6 +264,36 @@ object SettingsActions {
             "ISO set to " + file.name + "."
         }
 
+        Target.MOVE_PRISM_FOLDER -> movePrismFolder()
+
+        Target.SELECT_ECHO_ASSETS -> chooseFolder("Choose the Echo Chamber asset folder") { folder ->
+            PrismSettings.setEchoChamberAssetPath(folder.absolutePath)
+            PrismSettings.setEchoChamberUseCustomAssets(true)
+            com.prism.launcher.minigames.EchoAssets.invalidate()
+            "Echo Chamber assets set to " + folder.name + "."
+        }
+
+        Target.RESET_ECHO_ASSETS -> {
+            PrismSettings.setEchoChamberUseCustomAssets(false)
+            PrismSettings.setEchoChamberAssetPath("")
+            com.prism.launcher.minigames.EchoAssets.invalidate()
+            "Echo Chamber is back on the generated 1024² pack."
+        }
+
+        Target.SELECT_ZOMBIES_ASSETS -> chooseFolder("Choose the Zombies asset folder") { folder ->
+            PrismSettings.setZombiesAssetPath(folder.absolutePath)
+            PrismSettings.setZombiesUseCustomAssets(true)
+            com.prism.launcher.minigames.ZombiesAssets.invalidate()
+            "Zombies assets set to " + folder.name + "."
+        }
+
+        Target.RESET_ZOMBIES_ASSETS -> {
+            PrismSettings.setZombiesUseCustomAssets(false)
+            PrismSettings.setZombiesAssetPath("")
+            com.prism.launcher.minigames.ZombiesAssets.invalidate()
+            "Zombies is back on the generated baseline pack."
+        }
+
         Target.OPEN_SPEECH_MODEL -> {
             // THE PHONE'S FLOW, NOT A BARE FILE PICKER. Picking a speech model is described, not
             // typed: the dialog shows what is in use, walks the model-type question and asks
@@ -278,6 +379,23 @@ object SettingsActions {
      * The platform's box, so it looks like every other open dialog on the machine and starts wherever the
      * user last was. Swing's is portable and looks like nothing else on any platform.
      */
+    private fun chooseFolder(title: String, onChosen: (File) -> String): String {
+        val chooser = javax.swing.JFileChooser().apply {
+            dialogTitle = title
+            fileSelectionMode = javax.swing.JFileChooser.DIRECTORIES_ONLY
+            isMultiSelectionEnabled = false
+            currentDirectory = runCatching {
+                PrismSettings.getEchoChamberAssetPath().takeIf { it.isNotBlank() }?.let { File(it) }
+            }.getOrNull()
+        }
+        if (chooser.showOpenDialog(null) != javax.swing.JFileChooser.APPROVE_OPTION) {
+            return "Nothing chosen."
+        }
+        val folder = chooser.selectedFile ?: return "Nothing chosen."
+        if (!folder.isDirectory) return "That is not a folder."
+        return runCatching { onChosen(folder) }.getOrElse { "Could not use it: " + it.message }
+    }
+
     private fun chooseFile(title: String, onChosen: (File) -> String): String {
         val dialog = java.awt.FileDialog(null as java.awt.Frame?, title, java.awt.FileDialog.LOAD)
         dialog.isVisible = true
@@ -286,6 +404,61 @@ object SettingsActions {
         val file = File(directory, name)
         if (!file.isFile) return "That is not a file."
         return runCatching { onChosen(file) }.getOrElse { "Could not use it: " + it.message }
+    }
+
+    /**
+     * Picks a destination, confirms, and moves the user-visible Prism folder in the background.
+     *
+     * THE CONFIRMATION IS NOT OPTIONAL. A move deletes the old folder once the new copy is complete,
+     * and "I clicked a settings row" is not consent to delete every imported model on the machine.
+     * The copy itself is delegated to `PrismStorage`, which only switches the setting after every
+     * file has arrived.
+     */
+    private fun movePrismFolder(): String {
+        val chooser = javax.swing.JFileChooser().apply {
+            dialogTitle = "Choose the new Prism data folder"
+            fileSelectionMode = javax.swing.JFileChooser.DIRECTORIES_ONLY
+            isMultiSelectionEnabled = false
+            currentDirectory = runCatching {
+                PrismPlatform.host.documentsDir().parentFile
+            }.getOrNull()
+        }
+        if (chooser.showOpenDialog(null) != javax.swing.JFileChooser.APPROVE_OPTION) {
+            return "Nothing chosen."
+        }
+        val target = chooser.selectedFile ?: return "Nothing chosen."
+        val current = PrismPlatform.host.documentsDir()
+        val same = runCatching { target.canonicalFile == current.canonicalFile }.getOrDefault(false)
+        if (same) return "Prism already uses that folder."
+
+        val answer = javax.swing.JOptionPane.showConfirmDialog(
+            null,
+            "Prism will copy everything from\n$current\nto\n$target,\nswitch to the new folder, then " +
+                "remove the old copy.\n\nLarge model folders can take several minutes. Nothing is " +
+                "removed until every file has arrived. Continue?",
+            "Move Prism data folder",
+            javax.swing.JOptionPane.YES_NO_OPTION,
+            javax.swing.JOptionPane.WARNING_MESSAGE,
+        )
+        if (answer != javax.swing.JOptionPane.YES_OPTION) return "Nothing moved."
+
+        Thread({
+            val result = com.prism.core.PrismStorage.relocate(target)
+            if (result.ok) PrismPlatform.log.info(TAG, result.message)
+            else PrismPlatform.log.error(TAG, result.message)
+            javax.swing.SwingUtilities.invokeLater {
+                refresh?.invoke()
+                javax.swing.JOptionPane.showMessageDialog(
+                    null,
+                    result.message,
+                    if (result.ok) "Prism folder moved" else "Could not move the Prism folder",
+                    if (result.ok) javax.swing.JOptionPane.INFORMATION_MESSAGE
+                    else javax.swing.JOptionPane.ERROR_MESSAGE,
+                )
+            }
+        }, "prism-storage-move").apply { isDaemon = true }.start()
+
+        return "Moving Prism's files to " + target.absolutePath + "... This can take a while."
     }
 
     private fun describeDirectory(name: String, noun: String): String {

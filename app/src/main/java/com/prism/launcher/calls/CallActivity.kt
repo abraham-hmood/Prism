@@ -52,8 +52,26 @@ class CallActivity : PrismBaseActivity() {
     private lateinit var recordButton: ImageButton
     private lateinit var recordingView: TextView
     private lateinit var voicemailButton: ImageButton
+    private lateinit var transcriptButton: ImageButton
+    private lateinit var dialpadButton: ImageButton
     private lateinit var endButton: ImageButton
     private lateinit var answerButton: ImageButton
+
+    private var meshRecorder: MeshCallRecorder? = null
+    private var transcriptOverlay: CallTranscriptOverlay? = null
+    private var transcriber: CallTranscriber? = null
+    private var dialpadOverlay: CallDialpadOverlay? = null
+
+    /** Asked for the first time the user taps record, so a call can still be answered without it. */
+    private val recordPermission = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            toggleCallRecording()
+        } else {
+            Toast.makeText(this, "Recording needs microphone permission.", Toast.LENGTH_LONG).show()
+        }
+    }
 
     private lateinit var audioManager: AudioManager
 
@@ -67,8 +85,18 @@ class CallActivity : PrismBaseActivity() {
     private var timer: Runnable? = null
     private val handler = Handler(Looper.getMainLooper())
 
-    private var previousStateListener: ((MeshCalls.Call?) -> Unit)? = null
-    private var previousIncoming: ((MeshCalls.Call) -> Unit)? = null
+    /**
+     * This screen's observer, registered as a LISTENER rather than assigned to
+     * [MeshCalls.onState].
+     *
+     * The old code saved the previous lambda and restored it in `onDestroy`, which only works if
+     * nothing else replaced it in between. A dialer page, the window banner and a second call
+     * screen all did exactly that, so answering one call could leave the app's routing pointing at
+     * a destroyed activity and the next invitation went nowhere.
+     */
+    private val stateListener: (MeshCalls.Call?) -> Unit = { call ->
+        runOnUiThread { if (!isFinishing) follow(call) }
+    }
 
     private var attachOnly = false
     private var sawPstnCall = false
@@ -120,6 +148,8 @@ class CallActivity : PrismBaseActivity() {
         recordButton = findViewById(R.id.callRecord)
         recordingView = findViewById(R.id.callRecording)
         voicemailButton = findViewById(R.id.callVoicemail)
+        transcriptButton = findViewById(R.id.callTranscribe)
+        dialpadButton = findViewById(R.id.callDialpad)
         endButton = findViewById(R.id.callEnd)
         answerButton = findViewById(R.id.callAnswer)
 
@@ -168,6 +198,8 @@ class CallActivity : PrismBaseActivity() {
 
     override fun onDestroy() {
         if (recording) stopCallRecording()
+        closeTranscript()
+        closeDialpad()
         stopTimer()
         telecomListener?.let { listener ->
             if (PrismTelecom.listener === listener) PrismTelecom.listener = null
@@ -176,8 +208,7 @@ class CallActivity : PrismBaseActivity() {
         PrismTelecom.uiVisible = false
         super.onDestroy()
         handler.removeCallbacksAndMessages(null)
-        MeshCalls.onState = previousStateListener
-        MeshCalls.onIncoming = previousIncoming
+        MeshCalls.removeStateListener(stateListener)
         runCatching { PrismCalls.device()?.leaveCallMode() }
         PrismCalls.clearIncomingNotification(this)
         PrismCalls.stopFindSound()
@@ -186,11 +217,9 @@ class CallActivity : PrismBaseActivity() {
     // ── Starting ───────────────────────────────────────────────────────────
 
     private fun begin() {
-        // Keep whatever listener was installed, so ending this screen does not take the app's
-        // incoming-call routing with it.
-        previousStateListener = MeshCalls.onState
-        previousIncoming = MeshCalls.onIncoming
-        MeshCalls.onIncoming = previousIncoming
+        // A listener, so ending this screen removes only itself. The app's notification routing
+        // and the window banner keep listening.
+        MeshCalls.addStateListener(stateListener)
 
         when (mode) {
             MODE_INCOMING -> {
@@ -204,7 +233,6 @@ class CallActivity : PrismBaseActivity() {
                 } else {
                     "Not encrypted — this device is not one of your trusted devices"
                 }
-                MeshCalls.onState = { call -> runOnUiThread { follow(call) } }
             }
 
             MODE_PSTN_INCOMING -> {
@@ -245,7 +273,6 @@ class CallActivity : PrismBaseActivity() {
                 muteButton.visibility = android.view.View.GONE
                 speakerButton.visibility = android.view.View.GONE
                 voicemailButton.visibility = android.view.View.GONE
-                MeshCalls.onState = { call -> runOnUiThread { follow(call) } }
                 val started = MeshCalls.callVoicemail(peerIp, peerName, trusted = true)
                 if (!started) {
                     statusView.text = "The voicemail could not start — the calls key is unavailable."
@@ -259,7 +286,6 @@ class CallActivity : PrismBaseActivity() {
                 // A trusted device that is offline gets voicemail instead of a ringing call. The
                 // dialer decides which based on the peer list; this screen only records what it is
                 // told to do.
-                MeshCalls.onState = { call -> runOnUiThread { follow(call) } }
                 MeshCalls.call(peerIp, peerName, trusted)
                 statusView.text = if (trusted) "Calling over the mesh…" else "Connecting…"
             }
@@ -302,6 +328,8 @@ class CallActivity : PrismBaseActivity() {
             }
         }
         recordButton.setOnClickListener { toggleCallRecording() }
+        transcriptButton.setOnClickListener { toggleTranscript() }
+        dialpadButton.setOnClickListener { toggleDialpad() }
         voicemailButton.setOnClickListener {
             // An active mesh call is turned into a voicemail: the caller hung up and is leaving a
             // message, which is what the button says. The screen stays until it is sent.
@@ -405,11 +433,29 @@ class CallActivity : PrismBaseActivity() {
             stopCallRecording()
             return
         }
-        val started = PrismTelecom.startRecording(
-            this,
-            number = number,
-            name = nameView.text.toString(),
-        )
+        val granted = androidx.core.content.ContextCompat.checkSelfPermission(
+            this, android.Manifest.permission.RECORD_AUDIO
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (!granted) {
+            recordPermission.launch(android.Manifest.permission.RECORD_AUDIO)
+            return
+        }
+        // A carrier call can only be captured with an AudioRecord source, and Android protects the
+        // mix. A mesh call already carries both directions through the engine, so recording it with
+        // a second microphone was guaranteed silence; the tap-based recorder is the fix.
+        val isMesh = mode == MODE_MESH || mode == MODE_INCOMING || mode == MODE_VOICEMAIL
+        val started: CallRecorder.Start
+        if (isMesh) {
+            val next = MeshCallRecorder(this, peerIp, nameView.text.toString())
+            started = next.start()
+            if (started.started) meshRecorder = next
+        } else {
+            started = PrismTelecom.startRecording(
+                this,
+                number = number,
+                name = nameView.text.toString(),
+            )
+        }
         if (!started.started) {
             Toast.makeText(this, started.message, Toast.LENGTH_LONG).show()
             return
@@ -417,15 +463,22 @@ class CallActivity : PrismBaseActivity() {
         recording = true
         recordButton.isSelected = true
         recordButton.setBackgroundResource(R.drawable.bg_call_end)
+        recordButton.setImageResource(R.drawable.ic_call_record_24)
         recordingView.visibility = android.view.View.VISIBLE
-        recordingView.text = "● Recording · " + (PrismTelecom.recordingSource() ?: "call audio")
+        val source = if (isMesh) {
+            meshRecorder?.sourceLabel
+        } else {
+            PrismTelecom.recordingSource()
+        }
+        recordingView.text = "● Recording · " + (source ?: "call audio")
         Toast.makeText(this, "Recording this call", Toast.LENGTH_SHORT).show()
     }
 
     private fun stopCallRecording() {
         if (!recording) return
         recording = false
-        val saved = PrismTelecom.stopRecording()
+        val saved = meshRecorder?.stop() ?: PrismTelecom.stopRecording()
+        meshRecorder = null
         recordButton.isSelected = false
         recordButton.setBackgroundResource(R.drawable.bg_call_button)
         recordButton.setImageResource(R.drawable.ic_call_record_24)
@@ -435,6 +488,82 @@ class CallActivity : PrismBaseActivity() {
             if (saved == null) "The recording was empty and was discarded" else "Recording saved",
             Toast.LENGTH_SHORT,
         ).show()
+    }
+
+    // ── Live transcript and keypad ─────────────────────────────────────────
+
+    private fun toggleTranscript() {
+        if (transcriptOverlay != null) {
+            closeTranscript()
+            return
+        }
+        if (mode == MODE_PSTN || mode == MODE_PSTN_INCOMING || mode == MODE_VOICEMAIL) {
+            Toast.makeText(
+                this,
+                "Live transcription is available on Prism mesh calls.",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
+        val root = findViewById<android.widget.FrameLayout>(R.id.callRoot) ?: return
+        val overlay = CallTranscriptOverlay(this)
+        root.addView(
+            overlay,
+            android.widget.FrameLayout.LayoutParams(
+                (resources.displayMetrics.widthPixels * 0.86f).toInt(),
+                (resources.displayMetrics.heightPixels * 0.38f).toInt(),
+            ).apply {
+                gravity = android.view.Gravity.TOP or android.view.Gravity.START
+                leftMargin = (resources.displayMetrics.widthPixels * 0.07f).toInt()
+                topMargin = (resources.displayMetrics.heightPixels * 0.12f).toInt()
+            },
+        )
+        transcriptOverlay = overlay
+        val live = CallTranscriber(
+            onLine = { fromUser, text -> overlay.addMessage(fromUser, text) },
+            onStatus = { status -> overlay.setStatus(status) },
+        )
+        transcriber = live
+        live.start()
+        transcriptButton.isSelected = true
+    }
+
+    private fun closeTranscript() {
+        transcriber?.stop()
+        transcriber = null
+        val overlay = transcriptOverlay ?: return
+        (overlay.parent as? android.view.ViewGroup)?.removeView(overlay)
+        transcriptOverlay = null
+        transcriptButton.isSelected = false
+    }
+
+    private fun toggleDialpad() {
+        if (dialpadOverlay != null) {
+            closeDialpad()
+            return
+        }
+        val root = findViewById<android.widget.FrameLayout>(R.id.callRoot) ?: return
+        val overlay = CallDialpadOverlay(this)
+        overlay.onDigit = { digit -> sendDigit(digit) }
+        root.addView(overlay)
+        dialpadOverlay = overlay
+        dialpadButton.isSelected = true
+    }
+
+    private fun closeDialpad() {
+        val overlay = dialpadOverlay ?: return
+        (overlay.parent as? android.view.ViewGroup)?.removeView(overlay)
+        dialpadOverlay = null
+        dialpadButton.isSelected = false
+    }
+
+    /** One key press, delivered as a DTMF tone on a carrier call or as a mesh packet on a mesh call. */
+    private fun sendDigit(digit: String) {
+        if (mode == MODE_PSTN || mode == MODE_PSTN_INCOMING) {
+            PrismTelecom.sendDtmf(digit)
+        } else {
+            MeshCalls.sendDtmf(digit)
+        }
     }
 
     // ── State ──────────────────────────────────────────────────────────────

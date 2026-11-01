@@ -4,9 +4,11 @@ import android.Manifest
 import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.drawable.GradientDrawable
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.view.Gravity
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.VelocityTracker
@@ -25,6 +27,8 @@ import com.prism.launcher.browser.PrivateDnsVpnService
 import com.prism.launcher.browser.openInDefaultBrowser
 import com.prism.launcher.databinding.ActivityLauncherBinding
 import com.prism.launcher.messaging.MessagingPageView
+import android.widget.LinearLayout
+import android.widget.TextView
 import android.widget.Toast
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -44,6 +48,91 @@ class LauncherActivity : PrismBaseActivity() {
     private var nebulaSocialPage: com.prism.launcher.social.NebulaSocialPageView? = null
     private var discoveredPlugins: List<PluginPageInfo> = emptyList()
     private var pendingPickerSlot: Int = 1
+
+    /** Page windows the user put on the hotseat. */
+    private val minimizedWindows = LinkedHashMap<Int, String>()
+
+    /** Called by [PageWindowView] through the adapter when a window's minus is pressed. */
+    fun onPageWindowMinimized(slot: Int, title: String) {
+        minimizedWindows[slot] = title
+        rebuildWindowHotseat()
+    }
+
+    /**
+     * The hotseat: one chip per minimised page window.
+     *
+     * It is built in code rather than inflated because the number of chips is dynamic and each
+     * chip carries the page's own title. Tapping a chip brings the pager back to that slot AND
+     * restores the window, so the two states can never disagree.
+     */
+    private fun rebuildWindowHotseat() {
+        val row = binding.windowHotseat
+        row.removeAllViews()
+        if (minimizedWindows.isEmpty()) {
+            row.visibility = View.GONE
+            return
+        }
+        row.visibility = View.VISIBLE
+        val theme = com.prism.launcher.theme.PrismThemes.active()
+        val mode = if (com.prism.launcher.nora.IosUi.isDark(this)) theme.dark else theme.light
+        val palette = mode.palette
+        val density = resources.displayMetrics.density
+        fun dp(v: Float) = (v * density).toInt()
+
+        minimizedWindows.forEach { (slot, title) ->
+            val chip = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(12f), dp(8f), dp(12f), dp(8f))
+                background = GradientDrawable().apply {
+                    setColor(palette.card.toInt())
+                    cornerRadius = dp(10f).toFloat()
+                    setStroke(dp(1f), palette.divider.toInt())
+                }
+                isClickable = true
+                contentDescription = "Restore $title"
+                setOnClickListener {
+                    binding.desktopPager.setCurrentItem(slot, false)
+                    mainAdapter.restoreWindow(slot)
+                    binding.desktopPager.post { mainAdapter.restoreWindow(slot) }
+                    minimizedWindows.remove(slot)
+                    rebuildWindowHotseat()
+                }
+            }
+            chip.addView(View(this).apply {
+                background = GradientDrawable().apply {
+                    setColor(palette.accent.toInt())
+                    cornerRadius = dp(3f).toFloat()
+                }
+            }, LinearLayout.LayoutParams(dp(7f), dp(7f)))
+            chip.addView(TextView(this).apply {
+                text = title
+                textSize = 12f
+                setTextColor(palette.text.toInt())
+                setPadding(dp(8f), 0, dp(12f), 0)
+                maxLines = 1
+            })
+            chip.addView(TextView(this).apply {
+                text = "restore"
+                textSize = 10f
+                setTextColor(palette.accent.toInt())
+            })
+            row.addView(chip, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { rightMargin = dp(6f) })
+        }
+    }
+
+    /**
+     * A slot borrowed to show a page that had no slot of its own.
+     *
+     * The drawer lists every page the device has, not only the ones already placed, so tapping an
+     * unplaced one needs somewhere to put it. It takes a random slot, remembers what was there, and
+     * gives the slot back as soon as the user pages away -- see [openDrawerPage].
+     */
+    private var borrowedPageSlot: Int = -1
+    private var borrowedPageOriginal: SlotAssignment? = null
     
     // Page-picker gesture state. The trigger itself is either the built-in vertical overscroll
     // or the swipe the user captured on the tour / in Settings.
@@ -54,10 +143,73 @@ class LauncherActivity : PrismBaseActivity() {
     private var touchSlop = 0f
     private var velocityTracker: VelocityTracker? = null
     private var pagePickerTriggered = false
+    /** The current gesture's path, relative to where it began, and its pressure samples. */
+    private val pagePickerTrace = mutableListOf<PagePickerSwipe.TracePoint>()
+    private var pagePickerPressureSum = 0f
+    private var pagePickerPressureCount = 0
 
     // Shake-to-lock: locks the current desktop page against swiping/the page-switcher overlay.
     private lateinit var shakeDetector: ShakeDetector
     private var pageLocked = false
+
+    /** True while the page lock was engaged by an Echo Chamber run rather than by the user. */
+    private var echoPageLock = false
+
+    /** True while Lyke's full-screen Stremio player holds the page. */
+    private var lykePageLock = false
+
+    /** Whether the page was already locked by the user when the player took it. */
+    private var lykePreviousLock = false
+
+    /**
+     * Follows [com.prism.launcher.social.LykePlayerLock].
+     *
+     * The player turns the phone sideways and owns its own shake listener, so this does the part a
+     * view inside the pager cannot: stop the pager, raise the badge, and make sure the orientation
+     * goes back when the lock is released even if the player view has already been torn down.
+     */
+    private val lykePlayerLockListener: (Boolean) -> Unit = { active ->
+        if (!::binding.isInitialized) {
+            // The lock cannot outlive the activity, but the callback may arrive before onCreate
+            // has inflated the layout. Nothing to lock yet in that case.
+        } else if (active) {
+            lykePageLock = true
+            // PUT BACK WHAT WAS THERE. A user who had already locked the page did not ask for that
+            // lock to be released by shaking a video player, so the player borrows the lock rather
+            // than owning it.
+            lykePreviousLock = pageLocked
+            pageLocked = true
+            binding.desktopPager.isUserInputEnabled = false
+            binding.pageLockBadge.visibility = View.VISIBLE
+        } else if (lykePageLock) {
+            lykePageLock = false
+            pageLocked = lykePreviousLock
+            lykePreviousLock = false
+            binding.desktopPager.isUserInputEnabled = !pageLocked
+            binding.pageLockBadge.visibility = if (pageLocked) View.VISIBLE else View.GONE
+            requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_USER
+        }
+    }
+
+    /** Echo Chamber's session lock, held so the activity can stop listening when it is destroyed. */
+    private val echoSessionListener: (Boolean) -> Unit = { active ->
+        if (!::mainAdapter.isInitialized) {
+            // A session cannot outlive the activity that started it, but the callback can arrive
+            // before onCreate has built the pager. Nothing to lock yet in that case.
+        } else if (active) {
+            echoPageLock = true
+            pageLocked = true
+            binding.desktopPager.isUserInputEnabled = false
+            binding.pageLockBadge.visibility = View.VISIBLE
+        } else if (echoPageLock) {
+            // The run is over, so the page it was holding shut opens again. A lock the USER engaged
+            // before the match is left exactly where they put it.
+            echoPageLock = false
+            pageLocked = false
+            binding.desktopPager.isUserInputEnabled = true
+            binding.pageLockBadge.visibility = View.GONE
+        }
+    }
 
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
@@ -380,6 +532,10 @@ class LauncherActivity : PrismBaseActivity() {
         
         touchSlop = ViewConfiguration.get(this).scaledTouchSlop.toFloat()
         shakeDetector = ShakeDetector(this) { togglePageLock() }
+        com.prism.launcher.minigames.EchoSessionLock.addListener(echoSessionListener)
+        if (com.prism.launcher.minigames.EchoSessionLock.isActive()) echoSessionListener(true)
+        com.prism.launcher.social.LykePlayerLock.addListener(lykePlayerLockListener)
+        if (com.prism.launcher.social.LykePlayerLock.isActive()) lykePlayerLockListener(true)
 
         mainAdapter = MainDesktopPagerAdapter(
             activity = this,
@@ -401,7 +557,12 @@ class LauncherActivity : PrismBaseActivity() {
         )
         binding.desktopPager.adapter = mainAdapter
         binding.desktopPager.setCurrentItem(PrismSettings.getDefaultPage(), false)
-        binding.desktopPager.offscreenPageLimit = 2
+        // ONE NEIGHBOUR, NOT TWO. Each attached page is a full view tree with its own decoded
+        // images, adapter rows and -- for the browser -- a live WebView. Keeping four neighbours
+        // around meant five pages running at once, which is the single largest source of memory
+        // pressure and background CPU in this launcher. One either side is enough to make a swipe
+        // land on a real page, and the offloader releases the rest as before.
+        binding.desktopPager.offscreenPageLimit = 1
 
         binding.desktopPager.registerOnPageChangeCallback(object : ViewPager2.OnPageChangeCallback() {
             override fun onPageScrolled(position: Int, positionOffset: Float, positionOffsetPixels: Int) {
@@ -434,6 +595,12 @@ class LauncherActivity : PrismBaseActivity() {
             }
 
             override fun onPageSelected(position: Int) {
+                // Give a borrowed slot back as soon as the borrowed page is no longer the one on
+                // screen. Posted, because rebuilding the pager from inside its own page-change
+                // callback would notify it while it is still settling.
+                if (borrowedPageSlot >= 0 && position != borrowedPageSlot) {
+                    binding.desktopPager.post { restoreBorrowedPage() }
+                }
                 // The notifications page is a snapshot of a list that changes while the page is off
                 // screen, and ViewPager2 keeps neighbouring pages alive rather than rebuilding them.
                 // Without this the page shows whatever was true when it was first constructed, which
@@ -441,6 +608,12 @@ class LauncherActivity : PrismBaseActivity() {
                 (findPageViewAt(position) as? com.prism.launcher.notifications.NotificationsPageView)
                     ?.refresh()
                 publishDisplayPage(position)
+                mainAdapter.currentPosition = position
+                if (com.prism.launcher.offload.PageOffload.isEnabled()) {
+                    // Restore first: the slot being swiped toward must be real before it is visible.
+                    mainAdapter.restoreAround(position)
+                    mainAdapter.offloadInactive()
+                }
             }
         })
 
@@ -466,6 +639,11 @@ class LauncherActivity : PrismBaseActivity() {
                         tryConsumeEditorBack() -> Unit
                         tryConsumeMinigamesBack() -> Unit
                         tryConsumeCloudBack() -> Unit
+                        tryConsumeVideoCraftBack() -> Unit
+                        tryConsumeAudioCraftBack() -> Unit
+                        tryConsumeModelCraftBack() -> Unit
+                        tryConsumeDatasetCraftBack() -> Unit
+                        tryConsumeGameCraftBack() -> Unit
                         else -> {
                             // HOME, NOT AN ACTIVITY TO FINISH. Back used to fall through to
                             // AppCompatActivity, which finished and immediately relaunched the
@@ -549,7 +727,13 @@ class LauncherActivity : PrismBaseActivity() {
         // The windowed-pages switch lives in Settings, which means the way back is a resume.
         // Rebuilt only when the value actually changed; a rebuild every resume would recreate
         // every page (and reload its icons) for people who never touched the setting.
-        if (::mainAdapter.isInitialized) mainAdapter.refreshWindowMode()
+        if (::mainAdapter.isInitialized && mainAdapter.refreshWindowMode()) {
+            // Turning the mode off removes the only surface a minimised page could come back
+            // from, so the hotseat is cleared with it rather than leaving chips that restore
+            // windows into a launcher that no longer draws frames.
+            minimizedWindows.clear()
+            rebuildWindowHotseat()
+        }
 
         // Duress: the decoy replaces the launcher, and the launcher is what Home reaches. Checked
         // on every resume rather than once at startup, because the flag is set while the lock
@@ -620,6 +804,12 @@ class LauncherActivity : PrismBaseActivity() {
         shakeDetector.stop()
     }
 
+    override fun onDestroy() {
+        com.prism.launcher.minigames.EchoSessionLock.removeListener(echoSessionListener)
+        com.prism.launcher.social.LykePlayerLock.removeListener(lykePlayerLockListener)
+        super.onDestroy()
+    }
+
     /**
      * Leaving Prism with Lyke open floats it in a picture-in-picture window.
      *
@@ -649,6 +839,21 @@ class LauncherActivity : PrismBaseActivity() {
     }
 
     private fun togglePageLock() {
+        // A FULL-SCREEN PLAYER OWNS THE LOCK. The player view runs its own shake listener and is
+        // the only thing that knows how to leave full-screen; letting this one also toggle the lock
+        // would drop the badge while the video stayed sideways and locked.
+        if (com.prism.launcher.social.LykePlayerLock.isActive()) return
+
+        // AN ECHO RUN OWNS THE LOCK UNTIL IT ENDS. Shake cannot release it, and the badge stays up,
+        // because the same shake that usually unlocks a page would turn a live maze into a menu.
+        if (pageLocked && com.prism.launcher.minigames.EchoSessionLock.isActive()) {
+            Toast.makeText(
+                this,
+                "Echo Chamber is running. Finish the session to unlock this page.",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
         pageLocked = !pageLocked
         binding.desktopPager.isUserInputEnabled = !pageLocked
         binding.pageLockBadge.visibility = if (pageLocked) View.VISIBLE else View.GONE
@@ -815,6 +1020,68 @@ class LauncherActivity : PrismBaseActivity() {
             ?.onBackPressed() ?: false
     }
 
+    /**
+     * Back inside VideoCraft returns from the creator to the library before leaving the page.
+     *
+     * The creator is a layout inside the page, not an activity, so without this back jumped all the
+     * way to the desktop from a half-filled form -- and since the adapter recreates the page when
+     * the user returns, the prompt being written was gone. The standalone VideoCraftActivity has its
+     * own handler; this is for the page inside the launcher.
+     */
+    private fun tryConsumeVideoCraftBack(): Boolean {
+        val position = slotPreferences.getAssignments()
+            .indexOfFirst { it is SlotAssignment.VideoCraft }
+        if (position < 0) return false
+        if (binding.desktopPager.currentItem != position) return false
+        return (findPageViewAt(position) as? com.prism.launcher.videocraft.VideoCraftPageView)
+            ?.onBack() ?: false
+    }
+
+    /**
+     * Back inside AudioCraft leaves the player and returns to the audio library.
+     *
+     * The player is a layout in the page, not an activity, so without this back would jump to the
+     * desktop from a file the user was listening to -- and stop the playback on the way out, which
+     * is not what "go back one screen" means in an audiobook app.
+     */
+    private fun tryConsumeAudioCraftBack(): Boolean {
+        val position = slotPreferences.getAssignments()
+            .indexOfFirst { it is SlotAssignment.AudioCraft }
+        if (position < 0) return false
+        if (binding.desktopPager.currentItem != position) return false
+        return (findPageViewAt(position) as? com.prism.launcher.audiocraft.AudioCraftPageView)
+            ?.onBack() ?: false
+    }
+
+    /** Back inside ModelCraft leaves the creator and returns to the list of models. */
+    private fun tryConsumeModelCraftBack(): Boolean {
+        val position = slotPreferences.getAssignments()
+            .indexOfFirst { it is SlotAssignment.ModelCraft }
+        if (position < 0) return false
+        if (binding.desktopPager.currentItem != position) return false
+        return (findPageViewAt(position) as? com.prism.launcher.modelcraft.ModelCraftPageView)
+            ?.onBack() ?: false
+    }
+
+    /** Back inside DatasetCraft leaves the dataset and returns to the library. */
+    private fun tryConsumeDatasetCraftBack(): Boolean {
+        val position = slotPreferences.getAssignments()
+            .indexOfFirst { it is SlotAssignment.DatasetCraft }
+        if (position < 0) return false
+        if (binding.desktopPager.currentItem != position) return false
+        return (findPageViewAt(position) as? com.prism.launcher.datasetcraft.DatasetCraftPageView)
+            ?.onBack() ?: false
+    }
+
+    /** Back inside GameCraft leaves the maker and returns to the saved-game library. */
+    private fun tryConsumeGameCraftBack(): Boolean {
+        val position = slotPreferences.getAssignments().indexOfFirst { it is SlotAssignment.GameCraft }
+        if (position < 0) return false
+        if (binding.desktopPager.currentItem != position) return false
+        return (findPageViewAt(position) as? com.prism.launcher.gamecraft.GameCraftPageView)
+            ?.onBack() ?: false
+    }
+
     private fun tryConsumeMinigamesBack(): Boolean {
         val position = slotPreferences.getAssignments().indexOfFirst { it is SlotAssignment.Minigames }
         if (position < 0) return false
@@ -884,6 +1151,10 @@ class LauncherActivity : PrismBaseActivity() {
                 startTouchY = ev.rawY
                 startTouchLocalX = ev.x
                 pagePickerTriggered = false
+                pagePickerTrace.clear()
+                pagePickerTrace.add(PagePickerSwipe.TracePoint(0f, 0f))
+                pagePickerPressureSum = ev.pressure.coerceIn(0f, 1f)
+                pagePickerPressureCount = 1
                 velocityTracker?.clear()
                 velocityTracker = velocityTracker ?: VelocityTracker.obtain()
                 velocityTracker?.addMovement(ev)
@@ -893,9 +1164,19 @@ class LauncherActivity : PrismBaseActivity() {
                 velocityTracker?.addMovement(ev)
                 val dx = ev.rawX - startTouchX
                 val dy = ev.rawY - startTouchY
+                recordTracePoint(dx, dy, ev.pressure)
 
                 if (custom != null) {
+                    // A drawn shape is judged when the finger lifts, because its path is the
+                    // gesture. Matching only the first-to-last vector mid-drag would fire on the
+                    // opening arc of a circle before the shape existed.
+                    if (custom.path.size >= 3) {
+                        if (!custom.isEligibleStart(startTouchLocalX, binding.root.width, density)) return
+                        return
+                    }
+
                     if (!custom.matches(dx, dy, density, sensitivity)) return
+                    if (!custom.pressureAccepted(currentAveragePressure())) return
                     // Local, not raw: the edge test compares against the view's own width, and in
                     // split-screen or a freeform window raw coordinates start at a window offset,
                     // which would make every left edge look like the middle of the screen.
@@ -908,9 +1189,7 @@ class LauncherActivity : PrismBaseActivity() {
                         if (page?.canScrollVertically(scrollDirection) == true) return
                     }
 
-                    pagePickerTriggered = true
-                    window.decorView.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
-                    openPagePicker(binding.desktopPager.currentItem)
+                    triggerPagePicker()
                     return
                 }
 
@@ -925,17 +1204,71 @@ class LauncherActivity : PrismBaseActivity() {
                     val isAtEdge = currentPage?.canScrollVertically(direction) == false
 
                     if (isAtEdge && Math.abs(yVel) > 1500f * sensitivity) {
-                        pagePickerTriggered = true
-                        window.decorView.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
-                        openPagePicker(binding.desktopPager.currentItem)
+                        triggerPagePicker()
                     }
                 }
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (ev.actionMasked == MotionEvent.ACTION_UP && custom != null &&
+                    !pagePickerTriggered && custom.path.size >= 3
+                ) {
+                    val dx = ev.rawX - startTouchX
+                    val dy = ev.rawY - startTouchY
+                    recordTracePoint(dx, dy, ev.pressure)
+                    // A captured path is the user's own gesture, not a page swipe. Only an old
+                    // trigger with no path still has to prove the page cannot scroll: dragging a
+                    // path in a scrollable page is exactly how a diagonal or a loop is drawn.
+                    val scrollOk = if (custom.path.size < 3 &&
+                        custom.shape == PagePickerSwipe.Shape.STRAIGHT &&
+                        !custom.direction.isHorizontal
+                    ) {
+                        val scrollDirection = if (dy < 0) 1 else -1
+                        findPageViewAt(binding.desktopPager.currentItem)
+                            ?.canScrollVertically(scrollDirection) != true
+                    } else {
+                        true
+                    }
+                    if (scrollOk && custom.isEligibleStart(startTouchLocalX, binding.root.width, density) &&
+                        custom.matchesTrace(
+                            pagePickerTrace.toList(),
+                            currentAveragePressure(),
+                            density,
+                            sensitivity,
+                        )
+                    ) {
+                        triggerPagePicker()
+                    }
+                }
+                pagePickerTrace.clear()
+                pagePickerPressureSum = 0f
+                pagePickerPressureCount = 0
                 velocityTracker?.recycle()
                 velocityTracker = null
             }
         }
+    }
+
+    private fun recordTracePoint(dx: Float, dy: Float, pressure: Float) {
+        val last = pagePickerTrace.lastOrNull()
+        val minStep = 2f * resources.displayMetrics.density
+        if (last == null || Math.hypot((dx - last.x).toDouble(), (dy - last.y).toDouble()) > minStep) {
+            pagePickerTrace.add(PagePickerSwipe.TracePoint(dx, dy))
+        }
+        pagePickerPressureSum += pressure.coerceIn(0f, 1f)
+        pagePickerPressureCount++
+    }
+
+    /** Null when the sensor reported nothing, which [PagePickerSwipe.pressureAccepted] treats as no constraint. */
+    private fun currentAveragePressure(): Float? {
+        if (pagePickerPressureCount <= 0) return null
+        return pagePickerPressureSum / pagePickerPressureCount
+    }
+
+    private fun triggerPagePicker() {
+        if (pagePickerTriggered) return
+        pagePickerTriggered = true
+        window.decorView.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+        openPagePicker(binding.desktopPager.currentItem)
     }
 
     private fun launchComponent(cn: ComponentName) {
@@ -1291,6 +1624,16 @@ class LauncherActivity : PrismBaseActivity() {
             PagePickChoice.Mouse -> SlotAssignment.Mouse
             PagePickChoice.Photos -> SlotAssignment.Photos
             PagePickChoice.PhotoPix -> SlotAssignment.PhotoPix
+            PagePickChoice.VideoCraft -> SlotAssignment.VideoCraft
+            PagePickChoice.ImageCraft -> SlotAssignment.ImageCraft
+            PagePickChoice.AudioCraft -> SlotAssignment.AudioCraft
+            PagePickChoice.ModelCraft -> SlotAssignment.ModelCraft
+            PagePickChoice.DatasetCraft -> SlotAssignment.DatasetCraft
+            PagePickChoice.AssetCraft -> SlotAssignment.AssetCraft
+            PagePickChoice.EmailServer -> SlotAssignment.EmailServer
+            PagePickChoice.EmailClient -> SlotAssignment.EmailClient
+            PagePickChoice.AppStore -> SlotAssignment.AppStore
+            PagePickChoice.TaskManager -> SlotAssignment.TaskManager
             is PagePickChoice.PluginPage -> SlotAssignment.Custom(
                 choice.info.packageName,
                 choice.info.viewClassName,
@@ -1306,7 +1649,12 @@ class LauncherActivity : PrismBaseActivity() {
         val rv = binding.desktopPager.getChildAt(0) as? RecyclerView ?: return null
         val holder = rv.findViewHolderForAdapterPosition(adapterPosition) ?: return null
         if (holder !is MainDesktopPagerAdapter.PageHolder) return null
-        return holder.container.getChildAt(0)
+        val child = holder.container.getChildAt(0) ?: return null
+        // THE PAGE, NOT THE WINDOW AROUND IT. In windowed mode this container's child is the titled
+        // card the page was put inside, so every caller that casts the result to a page type got null
+        // -- which is how the VideoCraft creator's back step silently stopped working for anyone with
+        // windowed pages on.
+        return com.prism.launcher.offload.PageOffload.unwrapWindowFrame(child)
     }
 
     private fun isUnderLauncherAppTarget(rawX: Float, rawY: Float): Boolean {
@@ -1392,6 +1740,53 @@ class LauncherActivity : PrismBaseActivity() {
     /** Turns the pager to [position]. Public so a page can hand off to another page. */
     fun goToPage(position: Int) {
         if (position >= 0) binding.desktopPager.setCurrentItem(position, true)
+    }
+
+    /**
+     * Opens a page from the drawer.
+     *
+     * A page that is already on a slot is simply paged to. One that is not borrows a random slot
+     * for as long as the user stays on it, and the slot's previous page is put back when they page
+     * away. The borrow is deliberate rather than inserting a new slot: inserting would renumber
+     * every later page and shift the desktop grids stored against those numbers, so a tap in the
+     * drawer would quietly rearrange the user's home screens. See [SlotPreferences.addAt].
+     */
+    fun openDrawerPage(entry: PrismPageEntry, slotIndex: Int) {
+        restoreBorrowedPage()
+        val list = slotPreferences.getAssignments()
+
+        // Trust the live layout over the index the row was built with: a page can have been moved
+        // or removed between the drawer rendering and the tap.
+        val existing = list.indices.firstOrNull { list[it].serialize() == entry.key }
+            ?: slotIndex.takeIf { it in list.indices && list[it].serialize() == entry.key }
+        if (existing != null) {
+            binding.desktopPager.setCurrentItem(existing, true)
+            return
+        }
+        if (list.isEmpty()) return
+
+        val slot = list.indices.random()
+        borrowedPageSlot = slot
+        borrowedPageOriginal = list[slot]
+        slotPreferences.setAt(slot, entry.assignment)
+        mainAdapter.updateAssignments(slotPreferences.getAssignments())
+        binding.desktopPager.setCurrentItem(slot, false)
+        Toast.makeText(
+            this,
+            "${entry.label} · page ${slot + 1} until you page away",
+            Toast.LENGTH_SHORT,
+        ).show()
+    }
+
+    /** Puts back the page a borrowed slot held. Safe to call when nothing is borrowed. */
+    private fun restoreBorrowedPage() {
+        val slot = borrowedPageSlot
+        val original = borrowedPageOriginal ?: return
+        borrowedPageSlot = -1
+        borrowedPageOriginal = null
+        if (slot !in 0 until slotPreferences.getAssignments().size) return
+        slotPreferences.setAt(slot, original)
+        mainAdapter.updateAssignments(slotPreferences.getAssignments())
     }
 
     fun findModelsPosition(): Int =

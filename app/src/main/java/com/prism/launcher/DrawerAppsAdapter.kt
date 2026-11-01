@@ -5,6 +5,7 @@ import android.content.ComponentName
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.drawable.Drawable
+import android.graphics.drawable.GradientDrawable
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -15,6 +16,7 @@ import androidx.recyclerview.widget.RecyclerView
 import com.prism.launcher.databinding.ItemDrawerAppBinding
 import com.prism.launcher.databinding.ItemDrawerGroupBinding
 import com.prism.launcher.databinding.ItemDrawerNotificationBinding
+import com.prism.launcher.databinding.ItemDrawerPageBinding
 import com.prism.launcher.databinding.ItemDrawerWidgetBinding
 import com.prism.launcher.databinding.ItemDrawerSectionBinding
 import com.prism.launcher.databinding.ItemDrawerSearchResultBinding
@@ -33,6 +35,22 @@ data class DrawerAppEntry(
 sealed class DrawerItem {
     data class Group(val title: String, val apps: List<DrawerAppEntry>) : DrawerItem()
     data class App(val entry: DrawerAppEntry) : DrawerItem()
+
+    /**
+     * A Prism page the search matched -- either one already on a slot, or one this device can show.
+     *
+     * Pages are drawer content only when the search is running, which is why this is its own kind
+     * rather than a flag on [App]: an app is a package to launch, a page is a slot to page to.
+     *
+     * [slotIndex] is the slot the page currently occupies, or -1 when it is not placed anywhere.
+     * A placed page is one the user is actually using; an unplaced one is offered on the same list
+     * because "what pages does this device have" is a question worth answering in the same place.
+     */
+    data class Page(
+        val entry: PrismPageEntry,
+        val slotIndex: Int,
+        val configured: Boolean,
+    ) : DrawerItem()
 
     /** A heading between kinds of result, so a notification list below the apps is labelled. */
     data class Section(val title: String) : DrawerItem()
@@ -76,6 +94,7 @@ private object DrawerDiff : DiffUtil.ItemCallback<DrawerItem>() {
     override fun areItemsTheSame(old: DrawerItem, new: DrawerItem): Boolean {
         if (old is DrawerItem.Group && new is DrawerItem.Group) return old.title == new.title
         if (old is DrawerItem.App && new is DrawerItem.App) return old.entry.component == new.entry.component
+        if (old is DrawerItem.Page && new is DrawerItem.Page) return old.entry.key == new.entry.key
         if (old is DrawerItem.Section && new is DrawerItem.Section) return old.title == new.title
         if (old is DrawerItem.Widget && new is DrawerItem.Widget) return old.provider == new.provider
         if (old is DrawerItem.WebResult && new is DrawerItem.WebResult) {
@@ -103,6 +122,12 @@ class DrawerAppsAdapter(
     private val onShowMenu: ((DrawerAppEntry, View, () -> Boolean) -> Boolean)? = null,
     /** Opens a web result, through the desktop browser page when one is assigned. */
     private val onOpenWebResult: ((WebSearch.Result) -> Unit)? = null,
+    /**
+     * Pages to one of Prism's own pages. The second argument is the slot the page is placed on, or
+     * -1 for a page that is available but not on any slot -- the launcher decides what to do with
+     * an unplaced page, because only it knows the current arrangement.
+     */
+    private val onOpenPage: ((PrismPageEntry, Int) -> Unit)? = null,
 ) : ListAdapter<DrawerItem, RecyclerView.ViewHolder>(DrawerDiff) {
 
     companion object {
@@ -112,6 +137,7 @@ class DrawerAppsAdapter(
         const val VIEW_TYPE_NOTIFICATION = 4
         const val VIEW_TYPE_WIDGET = 5
         const val VIEW_TYPE_WEB_RESULT = 6
+        const val VIEW_TYPE_PAGE = 7
     }
 
     override fun getItemViewType(position: Int): Int {
@@ -122,6 +148,7 @@ class DrawerAppsAdapter(
             is DrawerItem.Notification -> VIEW_TYPE_NOTIFICATION
             is DrawerItem.Widget -> VIEW_TYPE_WIDGET
             is DrawerItem.WebResult -> VIEW_TYPE_WEB_RESULT
+            is DrawerItem.Page -> VIEW_TYPE_PAGE
         }
     }
 
@@ -137,6 +164,8 @@ class DrawerAppsAdapter(
                 WidgetVH(ItemDrawerWidgetBinding.inflate(inflater, parent, false))
             VIEW_TYPE_WEB_RESULT ->
                 WebResultVH(ItemDrawerSearchResultBinding.inflate(inflater, parent, false))
+            VIEW_TYPE_PAGE ->
+                PageVH(ItemDrawerPageBinding.inflate(inflater, parent, false))
             else -> AppVH(ItemDrawerAppBinding.inflate(inflater, parent, false))
         }
     }
@@ -157,6 +186,10 @@ class DrawerAppsAdapter(
         }
         if (holder is WebResultVH && item is DrawerItem.WebResult) {
             bindWebResult(holder, item.result)
+            return
+        }
+        if (holder is PageVH && item is DrawerItem.Page) {
+            bindPage(holder, item)
             return
         }
         if (holder is AppVH && item is DrawerItem.App) {
@@ -251,6 +284,45 @@ class DrawerAppsAdapter(
                 intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
                 context.startActivity(intent)
             }
+        }
+    }
+
+    /**
+     * A page row.
+     *
+     * The icon is the page's own -- pages carry one so that a slot and its drawer entry cannot
+     * disagree about what a page looks like. The badge says where it lives, which is the piece of
+     * information an app row never has: two pages can be the same page type on different slots.
+     */
+    private fun bindPage(holder: PageVH, item: DrawerItem.Page) {
+        val context = holder.itemView.context
+        val tint = item.entry.tint
+        holder.binding.pageLabel.text = item.entry.label
+        holder.binding.pageGlyph.text = item.entry.glyph
+        holder.binding.pageGlyph.alpha = if (item.configured) 1f else 0.55f
+
+        // Tinted rather than solid, so the glyph reads against its own page colour and a theme's
+        // icon-pack-free drawer still has recognisable marks.
+        holder.binding.pageIconWrapper.background = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = 18f * context.resources.displayMetrics.density
+            setColor((tint and 0x00FFFFFF) or if (item.configured) 0x4D000000 else 0x26000000)
+        }
+
+        if (item.slotIndex >= 0) {
+            holder.binding.pageSlotBadge.text = "${item.slotIndex + 1}"
+            holder.binding.pageSlotBadge.visibility = View.VISIBLE
+            holder.binding.pageSlotBadge.background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(tint)
+            }
+        } else {
+            // An unplaced page keeps its mark but not a slot number: a number would claim a place
+            // in the pager that does not exist.
+            holder.binding.pageSlotBadge.visibility = View.GONE
+        }
+        holder.itemView.setOnClickListener {
+            onOpenPage?.invoke(item.entry, item.slotIndex)
         }
     }
 
@@ -365,6 +437,8 @@ class DrawerAppsAdapter(
 
     class WebResultVH(val binding: ItemDrawerSearchResultBinding) :
         RecyclerView.ViewHolder(binding.root)
+
+    class PageVH(val binding: ItemDrawerPageBinding) : RecyclerView.ViewHolder(binding.root)
 
     class InnerGroupAdapter(
         private val onLaunch: (ComponentName) -> Unit,

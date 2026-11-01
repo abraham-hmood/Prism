@@ -70,8 +70,26 @@ object PocketTtsEngine : CloneEngine, CloneEngine.ReferenceSpeechEngine {
 
     private const val TAG = "PrismSpeech"
 
-    private const val TEMPERATURE = 0.7f
-    private const val LSD_STEPS = 1
+    /**
+     * Sampling temperature for the flow latent.
+     *
+     * 0.7 produced the liveliest prosody but measurably duller consonants: the archive probe's
+     * 2-4 kHz band sat about 4 dB lower than the same sentence at 0.3, and that band is most of
+     * what makes a voice sound close rather than muffled. 0.3 keeps some variation while giving
+     * the intelligibility band back.
+     */
+    private const val TEMPERATURE = 0.3f
+    /**
+     * Euler sub-steps per generated frame.
+     *
+     * The reference wrapper ships with ONE step, which is only enough to leave the latent close
+     * to the noise it started from: the vocoder then renders a muffled, nasal voice that reads
+     * as a cheap microphone. Each step is one tiny flow-net run, so a handful of steps is still
+     * far cheaper than the flow-LM run that produced the conditioning, and it is the single
+     * largest quality knob in this engine. Four steps is the point where extra steps stop
+     * changing the spectrum measurably; [stepsForTest] exists so a probe can compare.
+     */
+    private const val LSD_STEPS = 4
     private const val EOS_THRESHOLD = -4.0f
     private const val TOKENS_PER_SECOND_ESTIMATE = 3.0f
     private const val GEN_SECONDS_PADDING = 2.0f
@@ -82,6 +100,17 @@ object PocketTtsEngine : CloneEngine, CloneEngine.ReferenceSpeechEngine {
     /** Parity-harness hook: a value >= 0 overrides [TEMPERATURE] for the next generation. */
     @Volatile
     var temperatureForTest: Float = -1f
+
+    /** Parity/quality-harness hook: a value >= 1 overrides [LSD_STEPS] for the next generation. */
+    @Volatile
+    var stepsForTest: Int = -1
+
+    /**
+     * Whether [VoicePolish] conditions the reference and masters the result. Off only for the
+     * model-parity harness, whose golden audio was produced by the raw wrapper.
+     */
+    @Volatile
+    var polishForTest: Boolean = true
 
     private const val LATENT_DIM = 32
     private const val CONDITIONING_DIM = 1_024
@@ -510,7 +539,12 @@ object PocketTtsEngine : CloneEngine, CloneEngine.ReferenceSpeechEngine {
         val overall = System.nanoTime()
         val scrap = Scrap()
         try {
-            val voice = preparedFor(voiceId, reference)
+            val conditioned = if (polishForTest) {
+                VoicePolish.conditionReference(reference, WORK_RATE)
+            } else {
+                reference
+            }
+            val voice = preparedFor(voiceId, conditioned)
             val tokenizer = tokenizer()
             val audio = ArrayList<FloatArray>()
             var framesTotal = 0
@@ -548,8 +582,9 @@ object PocketTtsEngine : CloneEngine, CloneEngine.ReferenceSpeechEngine {
                     "Pocket TTS produced no audio for that text -- try a fuller sentence",
                 )
             }
+            val finished = if (polishForTest) VoicePolish.master(flat, SAMPLE_RATE) else flat
             logTiming("spoke $framesTotal frames in %.2fs".format((System.nanoTime() - overall) / 1e9))
-            return CloneEngine.Converted(flat, SAMPLE_RATE)
+            return CloneEngine.Converted(finished, SAMPLE_RATE)
         } finally {
             runCatching { scrap.close() }
         }
@@ -627,9 +662,10 @@ object PocketTtsEngine : CloneEngine, CloneEngine.ReferenceSpeechEngine {
                 for (i in x.indices) x[i] = (rng.nextGaussian() * noiseScale).toFloat()
             }
 
-            val dt = 1f / LSD_STEPS
-            var s = 0f
-            repeat(LSD_STEPS) {
+        val steps = if (stepsForTest >= 1) stepsForTest else LSD_STEPS
+        val dt = 1f / steps
+        var s = 0f
+        repeat(steps) {
                 val t = s + dt
                 val velocity = flow.run(mapOf(
                     "c" to floatT(conditioning, longArrayOf(1, CONDITIONING_DIM.toLong())),

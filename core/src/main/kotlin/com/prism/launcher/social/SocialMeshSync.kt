@@ -280,12 +280,23 @@ object SocialMeshSync {
      */
     fun startAnnouncing(intervalSeconds: Long = 90) {
         Thread({
+            // A FAILED OR OFF-MESH ANNOUNCEMENT MUST NOT SPIN. `dirty` stays true when this
+            // device is not on a meshnet, because the next post still needs announcing once one
+            // exists; the old loop read that as "announce again in five seconds" and woke the
+            // radio every five seconds for the life of the process. Fast retries are only for a
+            // successful path that has new content waiting.
+            var retryAt = 0L
             while (true) {
                 runCatching {
-                    // Sooner when dirty: publishing a post and waiting ninety seconds for anybody to
-                    // hear about it makes the feature feel broken even though it works.
-                    java.util.concurrent.TimeUnit.SECONDS.sleep(if (dirty) 5 else intervalSeconds)
+                    val prompt = dirty && MeshMembership.isOnMeshnet() &&
+                        System.currentTimeMillis() >= retryAt
+                    // Sooner when dirty: publishing a post and waiting ninety seconds for anybody
+                    // to hear about it makes the feature feel broken even though it works.
+                    java.util.concurrent.TimeUnit.SECONDS.sleep(if (prompt) 5 else intervalSeconds)
                     announce()
+                    retryAt = if (lastStatus.startsWith("announce failed")) {
+                        System.currentTimeMillis() + intervalSeconds * 1000L
+                    } else 0L
                 }
             }
         }, "social-mesh-announce").apply { isDaemon = true }.start()

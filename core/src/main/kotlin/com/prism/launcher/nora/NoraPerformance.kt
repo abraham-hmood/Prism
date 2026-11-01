@@ -1,6 +1,7 @@
 package com.prism.launcher.nora
 
 import com.prism.core.PrismPlatform
+import com.prism.launcher.PrismSettings
 
 /**
  * The performance switches: where Nora's memory lives and what runs her arithmetic.
@@ -62,8 +63,19 @@ object NoraPerformance {
     /** Put large structures in direct byte buffers -- off the managed heap, still in RAM. */
     var offHeap = false
 
-    /** Put large structures in a memory-mapped file. Overrides [offHeap] when both are on. */
-    var swapEnabled = false
+    /**
+     * Put large structures in a memory-mapped file. Overrides [offHeap] when both are on.
+     *
+     * THIS READS AND WRITES PRISM SWAP, not a Nora-private switch. Sam, Nora, Aether, VideoCraft
+     * and the page offloader share one file now (see `PrismSwap`), so a second, Nora-only toggle
+     * would either lie (the file is already open regardless) or fragment a single setting into
+     * two switches that disagree. The row stays on Nora's tuning screen because that is where a
+     * user looks for it while looking at Nora's memory; it is the same switch as Developer
+     * options → Prism Swap.
+     */
+    var swapEnabled: Boolean
+        get() = PrismSettings.getPrismSwapEnabled()
+        set(value) { PrismSettings.setPrismSwapEnabled(value) }
 
     /**
      * Use the NEON/SIMD kernels for the 5x5 predictive-coding convolutions.
@@ -101,8 +113,10 @@ object NoraPerformance {
     /** Below this many rows, gather serially -- the pool handoff costs more than it saves. */
     var hubParallelFloor = 512
 
-    /** Bytes the swap file may occupy. Set by the slider, bounded by free storage. */
-    var swapBytes = 256L shl 20
+    /** Bytes the shared swap file may occupy. Same setting as Developer options → Prism Swap. */
+    var swapBytes: Long
+        get() = PrismSettings.getPrismSwapBytes()
+        set(value) { PrismSettings.setPrismSwapBytes(value) }
 
     /**
      * Structures smaller than this stay in RAM even when swap is on.
@@ -250,7 +264,9 @@ object NoraPerformance {
             if (!p.contains(param.key)) continue
             param.write(p.getFloat(param.key, param.read()).coerceIn(param.min, param.max))
         }
-        swapBytes = p.getLong(KEY_SWAP_BYTES, swapBytes).coerceAtLeast(NoraSwap.MIN_BYTES)
+        // The old nora_performance/swap_bytes key is deliberately not read any more: capacity is
+        // Prism Swap's setting now, and honouring a stale Nora-only number here would silently
+        // override what Developer options shows.
         Par.configure(workerThreads)
     }
 
@@ -258,7 +274,6 @@ object NoraPerformance {
         val p = PrismPlatform.host.prefs(PREFS)
         for (flag in FLAGS) p.putBoolean(flag.key, flag.read())
         for (param in PARAMS) p.putFloat(param.key, param.read())
-        p.putLong(KEY_SWAP_BYTES, swapBytes)
         p.flush()
         Par.configure(workerThreads)
     }
@@ -267,7 +282,6 @@ object NoraPerformance {
         PrismPlatform.host.prefs(PREFS).clear()
         for ((i, flag) in FLAGS.withIndex()) flag.write(FLAG_DEFAULTS[i])
         for ((i, param) in PARAMS.withIndex()) param.write(PARAM_DEFAULTS[i])
-        swapBytes = DEFAULT_SWAP_BYTES
         Par.configure(workerThreads)
         NoraLog.info(NoraLog.Area.MEMORY, "Performance settings reset to defaults")
     }

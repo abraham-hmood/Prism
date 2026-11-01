@@ -50,7 +50,7 @@ class SocialSearchPanel(context: Context) : LinearLayout(context) {
      * Asked to play add-on content. Carries the headers the source needs, which some add-ons
      * require and without which the stream is a 403 that looks like a dead link.
      */
-    var onOpenStremio: ((StremioStore.Meta, String, Map<String, String>, String) -> Unit)? = null
+    var onOpenStremio: ((StremioStore.Meta, StremioStore.Stream, String) -> Unit)? = null
 
     var onDismiss: (() -> Unit)? = null
 
@@ -421,7 +421,7 @@ class SocialSearchPanel(context: Context) : LinearLayout(context) {
         }
 
         val labels = streams.map { stream ->
-            val reason = stream.unplayableReason
+            val reason = stream.unplayableReason ?: stream.sourceNote
             buildString {
                 append(stream.label)
                 append("\n").append(stream.addonName)
@@ -443,7 +443,7 @@ class SocialSearchPanel(context: Context) : LinearLayout(context) {
     private fun play(meta: StremioStore.Meta, stream: StremioStore.Stream, title: String) {
         close()
         // The named item, not the catalogue entry -- an episode's comments belong to that episode.
-        onOpenStremio?.invoke(meta.copy(name = title), stream.url, stream.headers, stream.addonName)
+        onOpenStremio?.invoke(meta.copy(name = title), stream, stream.addonName)
     }
 
     // ── Pieces ─────────────────────────────────────────────────────────────

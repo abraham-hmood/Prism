@@ -13,7 +13,17 @@ data class ThreadInfo(
     val threadId: Long,
     val address: String,
     val snippet: String,
-    val timestamp: Long = 0L
+    val timestamp: Long = 0L,
+    /**
+     * Every thread id this row stands for.
+     *
+     * One for an ordinary conversation; several when a group text arrived as more than one thread
+     * on this phone. Opening the row has to read all of them or the group loses the half that was
+     * split off, which is the same bug wearing a different hat.
+     */
+    val threadIds: List<Long> = listOf(threadId),
+    /** Whether the row is a group, for the label the list shows under the names. */
+    val group: Boolean = false,
 )
 
 private object ThreadInfoDiff : DiffUtil.ItemCallback<ThreadInfo>() {

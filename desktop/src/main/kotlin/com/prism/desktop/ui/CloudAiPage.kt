@@ -50,7 +50,20 @@ fun CloudAiPage() {
     val colors = LocalPrismColors.current
 
     var models by remember { mutableStateOf(PrismSettings.getCloudModels()) }
-    var activeId by remember { mutableStateOf(PrismSettings.getActiveCloudModelId()) }
+    // One active profile per kind; the page marks every row whose profile is active for its own.
+    var activeIds by remember {
+        mutableStateOf(
+            PrismSettings.CLOUD_KINDS
+                .mapNotNull { PrismSettings.getActiveCloudModelId(it) }
+                .toSet()
+        )
+    }
+
+    fun reloadActive() {
+        activeIds = PrismSettings.CLOUD_KINDS
+            .mapNotNull { PrismSettings.getActiveCloudModelId(it) }
+            .toSet()
+    }
     var servers by remember { mutableStateOf<List<OllamaDiscoveryService.OllamaServer>>(emptyList()) }
     var scanning by remember { mutableStateOf(false) }
     var adding by remember { mutableStateOf(false) }
@@ -76,18 +89,23 @@ fun CloudAiPage() {
                 models.forEachIndexed { i, model ->
                     if (i > 0) Hairline()
                     ModelRow(
-                        name = model.id,
-                        detail = "${model.baseUrl}  ·  ${model.modelId}",
-                        active = model.id == activeId,
+                        name = model.modelId,
+                        detail = "${PrismSettings.cloudKindLabel(model.resolvedKind)}  ·  " +
+                            "${model.baseUrl}",
+                        active = model.id in activeIds,
                         onSelect = {
-                            PrismSettings.setActiveCloudModelId(model.id)
-                            activeId = model.id
-                            target = Target.Cloud(model.id)
+                            PrismSettings.setActiveCloudModelId(model.resolvedKind, model.id)
+                            reloadActive()
+                            // Selecting an image or music endpoint is not an invitation to chat
+                            // with it; only a text profile becomes the chat target.
+                            if (model.resolvedKind == PrismSettings.KIND_TEXT) {
+                                target = Target.Cloud(model.id)
+                            }
                         },
                         onRemove = {
                             PrismSettings.removeCloudModel(model.id)
                             models = PrismSettings.getCloudModels()
-                            activeId = PrismSettings.getActiveCloudModelId()
+                            reloadActive()
                         },
                     )
                 }
@@ -208,7 +226,8 @@ fun CloudAiPage() {
                                             is Target.Ollama ->
                                                 CloudAiService.fetchOllamaChatStreaming(
                                                     t.ip, t.port, t.model, prompt,
-                                                ) { token -> reply += token }
+                                                    onToken = { token -> reply += token },
+                                                )
                                         }
                                     } catch (e: Exception) {
                                         reply = "Failed: ${e.message}"
@@ -239,14 +258,18 @@ fun CloudAiPage() {
     if (adding) {
         AddCloudModelDialog(
             onDismiss = { adding = false },
-            onAdd = { id, baseUrl, apiKey, modelId ->
+            onAdd = { id, baseUrl, apiKey, modelId, kind ->
                 PrismSettings.addCloudModel(
                     PrismSettings.CloudModelProfile(
                         id = id, apiKey = apiKey, baseUrl = baseUrl, modelId = modelId,
+                        kind = kind,
                     )
                 )
+                if (PrismSettings.getActiveCloudModelId(kind) == null) {
+                    PrismSettings.setActiveCloudModelId(kind, id)
+                }
                 models = PrismSettings.getCloudModels()
-                activeId = PrismSettings.getActiveCloudModelId()
+                reloadActive()
                 adding = false
             },
         )
@@ -298,25 +321,45 @@ private fun ModelRow(
 @Composable
 private fun AddCloudModelDialog(
     onDismiss: () -> Unit,
-    onAdd: (id: String, baseUrl: String, apiKey: String, modelId: String) -> Unit,
+    onAdd: (id: String, baseUrl: String, apiKey: String, modelId: String, kind: String) -> Unit,
 ) {
     var name by remember { mutableStateOf("") }
     var baseUrl by remember { mutableStateOf("https://api.openai.com/v1/") }
     var apiKey by remember { mutableStateOf("") }
     var model by remember { mutableStateOf("gpt-4o-mini") }
+    var kind by remember { mutableStateOf(PrismSettings.KIND_TEXT) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = {
             TextButton(
                 enabled = name.isNotBlank() && baseUrl.isNotBlank() && model.isNotBlank(),
-                onClick = { onAdd(name.trim(), baseUrl.trim(), apiKey.trim(), model.trim()) },
+                onClick = { onAdd(name.trim(), baseUrl.trim(), apiKey.trim(), model.trim(), kind) },
             ) { Text("Add") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
         title = { Text("Add a cloud model") },
         text = {
             Column(Modifier.width(420.dp)) {
+                // FIRST, because it decides what Prism will send this endpoint. A saved profile
+                // is exactly one kind -- the same server can be saved four times, once per role.
+                Text(
+                    "What this model produces",
+                    fontSize = 10.sp, letterSpacing = 1.0.sp, color = Color(0xFF6C6C78),
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    PrismSettings.CLOUD_KINDS.forEach { option ->
+                        Row(
+                            Modifier.clickableRow { kind = option }
+                                .padding(end = 10.dp, top = 2.dp, bottom = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            RadioButton(selected = kind == option, onClick = { kind = option })
+                            Text(PrismSettings.cloudKindLabel(option), fontSize = 12.sp)
+                        }
+                    }
+                }
                 LabelledField("Label", name) { name = it }
                 LabelledField("Base URL", baseUrl) { baseUrl = it }
                 LabelledField("API key", apiKey) { apiKey = it }

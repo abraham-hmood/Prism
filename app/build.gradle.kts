@@ -1,3 +1,14 @@
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import java.net.URI
+import java.net.URLEncoder
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.nio.charset.StandardCharsets
+import java.time.Duration
+import java.util.concurrent.TimeUnit
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -54,11 +65,30 @@ android {
              * selection is a build property instead. For distribution, `bundleRelease` produces an
              * App Bundle, which splits per ABI on Google's side without either mechanism.
              */
+            // ARM64 BY DEFAULT, WHICH IS A REVERSAL, AND THE MEASUREMENT IS WHY. The universal
+            // debug APK measured 610 MB and installed at roughly 700 MB on disk (jniLibs are
+            // extracted, so the installed figure is larger than the download). The same build for
+            // arm64-v8a alone measures 240 MB -- two thirds smaller -- and every phone that runs
+            // Prism is arm64. The other three ABIs were 370 MB of payload for hardware nobody
+            // installs this on.
+            //
+            //     ./gradlew assembleDebug                     -> arm64-v8a, 240 MB
+            //     ./gradlew assembleDebug -Pprism.abi=all     -> all four, ~610 MB
+            //     ./gradlew assembleDebug -Pprism.abi=x86_64  -> an emulator build
+            //
+            // The property is kept rather than hard-coding the filter because an x86_64 emulator
+            // still needs its own natives to run at all, and `all` is the honest way to get a
+            // universal artifact for a store upload.
             val requested = providers.gradleProperty("prism.abi").orNull
             val all = listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
+            val default = if (all.isEmpty()) all else listOf("arm64-v8a")
             abiFilters.addAll(
-                if (requested.isNullOrBlank()) all
-                else requested.split(",").map { it.trim() }.filter { it in all }.ifEmpty { all }
+                when {
+                    requested.isNullOrBlank() -> default
+                    requested.trim() == "all" -> all
+                    else -> requested.split(",").map { it.trim() }.filter { it in all }
+                        .ifEmpty { default }
+                }
             )
         }
     }
@@ -119,6 +149,21 @@ android {
         }
     }
 
+    defaultConfig {
+        externalNativeBuild {
+            cmake {
+                // Vulkan is off by default: this ggml revision needs Vulkan 1.2 buffer device
+                // address and a 1.1 driver crashes the process instead of declining. See the block
+                // in src/main/cpp/CMakeLists.txt and the note in src/main/cpp/vulkan.cmake.
+                arguments += if (providers.gradleProperty("prism.vulkan").orNull == "true") {
+                    "-DPRISM_VULKAN_BACKEND=ON"
+                } else {
+                    "-DPRISM_VULKAN_BACKEND=OFF"
+                }
+            }
+        }
+    }
+
     buildTypes {
         release {
             /**
@@ -164,6 +209,26 @@ android {
         // rather than dlopen()'d as a JNI library.
         jniLibs {
             useLegacyPackaging = true
+
+            /**
+             * THE OPENCL LOADER IS THE DEVICE'S, NOT OURS.
+             *
+             * ggml-opencl links `libOpenCL.so` and, on a phone, that name has a working
+             * implementation already: the GPU vendor's driver, listed in
+             * `/vendor/etc/public.libraries.txt` precisely so apps may bind to it (MEASURED on the
+             * S22: Adreno 730, OpenCL 3.0). Prism's native build also creates a `libOpenCL.so` --
+             * the Khronos ICD loader it compiles from source -- and packaging that copy SHADOWS the
+             * vendor driver inside the app's own linker namespace. The ICD loader looks for `.icd`
+             * vendor files under `/vendor/etc/OpenCL/vendors`, which do not exist on this or most
+             * Android builds, so it reports zero platforms; ggml's OpenCL backend then scores itself out
+             * and every GPU backend disappears from the process (MEASURED: `clGetPlatformIDs` ->
+             * -1001, no device; with the vendor lib, one platform and one Adreno device).
+             *
+             * Excluding it here leaves the DT_NEEDED entry (`libOpenCL.so`) resolving to the
+             * vendor driver. The stub still exists in the build tree -- it is what ggml-opencl was
+             * linked against -- but nothing loads it at runtime.
+             */
+            excludes += "**/libOpenCL.so"
 
             /**
              * QEMU's debug symbols, off by default.
@@ -261,6 +326,12 @@ dependencies {
     // MediaPipe Vision & GenAI — for Local LLM and Diffusion
     implementation("com.google.mediapipe:tasks-genai:0.10.33")
     implementation("com.google.mediapipe:tasks-vision-image-generator:0.10.20")
+
+    // ARCore — GeoTag's planes and anchors. This is the SDK that actually understands a wall, a
+    // floor and a ceiling: without it the old GeoTag camera overlay could only pin artwork to a
+    // screen coordinate. The Play Services for AR runtime is installed on demand and stays
+    // optional, so Prism still installs on a device that cannot run it.
+    implementation("com.google.ar:core:1.57.0")
 
     // WireGuard Tunnel JNI wrapper
     implementation("com.wireguard.android:tunnel:1.0.20260102")
@@ -414,3 +485,339 @@ tasks.matching { it.name.matches(Regex("generate(Debug|Release)PythonRequirement
     }
 }
 
+// ---------------------------------------------------------------------------
+// GitHub release
+// ---------------------------------------------------------------------------
+
+/**
+ * Version used for the release tag and the APK file name. The APK's own versionName is the source
+ * of truth; desktop installers carry the packageVersion declared in desktop/build.gradle.kts.
+ */
+val prismReleaseVersion: String = android.defaultConfig.versionName ?: "0.0.0"
+val prismReleaseTag = "v$prismReleaseVersion"
+
+fun prismHostOs(): String = System.getProperty("os.name").lowercase()
+
+val githubRelease by tasks.registering {
+    group = "publishing"
+    description =
+        "Builds the release APK and the desktop packages this OS can produce, then publishes " +
+            "them as GitHub release $prismReleaseTag. Needs GITHUB_TOKEN (Contents: write) or a " +
+            "git credential helper; Windows MSI/EXE also need WiX Toolset 3.x."
+
+    dependsOn("assembleRelease")
+    dependsOn(":desktop:packageReleaseUberJarForCurrentOS")
+
+    // Only the formats the host can actually build. jpackage cannot cross-build: asking for an
+    // MSI on Linux, or a deb on Windows, fails before anything is published.
+    //
+    // packageReleaseDistributionForCurrentOS is deliberately NOT used. It expands to every
+    // targetFormat declared in desktop/build.gradle.kts -- on Windows its graph contains deb, rpm
+    // and AppImage as well as exe/msi -- so it asks jpackage for foreign installers and fails. The
+    // explicit tasks below produce the same host-native files without dragging the others in.
+    when {
+        prismHostOs().contains("win") -> dependsOn(
+            ":desktop:packageReleaseExe",
+            ":desktop:packageReleaseMsi",
+        )
+        prismHostOs().contains("linux") -> dependsOn(
+            ":desktop:packageReleaseAppImage",
+            ":desktop:packageReleaseDeb",
+            ":desktop:packageReleaseRpm",
+        )
+        // macOS has no dmg/pkg in targetFormats, so the uber jar is its desktop artifact.
+    }
+
+    doLast {
+        publishGithubRelease(
+            project = project,
+            version = prismReleaseVersion,
+            tag = prismReleaseTag,
+            dryRun = project.providers.gradleProperty("prism.release.dryRun")
+                .map { it.toBoolean() }
+                .getOrElse(false),
+        )
+    }
+}
+
+/**
+ * Stages the release artifacts and publishes them.
+ *
+ * WHY THE RELEASE IS CREATED BEFORE THE UPLOADS AND REUSED IF IT EXISTS. A release with a tag that
+ * already exists is a normal state (rebuilding the same version), and GitHub refuses to create a
+ * second one. Existing assets with the same names are deleted first, so a rerun replaces the
+ * binaries rather than failing on a 422.
+ *
+ * THE TOKEN IS NEVER LOGGED. It can come from GITHUB_TOKEN, GH_TOKEN, -Pgithub.token, or the git
+ * credential helper that already authenticated the push; the last one is what makes this work on a
+ * developer machine with no extra setup.
+ */
+fun publishGithubRelease(project: Project, version: String, tag: String, dryRun: Boolean) {
+    val logger = project.logger
+
+    fun runCommand(vararg command: String): String {
+        val process = ProcessBuilder(*command)
+            .directory(project.rootDir)
+            .redirectErrorStream(true)
+            .start()
+        val finished = process.waitFor(30, TimeUnit.SECONDS)
+        val output = process.inputStream.bufferedReader().readText()
+        if (!finished) {
+            process.destroyForcibly()
+            throw GradleException("${command.joinToString(" ")} timed out")
+        }
+        if (process.exitValue() != 0) {
+            throw GradleException(
+                "${command.joinToString(" ")} failed (${process.exitValue()}): ${output.take(600)}"
+            )
+        }
+        return output
+    }
+
+    fun githubToken(): String {
+        val environment = System.getenv()
+        environment["GITHUB_TOKEN"]?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+        environment["GH_TOKEN"]?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+        (project.findProperty("github.token") as? String)?.trim()?.takeIf { it.isNotEmpty() }
+            ?.let { return it }
+
+        val process = ProcessBuilder("git", "credential", "fill")
+            .directory(project.rootDir)
+            .redirectErrorStream(true)
+            .apply {
+                environment()["GIT_TERMINAL_PROMPT"] = "0"
+                environment()["GCM_INTERACTIVE"] = "never"
+            }
+            .start()
+        process.outputStream.bufferedWriter().use {
+            it.write("protocol=https\nhost=github.com\n\n")
+        }
+        val finished = process.waitFor(30, TimeUnit.SECONDS)
+        val output = process.inputStream.bufferedReader().readText()
+        if (!finished) {
+            process.destroyForcibly()
+            throw GradleException("git credential fill timed out")
+        }
+        return output.lineSequence()
+            .firstOrNull { it.startsWith("password=") }
+            ?.substringAfter("password=")
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?: throw GradleException(
+                "No GitHub token. Set GITHUB_TOKEN (or GH_TOKEN) to a token with Contents: write, " +
+                    "or sign git in so its credential helper can supply one."
+            )
+    }
+
+    val token = githubToken()
+
+    val http: HttpClient = HttpClient.newBuilder()
+        .connectTimeout(Duration.ofSeconds(30))
+        .followRedirects(HttpClient.Redirect.NORMAL)
+        .build()
+
+    fun api(method: String, url: String, body: String? = null): HttpResponse<String> {
+        val builder = HttpRequest.newBuilder(URI.create(url))
+            .header("Authorization", "Bearer $token")
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .timeout(Duration.ofSeconds(60))
+        if (body == null) {
+            builder.method(method, HttpRequest.BodyPublishers.noBody())
+        } else {
+            builder.header("Content-Type", "application/json")
+            builder.method(method, HttpRequest.BodyPublishers.ofString(body))
+        }
+        return http.send(builder.build(), HttpResponse.BodyHandlers.ofString())
+    }
+
+    // Origin may still be the pre-rename URL (GitHub redirects it). Ask the API for the canonical
+    // full_name rather than guessing, because uploads.github.com does not follow that redirect.
+    val remote = runCommand("git", "remote", "get-url", "origin").trim()
+    val slugMatch = Regex("""github\.com[:/]([^/]+)/(.+?)(?:\.git)?$""").find(remote)
+        ?: throw GradleException("origin is not a GitHub remote: $remote")
+    val slug = "${slugMatch.groupValues[1]}/${slugMatch.groupValues[2]}"
+    val repositoryResponse = api("GET", "https://api.github.com/repos/$slug")
+    if (repositoryResponse.statusCode() !in 200..299) {
+        throw GradleException(
+            "Cannot read $slug (${repositoryResponse.statusCode()}): " +
+                repositoryResponse.body().take(400)
+        )
+    }
+    val repository = JsonSlurper().parseText(repositoryResponse.body()) as Map<*, *>
+    val fullName = repository["full_name"] as? String
+        ?: throw GradleException("GitHub returned no full_name for $slug")
+
+    // ---- stage ----------------------------------------------------------------
+    val staging = project.layout.buildDirectory.dir("github-release").get().asFile
+    staging.deleteRecursively()
+    staging.mkdirs()
+
+    fun stage(source: File, name: String): File {
+        var target = File(staging, name)
+        var counter = 2
+        while (target.exists()) {
+            val base = name.substringBeforeLast('.', name)
+            val extension = if (name.contains('.')) "." + name.substringAfterLast('.') else ""
+            target = File(staging, "$base-$counter$extension")
+            counter++
+        }
+        source.copyTo(target, overwrite = false)
+        return target
+    }
+
+    val apkDirectory = project.layout.buildDirectory.dir("outputs/apk/release").get().asFile
+    val apk = apkDirectory.listFiles { file -> file.isFile && file.extension.equals("apk", true) }
+        ?.maxByOrNull { it.length() }
+        ?: throw GradleException(
+            "No release APK in $apkDirectory. :app:assembleRelease produced nothing to publish."
+        )
+    val apkName = "Prism-$version.apk"
+    val assets = mutableListOf(stage(apk, apkName))
+
+    // Compose writes each installer into its own directory under main-release/. Walk it rather
+    // than naming paths, so a format that jpackage skipped is simply absent, not an error.
+    val desktopDirectory = File(project.rootDir, "desktop/build/compose/binaries/main-release")
+    val desktopExtensions = setOf("exe", "msi", "deb", "rpm", "appimage", "dmg", "pkg")
+    val desktopArtifacts = if (desktopDirectory.isDirectory) {
+        desktopDirectory.walkTopDown()
+            .filter { it.isFile && it.extension.lowercase() in desktopExtensions }
+            .sortedBy { it.name }
+            .toList()
+    } else {
+        emptyList()
+    }
+    desktopArtifacts.forEach { assets += stage(it, it.name) }
+
+    val jarsDirectory = File(project.rootDir, "desktop/build/compose/jars")
+    val uberJars = jarsDirectory.listFiles { file -> file.isFile && file.extension == "jar" }
+        .orEmpty()
+        .sortedBy { it.name }
+    uberJars.forEach { assets += stage(it, it.name) }
+
+    logger.lifecycle("Release $tag: staged ${assets.size} file(s) from the ${prismHostOs()} build.")
+    assets.forEach { logger.lifecycle("  ${it.name} (${it.length() / 1024 / 1024} MB)") }
+
+    if (dryRun) {
+        logger.lifecycle("prism.release.dryRun is set; nothing was uploaded.")
+        return
+    }
+
+    // ---- publish --------------------------------------------------------------
+    val commit = runCatching { runCommand("git", "rev-parse", "--short", "HEAD").trim() }
+        .getOrDefault("unknown")
+    val body = buildString {
+        appendLine("Prism $version, built from `$commit` on ${prismHostOs()}.")
+        appendLine()
+        appendLine("## Android")
+        appendLine()
+        append("- `$apkName`")
+        if (apk.name.contains("unsigned")) {
+            append(" — unsigned; sign it with your own release keystore before installing.")
+        }
+        appendLine()
+        if (desktopArtifacts.isNotEmpty() || uberJars.isNotEmpty()) {
+            appendLine()
+            appendLine("## Desktop")
+            appendLine()
+            (desktopArtifacts.map { it.name } + uberJars.map { it.name }).forEach {
+                appendLine("- `$it`")
+            }
+        }
+        appendLine()
+        appendLine(
+            "Desktop installers are built on the host above; other platforms' packages have to " +
+                "be produced on those platforms."
+        )
+    }
+
+    val payload = JsonOutput.toJson(
+        mapOf(
+            "tag_name" to tag,
+            "name" to "Prism $version",
+            "body" to body,
+            "draft" to false,
+            "prerelease" to false,
+        )
+    )
+    val created = api("POST", "https://api.github.com/repos/$fullName/releases", payload)
+    val release: Map<*, *> = if (created.statusCode() == 201) {
+        JsonSlurper().parseText(created.body()) as Map<*, *>
+    } else {
+        val existing = api(
+            "GET",
+            "https://api.github.com/repos/$fullName/releases/tags/" +
+                URLEncoder.encode(tag, StandardCharsets.UTF_8.name()),
+        )
+        if (existing.statusCode() == 200) {
+            logger.lifecycle("Release $tag already exists; replacing its assets.")
+            JsonSlurper().parseText(existing.body()) as Map<*, *>
+        } else {
+            throw GradleException(
+                "GitHub could not create release $tag (${created.statusCode()}): " +
+                    created.body().take(500)
+            )
+        }
+    }
+    val releaseId = (release["id"] as? Number)?.toLong()
+        ?: throw GradleException("GitHub returned a release without an id.")
+    val htmlUrl = release["html_url"] as? String
+
+    val existingAssetsResponse = api(
+        "GET",
+        "https://api.github.com/repos/$fullName/releases/$releaseId/assets?per_page=100",
+    )
+    val existingAssets = if (existingAssetsResponse.statusCode() == 200) {
+        (JsonSlurper().parseText(existingAssetsResponse.body()) as? List<*>)
+            .orEmpty()
+            .filterIsInstance<Map<*, *>>()
+    } else {
+        emptyList()
+    }
+
+    for (asset in assets) {
+        val previous = existingAssets.firstOrNull { (it["name"] as? String) == asset.name }
+        if (previous != null) {
+            val previousId = (previous["id"] as Number).toLong()
+            val deleted = api(
+                "DELETE",
+                "https://api.github.com/repos/$fullName/releases/assets/$previousId",
+            )
+            if (deleted.statusCode() !in 200..299) {
+                throw GradleException(
+                    "Cannot replace ${asset.name}: deleting the old asset returned " +
+                        "${deleted.statusCode()}."
+                )
+            }
+        }
+
+        val encodedName = URLEncoder.encode(asset.name, StandardCharsets.UTF_8.name())
+            .replace("+", "%20")
+        logger.lifecycle("Uploading ${asset.name} (${asset.length() / 1024 / 1024} MB)...")
+        val upload = HttpRequest.newBuilder(
+            URI.create(
+                "https://uploads.github.com/repos/$fullName/releases/$releaseId/assets" +
+                    "?name=$encodedName"
+            )
+        )
+            .header("Authorization", "Bearer $token")
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("Content-Type", "application/octet-stream")
+            .timeout(Duration.ofHours(2))
+            .POST(HttpRequest.BodyPublishers.ofFile(asset.toPath()))
+            .build()
+        val uploaded = http.send(upload, HttpResponse.BodyHandlers.ofString())
+        if (uploaded.statusCode() !in 200..299) {
+            throw GradleException(
+                "Upload of ${asset.name} failed (${uploaded.statusCode()}): " +
+                    uploaded.body().take(500)
+            )
+        }
+        logger.lifecycle("  uploaded ${asset.name}")
+    }
+
+    logger.lifecycle(
+        "Published $tag" + (htmlUrl?.let { ": $it" } ?: "") + " — ${assets.size} asset(s)."
+    )
+}

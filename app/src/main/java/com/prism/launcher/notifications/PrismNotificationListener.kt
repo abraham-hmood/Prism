@@ -74,6 +74,10 @@ class PrismNotificationListener : NotificationListenerService() {
             ?: extras.charSequenceText(Notification.EXTRA_TEXT)
             ?: extras.charSequenceText(Notification.EXTRA_SUMMARY_TEXT)
             ?: ""
+        // THE GROUP'S OWN NAME, which messaging apps put here while EXTRA_TITLE carries the sender.
+        // Capturing it is what lets the Messages page draw one row per group text instead of one per
+        // person who happened to speak in it.
+        val conversation = extras.charSequenceText(Notification.EXTRA_CONVERSATION_TITLE).orEmpty()
 
         NotificationHistory.record(
             packageName = sbn.packageName ?: return,
@@ -83,6 +87,7 @@ class PrismNotificationListener : NotificationListenerService() {
             at = if (sbn.postTime > 0) sbn.postTime else System.currentTimeMillis(),
             key = runCatching { sbn.key }.getOrNull().orEmpty(),
             ongoing = notification.flags and Notification.FLAG_ONGOING_EVENT != 0,
+            conversation = conversation,
         )
     }
 

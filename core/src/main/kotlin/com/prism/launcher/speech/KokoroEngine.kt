@@ -517,8 +517,15 @@ class KokoroEngine private constructor(
          * Null rather than an exception: "not downloaded yet" is an ordinary state on a fresh
          * install, and the caller's response to it is to use something else, not to fail.
          */
-        fun openOrNull(): KokoroEngine? {
-            if (!KokoroInstall.isModelInstalled()) return null
+        fun openOrNull(modelPath: String? = null): KokoroEngine? {
+            // An imported Kokoro-format ONNX export can replace the built-in weights while still
+            // using the tokenizer, lexicon and voice files that were downloaded with Kokoro. That
+            // is the shape the importer already recognises; the extra branch makes it runnable
+            // instead of merely listed.
+            val imported = modelPath?.takeIf {
+                it.isNotBlank() && File(it).isFile && File(it).extension.equals("onnx", true)
+            }
+            if (imported == null && !KokoroInstall.isModelInstalled()) return null
 
             val tokenizer = KokoroTokenizer.load(KokoroInstall.tokenizerFile()) ?: return null
             val phonemizer = KokoroPhonemizer.load(KokoroInstall.lexiconFile())
@@ -544,7 +551,7 @@ class KokoroEngine private constructor(
                     // giving up the fusions would have cost speed for nothing.
                 }
                 val session = environment.createSession(
-                    KokoroInstall.modelFile().absolutePath, options,
+                    imported ?: KokoroInstall.modelFile().absolutePath, options,
                 )
                 PrismPlatform.log.info(
                     TAG,

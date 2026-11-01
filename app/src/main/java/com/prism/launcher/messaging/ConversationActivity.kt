@@ -15,6 +15,9 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import com.prism.launcher.R
 import com.prism.launcher.databinding.ActivityConversationBinding
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -30,6 +33,8 @@ class ConversationActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityConversationBinding
     private var threadId: Long = -1
+    /** Every thread this conversation is made of. More than one when a group text was split. */
+    private var threadIds: List<Long> = emptyList()
     private var address: String = ""
     private val adapter = MessagesAdapter(
         emptyList(),
@@ -48,6 +53,9 @@ class ConversationActivity : AppCompatActivity() {
     // without fighting the reactive Flow collector in loadAiMessages().
     private var dbMessages: List<MessageInfo> = emptyList()
     private var liveBubble: MessageInfo? = null
+
+    /** Drives Sam's context meter while a reply streams; null when nothing is running. */
+    private var samMeterJob: Job? = null
 
     /** Nora's slash-command palette. Created lazily, only in her thread. */
     private var commandPopup: com.prism.launcher.nora.NoraCommandPopup? = null
@@ -92,6 +100,51 @@ class ConversationActivity : AppCompatActivity() {
         if (combined.isNotEmpty()) binding.conversationMessagesList.scrollToPosition(combined.size - 1)
     }
 
+    private val isSamThread: Boolean
+        get() = threadId == SAM_THREAD_ID || SAM_THREAD_ID in threadIds
+
+    /**
+     * The meter only means something when Sam is running a local model. A cloud or mesh reply has
+     * no context window on this device, and showing 0% for one would be a number that pretends to
+     * measure something it cannot see.
+     */
+    private fun showSamMeter() {
+        val visible = isSamThread &&
+            com.prism.launcher.PrismSettings.getAiMode() == com.prism.launcher.PrismSettings.AI_MODE_LOCAL &&
+            com.prism.launcher.PrismSettings.getLocalAiModelPath().isNotBlank()
+        binding.samContextMeter.visibility = if (visible) android.view.View.VISIBLE else android.view.View.GONE
+        if (visible) refreshSamMeter()
+    }
+
+    private fun refreshSamMeter() {
+        val stats = GgufInferenceService.liveStats
+        binding.samContextMeter.update(
+            stats.contextFraction,
+            stats.contextUsed,
+            GgufInferenceService.liveTokensPerSecond,
+            stats.contextSize,
+        )
+    }
+
+    private fun startSamMeter() {
+        if (binding.samContextMeter.visibility != android.view.View.VISIBLE) return
+        GgufInferenceService.resetLiveStats()
+        refreshSamMeter()
+        samMeterJob?.cancel()
+        samMeterJob = lifecycleScope.launch(Dispatchers.Main) {
+            while (isActive) {
+                refreshSamMeter()
+                delay(250)
+            }
+        }
+    }
+
+    private fun stopSamMeter() {
+        samMeterJob?.cancel()
+        samMeterJob = null
+        refreshSamMeter()
+    }
+
     // OpenDocument (not GetContent) so the read grant can be persisted -- GetContent's grant is
     // ephemeral and doesn't survive a process restart, which meant any attachment became
     // unreadable (and crashed MessagesAdapter) the next time the app launched.
@@ -131,9 +184,17 @@ class ConversationActivity : AppCompatActivity() {
         setContentView(binding.root)
 
         threadId = intent.getLongExtra("thread_id", -1)
+        val ids = intent.getLongArrayExtra("thread_ids")?.toList().orEmpty()
+        threadIds = if (ids.isEmpty()) listOf(threadId) else ids
         address = intent.getStringExtra("address") ?: "Unknown"
 
         binding.conversationHeaderName.text = address
+        // A previous thread's numbers would be wrong here, and an empty ring that fills as the
+        // first reply streams is the honest starting state.
+        if (isSamThread) {
+            GgufInferenceService.resetLiveStats()
+            showSamMeter()
+        }
 
         binding.conversationMessagesList.layoutManager = LinearLayoutManager(this).apply {
             stackFromEnd = true
@@ -493,8 +554,11 @@ class ConversationActivity : AppCompatActivity() {
         val messages = mutableListOf<MessageInfo>()
         val uri = Uri.parse("content://sms/")
         val projection = arrayOf("_id", "type", "body", "date")
-        val selection = "thread_id = ?"
-        val selectionArgs = arrayOf(threadId.toString())
+        // A group split across several system threads is read as one conversation here, which is
+        // what the merged row on the Messages page promised when it was tapped.
+        val ids = threadIds.ifEmpty { listOf(threadId) }
+        val selection = "thread_id IN (" + ids.joinToString(",") { "?" } + ")"
+        val selectionArgs = ids.map { it.toString() }.toTypedArray()
 
         try {
             contentResolver.query(uri, projection, selection, selectionArgs, "date ASC")?.use { cursor ->
@@ -755,6 +819,7 @@ class ConversationActivity : AppCompatActivity() {
 
     private fun sendToSam(text: String, uri: Uri?, mime: String?) {
         lifecycleScope.launch(Dispatchers.IO) {
+            withContext(Dispatchers.Main) { startSamMeter() }
             val db = com.prism.launcher.AppDatabase.get()
             val dao = db.aiMessageDao()
 
@@ -791,7 +856,8 @@ class ConversationActivity : AppCompatActivity() {
             // the model must not be given its own unfinished sentence as context.
             val dialogSoFar = dbMessages.filterNot { it.isThinking }.map { it.text }
 
-            val (aiText, aiMedia) = AiManager.getResponse(
+            val response = try {
+                AiManager.getResponse(
                 this@ConversationActivity, text, uri,
                 onToken = { delta ->
                     accumulatedAnswer.append(delta)
@@ -808,7 +874,13 @@ class ConversationActivity : AppCompatActivity() {
                     }
                 },
                 history = dialogSoFar,
-            )
+                )
+            } finally {
+                // The meter is a live view of a decode that has finished; the last snapshot stays
+                // visible so the user can still see what the turn cost.
+                withContext(Dispatchers.Main) { stopSamMeter() }
+            }
+            val (aiText, aiMedia) = response
             val (mediaUrl, mediaType) = aiMedia
 
             // 3b. GgufInferenceService.lastLoadDegradedMode reflects whatever load just happened
@@ -862,25 +934,81 @@ class ConversationActivity : AppCompatActivity() {
         }
         try {
             val smsManager = getSystemService(SmsManager::class.java)
+            val recipients = smsRecipients()
             if (uri == null) {
-                smsManager.sendTextMessage(address, null, text, null, null)
-                Toast.makeText(this, "Message Sent", Toast.LENGTH_SHORT).show()
+                // A group thread has more than one canonical address. SmsManager takes one at a
+                // time and there is no public group-MMS send API, so the message goes to each
+                // participant and the toast says how many. This is what makes a group text send
+                // at all here; a single address is still the ordinary path.
+                recipients.forEach { recipient ->
+                    smsManager.sendTextMessage(recipient, null, text, null, null)
+                }
+                Toast.makeText(
+                    this,
+                    if (recipients.size > 1) "Sent to ${recipients.size} recipients" else "Message Sent",
+                    Toast.LENGTH_SHORT,
+                ).show()
             } else {
                 // THE TEXT GOES, THE ATTACHMENT DOES NOT, AND THE USER IS TOLD SO. The old code
                 // showed "MMS feature simulation: Multi-media sent" and a second "Message Sent"
                 // toast without sending anything -- a success message for a message that never
                 // left the device. Sending a real MMS needs a PDU built to the carrier's spec and
                 // is not implemented; saying so is the honest behaviour.
-                smsManager.sendTextMessage(address, null, text, null, null)
+                recipients.forEach { recipient ->
+                    smsManager.sendTextMessage(recipient, null, text, null, null)
+                }
                 Toast.makeText(
                     this,
-                    "Text sent — MMS attachments are not supported yet, so the attachment was not sent",
+                    if (recipients.size > 1) {
+                        "Text sent to ${recipients.size} recipients — MMS attachments are not " +
+                            "supported yet, so the attachment was not sent"
+                    } else {
+                        "Text sent — MMS attachments are not supported yet, so the attachment was not sent"
+                    },
                     Toast.LENGTH_LONG,
                 ).show()
             }
         } catch (e: Exception) {
             Toast.makeText(this, "Failed: ${e.message}", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    /**
+     * Every canonical address in this thread, with [address] as the fallback.
+     *
+     * `content://mms-sms/conversations/{id}/recipients` is the only public view of a group's
+     * membership. Some OEM telephony providers do not implement it; a failed query must not stop
+     * the message from going to the address the thread was opened with.
+     */
+    private fun smsRecipients(): List<String> {
+        val found = mutableListOf<String>()
+        // Every thread the conversation is made of, so a group that arrived split still sends to
+        // everyone in it rather than to the newest thread's subset.
+        val ids = threadIds.ifEmpty { listOf(threadId) }.filter { it > 0 }
+        for (id in ids) {
+            runCatching {
+                contentResolver.query(
+                    Uri.parse("content://mms-sms/conversations/$id/recipients"),
+                    arrayOf("address"),
+                    null,
+                    null,
+                    null,
+                )?.use { cursor ->
+                    val index = cursor.getColumnIndex("address")
+                    while (cursor.moveToNext()) {
+                        val value = if (index >= 0) cursor.getString(index) else null
+                        if (!value.isNullOrBlank()) found.add(value)
+                    }
+                }
+            }
+        }
+        if (found.isEmpty() && address.isNotBlank()) {
+            // The fallback is the joined display name, which is only a single address for a
+            // one-to-one thread. Splitting it keeps a group from being sent to a literal
+            // "Alice, Bob" address if the provider refused the recipients query.
+            address.split(",").map { it.trim() }.filter { it.isNotBlank() }.forEach { found.add(it) }
+        }
+        return found.distinct()
     }
 }
 

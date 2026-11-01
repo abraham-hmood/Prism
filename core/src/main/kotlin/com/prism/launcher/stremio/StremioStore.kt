@@ -198,16 +198,28 @@ object StremioStore {
         val headers: Map<String, String>,
         /** Which add-on answered, so a picker can say where a stream came from. */
         val addonName: String,
+        /**
+         * Which file of a torrent this stream means, or -1 when it is a direct URL.
+         *
+         * Add-ons put a season pack behind one info hash and use this to point at the episode.
+         * Ignoring it plays whichever file the torrent lists first, which in a pack is usually not
+         * the episode somebody tapped.
+         */
+        val fileIdx: Int = -1,
+        /** `behaviorHints.filename`, the more reliable way to name the file. */
+        val filename: String = "",
+        /** Trackers the add-on supplied, in `sources` or as part of a magnet. */
+        val trackers: List<String> = emptyList(),
     ) {
         /**
          * Whether Prism can actually play this.
          *
-         * `infoHash` is BitTorrent and needs a torrent client Prism does not have; `externalUrl`
-         * means "open this elsewhere", which is not playback; `ytId` needs a YouTube player. Only a
-         * direct URL plays, and saying so up front beats handing the player something that fails
-         * silently.
+         * Three shapes are playable now: a direct HTTP URL, and a BitTorrent info hash, which the
+         * torrent client or a debrid account turns into one. `externalUrl` means "open this
+         * elsewhere", which is not playback; `ytId` needs a YouTube player. Saying so up front
+         * beats handing the player something that fails silently.
          */
-        val playable: Boolean get() = url.startsWith("http", ignoreCase = true)
+        val playable: Boolean get() = url.startsWith("http", ignoreCase = true) || infoHash.isNotBlank()
 
         val label: String get() = buildString {
             append(name.ifBlank { title }.ifBlank { "Stream" })
@@ -216,10 +228,15 @@ object StremioStore {
 
         val unplayableReason: String? get() = when {
             playable -> null
-            infoHash.isNotBlank() -> "BitTorrent — Prism has no torrent client"
             ytId.isNotBlank() -> "YouTube — opens outside Prism"
             externalUrl.isNotBlank() -> "A link to open elsewhere, not a stream"
             else -> "No playable address"
+        }
+
+        /** What the picker says about how this plays, when it is a torrent. */
+        val sourceNote: String? get() = when {
+            infoHash.isBlank() -> null
+            else -> "BitTorrent · plays through Prism's torrent client or a debrid account"
         }
     }
 
@@ -539,6 +556,9 @@ object StremioStore {
                             ytId = item.optString("ytId"),
                             headers = proxyHeaders(item),
                             addonName = addon.name,
+                            fileIdx = item.optInt("fileIdx", -1),
+                            filename = item.optJSONObject("behaviorHints")?.optString("filename").orEmpty(),
+                            trackers = trackersFrom(item),
                         )
                     )
                 }
@@ -548,6 +568,25 @@ object StremioStore {
         // Playable first; everything else is kept so the picker can explain why it cannot be used,
         // which is more useful than a list that silently omits most of what the add-ons returned.
         return out.sortedByDescending { it.playable }
+    }
+
+    /**
+     * The tracker list an add-on attached to a stream.
+     *
+     * `sources` is a list of strings, each `tracker:udp://...` or `dht:<hash>`. Only trackers can be
+     * used directly; the `dht:` entry is a statement that the torrent is on the DHT, which this
+     * client asks on its own anyway.
+     */
+    private fun trackersFrom(stream: JSONObject): List<String> {
+        val sources = stream.optJSONArray("sources") ?: return emptyList()
+        val out = LinkedHashSet<String>()
+        for (index in 0 until sources.length()) {
+            val entry = sources.optString(index)
+            if (entry.startsWith("tracker:", ignoreCase = true)) {
+                entry.removePrefix("tracker:").takeIf { it.isNotBlank() }?.let(out::add)
+            }
+        }
+        return out.toList()
     }
 
     private fun proxyHeaders(stream: JSONObject): Map<String, String> {

@@ -12,6 +12,44 @@ find_library(log-lib log)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# ── OPTIMISATION IS NOT OPTIONAL, EVEN IN A DEBUG BUILD ───────────────────────────────────────
+#
+# Gradle sets CMAKE_BUILD_TYPE=Debug for the debug variant, and the NDK's Debug flags are `-g`
+# alone: no -O at all. clang then defaults to -O0, which for ggml is not a mild slowdown, it is a
+# different program. The quantised matmul kernels are written to be INLINED and AUTO-VECTORISED --
+# ggml_vec_dot_q4_K_q8_K is a loop over blocks whose entire performance comes from the compiler
+# unrolling it and emitting SDOT/SMMLA. At -O0 every one of those loops calls a function per block
+# and spills to the stack between iterations.
+#
+# MEASURED, Galaxy S22 (SM-S901U), DeepSeek-R1-Distill-Qwen-1.5B Q5_K_M, CPU backend, 4 threads:
+#
+#     CMAKE_BUILD_TYPE=Debug, no -O (what shipped)      0.1 tok/s   (7.4 s per token)
+#     -O3                                               22-24 tok/s  (see PRISM_ZOMBIE notes)
+#
+# Two hundred times. Not a tuning difference -- the debug APK was, for local inference, unusable,
+# and every "the AI is slow" report from a debug build was this line and nothing else. Optimisation
+# is therefore forced on for the Debug configuration across every vendored library (llama, ggml,
+# whisper, stable-diffusion), and -g is kept so breakpoints and symbol names still work: -O3 with
+# debug info is what a RelWithDebInfo build does, and it debugs fine.
+#
+# FORCE, AND SET AS CACHE ENTRY: ndk-build's toolchain file assigns CMAKE_C_FLAGS_DEBUG itself, and
+# a plain set() before add_subdirectory() would be overwritten when the toolchain is re-read for
+# the subprojects. A FORCEd cache entry survives that and propagates to every add_subdirectory
+# below, which is required -- ggml is the subproject that matters.
+if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+    # BOTH the cache entry AND a plain variable. The NDK's android.toolchain.cmake sets these as
+    # NORMAL variables, and a normal variable shadows a cache entry of the same name -- so
+    # set(... CACHE ... FORCE) on its own changed the cache, left the effective value at "-g", and
+    # the build stayed at -O0 while looking fixed in CMakeCache.txt. Setting the plain variable is
+    # what actually wins.
+    set(CMAKE_C_FLAGS_DEBUG   "-O3 -g" CACHE STRING "" FORCE)
+    set(CMAKE_CXX_FLAGS_DEBUG "-O3 -g" CACHE STRING "" FORCE)
+    set(CMAKE_ASM_FLAGS_DEBUG "-O3 -g" CACHE STRING "" FORCE)
+    set(CMAKE_C_FLAGS_DEBUG   "-O3 -g")
+    set(CMAKE_CXX_FLAGS_DEBUG "-O3 -g")
+    set(CMAKE_ASM_FLAGS_DEBUG "-O3 -g")
+endif()
+
 # ── Local LLM inference: arm64-v8a only ─────────────────────────────────────
 #
 # llama.cpp with the OpenCL backend is a large, heavily arch-specific build, and it has only ever
@@ -26,6 +64,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # an honest degradation rather than a broken install.
 if (ANDROID_ABI STREQUAL "arm64-v8a")
 
+    # GGML_MAX_NAME IS 160 FOR THIS WHOLE BUILD, not llama.cpp's default of 64.
+    #
+    # stable-diffusion.cpp names its tensors after the model's own parameter names --
+    # `double_blocks.0.img_attn.qkv.weight` and longer -- and refuses to compile against a ggml
+    # whose name field would truncate them (a static_assert in its ggml_extend.h). The field is
+    # inside ggml_tensor, so it is an ABI decision: every library that touches ggml in this process
+    # has to agree. Setting it here, before llama.cpp is added, means ggml itself, llama, whisper
+    # and SD are all built with the same struct layout; the cost is 96 bytes per tensor node.
+    # ggml.h only defines the macro if it is not already defined, so this is the supported way in.
+    add_compile_definitions(GGML_MAX_NAME=160)
+
     # Keep the vendored llama.cpp build limited to the core inference library —
     # common/examples/tools/tests are already skipped automatically since
     # LLAMA_STANDALONE is OFF when included via add_subdirectory(), but OpenMP
@@ -33,12 +82,13 @@ if (ANDROID_ABI STREQUAL "arm64-v8a")
     # benefit at the thread counts a phone runs with.
     set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
 
-    # GPU offload via OpenCL — the same backend OGAM uses for Android GPU acceleration.
-    # Vulkan would need the full Vulkan SDK (glslc + SPIRV-Headers) installed on the build
-    # machine; OpenCL only needs these two small vendored Khronos repos, built from source
-    # in-tree just like llama.cpp itself. On-device, the loader dlopens the GPU vendor's
-    # real libOpenCL.so at runtime — if none exists, model load falls back to CPU (see
-    # nativeLoadModel's GPU->CPU retry in gguf_bridge.cpp), so this is safe on any device.
+    # GPU offload via OpenCL — the same backend OGAM uses for Android GPU acceleration. It
+    # needs only these two small vendored Khronos repos, built from source in-tree just like
+    # llama.cpp itself. On-device, the loader dlopens the GPU vendor's real libOpenCL.so at
+    # runtime — if none exists, model load falls back to CPU (see nativeLoadModel's GPU->CPU
+    # retry in gguf_bridge.cpp), so this is safe on any device. That fallback is load-bearing
+    # on Samsung hardware, which exposes no OpenCL platform to apps at all; GPU offload there
+    # comes from Vulkan instead — see the block below.
     set(OPENCL_ICD_LOADER_HEADERS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/opencl-headers" CACHE PATH "" FORCE)
     set(OPENCL_ICD_LOADER_BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
     add_subdirectory(opencl-icd-loader)
@@ -81,6 +131,31 @@ if (ANDROID_ABI STREQUAL "arm64-v8a")
     else()
         message(STATUS "HEXAGON_SDK_ROOT not set — building without NPU/Hexagon support (expected/normal; see hexagon-htp-prebuilt/README.md)")
     endif()
+
+    # ── GPU offload via Vulkan: OFF BY DEFAULT, AND WHY ─────────────────────
+    #
+    # It was built and tried, and on the reference device it cannot work: ggml-vulkan allocates
+    # every device buffer through `vkGetBufferDeviceAddress`, which is core Vulkan 1.2, with no
+    # fallback. The reference phone (Galaxy S22, Adreno 730, driver 615.0) reports Vulkan 1.1, so
+    # that dispatch entry is null and the FIRST buffer allocation jumps to address zero.
+    #
+    # MEASURED: with backend "Vulkan0" the app process dies in `vk::Device::getBufferAddress`
+    # (inside `ggml_vk_create_buffer`) 4 s into checkpoint load. It is worse than a non-starter: a
+    # SIGSEGV cannot be caught, so stable-diffusion.cpp's own "this device could not be created,
+    # retry on the CPU" fallback never runs -- the whole app goes down. And with Vulkan merely
+    # *present* it also happens on an OpenCL render, because sd.cpp's model manager spreads weight
+    # blocks across every registered device, so one Vulkan buffer allocation is enough.
+    #
+    # The accelerator this hardware actually has is OpenCL (the Adreno driver, OpenCL 3.0, reached
+    # by NOT packaging our own ICD loader -- see the jniLibs excludes in app/build.gradle.kts).
+    #
+    # The backend is still buildable for a driver that does expose Vulkan 1.2:
+    #     ./gradlew assembleDebug -Pprism.vulkan=true
+    #
+    # MUST PRECEDE add_subdirectory(llama.cpp): ggml reads these cache variables while its own
+    # CMakeLists is being processed, and the backend is created there — not by this file.
+    include("${CMAKE_CURRENT_SOURCE_DIR}/vulkan.cmake")
+    prism_enable_vulkan_backend()
 
     # ggml's RPC backend: what makes one model run across several phones.
     #
@@ -196,6 +271,23 @@ if (ANDROID_ABI STREQUAL "arm64-v8a")
         ggml
         ${log-lib}
     )
+
+    # ── Local image generation: stable-diffusion.cpp ─────────────────────────
+    #
+    # BEFORE THIS, Prism had no diffusion engine of its own on Android either: image generation
+    # went through MediaPipe (which wants a `.task` bundle and cannot do img2img) or through Nora's
+    # predictive-coding imagery, which is not a diffusion model and does not produce a photograph.
+    # SD-Turbo, SD 1.5 and the SDXL family are all ordinary checkpoints that stable-diffusion.cpp
+    # loads directly, and it does text-to-image AND img2img -- the two things VideoCraft needs to
+    # make a frame from a prompt and then carry it forward to the next keyframe.
+    #
+    # Inside the arm64 block for the same reason llama.cpp is: it compiles against the ggml defined
+    # above, and that ggml only exists for arm64-v8a. On other ABIs the Kotlin side finds no
+    # library and reports local diffusion as unavailable instead of crashing.
+    set(PRISM_GGML_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp" CACHE PATH "" FORCE)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/sd.cmake")
+    prism_add_stable_diffusion(sd_bridge "${CMAKE_CURRENT_SOURCE_DIR}/sd_bridge.cpp")
+    target_link_libraries(sd_bridge PRIVATE ${log-lib})
 
 endif()
 

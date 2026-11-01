@@ -27,7 +27,7 @@ object PrismSettings {
     const val THEME_LIGHT = 1
     const val THEME_DARK = 2
 
-    const val PREFS = "prism_settings"
+    const val PREFS = com.prism.core.PrismStorage.APP_PREFS
 
     // ── Launcher ────────────────────────────────────────────────────────────
 
@@ -563,6 +563,43 @@ object PrismSettings {
     fun setInferenceThreads(value: Int) =
         prefs().edit().putInt(KEY_INFERENCE_THREADS, value.coerceIn(0, 64)).apply()
 
+    private const val KEY_DIFFUSION_BACKEND = "diffusion_backend"
+
+    /**
+     * The accelerator local image generation renders on, or empty for auto-fit.
+     *
+     * A VALUE IS A DEVICE NAME from `StableDiffusion.devices()` — "CPU", "Vulkan0", whatever the
+     * build's ggml backends actually offer — and not a boolean, because "use the GPU" is a decision
+     * only the machine can make: a phone whose Vulkan driver misbehaves should be able to say so and
+     * go back to the CPU without waiting for a new build. Empty lets stable-diffusion.cpp pick the
+     * fastest device it finds, which is what almost every device should keep.
+     */
+    fun getDiffusionBackend(): String =
+        prefs().getString(KEY_DIFFUSION_BACKEND, "") ?: ""
+
+    fun setDiffusionBackend(value: String) =
+        prefs().edit().putString(KEY_DIFFUSION_BACKEND, value.trim()).apply()
+
+    // ── ImageCraft (AI Images) ────────────────────────────────────────────────
+
+    private const val KEY_IMAGECRAFT_SIZE = "imagecraft_size"
+
+    /**
+     * The resolution ImageCraft asks the image model for.
+     *
+     * STORED AS "WIDTHxHEIGHT" and parsed on read, rather than as two integers, so the setting is one
+     * row in one file and a profile archive carries it like every other preference. What each engine
+     * does with a size it cannot honour is that engine's own business -- the diffusion engine clamps
+     * it to what the checkpoint was trained for and says so, MediaPipe ignores it and says so, and a
+     * cloud endpoint gets it in the request body, which is the only one of the three that takes it
+     * literally.
+     */
+    fun getImageCraftSize(): com.prism.launcher.messaging.ImageSize =
+        com.prism.launcher.messaging.ImageSize.parse(prefs().getString(KEY_IMAGECRAFT_SIZE, null))
+
+    fun setImageCraftSize(value: com.prism.launcher.messaging.ImageSize) =
+        prefs().edit().putString(KEY_IMAGECRAFT_SIZE, value.stored).apply()
+
     fun getMiningThreads(): Int = prefs().getInt(KEY_MINING_THREADS, 0)
 
     fun setMiningThreads(value: Int) =
@@ -704,6 +741,15 @@ object PrismSettings {
         return generated
     }
     fun setLykePassword(value: String) = prefs().edit().putString(KEY_LYKE_PASSWORD, value).apply()
+
+    /**
+     * Whether the user has chosen a password, rather than one having been generated for them.
+     *
+     * [getLykePassword] creates a default on first read so old builds keep working; onboarding
+     * must not mistake that default for an account the user can actually sign in with elsewhere.
+     */
+    fun hasLykePassword(): Boolean =
+        prefs().getString(KEY_LYKE_PASSWORD, "").orEmpty().isNotBlank()
 
     fun getLykeProfileConfirmed(): Boolean = prefs().getBoolean(KEY_LYKE_CONFIRMED, false)
     fun setLykeProfileConfirmed(value: Boolean) =
@@ -1236,6 +1282,65 @@ object PrismSettings {
         prefs().edit().putBoolean(KEY_WINDOWED_PAGES, value).apply()
 
     /**
+     * Echo Chamber's own assets.
+     *
+     * The game ships with 1024 × 1024 textures and generated 3D meshes, which is enough to play.
+     * A user who wants their own look points this at a folder; every file is optional, so a folder
+     * containing only `wall.png` changes only the walls.
+     */
+    fun getEchoChamberUseCustomAssets(): Boolean =
+        prefs().getBoolean(KEY_ECHO_CUSTOM_ASSETS, false)
+
+    fun setEchoChamberUseCustomAssets(value: Boolean) =
+        prefs().edit().putBoolean(KEY_ECHO_CUSTOM_ASSETS, value).apply()
+
+    fun getEchoChamberAssetPath(): String =
+        prefs().getString(KEY_ECHO_ASSET_PATH, "") ?: ""
+
+    fun setEchoChamberAssetPath(value: String) =
+        prefs().edit().putString(KEY_ECHO_ASSET_PATH, value).apply()
+
+    /** 0 easy, 1 normal, 2 hard. Used for hunter speed and enemy count defaults. */
+    fun getEchoChamberDifficulty(): Int =
+        prefs().getInt(KEY_ECHO_DIFFICULTY, 1).coerceIn(0, 2)
+
+    fun setEchoChamberDifficulty(value: Int) =
+        prefs().edit().putInt(KEY_ECHO_DIFFICULTY, value.coerceIn(0, 2)).apply()
+
+    fun getEchoChamberEnemies(): Int =
+        prefs().getInt(KEY_ECHO_ENEMIES, 3).coerceIn(1, 8)
+
+    fun setEchoChamberEnemies(value: Int) =
+        prefs().edit().putInt(KEY_ECHO_ENEMIES, value.coerceIn(1, 8)).apply()
+
+    /** Microphone threshold, 0.01..0.25. Lower means a whisper is enough. */
+    fun getEchoChamberMicSensitivity(): Float =
+        prefs().getFloat(KEY_ECHO_MIC_SENSITIVITY, 0.055f).coerceIn(0.01f, 0.25f)
+
+    fun setEchoChamberMicSensitivity(value: Float) =
+        prefs().edit().putFloat(KEY_ECHO_MIC_SENSITIVITY, value.coerceIn(0.01f, 0.25f)).apply()
+
+    /**
+     * Zombies' optional baseline pack.
+     *
+     * The game is complete without it: maps, meshes, 1024² PBR textures and sounds are generated.
+     * A mesh host who wants their own art points this at a folder with `maps/`, `meshes/`,
+     * `textures/` and `sounds/` subfolders, and the Godot export replaces matching files rather
+     * than requiring an all-or-nothing import.
+     */
+    fun getZombiesUseCustomAssets(): Boolean =
+        prefs().getBoolean(KEY_ZOMBIES_CUSTOM_ASSETS, false)
+
+    fun setZombiesUseCustomAssets(value: Boolean) =
+        prefs().edit().putBoolean(KEY_ZOMBIES_CUSTOM_ASSETS, value).apply()
+
+    fun getZombiesAssetPath(): String =
+        prefs().getString(KEY_ZOMBIES_ASSET_PATH, "") ?: ""
+
+    fun setZombiesAssetPath(value: String) =
+        prefs().edit().putString(KEY_ZOMBIES_ASSET_PATH, value).apply()
+
+    /**
      * An explicit wallpaper, overriding whatever the OS is using.
      *
      * Blank means "follow the desktop", which is the default and the behaviour that matches
@@ -1272,6 +1377,33 @@ object PrismSettings {
     const val VPN_MODE_EXTERNAL = "external"
     const val PRISM_ROLE_SERVER = "server"
     const val PRISM_ROLE_CLIENT = "client"
+
+    /**
+     * A client that federates several fleet servers.
+     *
+     * Behaves like a client for every tunnel decision -- it does not listen, and it reaches the mesh
+     * through a server -- but additionally treats every server flagged [PrismServer.isBridged] as
+     * part of this device's world: their DNS names, hosted sites, mirrors and Lyke videos are
+     * merged locally, and their proxies are kept in the browser's fallback list. That is what makes
+     * two meshes look like one from here without moving either server.
+     */
+    const val PRISM_ROLE_BRIDGE = "bridge"
+
+    /**
+     * A client that also relays for its neighbours.
+     *
+     * A relay forwards mesh packets addressed to a peer it can reach but the sender cannot. It is
+     * not a server: it does not authenticate clients or host the control plane, so choosing Relay
+     * still requires an active fleet server to join through.
+     */
+    const val PRISM_ROLE_RELAY = "relay"
+
+    /** Every role except Server reaches the mesh through a server. */
+    fun isPrismClientRole(): Boolean = getPrismVpnRole() != PRISM_ROLE_SERVER
+
+    fun isPrismBridgeRole(): Boolean = getPrismVpnRole() == PRISM_ROLE_BRIDGE
+
+    fun isPrismRelayRole(): Boolean = getPrismVpnRole() == PRISM_ROLE_RELAY
 
     /** Whether VPN Tunneling is enabled */
     fun getVpnTunnelingEnabled(): Boolean =
@@ -1452,7 +1584,9 @@ object PrismSettings {
         val port: Int,
         val username: String,
         val password: String,
-        var isActive: Boolean = false
+        var isActive: Boolean = false,
+        /** True when a Bridge role has selected this server for federation. */
+        var isBridged: Boolean = false,
     )
 
     fun getPrismServers(): List<PrismServer> {
@@ -1478,15 +1612,29 @@ object PrismSettings {
         // De-serialize simple CSV for now to avoid bulky JSON libraries
         return raw.split(";;;").filter { it.isNotEmpty() }.mapNotNull { line ->
             val p = line.split("::")
-            if (p.size < 7) null else PrismServer(p[0], p[1], p[2], p[3].toInt(), p[4], p[5], p[6] == "1")
+            if (p.size < 7) null else PrismServer(
+                p[0], p[1], p[2], p[3].toInt(), p[4], p[5], p[6] == "1",
+                // The eighth field arrived with Bridge. Older lists have seven and simply are not
+                // bridged, so the migration is a missing field rather than a version bump.
+                p.getOrNull(7) == "1",
+            )
         }
     }
 
     fun setPrismServers(servers: List<PrismServer>) {
         val encoded = servers.joinToString(";;;") { 
-            "${it.id}::${it.name}::${it.address}::${it.port}::${it.username}::${it.password}::${if(it.isActive) "1" else "0"}"
+            "${it.id}::${it.name}::${it.address}::${it.port}::${it.username}::${it.password}::" +
+                "${if(it.isActive) "1" else "0"}::${if(it.isBridged) "1" else "0"}"
         }
         prefs().edit().putString(KEY_PRISM_SERVER_LIST, encoded).apply()
+    }
+
+    /** The fleet servers a Bridge role has selected. Empty for every other role. */
+    fun getBridgedServers(): List<PrismServer> =
+        getPrismServers().filter { it.isBridged }
+
+    fun setServerBridged(id: String, bridged: Boolean) {
+        setPrismServers(getPrismServers().map { if (it.id == id) it.copy(isBridged = bridged) else it })
     }
 
     fun getP2pSelfId(): String {
@@ -1720,31 +1868,47 @@ object PrismSettings {
 
     // ── Networked Storage ───────────────────────────────────────────────────
 
+    /**
+     * A saved network location.
+     *
+     * [protocol] is the connection type's id (see NetworkStorageTypes), and [extras] holds what that
+     * type needs beyond an address and a password -- share names, buckets, TLS options. Encoding and
+     * decoding live in [NetworkStorageCodec] so the format is tested in one place instead of being
+     * re-derived here.
+     */
     data class NetworkStorage(
         val id: String = java.util.UUID.randomUUID().toString(),
         val name: String,
-        val protocol: String, // ftp, p2p, webdav, etc.
+        val protocol: String, // ftp, sftp, smb, webdav, s3, p2p, ...
         val host: String,
         val port: Int,
         val username: String = "",
-        val password: String = ""
+        val password: String = "",
+        val extras: Map<String, String> = emptyMap(),
     )
 
-    fun getNetworkStorages(): List<NetworkStorage> {
-        val raw = prefs().getString(KEY_NETWORK_STORAGES, "") ?: ""
-        if (raw.isEmpty()) return emptyList()
-        
-        return raw.split(";;;").filter { it.isNotEmpty() }.mapNotNull { line ->
-            val p = line.split("::")
-            if (p.size < 7) null else NetworkStorage(p[0], p[1], p[2], p[3], p[4].toInt(), p[5], p[6])
-        }
-    }
+    fun getNetworkStorages(): List<NetworkStorage> =
+        com.prism.launcher.storage.NetworkStorageCodec.decode(
+            prefs().getString(KEY_NETWORK_STORAGES, "") ?: "",
+        )
 
     fun setNetworkStorages(list: List<NetworkStorage>) {
-        val encoded = list.joinToString(";;;") { 
-            "${it.id}::${it.name}::${it.protocol}::${it.host}::${it.port}::${it.username}::${it.password}"
-        }
-        prefs().edit().putString(KEY_NETWORK_STORAGES, encoded).apply()
+        prefs().edit().putString(
+            KEY_NETWORK_STORAGES,
+            com.prism.launcher.storage.NetworkStorageCodec.encode(list),
+        ).apply()
+    }
+
+    /** Replaces the connection with the same id, or appends it when it is new. */
+    fun updateNetworkStorage(item: NetworkStorage) {
+        val current = getNetworkStorages().toMutableList()
+        val index = current.indexOfFirst { it.id == item.id }
+        if (index >= 0) current[index] = item else current.add(item)
+        setNetworkStorages(current)
+    }
+
+    fun removeNetworkStorage(id: String) {
+        setNetworkStorages(getNetworkStorages().filterNot { it.id == id })
     }
 
     fun addNetworkStorage(item: NetworkStorage) {
@@ -1813,28 +1977,58 @@ object PrismSettings {
     // was in the old single-profile fields into the first saved entry the first time it's
     // called after this update, so an existing Gemini/OpenAI key survives the upgrade.
 
+    /**
+     * One saved cloud endpoint, tagged with the kind of model it is.
+     *
+     * THE KIND IS NOT COSMETIC. A profile is a base URL, a key and a model id, and which endpoint
+     * answers depends entirely on what the id names: `gpt-4o` chats, `dall-e-3` draws, and a
+     * music or interpolation endpoint is a third and fourth thing again. Before this field there
+     * was one "active cloud model" for everything, so switching the chat model silently switched
+     * the image model too, and a text endpoint was tried for pictures.
+     *
+     * [KIND_TEXT] is the default so every profile saved before this field existed keeps the meaning
+     * it had.
+     */
     data class CloudModelProfile(
         val id: String,
         val apiKey: String,
         val baseUrl: String,
-        val modelId: String
-    )
+        val modelId: String,
+        val kind: String = KIND_TEXT
+    ) {
+        /** The stored kind, or [KIND_TEXT] for a value written by a build that did not have kinds. */
+        val resolvedKind: String get() = normalizedCloudKind(kind)
+    }
 
+    /** Every saved profile, whatever its kind. */
     fun getCloudModels(): List<CloudModelProfile> {
         migrateLegacyCloudModelIfNeeded()
         val raw = prefs().getString(KEY_CLOUD_MODELS, "") ?: ""
         if (raw.isEmpty()) return emptyList()
         return raw.split(";;;").filter { it.isNotEmpty() }.mapNotNull { line ->
             val p = line.split("::")
-            if (p.size < 4) null else CloudModelProfile(p[0], p[1], p[2], p[3])
+            if (p.size < 4) null else CloudModelProfile(
+                id = p[0],
+                apiKey = p[1],
+                baseUrl = p[2],
+                modelId = p[3],
+                // Five fields from this build on; four from any build before kinds existed.
+                kind = normalizedCloudKind(p.getOrElse(4) { KIND_TEXT }),
+            )
         }
     }
 
     fun setCloudModels(models: List<CloudModelProfile>) {
         val encoded = models.joinToString(";;;") {
-            "${it.id}::${it.apiKey}::${it.baseUrl}::${it.modelId}"
+            "${it.id}::${it.apiKey}::${it.baseUrl}::${it.modelId}::${it.resolvedKind}"
         }
         prefs().edit().putString(KEY_CLOUD_MODELS, encoded).apply()
+    }
+
+    /** The profiles of one kind, in the order they were saved. */
+    fun getCloudModels(kind: String): List<CloudModelProfile> {
+        val normalised = normalizedCloudKind(kind)
+        return getCloudModels().filter { it.resolvedKind == normalised }
     }
 
     fun addCloudModel(model: CloudModelProfile) {
@@ -1845,14 +2039,40 @@ object PrismSettings {
 
     fun removeCloudModel(id: String) {
         setCloudModels(getCloudModels().filter { it.id != id })
-        if (getActiveCloudModelId() == id) setActiveCloudModelId(null)
+        CLOUD_KINDS.forEach { kind ->
+            if (getActiveCloudModelId(kind) == id) setActiveCloudModelId(kind, null)
+        }
     }
 
-    fun getActiveCloudModelId(): String? =
-        prefs().getString(KEY_ACTIVE_CLOUD_MODEL_ID, null)
+    /** The active profile id for [KIND_TEXT]; kept for the call sites that only ever meant chat. */
+    fun getActiveCloudModelId(): String? = getActiveCloudModelId(KIND_TEXT)
 
-    fun setActiveCloudModelId(id: String?) =
-        prefs().edit().putString(KEY_ACTIVE_CLOUD_MODEL_ID, id).apply()
+    fun setActiveCloudModelId(id: String?) = setActiveCloudModelId(KIND_TEXT, id)
+
+    /**
+     * The active profile id for one kind of model.
+     *
+     * Text keeps the original key so an install that predates kinds needs no migration: whatever
+     * was active for chat is still active for chat. The other three have their own keys, which is
+     * the whole point -- picking a music endpoint must not unhook the chat model.
+     */
+    fun getActiveCloudModelId(kind: String): String? {
+        val key = activeCloudKeyFor(kind) ?: return null
+        return prefs().getString(key, null)
+    }
+
+    fun setActiveCloudModelId(kind: String, id: String?) {
+        val key = activeCloudKeyFor(kind) ?: return
+        prefs().edit().putString(key, id).apply()
+    }
+
+    private fun activeCloudKeyFor(kind: String): String? = when (normalizedCloudKind(kind)) {
+        KIND_TEXT -> KEY_ACTIVE_CLOUD_MODEL_ID
+        KIND_IMAGE -> KEY_ACTIVE_CLOUD_IMAGE_MODEL_ID
+        KIND_AUDIO -> KEY_ACTIVE_CLOUD_AUDIO_MODEL_ID
+        KIND_INTERPOLATION -> KEY_ACTIVE_CLOUD_INTERPOLATION_MODEL_ID
+        else -> null
+    }
 
     /**
      * Which image generator the user picked, by [com.prism.launcher.messaging.ImageGenerator.id].
@@ -1915,6 +2135,35 @@ object PrismSettings {
     fun setMessagingBridgeEnabled(id: String, enabled: Boolean) =
         prefs().edit().putBoolean("messaging_bridge_$id", enabled).apply()
 
+    /**
+     * One credential for a messaging provider.
+     *
+     * Keyed by provider and field rather than one preference per token because the providers
+     * require different sets -- a WhatsApp number id, a Messenger page id, a Signal bridge URL --
+     * and adding another field should not mean another accessor here. Environment variables are
+     * read by [com.prism.launcher.messaging.MessagingApps], not stored, so a build can supply its
+     * own and the settings screen can still show that one is present.
+     */
+    fun getMessagingApiValue(app: String, key: String): String =
+        prefs().getString("messaging_api_${app}_$key", "").orEmpty()
+
+    fun setMessagingApiValue(app: String, key: String, value: String) =
+        prefs().edit().putString("messaging_api_${app}_$key", value.trim()).apply()
+
+    /** Whether the user wants the linked-message webhook receiver running on this device. */
+    fun getMessagingWebhookEnabled(): Boolean =
+        prefs().getBoolean(KEY_MESSAGING_WEBHOOK, false)
+
+    fun setMessagingWebhookEnabled(value: Boolean) =
+        prefs().edit().putBoolean(KEY_MESSAGING_WEBHOOK, value).apply()
+
+    /** The local port the WhatsApp/Messenger webhook listens on. */
+    fun getMessagingWebhookPort(): Int =
+        prefs().getInt(KEY_MESSAGING_WEBHOOK_PORT, 8791).coerceIn(1024, 65535)
+
+    fun setMessagingWebhookPort(value: Int) =
+        prefs().edit().putInt(KEY_MESSAGING_WEBHOOK_PORT, value.coerceIn(1024, 65535)).apply()
+
     /** Whether the user has been shown the bridges step, so the tour does not repeat it. */
     fun getMessagingBridgeSetupSeen(): Boolean =
         prefs().getBoolean(KEY_MESSAGING_BRIDGES_SEEN, false)
@@ -1963,9 +2212,13 @@ object PrismSettings {
     fun setMeshCallWarningSeen(value: Boolean) =
         prefs().edit().putBoolean(KEY_MESH_CALL_WARNING, value).apply()
 
-    fun getActiveCloudModel(): CloudModelProfile? {
-        val id = getActiveCloudModelId() ?: return null
-        return getCloudModels().find { it.id == id }
+    /** The active profile for chat. */
+    fun getActiveCloudModel(): CloudModelProfile? = getActiveCloudModel(KIND_TEXT)
+
+    /** The active profile for one kind of model, or null when the user has not chosen one. */
+    fun getActiveCloudModel(kind: String): CloudModelProfile? {
+        val id = getActiveCloudModelId(kind) ?: return null
+        return getCloudModels().find { it.id == id && it.resolvedKind == normalizedCloudKind(kind) }
     }
 
     private fun migrateLegacyCloudModelIfNeeded() {
@@ -2003,6 +2256,162 @@ object PrismSettings {
     fun setLocalImageModelPath(value: String) =
         prefs().edit().putString(KEY_LOCAL_IMAGE_MODEL_PATH, value).apply()
 
+    /** The music/ambience generator VideoCraft mixes under the dialogue. */
+    fun getLocalAudioGenModelPath(): String =
+        prefs().getString(KEY_LOCAL_AUDIO_GEN_MODEL_PATH, "") ?: ""
+
+    fun setLocalAudioGenModelPath(value: String) =
+        prefs().edit().putString(KEY_LOCAL_AUDIO_GEN_MODEL_PATH, value).apply()
+
+    /** The frame interpolator VideoCraft fills keyframe gaps with. */
+    fun getLocalInterpolationModelPath(): String =
+        prefs().getString(KEY_LOCAL_INTERPOLATION_MODEL_PATH, "") ?: ""
+
+    fun setLocalInterpolationModelPath(value: String) =
+        prefs().edit().putString(KEY_LOCAL_INTERPOLATION_MODEL_PATH, value).apply()
+
+    /** True when the text side of VideoCraft has an engine (local, cloud or Ollama). */
+    fun hasTextGenerator(): Boolean = when (getAiMode()) {
+        AI_MODE_CLOUD -> getActiveCloudModel() != null
+        AI_MODE_LOCAL_CLOUD -> getSelectedOllamaEndpoint() != null
+        else -> getLocalAiModelPath().isNotEmpty() || getUseCakeChat()
+    }
+
+    /** True when an image generator is selected, local or cloud. */
+    fun hasImageGeneratorForVideo(): Boolean =
+        getLocalImageModelPath().isNotEmpty() || getActiveCloudModel(KIND_IMAGE) != null
+
+    /** True when a soundtrack generator is selected. */
+    fun hasAudioGenerator(): Boolean =
+        getLocalAudioGenModelPath().isNotEmpty() || getActiveCloudModel(KIND_AUDIO) != null
+
+    /** True when a frame interpolator is selected. */
+    fun hasFrameInterpolator(): Boolean =
+        getLocalInterpolationModelPath().isNotEmpty() ||
+            getActiveCloudModel(KIND_INTERPOLATION) != null
+
+    /** True when dialogue can be spoken: Kokoro is installed, or a speech model was imported. */
+    fun hasSpeechModel(): Boolean =
+        getLocalAudioModelPath().isNotEmpty() ||
+            com.prism.launcher.speech.KokoroInstall.isModelInstalled()
+
+    /**
+     * What stops VideoCraft, or null when a render can start.
+     *
+     * [needsSpeech] is false for a film with no dialogue: the speech model is never opened in that
+     * case, so requiring Kokoro (or an imported voice) would refuse a score-only film on a machine
+     * that can make it perfectly well. The page still blocks on the text, image, interpolation and
+     * audio models, because every film -- spoken or not -- needs those.
+     */
+    fun videoCraftBlocker(needsSpeech: Boolean = true): String? = when {
+        !hasTextGenerator() -> "Set an active text model first"
+        !hasImageGeneratorForVideo() -> "Set an active image model first"
+        !hasFrameInterpolator() -> "Set an active frame interpolation model first"
+        !hasAudioGenerator() -> "Set an active audio generator first"
+        needsSpeech && !hasSpeechModel() ->
+            "Install Kokoro or import a speech model first, or tick \u201cNo dialogue\u201d"
+        else -> null
+    }
+
+    fun isVideoCraftReady(needsSpeech: Boolean = true): Boolean =
+        videoCraftBlocker(needsSpeech) == null
+
+    // ── VideoCraft ────────────────────────────────────────────────────────────
+
+    fun getVideoCraftWidth(): Int = prefs().getInt(KEY_VIDEOCRAFT_WIDTH, 768).coerceIn(128, 2160)
+    fun setVideoCraftWidth(value: Int) = prefs().edit().putInt(KEY_VIDEOCRAFT_WIDTH, value.coerceIn(128, 2160)).apply()
+
+    fun getVideoCraftHeight(): Int = prefs().getInt(KEY_VIDEOCRAFT_HEIGHT, 432).coerceIn(128, 2160)
+    fun setVideoCraftHeight(value: Int) = prefs().edit().putInt(KEY_VIDEOCRAFT_HEIGHT, value.coerceIn(128, 2160)).apply()
+
+    fun getVideoCraftDurationSeconds(): Int = prefs().getInt(KEY_VIDEOCRAFT_DURATION, 20).coerceIn(2, 600)
+    fun setVideoCraftDurationSeconds(value: Int) = prefs().edit().putInt(KEY_VIDEOCRAFT_DURATION, value.coerceIn(2, 600)).apply()
+
+    fun getVideoCraftFps(): Int = prefs().getInt(KEY_VIDEOCRAFT_FPS, 24).coerceIn(8, 60)
+    fun setVideoCraftFps(value: Int) = prefs().edit().putInt(KEY_VIDEOCRAFT_FPS, value.coerceIn(8, 60)).apply()
+
+    fun getVideoCraftKeyframesPerSecond(): Float =
+        prefs().getFloat(KEY_VIDEOCRAFT_KEYFRAMES, 3f).coerceIn(0.5f, 12f)
+    fun setVideoCraftKeyframesPerSecond(value: Float) =
+        prefs().edit().putFloat(KEY_VIDEOCRAFT_KEYFRAMES, value.coerceIn(0.5f, 12f)).apply()
+
+    fun getVideoCraftDenoise(): Float = prefs().getFloat(KEY_VIDEOCRAFT_DENOISE, 0.4f).coerceIn(0.05f, 0.95f)
+    fun setVideoCraftDenoise(value: Float) = prefs().edit().putFloat(KEY_VIDEOCRAFT_DENOISE, value.coerceIn(0.05f, 0.95f)).apply()
+
+    fun getVideoCraftClipThreshold(): Float =
+        prefs().getFloat(KEY_VIDEOCRAFT_CLIP, 0.28f).coerceIn(0f, 1f)
+    fun setVideoCraftClipThreshold(value: Float) =
+        prefs().edit().putFloat(KEY_VIDEOCRAFT_CLIP, value.coerceIn(0f, 1f)).apply()
+
+    fun getVideoCraftAdaptive(): Boolean = prefs().getBoolean(KEY_VIDEOCRAFT_ADAPTIVE, true)
+    fun setVideoCraftAdaptive(value: Boolean) = prefs().edit().putBoolean(KEY_VIDEOCRAFT_ADAPTIVE, value).apply()
+
+    private const val KEY_VIDEOCRAFT_CHARACTER_INJECTION = "videocraft_character_injection"
+
+    /**
+     * Whether a character's cutout is fed to the image generator as its img2img init image.
+     *
+     * OFF BY DEFAULT, and that is a decision rather than timidity. Turning it on changes what the
+     * generator is asked for on every keyframe -- an init image at a raised denoise -- which is a
+     * real quality trade: the figure is kept, and the sampler has less freedom in the composition.
+     * With it off, characters are still put into the film, by compositing their cutouts onto the
+     * finished keyframes, which is deterministic and costs no sampling at all.
+     *
+     * Stored in settings rather than per project, because it is a statement about how the user wants
+     * VideoCraft to work, and a film resumed next week has to render the same way it started.
+     */
+    fun getVideoCraftCharacterInjection(): Boolean =
+        prefs().getBoolean(KEY_VIDEOCRAFT_CHARACTER_INJECTION, false)
+
+    fun setVideoCraftCharacterInjection(value: Boolean) =
+        prefs().edit().putBoolean(KEY_VIDEOCRAFT_CHARACTER_INJECTION, value).apply()
+
+    fun getVideoCraftManualKeyframes(): Int = prefs().getInt(KEY_VIDEOCRAFT_MANUAL_KEYFRAMES, 3).coerceIn(1, 12)
+    fun setVideoCraftManualKeyframes(value: Int) = prefs().edit().putInt(KEY_VIDEOCRAFT_MANUAL_KEYFRAMES, value.coerceIn(1, 12)).apply()
+
+    fun getVideoCraftManualClips(): Int = prefs().getInt(KEY_VIDEOCRAFT_MANUAL_CLIPS, 1).coerceIn(1, 12)
+    fun setVideoCraftManualClips(value: Int) = prefs().edit().putInt(KEY_VIDEOCRAFT_MANUAL_CLIPS, value.coerceIn(1, 12)).apply()
+
+    /** Dialogue per shot by default; [AUDIO_SCOPE_SCENE] batches it per scene. */
+    fun getVideoCraftAudioScope(): String = prefs().getString(KEY_VIDEOCRAFT_AUDIO_SCOPE, AUDIO_SCOPE_SHOT) ?: AUDIO_SCOPE_SHOT
+    fun setVideoCraftAudioScope(value: String) = prefs().edit().putString(KEY_VIDEOCRAFT_AUDIO_SCOPE, value).apply()
+
+    fun getVideoCraftSeed(): Long = prefs().getLong(KEY_VIDEOCRAFT_SEED, 1L)
+    fun setVideoCraftSeed(value: Long) = prefs().edit().putLong(KEY_VIDEOCRAFT_SEED, value).apply()
+
+    /** 1 fast, 2 balanced, 3 fine: how hard the interpolator searches and how fine its flow is. */
+    fun getVideoCraftInterpolationQuality(): Int =
+        prefs().getInt(KEY_VIDEOCRAFT_INTERPOLATION_QUALITY, 2).coerceIn(1, 3)
+    fun setVideoCraftInterpolationQuality(value: Int) =
+        prefs().edit().putInt(KEY_VIDEOCRAFT_INTERPOLATION_QUALITY, value.coerceIn(1, 3)).apply()
+
+    /** The planner's sampling temperature; lower keeps a long plan closer to its schema. */
+    fun getVideoCraftTemperature(): Float =
+        prefs().getFloat(KEY_VIDEOCRAFT_TEMPERATURE, 0.7f).coerceIn(0f, 1.5f)
+    fun setVideoCraftTemperature(value: Float) =
+        prefs().edit().putFloat(KEY_VIDEOCRAFT_TEMPERATURE, value.coerceIn(0f, 1.5f)).apply()
+
+    fun getVideoCraftMaxScenes(): Int =
+        prefs().getInt(KEY_VIDEOCRAFT_MAX_SCENES, 8).coerceIn(1, 24)
+    fun setVideoCraftMaxScenes(value: Int) =
+        prefs().edit().putInt(KEY_VIDEOCRAFT_MAX_SCENES, value.coerceIn(1, 24)).apply()
+
+    /**
+     * The named look the film is made in: an entry from [VideoCraftStyles], kept by LABEL.
+     *
+     * By label rather than by index, so the catalogue can grow or be reordered without a saved film
+     * coming back pointing at a different look. A label the catalogue no longer knows reads as
+     * "None", which behaves exactly like never having chosen one.
+     */
+    fun getVideoCraftVideoType(): String =
+        prefs().getString(KEY_VIDEOCRAFT_VIDEO_TYPE, "") ?: ""
+
+    fun setVideoCraftVideoType(value: String) =
+        prefs().edit().putString(KEY_VIDEOCRAFT_VIDEO_TYPE, value).apply()
+
+    const val AUDIO_SCOPE_SHOT = "shot"
+    const val AUDIO_SCOPE_SCENE = "scene"
+
     fun getAiDownloadId(): Long =
         prefs().getLong(KEY_AI_DOWNLOAD_ID, -1L)
 
@@ -2015,6 +2424,71 @@ object PrismSettings {
 
     fun setAiDownloadIsImage(value: Boolean) =
         prefs().edit().putBoolean(KEY_AI_DOWNLOAD_IS_IMAGE, value).apply()
+
+    /** The imported-model type of the in-flight download, for the receiver after a process death. */
+    fun getAiDownloadType(): String =
+        prefs().getString(KEY_AI_DOWNLOAD_TYPE, "")
+            ?: ""
+
+    fun setAiDownloadType(value: String) =
+        prefs().edit().putString(KEY_AI_DOWNLOAD_TYPE, value).apply()
+
+    /**
+     * What kind of model a download in flight is, keyed by its DESTINATION PATH.
+     *
+     * ## Why this is a map on disk and not one field
+     *
+     * A model downloaded from the store is filed under the filter it was found with -- the Image
+     * tab means an image model, whatever the file is called. That decision is made by the store,
+     * but the registration happens later and somewhere else: by a downloader callback on the
+     * desktop and by a system broadcast receiver on Android. Both can run in a different process
+     * from the one that started the download, and the desktop one runs minutes later.
+     *
+     * It used to be remembered in a field in memory ([KEY_AI_DOWNLOAD_TYPE] is the single-download
+     * version of it, and still exists for the broadcast that has no map entry). Both lose the
+     * decision on a restart, and the fallback -- "it is a GGUF, so it is a text model" -- filed
+     * SD-Turbo under Text on desktop, where it then could not draw anything.
+     *
+     * Keyed by path rather than by name because two models can share a file name, and by path
+     * rather than by download id because a resumed or restarted download gets a new id.
+     */
+    fun setPendingModelType(path: String, type: String) {
+        if (path.isBlank() || type.isBlank()) return
+        val map = LinkedHashMap(getPendingModelTypes())
+        map[path] = type
+        // A download that is abandoned never clears its entry, so the list is capped rather than
+        // left to grow for the life of the install. Oldest first: a pending download that old is
+        // not going to complete.
+        while (map.size > MAX_PENDING_MODEL_TYPES) {
+            val oldest = map.keys.firstOrNull() ?: break
+            map.remove(oldest)
+        }
+        prefs().edit().putString(KEY_PENDING_MODEL_TYPES, encodePendingModelTypes(map)).apply()
+    }
+
+    /** Every pending download type, keyed by destination path. */
+    fun getPendingModelTypes(): Map<String, String> {
+        val raw = prefs().getString(KEY_PENDING_MODEL_TYPES, "") ?: ""
+        if (raw.isEmpty()) return emptyMap()
+        val out = LinkedHashMap<String, String>()
+        raw.split('\n').filter { it.contains('\t') }.forEach { line ->
+            val path = line.substringBefore('\t')
+            val type = line.substringAfter('\t')
+            if (path.isNotEmpty() && type.isNotEmpty()) out[path] = type
+        }
+        return out
+    }
+
+    /** Reads a pending type and consumes it, so a later reconcile cannot resurrect it. */
+    fun takePendingModelType(path: String): String? {
+        val map = LinkedHashMap(getPendingModelTypes())
+        val type = map.remove(path) ?: return null
+        prefs().edit().putString(KEY_PENDING_MODEL_TYPES, encodePendingModelTypes(map)).apply()
+        return type
+    }
+
+    private fun encodePendingModelTypes(map: Map<String, String>): String =
+        map.entries.joinToString("\n") { "${it.key}\t${it.value}" }
 
     // ── OS Virtualization ────────────────────────────────────────────────────
 
@@ -2419,20 +2893,33 @@ object PrismSettings {
     fun setMaxTokens(value: Int) =
         prefs().edit().putInt(KEY_MAX_TOKENS, value).apply()
 
-    // ── Prism Swap (Sam) ──────────────────────────────────────────────────────
-    // Sam's own disk-backed swap, alongside Nora's -- see PrismSwap.kt (core/messaging), which
-    // wraps a SwapRegion the same way NoraSwap does. Separate swapfile/settings from Nora's (the
-    // data is structurally unrelated -- a GGUF blob vs. Nora's float tensors), same user-facing
-    // "Prism Swap" name and shape.
+    // ── Prism Swap ────────────────────────────────────────────────────────────
+    // ONE setting for one file. Sam's GGUF weights and KV cache, Nora's tensors, Aether's staging
+    // buffers, VideoCraft's frame scratch and the inactive-page offloader all map slices of
+    // `prism/swap.bin` -- see PrismSwap.kt, which owns the mapping and the arena table.
+    //
+    // ON BY DEFAULT, which is a deliberate reversal. It used to be opt-in because it was Sam's
+    // private escape hatch; it is now load-bearing for the launcher itself (pages offload into the
+    // Pages arena when the user enables that in Developer options), so a fresh install has to have
+    // a mapping available or the feature would silently do nothing.
 
     /** Auto-enabled by AiManager.onLocalTextModelActivated when a model doesn't fit in free RAM. */
-    fun getPrismSwapEnabled(): Boolean = prefs().getBoolean(KEY_PRISM_SWAP_ENABLED, false)
+    fun getPrismSwapEnabled(): Boolean = prefs().getBoolean(KEY_PRISM_SWAP_ENABLED, true)
     fun setPrismSwapEnabled(value: Boolean) = prefs().edit().putBoolean(KEY_PRISM_SWAP_ENABLED, value).apply()
 
-    /** Swap file size, bytes. Auto-raised to cover a model's shortfall on import/activation;
-     * user-adjustable afterward via the Prism Swap size slider. */
-    fun getPrismSwapBytes(): Long = prefs().getLong(KEY_PRISM_SWAP_BYTES, 512L shl 20)
+    /** Swap file size, bytes. The file is sparse, so a larger setting costs address space until
+     * a page is actually written; 2 GB leaves Sam ~1.6 GB and the small consumers ~400 MB. */
+    fun getPrismSwapBytes(): Long = prefs().getLong(KEY_PRISM_SWAP_BYTES, 2L shl 30)
     fun setPrismSwapBytes(value: Long) = prefs().edit().putLong(KEY_PRISM_SWAP_BYTES, value).apply()
+
+    /**
+     * Offload pages that are neither visible nor running background work into Prism Swap.
+     *
+     * Developer options, off by default: it trades a page-switch delay for memory, and the delay
+     * is exactly what a user notices when they swipe between pages.
+     */
+    fun getPageOffloadEnabled(): Boolean = prefs().getBoolean(KEY_PAGE_OFFLOAD_ENABLED, false)
+    fun setPageOffloadEnabled(value: Boolean) = prefs().edit().putBoolean(KEY_PAGE_OFFLOAD_ENABLED, value).apply()
 
     /** RAM deficit (bytes) below which Tier 1 (mmap fallback + KV-cache/context downgrade, real
      * swap only for the one buffer that's actually file-shaped) is tried before failing. */
@@ -2444,12 +2931,20 @@ object PrismSettings {
     fun getPrismSwapFullThresholdBytes(): Long = prefs().getLong(KEY_PRISM_SWAP_FULL_THRESHOLD, 3L shl 30)
     fun setPrismSwapFullThresholdBytes(value: Long) = prefs().edit().putLong(KEY_PRISM_SWAP_FULL_THRESHOLD, value).apply()
 
-    /** Returns true if a local image model exists in internal storage */
+    /**
+     * Returns true when the local image slot names something that exists.
+     *
+     * It used to require the path to sit under the app's data directory, which rejected every
+     * checkpoint the user picked from Downloads -- including a 2 GB safetensors they had just
+     * chosen on the Models page. The slot is written only by Prism's own picker, so the path is
+     * already user-authorised; existence is the only thing that needs checking here. A ModelCraft
+     * artifact directory is valid too, because its `image_model.json` and weights are read as a
+     * directory rather than a checkpoint file.
+     */
     fun isLocalImageModelImported(): Boolean {
         val path = getLocalImageModelPath()
         if (path.isEmpty()) return false
-        val file = java.io.File(path)
-        return file.exists() && file.absolutePath.startsWith(PrismPlatform.host.dataDir().absolutePath)
+        return java.io.File(path).exists()
     }
 
     /**
@@ -2472,8 +2967,14 @@ object PrismSettings {
      * greyed-out button.
      */
     fun hasImageGenerator(): Boolean =
-        if (getAiMode() == AI_MODE_CLOUD) getActiveCloudModel() != null
-        else isLocalImageModelImported()
+        if (getAiMode() == AI_MODE_CLOUD) {
+            // KIND_IMAGE, not "any active cloud model". A text endpoint answers a description
+            // request with a completion, and the old check made GameCraft and the generate_image
+            // tool promise a texture they could not draw.
+            getActiveCloudModel(KIND_IMAGE) != null
+        } else {
+            isLocalImageModelImported()
+        }
 
     // ── Imported Model Registry ─────────────────────────────────────────────
 
@@ -2488,6 +2989,73 @@ object PrismSettings {
      * runtime loads them and a different part of the app asks them for anything.
      */
     const val MODEL_TYPE_AUDIO = "audio"
+
+    /**
+     * Ambience and music generation, which is a different job from speech.
+     *
+     * Kept apart from [MODEL_TYPE_AUDIO] deliberately: an audio model imported for VideoCraft's
+     * soundtrack is not a replacement voice, and listing it under Speech would let a user
+     * accidentally change what Sam sounds like by importing a music model.
+     */
+    const val MODEL_TYPE_AUDIO_GEN = "audio_gen"
+
+    /** Start/end frame interpolation for VideoCraft. */
+    const val MODEL_TYPE_INTERPOLATION = "interpolation"
+
+    /**
+     * A game asset model: something AssetCraft can load and turn into a mesh.
+     *
+     * Kept apart from IMAGE for the same reason AUDIO_GEN is kept apart from AUDIO: a texture model
+     * and a shape model are not interchangeable, and a page that listed one under the other would
+     * offer a download that cannot be used. A ModelCraft-created game model is not in this registry
+     * -- it lives on its model record -- so both sources are read when AssetCraft builds its list.
+     */
+    const val MODEL_TYPE_GAME = "game"
+
+    /** How many in-flight download types are remembered; see [setPendingModelType]. */
+    private const val MAX_PENDING_MODEL_TYPES = 32
+
+    /**
+     * Built-in media models.
+     *
+     * The two built-ins exist so VideoCraft is usable on a fresh install without network access to
+     * a model hub: a deterministic optical-flow interpolator and a small procedural score synth.
+     * They are still models the user must deliberately activate, so the page's gate means what it
+     * says rather than being satisfied by a hidden default.
+     */
+    const val BUILTIN_INTERPOLATION = "builtin:prism-flow"
+    const val BUILTIN_AUDIO_GEN = "builtin:prism-score"
+
+    /** The active cloud profile is used for this capability. */
+    const val CLOUD_MODEL_SENTINEL = "cloud:active"
+
+    // ── Cloud model kinds ────────────────────────────────────────────────────
+    // A cloud endpoint is only one of these four things, and which one it is decides which
+    // request Prism sends it. They are separate lists with separate active selections so that
+    // choosing a music endpoint cannot unhook the chat model.
+    const val KIND_TEXT = "text"
+    const val KIND_IMAGE = "image"
+    const val KIND_AUDIO = "audio"
+    const val KIND_INTERPOLATION = "interpolation"
+
+    /** Every kind, in the order the Add Cloud Model dialog offers them. */
+    val CLOUD_KINDS = listOf(KIND_TEXT, KIND_IMAGE, KIND_AUDIO, KIND_INTERPOLATION)
+
+    /** What to call a kind in the UI. */
+    fun cloudKindLabel(kind: String): String = when (normalizedCloudKind(kind)) {
+        KIND_IMAGE -> "Image"
+        KIND_AUDIO -> "Audio"
+        KIND_INTERPOLATION -> "Frame interpolation"
+        else -> "Text"
+    }
+
+    /** Maps any spelling of a kind onto the canonical constant; anything unknown is text. */
+    fun normalizedCloudKind(kind: String?): String = when (kind?.trim()?.lowercase()) {
+        KIND_IMAGE, "image_gen", "imagegen", "diffusion" -> KIND_IMAGE
+        KIND_AUDIO, "audio_gen", "audiogen", "music" -> KIND_AUDIO
+        KIND_INTERPOLATION, "frame_interpolation", "frameinterpolation", "interp" -> KIND_INTERPOLATION
+        else -> KIND_TEXT
+    }
 
     data class ImportedModel(
         val path: String,
@@ -2705,8 +3273,39 @@ object PrismSettings {
     fun getAiBackend(): Int =
         prefs().getInt(KEY_AI_BACKEND, AI_BACKEND_GPU)
 
-    fun setAiBackend(value: Int) =
+    fun setAiBackend(value: Int) {
         prefs().edit().putInt(KEY_AI_BACKEND, value).apply()
+        // PICKING A BACKEND AGAIN IS ALSO "TRY IT ONCE MORE". A load that stalled with an offload
+        // backend engaged suspends that backend for the rest of the process (see GgufInferenceService
+        // .reportStalledLoad) -- otherwise a driver that hung once would leave every later load on the
+        // CPU with no way to say "I know, try the GPU anyway". This is that way.
+        com.prism.launcher.messaging.GgufInferenceService.allowGpuOffloadAgain()
+    }
+
+    // ── Inference mode ───────────────────────────────────────────────────────
+
+    /**
+     * How local GGUF decoding spends its model passes. See InferenceMode.
+     *
+     * Stored by id rather than ordinal so inserting a mode later cannot silently repoint an
+     * existing preference at a different algorithm.
+     */
+    fun getInferenceMode(): String =
+        prefs().getString(KEY_INFERENCE_MODE, com.prism.launcher.messaging.InferenceMode.STANDARD.id)
+            ?: com.prism.launcher.messaging.InferenceMode.STANDARD.id
+
+    fun setInferenceMode(value: String) {
+        prefs().edit()
+            .putString(KEY_INFERENCE_MODE, com.prism.launcher.messaging.InferenceMode.normalise(value))
+            .apply()
+    }
+
+    /**
+     * Whether a local GGUF model is selected. The mode rows are disabled without one: every mode
+     * here is a GGUF decoding strategy, and offering the choice with no model to run would be a
+     * setting that cannot do anything.
+     */
+    fun hasActiveLocalModel(): Boolean = getLocalAiModelPath().isNotBlank()
 
     // ── Agentic Tools ────────────────────────────────────────────────────────
 
@@ -2900,6 +3499,8 @@ object PrismSettings {
     const val DEFAULT_DNS_A = "1.1.1.1"
     const val DEFAULT_DNS_B = "1.0.0.1"
 
+    private const val KEY_MESSAGING_WEBHOOK = "messaging_webhook_enabled"
+    private const val KEY_MESSAGING_WEBHOOK_PORT = "messaging_webhook_port"
     private const val KEY_ICON_PACK_PACKAGE  = "icon_pack_package"
     private const val KEY_DEFAULT_PAGE       = "default_page"
     private const val KEY_SHOW_DRAWER_LABELS = "show_drawer_labels"
@@ -2998,9 +3599,15 @@ object PrismSettings {
     private const val KEY_CLOUD_AI_MODEL     = "cloud_ai_model"
     private const val KEY_CLOUD_MODELS       = "cloud_models"
     private const val KEY_ACTIVE_CLOUD_MODEL_ID = "active_cloud_model_id"
+    private const val KEY_ACTIVE_CLOUD_IMAGE_MODEL_ID = "active_cloud_image_model_id"
+    private const val KEY_ACTIVE_CLOUD_AUDIO_MODEL_ID = "active_cloud_audio_model_id"
+    private const val KEY_ACTIVE_CLOUD_INTERPOLATION_MODEL_ID =
+        "active_cloud_interpolation_model_id"
     private const val KEY_CLOUD_MODELS_MIGRATED  = "cloud_models_migrated"
     private const val KEY_AI_DOWNLOAD_ID     = "ai_download_id"
     private const val KEY_AI_DOWNLOAD_IS_IMAGE = "ai_download_is_image"
+    private const val KEY_AI_DOWNLOAD_TYPE = "ai_download_type"
+    private const val KEY_PENDING_MODEL_TYPES = "pending_model_types_v1"
     private const val KEY_AI_MODEL           = "ai_model"
     private const val KEY_LOCAL_AI_MODEL_PATH = "local_ai_model_path"
     private const val KEY_LOCAL_IMAGE_MODEL_PATH = "local_image_model_path"
@@ -3008,6 +3615,24 @@ object PrismSettings {
     private const val KEY_MAX_TOKENS           = "ai_max_tokens"
     private const val KEY_IMPORTED_MODELS      = "imported_models"
     private const val KEY_LOCAL_AUDIO_MODEL_PATH = "local_audio_model_path"
+    private const val KEY_LOCAL_AUDIO_GEN_MODEL_PATH = "local_audio_gen_model_path"
+    private const val KEY_LOCAL_INTERPOLATION_MODEL_PATH = "local_interpolation_model_path"
+    private const val KEY_VIDEOCRAFT_INTERPOLATION_QUALITY = "videocraft_interpolation_quality"
+    private const val KEY_VIDEOCRAFT_TEMPERATURE = "videocraft_temperature"
+    private const val KEY_VIDEOCRAFT_MAX_SCENES = "videocraft_max_scenes"
+    private const val KEY_VIDEOCRAFT_VIDEO_TYPE = "videocraft_video_type"
+    private const val KEY_VIDEOCRAFT_WIDTH = "videocraft_width"
+    private const val KEY_VIDEOCRAFT_HEIGHT = "videocraft_height"
+    private const val KEY_VIDEOCRAFT_DURATION = "videocraft_duration"
+    private const val KEY_VIDEOCRAFT_FPS = "videocraft_fps"
+    private const val KEY_VIDEOCRAFT_KEYFRAMES = "videocraft_keyframes_per_second"
+    private const val KEY_VIDEOCRAFT_DENOISE = "videocraft_denoise"
+    private const val KEY_VIDEOCRAFT_CLIP = "videocraft_clip_threshold"
+    private const val KEY_VIDEOCRAFT_ADAPTIVE = "videocraft_adaptive"
+    private const val KEY_VIDEOCRAFT_MANUAL_KEYFRAMES = "videocraft_manual_keyframes"
+    private const val KEY_VIDEOCRAFT_MANUAL_CLIPS = "videocraft_manual_clips"
+    private const val KEY_VIDEOCRAFT_AUDIO_SCOPE = "videocraft_audio_scope"
+    private const val KEY_VIDEOCRAFT_SEED = "videocraft_seed"
     private const val KEY_KOKORO_VOICE_PREFIX  = "kokoro_voice_"
     private const val KEY_KOKORO_SPEED         = "kokoro_speed"
     private const val KEY_KOKORO_VARIANT       = "kokoro_variant"
@@ -3018,6 +3643,7 @@ object PrismSettings {
     private const val KEY_SPEAK_REPLIES_ALOUD  = "speak_replies_aloud"
     private const val KEY_KV_CACHE_QUANT       = "kv_cache_quant"
     private const val KEY_AI_BACKEND           = "ai_backend_mode"
+    private const val KEY_INFERENCE_MODE       = "inference_mode"
     private const val KEY_NEBULA_INTERVAL_HOURS = "nebula_generation_interval_hours"
     private const val KEY_AGENTIC_ENABLED       = "agentic_tools_enabled"
     private const val KEY_CONTEXT_OFFLOAD_ENABLED = "context_offload_enabled"
@@ -3045,6 +3671,7 @@ object PrismSettings {
     private const val KEY_SEEN_DATASET_REPO_IDS = "seen_dataset_repo_ids"
     private const val KEY_DATASET_USE_GIT = "dataset_use_git_enabled"
 
+    private const val KEY_PAGE_OFFLOAD_ENABLED           = "page_offload_enabled"
     private const val KEY_PRISM_SWAP_ENABLED              = "prism_swap_enabled"
     private const val KEY_PRISM_SWAP_BYTES                = "prism_swap_bytes"
     private const val KEY_PRISM_SWAP_MITIGATION_THRESHOLD = "prism_swap_mitigation_threshold_bytes"
@@ -3136,6 +3763,13 @@ object PrismSettings {
     private const val KEY_CLOUD_STORAGE_QUOTA    = "cloud_storage_quota_mb"
     private const val KEY_WINDOWS_MODE           = "windows_mode"
     private const val KEY_WINDOWED_PAGES         = "windowed_pages"
+    private const val KEY_ECHO_CUSTOM_ASSETS     = "echo_custom_assets"
+    private const val KEY_ECHO_ASSET_PATH        = "echo_asset_path"
+    private const val KEY_ECHO_DIFFICULTY        = "echo_difficulty"
+    private const val KEY_ECHO_ENEMIES           = "echo_enemies"
+    private const val KEY_ECHO_MIC_SENSITIVITY   = "echo_mic_sensitivity"
+    private const val KEY_ZOMBIES_CUSTOM_ASSETS  = "zombies_custom_assets"
+    private const val KEY_ZOMBIES_ASSET_PATH     = "zombies_asset_path"
     private const val KEY_WINDOWS_LAYER_URL      = "windows_layer_url"
     private const val KEY_NETWORK_STORAGES       = "network_storages"
     const val KEY_ACCESS_POINTS                 = "access_points"

@@ -8,4 +8,7 @@
     <attr name="prismCardColor" format="color" />
     <attr name="prismDivider" format="color" />
     <attr name="prismOverlay" format="color" />
+    <!-- Set on the card that wraps a page in windowed mode, pointing at the page inside it. See
+         PageOffload.unwrapWindowFrame: back handlers and page lookups want the page, not the chrome. -->
+    <item name="tag_prism_page_content" type="id" />
 </resources>

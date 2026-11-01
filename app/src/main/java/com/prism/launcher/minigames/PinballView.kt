@@ -36,7 +36,7 @@ import kotlin.math.min
 class PinballView(
     context: Context,
     private val onFinished: (score: Int) -> Unit,
-) : View(context) {
+) : View(context), MinigameFeedback {
 
     private val density = resources.displayMetrics.density
     private val dark: Boolean
@@ -51,6 +51,17 @@ class PinballView(
     private var lastNanos = 0L
     private var carry = 0.0
     private var reported = false
+
+    /** Fewer balls and a bigger score raise the tempo; a drained table stops it. */
+    override fun musicIntensity(): Float {
+        if (state.status == State.Status.GAME_OVER) return 0f
+        val danger = (1f - state.ballsLeft / 3f).coerceIn(0f, 1f)
+        val heat = (state.score % 6000) / 6000f
+        return (0.22f + danger * 0.38f + heat * 0.34f).coerceIn(0f, 1f)
+    }
+
+    override fun outcome(): Boolean? =
+        if (state.status == State.Status.GAME_OVER) false else null
 
     private val ink = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -153,7 +164,7 @@ class PinballView(
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        PencilStyle.drawPaper(canvas, width, height, dark, density)
+        ArcadeStyle.drawBackdrop(canvas, width, height, density, ArcadeStyle.PINBALL)
         fit()
 
         if (running) {
@@ -165,9 +176,10 @@ class PinballView(
             postInvalidateOnAnimation()
         }
 
-        val graphite = PencilStyle.graphite(dark)
-        val light = PencilStyle.graphiteLight(dark)
-        val table = Pinball.table
+        val graphite = ArcadeStyle.PINBALL
+        val light = ArcadeStyle.MUTED
+        // The table this ball was generated on, not the demo table the model keeps for tests.
+        val table = state.table
 
         // Header.
         text.color = graphite
@@ -189,7 +201,7 @@ class PinballView(
             canvas.drawLine(sx(segment.x1), sy(segment.y1), sx(segment.x2), sy(segment.y2), ink)
         }
 
-        ink.color = PencilStyle.BLUE_PENCIL
+        ink.color = 0xFF39E7FF.toInt()
         table.slings.forEach { segment ->
             canvas.drawLine(sx(segment.x1), sy(segment.y1), sx(segment.x2), sy(segment.y2), ink)
         }
@@ -197,11 +209,11 @@ class PinballView(
         // Bumpers.
         table.bumpers.forEach { bumper ->
             val lit = state.lit == bumper.id && state.litFor > 0
-            fill.color = if (lit) PencilStyle.RED_PENCIL else PencilStyle.paper(dark)
+            fill.color = if (lit) ArcadeStyle.PINBALL else 0xFF0B0620.toInt()
             canvas.drawCircle(sx(bumper.x), sy(bumper.y), bumper.radius.toFloat() * scale, fill)
-            ink.color = if (lit) PencilStyle.RED_PENCIL else graphite
+            ink.color = if (lit) ArcadeStyle.PINBALL else graphite
             canvas.drawCircle(sx(bumper.x), sy(bumper.y), bumper.radius.toFloat() * scale, ink)
-            text.color = if (lit) PencilStyle.RED_PENCIL else light
+            text.color = if (lit) 0xFFFFFFFF.toInt() else light
             text.textSize = 9f * density
             text.textAlign = Paint.Align.CENTER
             canvas.drawText(
@@ -219,7 +231,7 @@ class PinballView(
         drawFlipper(canvas, table.rightFlipper.pivotX, table.rightFlipper.pivotY, table.rightFlipper.length, state.rightAngle, graphite)
 
         // The ball.
-        fill.color = PencilStyle.graphite(dark)
+        fill.color = 0xFFE6FBFF.toInt()
         canvas.drawCircle(sx(state.ballX), sy(state.ballY), Pinball.BALL_RADIUS.toFloat() * scale, fill)
         ink.color = graphite
         canvas.drawCircle(sx(state.ballX), sy(state.ballY), Pinball.BALL_RADIUS.toFloat() * scale, ink)

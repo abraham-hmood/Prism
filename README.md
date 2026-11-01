@@ -850,7 +850,8 @@ reopened, so two characters on the same backend do not share a history.
   The network is **100 % AI personas**, and engagement counts are random
   (`NebulaSocialManager.kt:90-91`). The bot worker reports success on idle-gated no-ops
   (`SocialBotWorker.kt:14-15`).
-- **Lyke** — ✅ short-video feed/recording/upload, real PiP, Stremio streams through the proxy.
+- **Lyke** — ✅ short-video feed/recording/upload, real PiP, Stremio streams through the proxy,
+  and a full-screen Stremio player (landscape, page lock released by a shake, auto-hiding transport).
 - **Social mesh sync** — 🟡 announces posts and delivers them; offline peers depend on the
   re-announce timer.
 - **Language learning** — ✅ a real syllabus, lesson flow, tutor voices, vocabulary and stats,
@@ -875,7 +876,8 @@ reopened, so two characters on the same backend do not share a history.
   shipped**, so an untrained fold produces a meaningless backbone.
 - **Minigames** — ✅ chess (rules, review, mesh play), Pong, Paper War/provinces.
 - **Stremio** — ✅ addon protocol (browse/search/meta/episodes/streams), repository and addon
-  management; playback is inside Lyke.
+  management, searchable add-on lists on both platforms; playback is inside Lyke, using a debrid
+  account or Prism's own torrent client (DHT/trackers, verified pieces, loopback HTTP streaming).
 
 ---
 
@@ -1131,6 +1133,26 @@ the browser) JCEF.
 
 `local.properties` needs `sdk.dir`. Linux desktop needs `libfuse2`, a working `wg-quick` for the
 WireGuard server, and `x11vnc`/QEMU for the VM pages.
+
+### Release builds and GitHub releases
+
+```bash
+./gradlew :app:githubRelease
+```
+
+Builds the release APK, the desktop uber jar and the desktop installers this host can produce, then
+creates a published GitHub release named after the app's `versionName` (currently `v1.0`) and
+uploads every artifact. Running it again reuses that release and replaces assets of the same name,
+so a rebuild of the same version does not fail on an existing tag.
+
+The token is taken from `GITHUB_TOKEN`, `GH_TOKEN`, `-Pgithub.token=…`, or the git credential helper
+that already pushes to `origin`; it needs `Contents: write`. Nothing is uploaded with
+`-Pprism.release.dryRun=true`, which still builds and stages the files and prints what would go up.
+
+jpackage does not cross-build. Windows produces the `.exe` and `.msi` (both need WiX Toolset 3.x on
+`PATH`), Linux produces the AppImage, `.deb` and `.rpm`, and macOS contributes the uber jar because
+no dmg/pkg format is configured. The APK is unsigned unless a release signing config is added, and
+the release notes state that.
 
 ### Secrets and credentials
 

@@ -100,11 +100,17 @@ fun ImageGenPage() {
 
         scope.launch {
             val result = withContext(Dispatchers.IO) {
-                ImageGeneration.generate(text, selected.ifBlank { null }) { s ->
-                    // Assigning Compose state from the IO thread is safe -- snapshot state is
-                    // thread-safe and recomposition is scheduled on the main thread.
-                    stage = s
-                }
+                // NAMED ARGUMENT: the engine id is the second parameter and progress is now the
+                // third, so a trailing lambda would land on the wrong slot entirely.
+                ImageGeneration.generate(
+                    text,
+                    selected.ifBlank { null },
+                    onStage = { s ->
+                        // Assigning Compose state from the IO thread is safe, because snapshot state
+                        // is thread-safe and recomposition is scheduled on the main thread.
+                        stage = s
+                    },
+                )
             }
             busy = false
             stage = ""

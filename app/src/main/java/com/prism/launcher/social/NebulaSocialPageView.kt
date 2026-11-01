@@ -358,9 +358,9 @@ class NebulaSocialPageView @JvmOverloads constructor(
                 showSection(true)
                 lykeView?.startAt(videoId)
             }
-            onOpenStremio = { meta, streamUrl, headers, addonName ->
+            onOpenStremio = { meta, stream, addonName ->
                 showSection(true)
-                lykeView?.playStremio(meta, streamUrl, headers, addonName)
+                lykeView?.playStremio(meta, stream, addonName)
             }
         }
         searchPanel = panel

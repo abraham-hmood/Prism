@@ -12,7 +12,6 @@ import androidx.core.app.NotificationCompat
 import com.prism.launcher.LauncherActivity
 import com.prism.launcher.PrismLogger
 import com.prism.launcher.PrismSettings
-import com.prism.launcher.quant.PrismQuantizer.Level
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -55,14 +54,22 @@ class QuantizationService : Service() {
 
         val sourcePath = intent?.getStringExtra(EXTRA_SOURCE)
         val levelName = intent?.getStringExtra(EXTRA_LEVEL)
+        val container = intent?.getStringExtra(EXTRA_CONTAINER)
         if (sourcePath == null || levelName == null) {
             stopSelf()
             return START_NOT_STICKY
         }
 
-        val level = runCatching { Level.valueOf(levelName) }.getOrNull()
         val source = File(sourcePath)
-        if (level == null || !source.isFile) {
+        // RESOLVED FROM THE FILE, not from a stored enum. The level's name is enough to identify it
+        // inside the list the source's OWN container offers, which is what lets a GGUF level and a
+        // safetensors level travel through one service: whichever list the file answers with is the
+        // one the name is looked up in.
+        val target = QuantTarget.forSource(source).firstOrNull { candidate ->
+            candidate.fileSuffix == levelName && (container == null || candidate.extension == container)
+        }
+        if (target == null) {
+            PrismLogger.logWarning(TAG, "No quantisation called $levelName applies to ${source.name}")
             stopSelf()
             return START_NOT_STICKY
         }
@@ -75,14 +82,14 @@ class QuantizationService : Service() {
             return START_NOT_STICKY
         }
 
-        val destination = destinationFor(source, level)
-        val expectedBytes = PrismQuantizer.estimateOutputBytes(source, level)
+        val destination = destinationFor(source, target)
+        val expectedBytes = target.estimateOutputBytes(source)
         val modelName = source.nameWithoutExtension
 
         if (!hasRoomFor(destination, expectedBytes)) {
             val needed = (expectedBytes + SPACE_MARGIN_BYTES) / (1024 * 1024)
             _state.value = State(
-                running = false, modelName = modelName, level = level, finished = true,
+                running = false, modelName = modelName, target = target, finished = true,
                 error = "Not enough free space — about $needed MB is needed",
             )
             PrismLogger.logWarning(TAG, "Refusing to quantise ${source.name}: not enough free space")
@@ -93,7 +100,7 @@ class QuantizationService : Service() {
         _state.value = State(
             running = true,
             modelName = modelName,
-            level = level,
+            target = target,
             percent = 0,
             outputPath = destination.absolutePath,
         )
@@ -117,27 +124,30 @@ class QuantizationService : Service() {
 
         worker = scope.launch {
             val threads = Runtime.getRuntime().availableProcessors().coerceAtMost(6)
-            PrismLogger.logInfo(TAG, "Quantising ${source.name} to ${level.label} on $threads thread(s)")
+            PrismLogger.logInfo(
+                TAG,
+                "Quantising ${QuantTarget.describe(target, source)} on $threads thread(s)",
+            )
 
-            val error = PrismQuantizer.quantize(source, destination, level, threads)
+            val error = target.quantize(source, destination, threads)
 
             watcher?.cancel()
             if (error == null) {
-                importResult(destination, modelName, level)
+                importResult(destination, source, target)
                 _state.value = State(
                     running = false,
                     modelName = modelName,
-                    level = level,
+                    target = target,
                     percent = 100,
                     outputPath = destination.absolutePath,
                     finished = true,
                 )
-                PrismLogger.logSuccess(TAG, "Quantised ${source.name} to ${level.label}")
+                PrismLogger.logSuccess(TAG, "Quantised ${source.name} to ${target.label}")
             } else {
                 _state.value = State(
                     running = false,
                     modelName = modelName,
-                    level = level,
+                    target = target,
                     percent = 0,
                     outputPath = null,
                     finished = true,
@@ -184,12 +194,14 @@ class QuantizationService : Service() {
      * their models, the export action hands the file out from there, and a model the user cannot see
      * in a file browser is one they cannot back up.
      */
-    private fun destinationFor(source: File, level: Level): File {
+    private fun destinationFor(source: File, target: QuantTarget): File {
         val base = source.nameWithoutExtension
             // Strip a quantisation already in the name so requantising Q4_K_M to Q2_K does not
             // produce "model-Q4_K_M-Q2_K", which reads as a model that is somehow both.
-            .replace(Regex("(?i)[-_.](Q\\d[_A-Z0-9]*|F16|F32|BF16|BQ|TQ|QQ|5QQ)$"), "")
-        val name = "$base-${level.fileSuffix}.gguf"
+            .replace(Regex("(?i)[-_.](Q\\d[_A-Z0-9]*|F16|F32|BF16|BQ|TQ|QQ|5QQ|I8|I4)$"), "")
+        // The container's own extension: a quantised safetensors is still a safetensors file, and
+        // naming it `.gguf` would be a lie a loader would believe.
+        val name = "$base-${target.fileSuffix}.${target.extension}"
 
         // Beside the source when that is writable, which is the useful place -- the user's other
         // models are there and a file browser can find it. But an imported model can perfectly well
@@ -222,14 +234,27 @@ class QuantizationService : Service() {
         return free > expectedBytes + SPACE_MARGIN_BYTES
     }
 
-    /** Registers the result as an imported model so it appears in the models list immediately. */
-    private fun importResult(destination: File, sourceName: String, level: Level) {
+    /**
+     * Registers the result as an imported model so it appears in the models list immediately.
+     *
+     * THE TYPE IS INHERITED FROM THE SOURCE when the source is a known import. A quantised copy of a
+     * diffuser is a diffuser, and registering it as text -- which is what the GGUF-only version did
+     * unconditionally -- would have Sam route chat through a diffusion checkpoint. Anything unknown
+     * falls back to the GGUF answer, since a GGUF this app has never seen is still a text model it
+     * can load.
+     */
+    private fun importResult(destination: File, source: File, target: QuantTarget) {
         runCatching {
+            val sourceType = PrismSettings.getImportedModels()
+                .firstOrNull { it.path == source.absolutePath }
+                ?.type
+                ?.takeIf { it.isNotBlank() }
+                ?: PrismSettings.MODEL_TYPE_TEXT
             PrismSettings.addImportedModel(
                 PrismSettings.ImportedModel(
                     path = destination.absolutePath,
-                    displayName = "$sourceName (${level.fileSuffix})",
-                    type = PrismSettings.MODEL_TYPE_TEXT,
+                    displayName = "${source.nameWithoutExtension} (${target.fileSuffix})",
+                    type = sourceType,
                 )
             )
         }.onFailure {
@@ -247,7 +272,7 @@ class QuantizationService : Service() {
         val summary = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setContentTitle(
-                if (state.error == null) "Quantised to ${state.level?.fileSuffix}"
+                if (state.error == null) "Quantised to ${state.target?.fileSuffix}"
                 else "Quantisation failed"
             )
             .setContentText(
@@ -275,13 +300,13 @@ class QuantizationService : Service() {
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setContentTitle("Quantising to ${state.level?.fileSuffix ?: ""}")
+            .setContentTitle("Quantising to ${state.target?.fileSuffix ?: ""}")
             .setContentText(state.modelName)
             .setStyle(
                 NotificationCompat.BigTextStyle().bigText(
                     buildString {
                         append(state.modelName)
-                        append("\n").append(state.level?.label ?: "")
+                        append("\n").append(state.target?.label ?: "")
                         if (state.bytesWritten > 0) {
                             append("\n").append(state.bytesWritten / (1024 * 1024)).append(" MB written")
                         }
@@ -335,7 +360,7 @@ class QuantizationService : Service() {
     data class State(
         val running: Boolean = false,
         val modelName: String = "",
-        val level: Level? = null,
+        val target: QuantTarget? = null,
         val percent: Int = 0,
         val bytesWritten: Long = 0L,
         /** Where the finished model landed, for the export action. */
@@ -353,6 +378,10 @@ class QuantizationService : Service() {
 
         private const val EXTRA_SOURCE = "source"
         private const val EXTRA_LEVEL = "level"
+
+        /** The container the level belongs to, so a name that exists in both lists cannot be taken
+         * for the wrong one. Null means "resolve against whatever applies". */
+        private const val EXTRA_CONTAINER = "container"
         const val ACTION_CANCEL = "com.prism.launcher.QUANT_CANCEL"
 
         /**
@@ -363,10 +392,11 @@ class QuantizationService : Service() {
         private val _state = MutableStateFlow(State())
         val state: StateFlow<State> = _state
 
-        fun start(context: Context, source: File, level: Level) {
+        fun start(context: Context, source: File, target: QuantTarget) {
             val intent = Intent(context, QuantizationService::class.java)
                 .putExtra(EXTRA_SOURCE, source.absolutePath)
-                .putExtra(EXTRA_LEVEL, level.name)
+                .putExtra(EXTRA_LEVEL, target.fileSuffix)
+                .putExtra(EXTRA_CONTAINER, target.extension)
             context.startForegroundService(intent)
         }
 

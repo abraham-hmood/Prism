@@ -49,6 +49,19 @@ object PrismCalls {
     private const val TAG = "PrismCalls"
     const val CHANNEL_INCOMING = "prism_calls"
     private const val NOTIFICATION_RINGING = 4711
+    private const val NOTIFICATION_UNDELIVERABLE = 4712
+
+    /**
+     * The app-wide invitation routing, held as a field so it can be registered exactly once.
+     *
+     * [install] is guarded by [installed], but a listener is now added rather than assigned, and a
+     * second install on a new application context must not double-post the same call.
+     */
+    private val incomingListener: (MeshCalls.Call) -> Unit = { call ->
+        appContext?.let { announceIncoming(it, call) }
+    }
+
+    @Volatile private var appContext: Context? = null
 
     @Volatile private var audio: CallAudio? = null
     @Volatile private var ringtone: Ringtone? = null
@@ -60,6 +73,7 @@ object PrismCalls {
         if (installed) return
         installed = true
         val app = context.applicationContext
+        appContext = app
 
         // THE PROBE WAS NEVER INSTALLED, and every plan check therefore answered "no plan" with
         // the object's own fallback -- the dialer, Meshvoice and Settings all disagreed with the SIM
@@ -76,7 +90,27 @@ object PrismCalls {
 
         // An invite has to reach the user even when Prism is in the background, which is most of the
         // time. A full-screen notification is the only route a non-phone app has to a call screen.
-        MeshCalls.onIncoming = { call -> announceIncoming(app, call) }
+        //
+        // A LISTENER, not an assignment. The call screen also observes the engine; assigning here
+        // meant whichever component started last was the only one that heard an invitation. If that
+        // was a destroyed call screen's restored lambda, no notification was ever posted -- which is
+        // how a call could ring the caller forever and show the receiver nothing.
+        MeshCalls.addIncomingListener(incomingListener)
+        MeshCalls.onUndeliverableInvite = { reason ->
+            ensureChannel(app)
+            val notify = NotificationCompat.Builder(app, CHANNEL_INCOMING)
+                .setSmallIcon(android.R.drawable.stat_notify_error)
+                .setContentTitle("A mesh call could not be shown")
+                .setContentText(reason)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(reason))
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setAutoCancel(true)
+                .build()
+            runCatching {
+                app.getSystemService(NotificationManager::class.java)
+                    ?.notify(NOTIFICATION_UNDELIVERABLE, notify)
+            }
+        }
 
         ensureChannel(app)
         PrismLogger.logInfo(TAG, "Mesh calls installed")

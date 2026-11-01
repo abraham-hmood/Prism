@@ -17,6 +17,9 @@ import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import com.prism.launcher.databinding.PageMessagingRootBinding
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -49,6 +52,7 @@ class MessagingPageView(context: Context) : LinearLayout(context) {
     private val adapter = ConversationAdapter(emptyList()) { thread ->
         val intent = android.content.Intent(context, ConversationActivity::class.java).apply {
             putExtra("thread_id", thread.threadId)
+            putExtra("thread_ids", thread.threadIds.toLongArray())
             putExtra("address", thread.address)
         }
         context.startActivity(intent)
@@ -91,8 +95,20 @@ class MessagingPageView(context: Context) : LinearLayout(context) {
      */
     private val bridgeFeed = LinearLayout(context).apply { orientation = VERTICAL }
 
+    /**
+     * API-backed conversations.
+     *
+     * A separate stack from the notification feed because these ARE conversations: they have a
+     * transcript Prism can open and a send path. The notification rows above are a copy of what
+     * the personal apps posted and can only be handed back to their app.
+     */
+    private val linkedSection = LinearLayout(context).apply { orientation = VERTICAL }
+
     /** Bumped for every render so a slow file read cannot overwrite a newer one. */
     private var bridgeRenderGeneration = 0
+
+    /** Keeps the linked rows current while the page stays open. */
+    private var linkedPoll: Job? = null
 
     /** Rebuilds the feed, coalescing a burst of notifications into one redraw. */
     private val bridgeRefresh = Runnable {
@@ -113,7 +129,10 @@ class MessagingPageView(context: Context) : LinearLayout(context) {
         installMenuButton()
         installTabs()
         installBridges()
-        addView(bridgeFeed, 2, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+        // API conversations sit ABOVE the copied notifications: they are the ones that can be
+        // read and answered here, and a feed of app notifications must not push them off screen.
+        addView(linkedSection, 2, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+        addView(bridgeFeed, 3, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
         refreshBridges()
         
         binding.messagingConversationList.layoutManager = LinearLayoutManager(context)
@@ -249,7 +268,11 @@ class MessagingPageView(context: Context) : LinearLayout(context) {
         val groups = LinkedHashMap<String, BridgeGroup>()
         for (record in com.prism.launcher.notifications.NotificationHistory.all()) {
             val bridge = byPackage[record.packageName] ?: continue
-            val key = record.packageName + "\u0000" + record.title
+            // THE CONVERSATION IS THE THREAD. For a group text Android names the group in
+            // EXTRA_CONVERSATION_TITLE and puts the sender in the title, so keying on the title made
+            // every member of the group a separate row. `conversationKey` falls back to the title
+            // for the one-to-one chats and apps that name no conversation.
+            val key = record.packageName + "\u0000" + record.conversationKey
             val existing = groups[key]
             groups[key] = if (existing == null) {
                 BridgeGroup(record, bridge, 1)
@@ -340,13 +363,254 @@ class MessagingPageView(context: Context) : LinearLayout(context) {
         }
 
         bridgeFeed.addView(TextView(context).apply {
-            text = "Copied from the notifications these apps post. Prism cannot read their " +
-                "history or send as you — tap one to open the app and reply."
+            text = "Copied from the notifications these apps post, for the personal accounts. " +
+                "The linked chats below use the services' own APIs and can be answered here."
             textSize = 12f
             setTextColor(com.prism.launcher.nora.IosUi.tertiaryLabel(context))
             setLineSpacing(d(2).toFloat(), 1f)
             setPadding(d(20), d(6), d(20), d(4))
         })
+    }
+
+    /**
+     * Rebuilds the API-backed chat rows.
+     *
+     * Reading the store is a file parse per thread, so it happens off the main thread; a failure
+     * hides the section rather than showing a half-read list. WhatsApp has no history endpoint, so
+     * a row appears as soon as its webhook delivers a message; Signal and Messenger are also
+     * synced here so a conversation started elsewhere shows up.
+     */
+    private fun refreshLinkedChats() {
+        val owner = context as? LifecycleOwner
+        if (owner == null) {
+            renderLinkedChats(MessagingStore.threads().filter { MessagingApps.isApi(it.app) })
+            return
+        }
+        owner.lifecycleScope.launch(Dispatchers.IO) {
+            runCatching { MessagingApi.syncAll() }
+            val threads = MessagingStore.threads().filter { MessagingApps.isApi(it.app) }
+            withContext(Dispatchers.Main) {
+                if (isAttachedToWindow) renderLinkedChats(threads)
+            }
+        }
+    }
+
+    private fun renderLinkedChats(threads: List<MessagingStore.Thread>) {
+        linkedSection.removeAllViews()
+        val configured = MessagingApps.configured()
+        linkedSection.visibility = if (showingContacts || showingCharacters) GONE else VISIBLE
+
+        val header = LinearLayout(context).apply {
+            orientation = HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            setPadding(d(20), d(8), d(20), d(4))
+        }
+        // The heading goes; the actions stay. The section is already visually distinct as the
+        // first card above the personal-app list, and the label was taking a row for nothing.
+        header.addView(View(context), LayoutParams(0, 1, 1f))
+        header.addView(TextView(context).apply {
+            text = if (configured.isEmpty()) "Set up" else "New"
+            textSize = 13f
+            setTextColor(com.prism.launcher.nora.IosUi.accent(context))
+            setPadding(d(8), d(4), 0, d(4))
+            isClickable = true
+            setOnClickListener {
+                if (configured.isEmpty()) {
+                    context.startActivity(
+                        android.content.Intent(context, MessagingBridgesActivity::class.java)
+                            .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
+                } else {
+                    chooseLinkedApp(configured)
+                }
+            }
+        })
+        linkedSection.addView(header)
+
+        if (threads.isEmpty()) {
+            // NOTHING TO SAY WHEN NOTHING IS CONNECTED. The paragraph that used to live here
+            // explained WhatsApp Cloud API, Messenger Platform and signal-cli on the conversation
+            // list itself -- a wall of setup prose between the user and their messages. The "Set
+            // up" action in the header is the way in, and Settings owns the explanation. Only a
+            // connected-but-empty state earns a line, because then "New" is not obvious.
+            if (configured.isNotEmpty()) {
+                linkedSection.addView(TextView(context).apply {
+                    text = "No linked conversations yet. Tap New to start one."
+                    textSize = 12f
+                    setTextColor(com.prism.launcher.nora.IosUi.tertiaryLabel(context))
+                    setLineSpacing(d(2).toFloat(), 1f)
+                    setPadding(d(20), 0, d(20), d(6))
+                })
+            }
+            return
+        }
+
+        val card = LinearLayout(context).apply {
+            orientation = VERTICAL
+            background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = d(12).toFloat()
+                setColor(com.prism.launcher.nora.IosUi.cardBackground(context))
+            }
+        }
+        threads.take(4).forEachIndexed { index, thread ->
+            if (index > 0) {
+                card.addView(android.view.View(context).apply {
+                    setBackgroundColor(com.prism.launcher.nora.IosUi.separator(context))
+                }, LinearLayout.LayoutParams(
+                    LayoutParams.MATCH_PARENT, maxOf(1, d(0.5f))
+                ).apply {
+                    leftMargin = d(14)
+                    rightMargin = d(14)
+                })
+            }
+            card.addView(linkedRow(thread))
+        }
+        linkedSection.addView(card, LayoutParams(
+            LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT
+        ).apply {
+            leftMargin = d(16)
+            rightMargin = d(16)
+        })
+    }
+
+    private fun linkedRow(thread: MessagingStore.Thread): LinearLayout =
+        LinearLayout(context).apply {
+            orientation = VERTICAL
+            setPadding(d(14), d(11), d(14), d(11))
+            isClickable = true
+            isFocusable = true
+            background = selectableBackground()
+            contentDescription = thread.title + ", " + thread.app + ". Open conversation."
+            setOnClickListener {
+                context.startActivity(
+                    LinkedChatActivity.intent(context, thread)
+                        .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            }
+            addView(LinearLayout(context).apply {
+                orientation = HORIZONTAL
+                gravity = android.view.Gravity.CENTER_VERTICAL
+                addView(TextView(context).apply {
+                    text = thread.title
+                    textSize = 15f
+                    setTextColor(com.prism.launcher.nora.IosUi.label(context))
+                    maxLines = 1
+                    ellipsize = TextUtils.TruncateAt.END
+                }, LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f))
+                if (thread.unread > 0) {
+                    addView(TextView(context).apply {
+                        text = thread.unread.toString()
+                        textSize = 11f
+                        setTextColor(android.graphics.Color.WHITE)
+                        gravity = android.view.Gravity.CENTER
+                        background = android.graphics.drawable.GradientDrawable().apply {
+                            cornerRadius = d(9).toFloat()
+                            setColor(com.prism.launcher.nora.IosUi.accent(context))
+                        }
+                        setPadding(d(6), d(1), d(6), d(1))
+                    })
+                }
+            })
+            addView(TextView(context).apply {
+                text = thread.snippet.ifBlank { "No messages yet" }
+                textSize = 13f
+                setTextColor(com.prism.launcher.nora.IosUi.secondaryLabel(context))
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+                setPadding(0, d(2), 0, 0)
+            })
+            addView(TextView(context).apply {
+                val app = MessagingApps.byId(thread.app)?.label ?: thread.app
+                val kind = if (thread.app == RcsChat.APP_ID) "Prism mesh" else "API chat"
+                text = app + if (thread.group) " · group" else " · $kind"
+                textSize = 11f
+                setTextColor(com.prism.launcher.nora.IosUi.tertiaryLabel(context))
+                setPadding(0, d(4), 0, 0)
+            })
+        }
+
+    /** Picks which API service the new conversation belongs to. */
+    private fun chooseLinkedApp(apps: List<MessagingApps.App>) {
+        val labels = apps.map { it.label }.toTypedArray()
+        android.app.AlertDialog.Builder(context)
+            .setTitle("New linked chat")
+            .setItems(labels) { _, index -> newLinkedChat(apps[index]) }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun newLinkedChat(app: MessagingApps.App) {
+        val column = LinearLayout(context).apply {
+            orientation = VERTICAL
+            setPadding(d(20), d(8), d(20), 0)
+        }
+        val title = android.widget.EditText(context).apply {
+            hint = "Conversation name"
+            textSize = 14f
+        }
+        val recipient = android.widget.EditText(context).apply {
+            hint = when (app.id) {
+                "whatsapp" -> "Phone number, or group id for a group"
+                "messenger" -> "Page-scoped id (PSID)"
+                "signal" -> "Phone number, or signal-cli group id"
+                "rcs" -> "The other Prism device's Lyke username"
+                else -> "Recipient"
+            }
+            textSize = 14f
+        }
+        val participants = android.widget.EditText(context).apply {
+            hint = "Group participants, comma separated (optional)"
+            textSize = 14f
+        }
+        val group = android.widget.CheckBox(context).apply {
+            text = "This is a group chat"
+            textSize = 14f
+        }
+        column.addView(title)
+        column.addView(recipient)
+        column.addView(group)
+        column.addView(participants)
+        column.addView(TextView(context).apply {
+            text = when (app.id) {
+                "whatsapp" -> "Cloud API sends as your business number. Inbound replies arrive through the webhook."
+                "messenger" -> "Messenger has no group send API; group messages are delivered to each participant separately."
+                "rcs" -> "Prism RCS travels over the mesh, sealed with your wallet. The other device " +
+                    "must be on the same mesh and hold this wallet. Carrier RCS is not used."
+                else -> "signal-cli must already be linked as a device; Prism talks to its REST bridge."
+            }
+            textSize = 11f
+            setTextColor(com.prism.launcher.nora.IosUi.tertiaryLabel(context))
+            setLineSpacing(d(2).toFloat(), 1f)
+            setPadding(0, d(6), 0, 0)
+        })
+
+        android.app.AlertDialog.Builder(context)
+            .setTitle(app.label)
+            .setView(android.widget.ScrollView(context).apply { addView(column) })
+            .setPositiveButton("Start") { _, _ ->
+                val address = recipient.text?.toString()?.trim().orEmpty()
+                if (address.isBlank()) {
+                    android.widget.Toast.makeText(context, "A recipient is required", android.widget.Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+                val thread = MessagingApi.startThread(
+                    appId = app.id,
+                    title = title.text?.toString().orEmpty().ifBlank { address },
+                    recipient = address,
+                    group = group.isChecked,
+                    participants = participants.text?.toString().orEmpty()
+                        .split(',', ';')
+                        .map { it.trim() }
+                        .filter { it.isNotBlank() },
+                )
+                context.startActivity(
+                    LinkedChatActivity.intent(context, thread)
+                        .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+                postDelayed({ refreshLinkedChats() }, 500)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun bridgeMessageRow(group: BridgeGroup): LinearLayout =
@@ -356,14 +620,14 @@ class MessagingPageView(context: Context) : LinearLayout(context) {
             isClickable = true
             isFocusable = true
             background = selectableBackground()
-            contentDescription = "${group.record.title}, ${group.bridge.label}. Open the app."
+            contentDescription = "${group.record.conversationKey}, ${group.bridge.label}. Open the app."
             setOnClickListener { MessagingBridgesView.open(context, group.bridge) }
 
             addView(LinearLayout(context).apply {
                 orientation = HORIZONTAL
                 gravity = android.view.Gravity.CENTER_VERTICAL
                 addView(TextView(context).apply {
-                    text = group.record.title.ifBlank { group.bridge.label }
+                    text = group.record.conversationKey.ifBlank { group.bridge.label }
                     textSize = 15f
                     setTextColor(com.prism.launcher.nora.IosUi.label(context))
                     maxLines = 1
@@ -415,6 +679,7 @@ class MessagingPageView(context: Context) : LinearLayout(context) {
         // The connected-app row belongs to the conversation list, not to the contacts list above
         // it. The feed follows it for the same reason: it is messages, not people.
         bridgeRow.visibility = if (contacts) GONE else VISIBLE
+        linkedSection.visibility = if (contacts) GONE else VISIBLE
         if (contacts) bridgeFeed.visibility = GONE else refreshBridges()
 
         if (contacts) {
@@ -573,6 +838,7 @@ class MessagingPageView(context: Context) : LinearLayout(context) {
         // Restoring every child shows the bridge row even when nothing is connected; refreshing
         // puts both the chips and the feed back to what they should be.
         refreshBridges()
+        refreshLinkedChats()
         backToMessages.isEnabled = false
     }
 
@@ -627,20 +893,40 @@ class MessagingPageView(context: Context) : LinearLayout(context) {
         // Settings can connect an app while this page is alive in the pager, so the row is rebuilt
         // on every attach rather than only when the view is constructed.
         com.prism.launcher.notifications.NotificationHistory.addChangeListener(bridgeHistoryListener)
+        // RCS arrives on the mesh thread; the store has no reactive flow, so the receive path calls
+        // this to redraw the linked-chat rows instead of waiting for the once-a-minute poll.
+        RcsChat.onChanged = { post { if (isAttachedToWindow) refreshLinkedChats() } }
         refreshBridges()
+        refreshLinkedChats()
         checkPermissionsAndLoad()
+        linkedPoll?.cancel()
+        linkedPoll = (context as? LifecycleOwner)?.lifecycleScope?.launch {
+            while (isActive) {
+                // The linked-chat list is a database read and a re-render. Once a minute is
+                // enough for a conversation list; new messages still arrive through the webhook
+                // and refresh the feed without this poll.
+                delay(60_000)
+                refreshLinkedChats()
+            }
+        }
     }
 
     override fun onDetachedFromWindow() {
         com.prism.launcher.notifications.NotificationHistory.removeChangeListener(bridgeHistoryListener)
+        if (RcsChat.onChanged != null) RcsChat.onChanged = null
         removeCallbacks(bridgeRefresh)
+        linkedPoll?.cancel()
+        linkedPoll = null
         super.onDetachedFromWindow()
     }
 
     /** Coming back from WhatsApp or Settings should show what arrived while away. */
     override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
         super.onWindowFocusChanged(hasWindowFocus)
-        if (hasWindowFocus) refreshBridges()
+        if (hasWindowFocus) {
+            refreshBridges()
+            refreshLinkedChats()
+        }
     }
 
     private fun checkPermissionsAndLoad() {
@@ -702,9 +988,16 @@ class MessagingPageView(context: Context) : LinearLayout(context) {
             // 2b. Add Aether (Permanent, a second brain-based AI -- spiking neurons)
             threads.add(aetherThread())
 
-            // 3. Load Real SMS Threads
+            // 3. Load Real SMS Threads, then collapse threads that are the same conversation.
+            //
+            // A GROUP TEXT IS ONE CONVERSATION. Android normally gives one thread the whole group,
+            // but an OEM telephony provider can hand the same group back as a thread per sender (and
+            // a group whose members are listed in a different order is a second row unless the
+            // membership is normalized). Grouping here is by the SET of participants, not by the
+            // thread id, so those rows become one with every thread id kept for the message query.
             val uri = Uri.parse("content://mms-sms/conversations?simple=true")
             val projection = arrayOf("_id", "recipient_ids", "snippet", "date")
+            val drafts = mutableListOf<ThreadDraft>()
 
             try {
                 context.contentResolver.query(uri, projection, null, null, "date DESC")?.use { cursor ->
@@ -718,12 +1011,31 @@ class MessagingPageView(context: Context) : LinearLayout(context) {
                         val recipientIds = cursor.getString(recIdx)
                         val snippet = cursor.getString(snipIdx) ?: ""
                         val date = if (dateIdx >= 0) cursor.getLong(dateIdx) else 0L
-                        val address = resolveAddress(recipientIds)
-                        threads.add(ThreadInfo(threadId, address, snippet, date))
+                        drafts += ThreadDraft(threadId, resolveAddresses(recipientIds), snippet, date)
                     }
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
+            }
+
+            val grouped = LinkedHashMap<String, MutableList<ThreadDraft>>()
+            for (draft in drafts) {
+                val key = draft.conversationKey()
+                grouped.getOrPut(key) { mutableListOf() }.add(draft)
+            }
+            for (group in grouped.values) {
+                val newest = group.maxByOrNull { it.date } ?: continue
+                val addresses = group.flatMap { it.addresses }.distinct()
+                threads.add(
+                    ThreadInfo(
+                        threadId = newest.threadId,
+                        address = addresses.joinToString(", ").ifBlank { "Unknown" },
+                        snippet = newest.snippet,
+                        timestamp = newest.date,
+                        threadIds = group.map { it.threadId }.distinct(),
+                        group = addresses.size > 1,
+                    )
+                )
             }
 
             // 4. Conversations a trusted device shared with this one.
@@ -811,21 +1123,53 @@ class MessagingPageView(context: Context) : LinearLayout(context) {
             }
         }
     }
-    private fun resolveAddress(recipientIds: String?): String {
-        if (recipientIds.isNullOrEmpty()) return "Unknown"
-        val firstId = recipientIds.split(" ").firstOrNull() ?: return "Unknown"
-        
-        var address = "Unknown"
-        val uri = Uri.parse("content://mms-sms/canonical-address/$firstId")
-        try {
-            context.contentResolver.query(uri, null, null, null, null)?.use { c ->
-                if (c.moveToFirst()) {
-                    address = c.getString(c.getColumnIndexOrThrow("address"))
+    /**
+     * The people in a thread, not just the first one.
+     *
+     * A group MMS thread lists several recipient ids; showing only the first made a group look
+     * like a one-to-one chat with whoever happened to sort first, which then looked like the
+     * wrong person had sent the message. Joining them is the only place the thread list can show
+     * that it is a group without opening it.
+     */
+    private fun resolveAddresses(recipientIds: String?): List<String> {
+        if (recipientIds.isNullOrEmpty()) return emptyList()
+        return recipientIds.split(" ").mapNotNull { id ->
+            if (id.isBlank()) return@mapNotNull null
+            runCatching {
+                context.contentResolver.query(
+                    Uri.parse("content://mms-sms/canonical-address/$id"),
+                    null,
+                    null,
+                    null,
+                    null,
+                )?.use { c ->
+                    if (c.moveToFirst()) c.getString(c.getColumnIndexOrThrow("address")) else null
                 }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
+            }.getOrNull()
+        }.filter { it.isNotBlank() }.distinct()
+    }
+
+    /** One conversation row before same-conversation threads are collapsed. */
+    private data class ThreadDraft(
+        val threadId: Long,
+        val addresses: List<String>,
+        val snippet: String,
+        val date: Long,
+    ) {
+        /**
+         * The participant set, normalized so order and formatting cannot split one group in two.
+         * A blank address (a thread whose recipients could not be resolved) keeps its own id, so
+         * unknown threads are never merged with each other.
+         */
+        fun conversationKey(): String {
+            if (addresses.isEmpty()) return "thread:$threadId"
+            return addresses.map { address ->
+                // A phone number is compared by its digits so formatting cannot split a group; an
+                // email address is compared as text, because stripping punctuation would make
+                // a.b@example.com and ab@example.com the same participant.
+                if (address.contains('@')) address.trim().lowercase()
+                else address.lowercase().filter { it.isDigit() || it == '+' }
+            }.filter { it.isNotBlank() }.sorted().joinToString("|")
         }
-        return address
     }
 }

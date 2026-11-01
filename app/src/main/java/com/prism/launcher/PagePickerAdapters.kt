@@ -33,6 +33,16 @@ sealed interface PagePickChoice {
     data object Mouse : PagePickChoice
     data object Photos : PagePickChoice
     data object PhotoPix : PagePickChoice
+    data object VideoCraft : PagePickChoice
+    data object ImageCraft : PagePickChoice
+    data object AudioCraft : PagePickChoice
+    data object ModelCraft : PagePickChoice
+    data object DatasetCraft : PagePickChoice
+    data object AssetCraft : PagePickChoice
+    data object EmailServer : PagePickChoice
+    data object EmailClient : PagePickChoice
+    data object AppStore : PagePickChoice
+    data object TaskManager : PagePickChoice
 }
 
 class PositionPickerAdapter(
@@ -182,6 +192,16 @@ class VerticalPageOptionsAdapter(
         add(Option("Mouse", "Drive a trusted desktop's pointer from this device", PagePickChoice.Mouse))
         add(Option("Photos", "Every photo and video on this device, and the encrypted mesh backup", PagePickChoice.Photos))
         add(Option("PhotoPix", "Layer-based photo editor, as a canvas of its own", PagePickChoice.PhotoPix))
+        add(Option("VideoCraft", "Turn a prompt into a scored, cut film — resumable renders", PagePickChoice.VideoCraft))
+        add(Option("ImageCraft", "A sentence in, a picture out — drawn in the background", PagePickChoice.ImageCraft))
+        add(Option("AudioCraft", "Text or a document in, an audio file out — read by your speech model", PagePickChoice.AudioCraft))
+        add(Option("ModelCraft", "Build text, image, audio, interpolator and video models from your own datasets", PagePickChoice.ModelCraft))
+        add(Option("DatasetCraft", "Build the datasets those models train on — files, columns and rows, kept as a CSV", PagePickChoice.DatasetCraft))
+        add(Option("AssetCraft", "A prompted 3D asset viewport, using an active game model and a text model", PagePickChoice.AssetCraft))
+        add(Option("Email server", "Serve inbound mail, submission and IMAP, with a live dashboard", PagePickChoice.EmailServer))
+        add(Option("Email", "Inbox, folders, filters, several accounts and text alerts", PagePickChoice.EmailClient))
+        add(Option("App Store", "Mesh-gated apps, games, tools and your publisher listings", PagePickChoice.AppStore))
+        add(Option("Task Manager", "Running tasks, their memory, and the files they hold open", PagePickChoice.TaskManager))
         for (p in plugins) add(Option(p.label, p.packageName, PagePickChoice.PluginPage(p)))
     }
 

@@ -243,10 +243,12 @@ class DictationTest {
         val engine = WhisperCppEngine()
         when (val availability = engine.availability()) {
             is ImageGenerator.Availability.Ready -> {
-                // Then the model it named must really be there -- a Ready engine that cannot load is
-                // the failure this check exists to rule out.
-                val path = PrismSettings.getWhisperModelPath()
-                assertTrue(path.isNotBlank() && java.io.File(path).isFile,
+                // Then the model it resolved must really be there -- a Ready engine that cannot
+                // load is the failure this check exists to rule out. It may be the user's chosen
+                // path or the model auto-transcription installed, so the resolver is what is
+                // asked rather than the raw setting.
+                val path = WhisperModels.modelPath()
+                assertTrue(path != null && java.io.File(path).isFile,
                     "reported Ready with no model behind it: \"$path\"")
             }
 

@@ -114,6 +114,16 @@ class SettingsActivity : PrismBaseActivity() {
                 listOf("Mouse")
             ),
             Group(
+                "Storage",
+                "Where Prism keeps imported models, datasets, editor projects and generated files",
+                listOf("Storage")
+            ),
+            Group(
+                "Minigames",
+                "Echo Chamber, GameCraft and the other games",
+                listOf("Minigames", "GameCraft")
+            ),
+            Group(
                 "Developer options",
                 "Prism Debug Bridge and developer tooling",
                 listOf("Developer options")
@@ -128,6 +138,20 @@ class SettingsActivity : PrismBaseActivity() {
     private var activeGroup: String? = null
 
     private var searchQuery: String = ""
+
+    /**
+     * The folder picker for the user-visible Prism folder.
+     *
+     * A tree picker rather than a path box: on Android a typed path is a path the app may not be
+     * able to write to, and the system picker is also where the user grants that access. The URI is
+     * converted back to a real directory by [resolveTreePath], because every other part of Prism
+     * works in `File`s and rewriting all of them for SAF is a much larger change than moving one
+     * folder.
+     */
+    private val dataFolderPicker =
+        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+            if (uri != null) confirmDataFolder(uri)
+        }
 
     /** One header's worth of settings, in the order [buildItems] produced them. */
     private class Block(val header: String, val items: List<SettingItem>)
@@ -545,6 +569,55 @@ class SettingsActivity : PrismBaseActivity() {
     private fun refresh() {
         if (::adapter.isInitialized) adapter.setItems(displayItems())
     }
+
+    /**
+     * Benchmarks every inference mode on the active model and stores the fastest.
+     *
+     * The test runs off the UI thread because it loads and runs the model; the dialog on top of it
+     * is updated from the benchmark's progress callback. Cancelling is deliberately not offered:
+     * a native decode cannot be interrupted safely mid-batch, so a "Cancel" button would either
+     * lie or tear down the context under the model.
+     */
+    private fun autoSelectInferenceMode() {
+        if (!PrismSettings.hasActiveLocalModel()) return
+        val progress = android.app.AlertDialog.Builder(this)
+            .setTitle("Finding the fastest mode")
+            .setMessage("Starting the smoke test…")
+            .setCancelable(false)
+            .create()
+        progress.show()
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            val results = com.prism.launcher.messaging.InferenceModeBench.run { index, total, mode ->
+                lifecycleScope.launch(Dispatchers.Main) {
+                    progress.setMessage("Testing ${mode.label}… (${index + 1}/$total)")
+                }
+            }
+            val best = com.prism.launcher.messaging.InferenceModeBench.best(results)
+            if (best != null) PrismSettings.setInferenceMode(best.id)
+
+            withContext(Dispatchers.Main) {
+                progress.dismiss()
+                val ranked = results
+                    .filter { it.tokensPerSecond > 0.0 }
+                    .joinToString("\n") {
+                        "%.1f tok/s  —  %s".format(it.tokensPerSecond, it.mode.label)
+                    }
+                val message = when {
+                    best == null ->
+                        "No mode produced tokens. The model may not be loaded; the log says why."
+                    ranked.isBlank() -> "Selected ${best.label}."
+                    else -> ranked
+                }
+                PrismDialogFactory.show(
+                    this@SettingsActivity,
+                    best?.let { "Selected ${it.label}" } ?: "No mode completed",
+                    message,
+                )
+                refresh()
+            }
+        }
+    }
     
     /**
      * Picks a folder to auto-caption.
@@ -555,6 +628,95 @@ class SettingsActivity : PrismBaseActivity() {
      * java.io.File is usable once the path is known, and the caption service can then be the same
      * code on both platforms.
      */
+    /** Echo Chamber's texture/model folder. A tree picker, because it is a directory. */
+    private val echoAssetPicker = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri == null) return@registerForActivityResult
+        val path = resolveTreePath(uri)
+        if (path == null) {
+            Toast.makeText(
+                this,
+                "That folder cannot be addressed directly. Pick one under Internal storage.",
+                Toast.LENGTH_LONG,
+            ).show()
+            return@registerForActivityResult
+        }
+        PrismSettings.setEchoChamberAssetPath(path.absolutePath)
+        PrismSettings.setEchoChamberUseCustomAssets(true)
+        com.prism.launcher.minigames.EchoAssets.invalidate()
+        refresh()
+        Toast.makeText(this, "Echo Chamber assets: ${path.name}", Toast.LENGTH_SHORT).show()
+    }
+
+    /** Zombies' optional baseline pack: maps, meshes, 1024² textures and sounds. */
+    private val zombiesAssetPicker = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri == null) return@registerForActivityResult
+        val path = resolveTreePath(uri)
+        if (path == null) {
+            Toast.makeText(
+                this,
+                "That folder cannot be addressed directly. Pick one under Internal storage.",
+                Toast.LENGTH_LONG,
+            ).show()
+            return@registerForActivityResult
+        }
+        PrismSettings.setZombiesAssetPath(path.absolutePath)
+        PrismSettings.setZombiesUseCustomAssets(true)
+        com.prism.launcher.minigames.ZombiesAssets.invalidate()
+        refresh()
+        Toast.makeText(this, "Zombies assets: ${path.name}", Toast.LENGTH_SHORT).show()
+    }
+
+    /**
+     * A folder holding a ModelCraft game export. Two files means the SAF's single-file picker is the
+     * wrong shape; a tree picker is the only Android picker that names a directory.
+     */
+    private val gameModelFolderPicker =
+        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+            uri ?: return@registerForActivityResult
+            val path = resolveTreePath(uri)
+            if (path == null) {
+                Toast.makeText(
+                    this,
+                    "That folder cannot be addressed directly. Pick one under Internal storage.",
+                    Toast.LENGTH_LONG,
+                ).show()
+                return@registerForActivityResult
+            }
+            val choice = com.prism.launcher.assetcraft.AssetCraft.importGameFolder(path)
+            refresh()
+            Toast.makeText(
+                this,
+                if (choice != null) "Game model ready: ${choice.name}"
+                else "No game_model.json and weights found in ${path.name}",
+                Toast.LENGTH_LONG,
+            ).show()
+        }
+
+    /** Picks which mesh generator GameCraft and AssetCraft use. */
+    private fun pickActiveGameModel() {
+        val choices = com.prism.launcher.assetcraft.AssetCraft.gameChoices()
+        if (choices.isEmpty()) {
+            Toast.makeText(
+                this,
+                "No game generator yet. Train one in ModelCraft, or import a game folder above.",
+                Toast.LENGTH_LONG,
+            ).show()
+            return
+        }
+        val activeId = com.prism.launcher.assetcraft.AssetCraft.activeGameId()
+        val labels = choices.map { choice ->
+            (if (choice.id == activeId) "✓ " else "") + choice.name + "\n" + choice.detail
+        }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Mesh generator model")
+            .setItems(labels) { _, which ->
+                com.prism.launcher.assetcraft.AssetCraft.setActiveGame(choices.getOrNull(which))
+                refresh()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     private val captionDirPicker = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri != null) {
             val path = resolveTreePath(uri)
@@ -792,9 +954,17 @@ class SettingsActivity : PrismBaseActivity() {
             name = uri.path?.substringAfterLast('/') ?: "external_model.task"
         }
         
-        // Safety: Ensure it doesn't have reserved characters and a sensible default extension
-        if (!name.contains(".") && !isPickingImageModel) {
-            name += ".task"
+        // A sensible default extension per kind. A diffusion bundle is .task, a speech or score
+        // model is usually ONNX, and a language model is GGUF; appending .task to an audio model
+        // made the import look like a vision bundle even when its bytes were fine.
+        if (!name.contains(".")) {
+            name += when (pendingImportType) {
+                PrismSettings.MODEL_TYPE_IMAGE -> ".task"
+                PrismSettings.MODEL_TYPE_AUDIO,
+                PrismSettings.MODEL_TYPE_AUDIO_GEN,
+                PrismSettings.MODEL_TYPE_INTERPOLATION -> ".onnx"
+                else -> ".gguf"
+            }
         }
         
         return name
@@ -808,6 +978,13 @@ class SettingsActivity : PrismBaseActivity() {
      * rather than positive/negative. The order is the order they were added, which is also roughly
      * how often each is used.
      */
+    /** Opens the picker for one kind directly, for the dedicated import rows. */
+    private fun pickLocalModelOfType(type: String) {
+        pendingImportType = type
+        isPickingImageModel = type == PrismSettings.MODEL_TYPE_IMAGE
+        modelPicker.launch("*/*")
+    }
+
     private fun pickLocalModel() {
         val kinds = listOf(
             Triple("Text AI", "A language model — .task, .gguf or .bin", PrismSettings.MODEL_TYPE_TEXT),
@@ -818,6 +995,16 @@ class SettingsActivity : PrismBaseActivity() {
                     com.prism.launcher.speech.ImportedAudioEngine.ACCEPTED_EXTENSIONS
                         .joinToString(", ") { ".$it" },
                 PrismSettings.MODEL_TYPE_AUDIO,
+            ),
+            Triple(
+                "Audio Generation",
+                "Ambience and music for VideoCraft — ONNX preferred",
+                PrismSettings.MODEL_TYPE_AUDIO_GEN,
+            ),
+            Triple(
+                "Frame Interpolation",
+                "Start/end frame model for VideoCraft — ONNX preferred",
+                PrismSettings.MODEL_TYPE_INTERPOLATION,
             ),
         )
 
@@ -996,6 +1183,32 @@ class SettingsActivity : PrismBaseActivity() {
             ModelListingScanner.MINIMUM_INTERVAL_HOURS, 2, 4, 6, 12, 24
         ).distinct()
 
+        // THE MAIL SETTINGS ARE READ AND WRITTEN THROUGH THESE TWO, so every row below saves the
+        // whole config rather than a field of it. EmailConfig is immutable and EmailSettings stores
+        // it as one object: editing a field through a setter per-field would let two screens write
+        // stale copies over each other.
+        fun mailConfig() = runCatching { com.prism.launcher.email.EmailSettings.load() }
+            .getOrElse { com.prism.launcher.email.EmailConfig() }
+        fun editMail(block: (com.prism.launcher.email.EmailConfig) -> com.prism.launcher.email.EmailConfig) {
+            val next = block(mailConfig())
+            next.save()
+            if (next.enabled) {
+                Thread {
+                    val error = com.prism.launcher.email.EmailServer.start(next)
+                    // NO TOAST. A mail server's start result is a diagnostic, not a passing
+                    // message: it names a port that could not bind or a certificate that could not
+                    // be made, and the user needs to be able to read it again after the toast has
+                    // gone. It is in System Diagnostics with the rest of the email stack.
+                    if (error.isNotBlank()) {
+                        PrismLogger.logWarning("PrismMail", "Email server: $error")
+                    }
+                }.start()
+            } else {
+                com.prism.launcher.email.EmailServer.stop()
+            }
+            refresh()
+        }
+
         return listOf(
             SettingItem.Header("Themes"),
             SettingItem.Nav(
@@ -1061,6 +1274,207 @@ class SettingsActivity : PrismBaseActivity() {
                     }
                     PrismSettings.setGlowColor(android.graphics.Color.parseColor(color))
                     refresh() // Refresh to update neon borders if needed
+                }
+            ),
+
+            SettingItem.Header("Email"),
+            SettingItem.Toggle(
+                "Email server",
+                "Serve inbound mail, submission and IMAP from this device",
+                mailConfig().enabled,
+                { on -> editMail { it.copy(enabled = on) } }
+            ),
+            SettingItem.Nav(
+                "Email server dashboard",
+                run {
+                    val state = mailConfig()
+                    val status = com.prism.launcher.email.EmailServer.status(state)
+                    when {
+                        !state.enabled -> "Stopped · " + state.addressFor(PrismSettings.getLykeUserName())
+                        status.services.any { it.running } ->
+                            status.services.filter { it.running }.joinToString(", ") { it.name + " " + it.port }
+                        else -> "Not listening"
+                    } + " · tap for the log, DNS and certificates"
+                },
+                { startActivity(android.content.Intent(this, com.prism.launcher.email.EmailServerActivity::class.java)) }
+            ),
+            SettingItem.Nav(
+                "Email client",
+                "Inbox, folders, filters, accounts and text alerts",
+                { startActivity(android.content.Intent(this, com.prism.launcher.email.EmailClientActivity::class.java)) }
+            ),
+            SettingItem.Picker(
+                "Mail network",
+                "Auto follows the mesh; internet mail always uses the standard ports",
+                listOf("Auto", "Internet only", "Meshnet only"),
+                mailConfig().mode.ordinal,
+                { index ->
+                    val mode = com.prism.launcher.email.EmailConfig.Mode.entries[index]
+                    editMail { it.copy(mode = mode) }
+                }
+            ),
+            SettingItem.TextInput(
+                "Mesh mail domain",
+                "Claimed in the P2P DNS; other devices cannot use the same name",
+                mailConfig().domain,
+                { raw ->
+                    val name = raw.lowercase().trim().trimEnd('.')
+                    if (name.isBlank()) {
+                        android.widget.Toast.makeText(this, "Enter a domain", android.widget.Toast.LENGTH_SHORT).show()
+                    } else {
+                        editMail { it.copy(domain = name) }
+                        val error = com.prism.launcher.email.EmailSettings.publishMeshDomain(name)
+                        if (error.isNotBlank()) {
+                            android.widget.Toast.makeText(this, error, android.widget.Toast.LENGTH_LONG).show()
+                        }
+                    }
+                },
+                isSingleLine = true
+            ),
+            SettingItem.TextInput(
+                "Inbound SMTP port", "Internet mail arrives on 25",
+                mailConfig().inboundPort.toString(),
+                { raw -> raw.toIntOrNull()?.let { port -> editMail { it.copy(inboundPort = port) } } },
+                isSingleLine = true
+            ),
+            SettingItem.TextInput(
+                "Submission port", "Internet submission uses 587",
+                mailConfig().submissionPort.toString(),
+                { raw -> raw.toIntOrNull()?.let { port -> editMail { it.copy(submissionPort = port) } } },
+                isSingleLine = true
+            ),
+            SettingItem.TextInput(
+                "IMAP port", "TLS-only; internet IMAP uses 993",
+                mailConfig().imapPort.toString(),
+                { raw -> raw.toIntOrNull()?.let { port -> editMail { it.copy(imapPort = port) } } },
+                isSingleLine = true
+            ),
+            SettingItem.TextInput(
+                "Mesh inbound port", "Used instead of 25 on the meshnet",
+                mailConfig().meshInboundPort.toString(),
+                { raw -> raw.toIntOrNull()?.let { port -> editMail { it.copy(meshInboundPort = port) } } },
+                isSingleLine = true
+            ),
+            SettingItem.TextInput(
+                "Mesh submission port", "Used instead of 587 on the meshnet",
+                mailConfig().meshSubmissionPort.toString(),
+                { raw -> raw.toIntOrNull()?.let { port -> editMail { it.copy(meshSubmissionPort = port) } } },
+                isSingleLine = true
+            ),
+            SettingItem.TextInput(
+                "Mesh IMAP port", "Used instead of 993 on the meshnet",
+                mailConfig().meshImapPort.toString(),
+                { raw -> raw.toIntOrNull()?.let { port -> editMail { it.copy(meshImapPort = port) } } },
+                isSingleLine = true
+            ),
+            SettingItem.Toggle(
+                "Require TLS",
+                "Refuse authentication and delivery over a plaintext session",
+                mailConfig().requireTls,
+                { on -> editMail { it.copy(requireTls = on) } }
+            ),
+            SettingItem.Toggle(
+                "Accept external mail",
+                "Take mail from servers outside this meshnet",
+                mailConfig().acceptExternalMail,
+                { on -> editMail { it.copy(acceptExternalMail = on) } }
+            ),
+            SettingItem.Toggle(
+                "Relay outgoing mail",
+                "Send through a smart host instead of delivering directly",
+                mailConfig().allowRelay,
+                { on -> editMail { it.copy(allowRelay = on) } }
+            ),
+            SettingItem.TextInput(
+                "Relay host", "The smart host that sends on your behalf",
+                mailConfig().relayHost,
+                { raw -> editMail { it.copy(relayHost = raw.trim()) } },
+                isSingleLine = true
+            ),
+            SettingItem.TextInput(
+                "Relay username", "The smart host account",
+                mailConfig().relayUsername,
+                { raw -> editMail { it.copy(relayUsername = raw.trim()) } },
+                isSingleLine = true
+            ),
+            SettingItem.Toggle(
+                "Spam filtering",
+                "Score every message and sort what scores too high into Spam",
+                mailConfig().spamFilter,
+                { on -> editMail { it.copy(spamFilter = on) } }
+            ),
+            SettingItem.Toggle(
+                "Malware filtering",
+                "Quarantine executables and dangerous attachments",
+                mailConfig().malwareFilter,
+                { on -> editMail { it.copy(malwareFilter = on) } }
+            ),
+            SettingItem.Toggle(
+                "Blocklist recovery",
+                "Check this address against blocklists and explain how to delist it",
+                mailConfig().blocklistRecovery,
+                { on -> editMail { it.copy(blocklistRecovery = on) } }
+            ),
+            SettingItem.Toggle(
+                "Mail backups",
+                "Keep a scheduled copy of the mailbox",
+                mailConfig().backups,
+                { on -> editMail { it.copy(backups = on) } }
+            ),
+            SettingItem.TextInput(
+                "Backup interval", "Hours between backups",
+                mailConfig().backupEveryHours.toString(),
+                { raw -> raw.toIntOrNull()?.let { hours -> editMail { it.copy(backupEveryHours = hours) } } },
+                isSingleLine = true
+            ),
+            SettingItem.TextInput(
+                "Email retention", "Days a message is kept before pruning",
+                mailConfig().retentionDays.toString(),
+                { raw -> raw.toIntOrNull()?.let { days -> editMail { it.copy(retentionDays = days) } } },
+                isSingleLine = true
+            ),
+            SettingItem.TextInput(
+                "Abuse contact", "The mailbox complaints are sent to",
+                mailConfig().abuseContact,
+                { raw -> editMail { it.copy(abuseContact = raw.trim()) } },
+                isSingleLine = true
+            ),
+            SettingItem.TextInput(
+                "Privacy contact", "The mailbox data-protection requests are sent to",
+                mailConfig().privacyContact,
+                { raw -> editMail { it.copy(privacyContact = raw.trim()) } },
+                isSingleLine = true
+            ),
+            SettingItem.Picker(
+                "DMARC policy",
+                "What receivers do with mail that fails SPF and DKIM",
+                listOf("None (monitor)", "Quarantine", "Reject"),
+                when (mailConfig().dmarcPolicy) {
+                    "reject" -> 2
+                    "quarantine" -> 1
+                    else -> 0
+                },
+                { index ->
+                    val policy = listOf("none", "quarantine", "reject")[index]
+                    editMail { it.copy(dmarcPolicy = policy) }
+                }
+            ),
+            SettingItem.TextInput(
+                "DKIM selector", "The name the public key is published under",
+                mailConfig().dkimSelector,
+                { raw -> editMail { it.copy(dkimSelector = raw.trim().ifBlank { "prism" }) } },
+                isSingleLine = true
+            ),
+            SettingItem.Nav(
+                "Back up the mailbox now",
+                "Write a copy into the email backups folder",
+                {
+                    val file = com.prism.launcher.email.EmailStore.backup()
+                    android.widget.Toast.makeText(
+                        this,
+                        if (file == null) "The mailbox could not be backed up" else "Saved ${file.name}",
+                        android.widget.Toast.LENGTH_LONG,
+                    ).show()
                 }
             ),
 
@@ -1256,11 +1670,23 @@ class SettingsActivity : PrismBaseActivity() {
             SettingItem.Custom(vpnServerActionRow()),
             SettingItem.Picker(
                 "Prism VPN Role",
-                "Serve as a node or connect as a client",
-                listOf("Client", "Server"),
-                if (PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_SERVER) 1 else 0,
+                "Serve, connect, bridge several servers, or relay for the mesh",
+                listOf("Client", "Server", "Bridge", "Relay"),
+                when (PrismSettings.getPrismVpnRole()) {
+                    PrismSettings.PRISM_ROLE_SERVER -> 1
+                    PrismSettings.PRISM_ROLE_BRIDGE -> 2
+                    PrismSettings.PRISM_ROLE_RELAY -> 3
+                    else -> 0
+                },
                 {
-                    PrismSettings.setPrismVpnRole(if (it == 1) PrismSettings.PRISM_ROLE_SERVER else PrismSettings.PRISM_ROLE_CLIENT)
+                    PrismSettings.setPrismVpnRole(
+                        when (it) {
+                            1 -> PrismSettings.PRISM_ROLE_SERVER
+                            2 -> PrismSettings.PRISM_ROLE_BRIDGE
+                            3 -> PrismSettings.PRISM_ROLE_RELAY
+                            else -> PrismSettings.PRISM_ROLE_CLIENT
+                        },
+                    )
                     // Swapping role swaps which listeners should be bound, so the engine has to be
                     // told; it tears the old role down before building the new one.
                     runCatching { (application as PrismApp).tunnelEngine.start() }
@@ -1329,7 +1755,7 @@ class SettingsActivity : PrismBaseActivity() {
                 "Manage Prism Servers",
                 "${PrismSettings.getPrismServers().size} servers saved (Auto-failover active)",
                 { showServerFleetManager() },
-                isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM && PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_CLIENT
+                isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM && PrismSettings.isPrismClientRole()
             ),
             SettingItem.Header("Mesh Bootstrap Server"),
             SettingItem.Toggle(
@@ -1359,14 +1785,14 @@ class SettingsActivity : PrismBaseActivity() {
                 "Primary entry point for P2P DNS & Mesh search",
                 PrismSettings.getMeshBootstrapAddress(),
                 { PrismSettings.setMeshBootstrapAddress(it) },
-                isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM && PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_CLIENT
+                isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM && PrismSettings.isPrismClientRole()
             ),
             SettingItem.TextInput(
                 "Bootstrap Port",
                 "Port of the bootstrap node (Default 8081)",
                 PrismSettings.getMeshBootstrapPort(),
                 { PrismSettings.setMeshBootstrapPort(it) },
-                isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM && PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_CLIENT
+                isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM && PrismSettings.isPrismClientRole()
             ),
             SettingItem.Nav(
                 "Configure External VPN",
@@ -1627,7 +2053,7 @@ class SettingsActivity : PrismBaseActivity() {
                         }
                         refresh()
                     },
-                    isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_CLIENT
+                    isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.isPrismClientRole()
                 )
             },
             SettingItem.TextInput(
@@ -1692,6 +2118,50 @@ class SettingsActivity : PrismBaseActivity() {
             ),
 
             SettingItem.Header("Intelligence & Messaging"),
+            run {
+                val modes = com.prism.launcher.messaging.InferenceMode.selectable
+                SettingItem.Picker(
+                    "Inference mode",
+                    "How local generation spends model passes. Parallel modes trade sampling " +
+                        "variety for speed; forced diffusion is experimental.",
+                    modes.map { it.label },
+                    modes.indexOfFirst { it.id == PrismSettings.getInferenceMode() }.coerceAtLeast(0),
+                    { index ->
+                        val chosen = modes.getOrNull(index) ?: com.prism.launcher.messaging.InferenceMode.STANDARD
+                        if (!chosen.experimental) {
+                            PrismSettings.setInferenceMode(chosen.id)
+                            refresh()
+                        } else {
+                            android.app.AlertDialog.Builder(this)
+                                .setTitle("Forced diffusion is experimental")
+                                .setMessage(
+                                    "This applies diffusion-style parallel denoising to a model that " +
+                                        "was not trained for it. Replies are greedy, can be less coherent, " +
+                                        "and can repeat themselves.\n\nEnable it anyway?"
+                                )
+                                .setPositiveButton("Enable anyway") { _, _ ->
+                                    PrismSettings.setInferenceMode(chosen.id)
+                                    refresh()
+                                }
+                                // The picker has already moved its own highlight; rebuilding the
+                                // rows is what puts it back on the stored value.
+                                .setNegativeButton("Cancel") { _, _ -> refresh() }
+                                .setOnCancelListener { refresh() }
+                                .show()
+                        }
+                    },
+                    isEnabled = PrismSettings.hasActiveLocalModel(),
+                )
+            },
+            SettingItem.Nav(
+                "Select the fastest inference mode",
+                if (PrismSettings.hasActiveLocalModel())
+                    "Runs a short smoke test on the active local model and keeps the fastest mode"
+                else
+                    "Set a local AI model first",
+                { autoSelectInferenceMode() },
+                isEnabled = PrismSettings.hasActiveLocalModel(),
+            ),
             SettingItem.Nav(
                 "Messaging apps",
                 com.prism.launcher.messaging.MessagingBridges.summary() +
@@ -1799,11 +2269,16 @@ class SettingsActivity : PrismBaseActivity() {
             run {
                 val cloudModels = PrismSettings.getCloudModels()
                 val active = PrismSettings.getActiveCloudModel()
+                val activeKinds = PrismSettings.CLOUD_KINDS.count {
+                    PrismSettings.getActiveCloudModelId(it) != null
+                }
                 SettingItem.Nav(
                     "Manage Cloud Models",
                     when {
                         cloudModels.isEmpty() -> "No cloud models saved yet"
-                        active != null -> "${cloudModels.size} saved • Active: ${active.modelId}"
+                        active != null ->
+                            "${cloudModels.size} saved • $activeKinds of " +
+                                "${PrismSettings.CLOUD_KINDS.size} kinds active"
                         else -> "${cloudModels.size} saved • None active"
                     },
                     { startActivity(android.content.Intent(this, CloudModelsActivity::class.java)) },
@@ -1816,6 +2291,30 @@ class SettingsActivity : PrismBaseActivity() {
                 "Select a .task, .gguf, or .bin LLM from storage",
                 { pickLocalModel() },
                 isEnabled = PrismSettings.getAiMode() == PrismSettings.AI_MODE_LOCAL
+            ),
+            SettingItem.Nav(
+                "Import Image Model",
+                "Add a diffusion bundle for image generation — " +
+                    com.prism.launcher.videocraft.VideoCraftModels.summary(
+                        com.prism.launcher.videocraft.VideoCraftModels.Kind.IMAGE,
+                    ),
+                { pickLocalModelOfType(PrismSettings.MODEL_TYPE_IMAGE) }
+            ),
+            SettingItem.Nav(
+                "Import Audio Generation Model",
+                "Add a model for VideoCraft's ambience and score — " +
+                    com.prism.launcher.videocraft.VideoCraftModels.summary(
+                        com.prism.launcher.videocraft.VideoCraftModels.Kind.AUDIO_GEN,
+                    ),
+                { pickLocalModelOfType(PrismSettings.MODEL_TYPE_AUDIO_GEN) }
+            ),
+            SettingItem.Nav(
+                "Import Frame Interpolation Model",
+                "Add a start/end frame interpolator — " +
+                    com.prism.launcher.videocraft.VideoCraftModels.summary(
+                        com.prism.launcher.videocraft.VideoCraftModels.Kind.INTERPOLATION,
+                    ),
+                { pickLocalModelOfType(PrismSettings.MODEL_TYPE_INTERPOLATION) }
             ),
 
             SettingItem.Header("Speech"),
@@ -1936,6 +2435,27 @@ class SettingsActivity : PrismBaseActivity() {
                 isEnabled = PrismSettings.getAiMode() == PrismSettings.AI_MODE_LOCAL
             ),
 
+            SettingItem.Header("AI Images"),
+            run {
+                // THE RESOLUTION IMAGECRAFT ASKS FOR, on the phone's own row style so it matches the
+                // rest of the group. The list is shared with the catalog (ImageSize.CHOICES), which is
+                // what keeps the desktop and the phone offering the same sizes -- a size one platform
+                // can offer and the other cannot is how a setting becomes a platform difference.
+                val sizes = com.prism.launcher.messaging.ImageSize.CHOICES
+                val current = PrismSettings.getImageCraftSize()
+                SettingItem.Picker(
+                    "Image Resolution",
+                    "What ImageCraft asks the image model for. A checkpoint trained at 512 is clamped " +
+                        "to the largest size it can actually draw, and the page says when that happened.",
+                    sizes.map { it.label },
+                    sizes.indexOfFirst { it == current }.coerceAtLeast(0),
+                    { idx ->
+                        sizes.getOrNull(idx)?.let { PrismSettings.setImageCraftSize(it) }
+                        refresh()
+                    }
+                )
+            },
+
             SettingItem.Header("Nora (Brain-Based Generation)"),
             run {
                 // Everything Nora lives on its own screen now. Brain size alone is nine coupled
@@ -2002,21 +2522,25 @@ class SettingsActivity : PrismBaseActivity() {
                 // the wrong Hexagon version, a build without the SDK, or a vendor llama.cpp has no
                 // backend for at all. Those are three different answers and only one of them is
                 // something the user could act on.
-                val npu = com.prism.launcher.messaging.NpuSupport.detect()
+                val npu = com.prism.launcher.messaging.AndroidNpuReporter.capability()
 
                 SettingItem.Picker(
                     "AI Backend",
                     buildString {
                         append(
-                            "Force which backend AI text generation uses, for both GGUF and .task " +
-                                "models. GPU is faster when well-supported (falls back to CPU " +
-                                "automatically if it fails); switch to CPU if generation is slow or " +
-                                "unstable on your device. GPU only speeds up Q4_0/Q8_0 GGUF quants — " +
-                                "K-quants (e.g. Q2_K) always run on CPU regardless."
+                            "Which processor runs your models. NPU is used only when NPU is what " +
+                                "you pick here and the model's format has a path to it. "
                         )
-                        append(System.lineSeparator() + System.lineSeparator() + "NPU: ")
-                        append(npu.displayName)
-                        append(if (npu.usable) " — available." else " — unavailable. ${npu.reason}")
+                        append(npu.summary())
+                        append(System.lineSeparator() + System.lineSeparator())
+                        append(
+                            "TFLite and ONNX models can use the NPU on every vendor (Qualcomm, " +
+                                "Exynos, Tensor, Dimensity, Kirin) through NNAPI. A GGUF can use " +
+                                "Qualcomm's Hexagon DSP where the build includes it. Diffusion " +
+                                "checkpoints cannot: stable-diffusion.cpp has no NPU backend. " +
+                                "Anything that cannot use the NPU runs on the CPU or GPU and the " +
+                                "page says so rather than pretending."
+                        )
                     },
                     listOf("CPU", "GPU", "NPU"),
                     PrismSettings.getAiBackend().coerceIn(0, 2),
@@ -2024,12 +2548,22 @@ class SettingsActivity : PrismBaseActivity() {
                         if (idx == PrismSettings.AI_BACKEND_NPU && !npu.usable) {
                             // Refused rather than accepted-and-ignored. Storing the choice would
                             // leave the picker reading "NPU" while every token came off the CPU.
+                            // The message is per-workload, because "why can't I use my NPU" has a
+                            // different answer for a GGUF than for an ONNX graph.
                             com.prism.launcher.theme.PrismDialogs.Builder(this)
                                 .setTitle("NPU unavailable")
-                                .setMessage(
-                                    npu.displayName + System.lineSeparator() +
-                                        System.lineSeparator() + npu.reason
-                                )
+                                .setMessage(npu.detail())
+                                .setPositiveButton("OK", null)
+                                .show()
+                            refresh()
+                        } else if (idx == PrismSettings.AI_BACKEND_NPU) {
+                            PrismSettings.setAiBackend(idx)
+                            // The format-by-format table, shown once on choosing NPU: the user is
+                            // about to run things that will or will not reach the accelerator, and
+                            // finding out from a notification halfway through is too late.
+                            com.prism.launcher.theme.PrismDialogs.Builder(this)
+                                .setTitle("NPU on this device")
+                                .setMessage(npu.detail())
                                 .setPositiveButton("OK", null)
                                 .show()
                             refresh()
@@ -2104,6 +2638,17 @@ class SettingsActivity : PrismBaseActivity() {
                 )
             },
 
+            SettingItem.Header("Storage"),
+            SettingItem.Nav(
+                "Prism data folder",
+                run {
+                    val folder = com.prism.core.PrismPlatform.host.documentsDir()
+                    val kind = if (com.prism.core.PrismStorage.configuredRoot() == null) "default" else "custom"
+                    folder.absolutePath + " · " + kind + " · tap to move"
+                },
+                { dataFolderPicker.launch(null) }
+            ),
+
             // Developer options is a top-level group rather than a row buried in another screen:
             // the bridge is a shell, and putting it one level deeper than the trusted devices it
             // depends on would make the feature hard to find at exactly the moment it is needed.
@@ -2161,6 +2706,33 @@ class SettingsActivity : PrismBaseActivity() {
                 "Live terminal console and error logs",
                 {
                     startActivity(android.content.Intent(this, DiagnosticsActivity::class.java))
+                }
+            ),
+
+            SettingItem.Header("System Update"),
+            SettingItem.Nav(
+                "Update repositories",
+                run {
+                    val repositories = com.prism.launcher.update.UpdateCenter.Repositories.all()
+                    "${repositories.size} GitHub repositor${if (repositories.size == 1) "y" else "ies"} · add a fork or discover them"
+                },
+                {
+                    startActivity(
+                        android.content.Intent(
+                            this, com.prism.launcher.update.UpdateRepositoriesActivity::class.java
+                        )
+                    )
+                }
+            ),
+            SettingItem.Nav(
+                "Check for updates",
+                "Read every repository, quarantine the release, then install it if it passes",
+                {
+                    startActivity(
+                        android.content.Intent(
+                            this, com.prism.launcher.update.UpdateCheckActivity::class.java
+                        )
+                    )
                 }
             ),
 
@@ -2632,7 +3204,7 @@ class SettingsActivity : PrismBaseActivity() {
             SettingItem.Nav(
                 "Page picker swipe",
                 PrismSettings.getPagePickerSwipe()?.let { trigger ->
-                    "${trigger.direction.label} — at least ${trigger.distanceDp} dp. Tap to change."
+                    "${trigger.label} — ${trigger.detail}. Tap to change."
                 } ?: "Using the built-in vertical overscroll. Tap to define your own.",
                 { startActivity(Intent(this, PagePickerSwipeActivity::class.java)) }
             ),
@@ -2937,6 +3509,123 @@ class SettingsActivity : PrismBaseActivity() {
                 }
             ),
 
+            // ── Minigames ───────────────────────────────────────────────────
+            //
+            // Echo Chamber's art direction is generated at 1024 × 1024, but a folder of PNGs and
+            // two OBJ files replaces any part of it. The folder picker is Android's own tree
+            // picker so the app is actually granted access to what it reads.
+            SettingItem.Header("Minigames"),
+            SettingItem.Toggle(
+                "Use custom Echo Chamber assets",
+                "Replace the generated 1024² textures and 3D meshes with your own folder",
+                PrismSettings.getEchoChamberUseCustomAssets(),
+                {
+                    PrismSettings.setEchoChamberUseCustomAssets(it)
+                    com.prism.launcher.minigames.EchoAssets.invalidate()
+                    refresh()
+                },
+            ),
+            SettingItem.Nav(
+                "Echo Chamber assets folder",
+                run {
+                    val path = PrismSettings.getEchoChamberAssetPath()
+                    if (path.isBlank()) "Generated 1024² textures and meshes"
+                    else path.substringAfterLast('/').ifBlank { path }
+                },
+                { echoAssetPicker.launch(null) },
+            ),
+            SettingItem.Picker(
+                "Echo Chamber difficulty",
+                "How fast and how persistent the hunters are",
+                com.prism.launcher.minigames.Echo.DIFFICULTY_LABELS,
+                PrismSettings.getEchoChamberDifficulty(),
+                { PrismSettings.setEchoChamberDifficulty(it) },
+            ),
+            SettingItem.Picker(
+                "Echo Chamber hunters",
+                "How many enemies share the maze with you",
+                (1..5).map { it.toString() },
+                PrismSettings.getEchoChamberEnemies() - 1,
+                { PrismSettings.setEchoChamberEnemies(it + 1) },
+            ),
+            SettingItem.Picker(
+                "Echo Chamber microphone sensitivity",
+                "How loud a noise has to be to become a shout",
+                listOf("Whisper friendly", "Normal", "Loud room"),
+                when {
+                    PrismSettings.getEchoChamberMicSensitivity() < 0.04f -> 0
+                    PrismSettings.getEchoChamberMicSensitivity() > 0.08f -> 2
+                    else -> 1
+                },
+                {
+                    PrismSettings.setEchoChamberMicSensitivity(
+                        when (it) { 0 -> 0.028f; 2 -> 0.10f; else -> 0.055f },
+                    )
+                },
+            ),
+            SettingItem.Nav(
+                "Reset Echo Chamber assets",
+                "Forget the custom folder and go back to the generated pack",
+                {
+                    PrismSettings.setEchoChamberUseCustomAssets(false)
+                    PrismSettings.setEchoChamberAssetPath("")
+                    com.prism.launcher.minigames.EchoAssets.invalidate()
+                    refresh()
+                    Toast.makeText(this, "Echo Chamber assets reset", Toast.LENGTH_SHORT).show()
+                },
+            ),
+            SettingItem.Toggle(
+                "Use custom Zombies assets",
+                "Replace generated maps, meshes, 1024² textures and sounds with your own folder",
+                PrismSettings.getZombiesUseCustomAssets(),
+                {
+                    PrismSettings.setZombiesUseCustomAssets(it)
+                    com.prism.launcher.minigames.ZombiesAssets.invalidate()
+                    refresh()
+                },
+            ),
+            SettingItem.Nav(
+                "Zombies assets folder",
+                run {
+                    val path = PrismSettings.getZombiesAssetPath()
+                    if (path.isBlank()) "Generated baseline maps, meshes, textures and sounds"
+                    else path.substringAfterLast('/').ifBlank { path }
+                },
+                { zombiesAssetPicker.launch(null) },
+            ),
+            SettingItem.Nav(
+                "Reset Zombies assets",
+                "Forget the custom folder and go back to the generated baseline pack",
+                {
+                    PrismSettings.setZombiesUseCustomAssets(false)
+                    PrismSettings.setZombiesAssetPath("")
+                    com.prism.launcher.minigames.ZombiesAssets.invalidate()
+                    refresh()
+                    Toast.makeText(this, "Zombies assets reset", Toast.LENGTH_SHORT).show()
+                },
+            ),
+
+            // ── GameCraft ─────────────────────────────────────────────────────
+            //
+            // A game generator is a MODEL, so its import belongs in Settings. A ModelCraft run
+            // registers its own folder automatically; this row is for one made elsewhere or carried
+            // over on a stick. A folder is required because a game model is two files, not one.
+            SettingItem.Header("GameCraft"),
+            SettingItem.Nav(
+                "Mesh generator model",
+                run {
+                    val active = com.prism.launcher.assetcraft.AssetCraft.activeGame()
+                    if (active == null) "None active — GameCraft needs one before it can make anything"
+                    else "${active.name} · ${active.detail}"
+                },
+                { pickActiveGameModel() },
+            ),
+            SettingItem.Nav(
+                "Import game generator model",
+                "Choose a folder holding a ModelCraft game export (game_model.json and its weights)",
+                { gameModelFolderPicker.launch(null) },
+            ),
+
             // ── Stremio ──────────────────────────────────────────────────────
             //
             // Deliberately NOT in any group in GROUPS, so groupOf() drops it into "Other" -- which
@@ -2971,6 +3660,15 @@ class SettingsActivity : PrismBaseActivity() {
                 {
                     startActivity(
                         Intent(this, com.prism.launcher.stremio.StremioAddonsActivity::class.java)
+                    )
+                }
+            ),
+            SettingItem.Nav(
+                "Torrent & Debrid",
+                com.prism.launcher.stremio.StremioPlaybackSettings.summary(),
+                {
+                    startActivity(
+                        Intent(this, com.prism.launcher.stremio.StremioPlaybackActivity::class.java)
                     )
                 }
             )
@@ -3264,8 +3962,13 @@ class SettingsActivity : PrismBaseActivity() {
                     val t1 = view.findViewById<android.widget.TextView>(android.R.id.text1)
                     val t2 = view.findViewById<android.widget.TextView>(android.R.id.text2)
                     
-                    t1.text = if (s.isActive) "● ${s.name} (ACTIVE)" else s.name
-                    t1.setTextColor(if (s.isActive) com.prism.launcher.nora.IosUi.accent(this@SettingsActivity) else com.prism.launcher.nora.IosUi.label(this@SettingsActivity))
+                    t1.text = buildString {
+                        if (s.isActive) append("● ")
+                        append(s.name)
+                        if (s.isActive) append(" (ACTIVE)")
+                        if (s.isBridged) append(" · BRIDGED")
+                    }
+                    t1.setTextColor(if (s.isActive || s.isBridged) com.prism.launcher.nora.IosUi.accent(this@SettingsActivity) else com.prism.launcher.nora.IosUi.label(this@SettingsActivity))
                     t2.text = "${s.address}:${s.port} | User: ${s.username}"
                     t2.setTextColor(com.prism.launcher.nora.IosUi.secondaryLabel(this@SettingsActivity))
                     
@@ -3360,9 +4063,21 @@ class SettingsActivity : PrismBaseActivity() {
         fleetDialog = PrismDialogFactory.show(
             this,
             "Prism Server Fleet",
-            "Select an active server or long-press for server actions.",
+            if (PrismSettings.isPrismBridgeRole()) {
+                "Select an active server, or long-press one to include it in the bridge. " +
+                    "Bridged servers share their P2P DNS, hosted sites, mirrors and Lyke videos."
+            } else {
+                "Select an active server or long-press for server actions."
+            },
             customView = container,
         )
+        if (PrismSettings.isPrismBridgeRole()) {
+            // The fleet manager is the natural place to refresh: the user is looking at exactly
+            // the servers the bridge reads.
+            Thread {
+                runCatching { com.prism.launcher.vpn.FleetBridge.refresh() }
+            }.apply { isDaemon = true }.start()
+        }
         refreshNearby = Runnable {
             val saved = PrismSettings.getPrismServers()
             nearby.clear()
@@ -3418,6 +4133,17 @@ class SettingsActivity : PrismBaseActivity() {
             ))
         }
 
+        if (PrismSettings.isPrismBridgeRole()) {
+            addAction(
+                if (server.isBridged) "Remove from bridge" else "Include in bridge",
+                com.prism.launcher.nora.IosUi.accent(this),
+            ) {
+                PrismSettings.setServerBridged(server.id, !server.isBridged)
+                refresh()
+                fleetDialog.dismiss()
+                showServerFleetManager()
+            }
+        }
         addAction("Edit", com.prism.launcher.nora.IosUi.accent(this)) {
             fleetDialog.dismiss()
             showServerEditor(server)
@@ -3696,12 +4422,71 @@ class SettingsActivity : PrismBaseActivity() {
     // slug rules, collision suffixes, refusal to overwrite -- are CaptionService, shared with the
     // desktop build so both platforms rename identically.
 
+    /** Asks before moving a folder full of the user's models and projects. */
+    private fun confirmDataFolder(uri: android.net.Uri) {
+        val target = resolveTreePath(uri)
+        if (target == null) {
+            Toast.makeText(
+                this,
+                "That folder is not on this device's storage. Pick a folder under Internal storage or an SD card.",
+                Toast.LENGTH_LONG,
+            ).show()
+            return
+        }
+        val current = com.prism.core.PrismPlatform.host.documentsDir()
+        val same = runCatching { target.canonicalFile == current.canonicalFile }.getOrDefault(false)
+        if (same) {
+            Toast.makeText(this, "Prism already uses this folder", Toast.LENGTH_SHORT).show()
+            return
+        }
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
+            .setTitle("Move Prism's data folder?")
+            .setMessage(
+                "Prism will copy everything from\n$current\nto\n$target,\nswitch to the new folder, " +
+                    "then remove the old copy.\n\nKeep Prism open while it copies. Large model " +
+                    "folders can take several minutes, and nothing is removed until every file " +
+                    "has arrived."
+            )
+            .setPositiveButton("Move here") { _, _ -> moveDataFolder(uri, target) }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /**
+     * Runs the move off the main thread, with a modal progress note.
+     *
+     * The old folder is not deleted until the new one is complete ([com.prism.core.PrismStorage]),
+     * so backing out of this screen mid-copy is safe: Prism keeps using the folder it already had.
+     */
+    @Suppress("DEPRECATION")
+    private fun moveDataFolder(uri: android.net.Uri, target: java.io.File) {
+        runCatching {
+            contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+            )
+        }
+        val progress = android.app.ProgressDialog(this).apply {
+            setTitle("Moving Prism's data folder")
+            setMessage("Copying to ${target.absolutePath}…")
+            isIndeterminate = true
+            setCancelable(false)
+            show()
+        }
+        lifecycleScope.launch {
+            val result = withContext(Dispatchers.IO) { com.prism.core.PrismStorage.relocate(target) }
+            progress.dismiss()
+            Toast.makeText(this@SettingsActivity, result.message, Toast.LENGTH_LONG).show()
+            refresh()
+        }
+    }
+
     /**
      * Turns a Storage Access Framework tree URI into a real path.
      *
-     * Only the `primary:` volume is convertible; an SD card or a cloud document provider has no
-     * filesystem path at all, and guessing one produces a File that silently refers to nothing.
-     * Returning null there lets the caller say so instead.
+     * `primary:` is the device's shared storage and a UUID volume is a physical SD card. A cloud
+     * document provider has no filesystem path at all, and guessing one produces a File that
+     * silently refers to nothing -- returning null lets the caller say so instead.
      */
     private fun resolveTreePath(uri: android.net.Uri): java.io.File? {
         val docId = try {
@@ -3709,12 +4494,23 @@ class SettingsActivity : PrismBaseActivity() {
         } catch (e: Exception) {
             return null
         }
-        val parts = docId.split(":")
-        if (parts.size < 2 || parts[0] != "primary") return null
+        val parts = docId.split(":", limit = 2)
+        if (parts.size < 2) return null
+        val root = when {
+            parts[0].equals("primary", true) -> android.os.Environment.getExternalStorageDirectory()
+            else -> java.io.File("/storage", parts[0])
+        }
+        if (!root.isDirectory) return null
         val relative = parts[1]
-        val root = android.os.Environment.getExternalStorageDirectory()
         val file = if (relative.isEmpty()) root else java.io.File(root, relative)
-        return file.takeIf { it.isDirectory }
+        val canonicalRoot = runCatching { root.canonicalFile }.getOrNull() ?: return null
+        val canonicalFile = runCatching { file.canonicalFile }.getOrNull() ?: return null
+        if (canonicalFile != canonicalRoot &&
+            !canonicalFile.path.startsWith(canonicalRoot.path.trimEnd(java.io.File.separatorChar) + java.io.File.separator)
+        ) {
+            return null
+        }
+        return canonicalFile.takeIf { it.isDirectory }
     }
 
     /**

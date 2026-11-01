@@ -51,6 +51,7 @@ class BattlePlaybackView(
 ) : FrameLayout(context), TopInsetAware {
 
     private val handler = Handler(Looper.getMainLooper())
+    private val neon: Boolean by lazy { PaperUi.isNeon(context) }
 
     private var orders = mutableListOf<Battle.Order>()
     private var playback: Battle.Playback? = null
@@ -94,7 +95,10 @@ class BattlePlaybackView(
     }
 
     init {
-        setBackgroundColor(PencilStyle.paper(PaperUi.isDark(context)))
+        setBackgroundColor(
+            if (neon) PencilStyle.neonPaper(PaperUi.isDark(context))
+            else PencilStyle.paper(PaperUi.isDark(context)),
+        )
 
         stage = PaperBaseView(
             context,
@@ -123,7 +127,9 @@ class BattlePlaybackView(
                     orientation = LinearLayout.VERTICAL
                     setPadding(PaperUi.dp(context, 8f), 0, 0, 0)
                     addView(PaperUi.heading(context, title))
-                    status = PaperUi.note(context, "")
+                    status = PaperUi.note(context, "").apply {
+                        if (neon) setTextColor(PencilStyle.NEON_MAGENTA)
+                    }
                     addView(status)
                 },
                 LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
@@ -251,6 +257,7 @@ class BattlePlaybackView(
                 seed = ticket.seed,
                 attackerSupportIds = ticket.attackerSupportIds,
                 attackerMilitaryBonus = ticket.attackerMilitaryBonus,
+                defenderSortie = true,
             )
             handler.post {
                 simulating = false

@@ -22,9 +22,12 @@ import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.Hub
 import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.Sms
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -105,6 +108,12 @@ fun MessagesPage(onOpenThread: (PageId) -> Unit, onOpenDialer: () -> Unit = {}) 
     var threads by remember { mutableStateOf<Map<String, List<SmsRelay.Relayed>>>(emptyMap()) }
     var openThread by remember { mutableStateOf<String?>(null) }
     var revision by remember { mutableStateOf(0) }
+    // API-backed conversations. They are not relayed texts: Prism holds the transcript and calls
+    // the provider itself, so they live in the same page but not in the same list.
+    var linkedThreads by remember { mutableStateOf<List<com.prism.launcher.messaging.MessagingStore.Thread>>(emptyList()) }
+    var openLinked by remember { mutableStateOf<com.prism.launcher.messaging.MessagingStore.Thread?>(null) }
+    var addingLinked by remember { mutableStateOf(false) }
+    var linkedRevision by remember { mutableStateOf(0) }
 
     LaunchedEffect(Unit) {
         val messages = withContext(Dispatchers.IO) {
@@ -126,6 +135,22 @@ fun MessagesPage(onOpenThread: (PageId) -> Unit, onOpenDialer: () -> Unit = {}) 
         }
     }
 
+    LaunchedEffect(linkedRevision) {
+        // Signal and Messenger are polled here as well as inside an open thread. The extra request
+        // every 20 s is what makes a message sent from another client appear in this list without
+        // a manual Sync, and WhatsApp simply reads whatever its webhook already wrote.
+        while (true) {
+            linkedThreads = withContext(Dispatchers.IO) {
+                runCatching {
+                    com.prism.launcher.messaging.MessagingApi.syncAll()
+                    com.prism.launcher.messaging.MessagingStore.threads()
+                        .filter { com.prism.launcher.messaging.MessagingApps.isApi(it.app) }
+                }.getOrDefault(emptyList())
+            }
+            kotlinx.coroutines.delay(20_000)
+        }
+    }
+
     val current = openThread
     if (current != null) {
         ThreadView(
@@ -135,6 +160,26 @@ fun MessagesPage(onOpenThread: (PageId) -> Unit, onOpenDialer: () -> Unit = {}) 
             onSent = { revision++ },
         )
         return
+    }
+
+    openLinked?.let { conversation ->
+        LinkedThreadView(
+            initial = conversation,
+            onBack = { openLinked = null },
+            onSent = { linkedRevision++ },
+        )
+        return
+    }
+
+    if (addingLinked) {
+        NewLinkedChatDialog(
+            onDismiss = { addingLinked = false },
+            onStart = { thread ->
+                addingLinked = false
+                openLinked = thread
+                linkedRevision++
+            },
+        )
     }
 
     PageScaffold(
@@ -196,9 +241,57 @@ fun MessagesPage(onOpenThread: (PageId) -> Unit, onOpenDialer: () -> Unit = {}) 
                     "pathway, so merging the two would mean one of them pretending to be the other."
             )
 
+            // Linked chats. These ARE threads: Prism holds the transcript and calls the provider's
+            // API, unlike the personal-app rows below which only hand off to a client.
+            val configuredApps = com.prism.launcher.messaging.MessagingApps.configured()
+            // NO SETUP WALL ON THE CONVERSATION LIST. When nothing is linked there is nothing to
+            // list, and a paragraph about Cloud APIs between the user and their messages is exactly
+            // the clutter this page was asked to lose. Settings owns the explanation; the page only
+            // appears once there is a thread or an account to show.
+            if (configuredApps.isNotEmpty() || linkedThreads.isNotEmpty()) {
+                Card {
+                    if (linkedThreads.isEmpty()) {
+                        Text(
+                            "No linked conversations yet",
+                            fontSize = 13.sp,
+                            color = colors.faint,
+                            modifier = Modifier.padding(16.dp),
+                        )
+                    } else {
+                        linkedThreads.take(6).forEachIndexed { index, thread ->
+                            if (index > 0) Hairline()
+                            val app = com.prism.launcher.messaging.MessagingApps.byId(thread.app)
+                            ThreadRow(
+                                icon = Icons.Filled.Hub,
+                                title = thread.title,
+                                detail = (app?.label ?: thread.app) +
+                                    (if (thread.group) " · group" else "") +
+                                    (if (thread.app == com.prism.launcher.messaging.RcsChat.APP_ID)
+                                        " · Prism mesh" else " · API chat") + " · " +
+                                    thread.snippet.ifBlank { "No messages yet" },
+                                trailing = if (thread.unread > 0) thread.unread.toString() else "",
+                                colors = colors,
+                                onClick = { openLinked = thread },
+                            )
+                        }
+                    }
+                    if (configuredApps.isNotEmpty()) {
+                        Hairline()
+                        Row(
+                            Modifier.fillMaxWidth().clickableRow { addingLinked = true }
+                                .padding(horizontal = 16.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text("New linked chat", fontSize = 13.sp, color = colors.accent)
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+
             // Connected third-party messengers. They are not threads -- Prism cannot read their
-            // history -- so they are listed as apps that open, with their web client because this
-            // platform has no equivalent of the phone's notification listener.
+            // personal history -- so they are listed as apps that open, with their web client because
+            // this platform has no equivalent of the phone's notification listener.
             val bridges = com.prism.launcher.messaging.MessagingBridges.enabled()
             if (bridges.isNotEmpty()) {
                 SectionHeader("CONNECTED APPS")
@@ -208,7 +301,7 @@ fun MessagesPage(onOpenThread: (PageId) -> Unit, onOpenDialer: () -> Unit = {}) 
                         ThreadRow(
                             icon = Icons.Filled.Hub,
                             title = bridge.label,
-                            detail = "Opens in your browser · messages are not read by Prism here",
+                            detail = "Opens your personal client · the API thread is listed above",
                             trailing = "",
                             colors = colors,
                             onClick = {
@@ -441,6 +534,247 @@ private fun ThreadView(
             }
         }
     }
+}
+
+/**
+ * An API-backed conversation on the desktop.
+ *
+ * The thread is re-read from [com.prism.launcher.messaging.MessagingStore] after every send and
+ * poll rather than held in Compose state as the source of truth: the webhook and the Signal bridge
+ * write to the store from other threads, and a view that owned its own copy would be the one place
+ * a message could go missing.
+ */
+@Composable
+private fun LinkedThreadView(
+    initial: com.prism.launcher.messaging.MessagingStore.Thread,
+    onBack: () -> Unit,
+    onSent: () -> Unit,
+) {
+    val colors = LocalPrismColors.current
+    var thread by remember(initial.id) { mutableStateOf(initial) }
+    var messages by remember(initial.id) {
+        mutableStateOf(com.prism.launcher.messaging.MessagingStore.messages(initial.id))
+    }
+    var draft by remember(initial.id) { mutableStateOf("") }
+    var note by remember(initial.id) { mutableStateOf("") }
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(initial.id) {
+        while (true) {
+            val refreshed = withContext(Dispatchers.IO) {
+                runCatching {
+                    com.prism.launcher.messaging.MessagingApi.sync(initial.app)
+                    com.prism.launcher.messaging.MessagingStore.thread(initial.id) to
+                        com.prism.launcher.messaging.MessagingStore.messages(initial.id)
+                }.getOrNull()
+            }
+            if (refreshed != null) {
+                refreshed.first?.let { thread = it }
+                messages = refreshed.second
+            }
+            kotlinx.coroutines.delay(4_000)
+        }
+    }
+
+    Column(Modifier.fillMaxSize().padding(horizontal = 28.dp)) {
+        Row(
+            Modifier.fillMaxWidth().padding(top = 22.dp, bottom = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            androidx.compose.material3.IconButton(onClick = onBack, modifier = Modifier.size(30.dp)) {
+                Icon(
+                    Icons.AutoMirrored.Filled.ArrowBack, "Back",
+                    tint = colors.muted, modifier = Modifier.size(20.dp),
+                )
+            }
+            Spacer(Modifier.width(8.dp))
+            Column {
+                Text(thread.title, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Text(
+                    (com.prism.launcher.messaging.MessagingApps.byId(thread.app)?.label ?: thread.app) +
+                        (if (thread.group) " · group · " + thread.participants.joinToString(", ") else
+                            " · API conversation"),
+                    fontSize = 11.sp,
+                    color = colors.faint,
+                )
+            }
+            Spacer(Modifier.weight(1f))
+            TextButton(onClick = { onSent() }) { Text("Sync", color = colors.accent, fontSize = 13.sp) }
+        }
+
+        Column(Modifier.weight(1f).verticalScroll(rememberScrollState())) {
+            messages.forEach { message ->
+                Row(
+                    Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                    horizontalArrangement = if (message.outgoing) Arrangement.End else Arrangement.Start,
+                ) {
+                    Surface(
+                        color = if (message.outgoing) colors.accent else Color(0xFF23232B),
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier.widthIn(max = 520.dp),
+                    ) {
+                        Column(Modifier.padding(horizontal = 13.dp, vertical = 9.dp)) {
+                            if (!message.outgoing) {
+                                Text(message.author, fontSize = 10.sp, color = colors.faint)
+                            }
+                            Text(
+                                message.body,
+                                fontSize = 13.sp,
+                                lineHeight = 19.sp,
+                                color = if (message.outgoing) Color.White else colors.onSurface,
+                            )
+                        }
+                    }
+                }
+            }
+            if (messages.isEmpty()) {
+                Text(
+                    "No messages yet. The first one will appear here after it is sent.",
+                    fontSize = 12.sp,
+                    color = colors.faint,
+                    modifier = Modifier.padding(vertical = 12.dp),
+                )
+            }
+            Spacer(Modifier.height(12.dp))
+        }
+
+        if (note.isNotBlank()) {
+            Text(note, fontSize = 11.sp, color = colors.faint, modifier = Modifier.padding(bottom = 4.dp))
+        }
+
+        Row(
+            Modifier.fillMaxWidth().padding(bottom = 18.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            OutlinedTextField(
+                value = draft,
+                onValueChange = { draft = it },
+                placeholder = { Text("Message", fontSize = 13.sp) },
+                modifier = Modifier.weight(1f),
+                maxLines = 4,
+            )
+            Spacer(Modifier.width(8.dp))
+            androidx.compose.material3.IconButton(
+                enabled = draft.isNotBlank(),
+                onClick = {
+                    val text = draft.trim()
+                    draft = ""
+                    scope.launch {
+                        val result = withContext(Dispatchers.IO) {
+                            com.prism.launcher.messaging.MessagingApi.send(thread, text)
+                        }
+                        note = when (result) {
+                            is com.prism.launcher.messaging.MessagingApi.SendResult.Failed -> result.message
+                            is com.prism.launcher.messaging.MessagingApi.SendResult.Sent -> result.detail
+                        }
+                        messages = withContext(Dispatchers.IO) {
+                            com.prism.launcher.messaging.MessagingStore.messages(thread.id)
+                        }
+                        onSent()
+                    }
+                },
+            ) {
+                Icon(Icons.AutoMirrored.Filled.Send, "Send", tint = colors.accent, modifier = Modifier.size(19.dp))
+            }
+        }
+    }
+}
+
+/** Chooses an API service and creates the local side of a new conversation. */
+@Composable
+private fun NewLinkedChatDialog(
+    onDismiss: () -> Unit,
+    onStart: (com.prism.launcher.messaging.MessagingStore.Thread) -> Unit,
+) {
+    val apps = com.prism.launcher.messaging.MessagingApps.configured()
+    var selected by remember { mutableStateOf(apps.firstOrNull()?.id.orEmpty()) }
+    var title by remember { mutableStateOf("") }
+    var recipient by remember { mutableStateOf("") }
+    var participants by remember { mutableStateOf("") }
+    var group by remember { mutableStateOf(false) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("New linked chat", fontSize = 17.sp) },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    apps.forEach { app ->
+                        TextButton(onClick = { selected = app.id }) {
+                            Text(
+                                app.label,
+                                fontSize = 12.sp,
+                                color = if (selected == app.id) Color.White else LocalPrismColors.current.faint,
+                            )
+                        }
+                    }
+                }
+                OutlinedTextField(
+                    value = title,
+                    onValueChange = { title = it },
+                    label = { Text("Conversation name") },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(6.dp))
+                OutlinedTextField(
+                    value = recipient,
+                    onValueChange = { recipient = it },
+                    label = {
+                        Text(
+                            when (selected) {
+                                "whatsapp" -> "Phone number or group id"
+                                "messenger" -> "Page-scoped id (PSID)"
+                                "rcs" -> "The other device's Lyke username"
+                                else -> "Phone number or group id"
+                            },
+                        )
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(6.dp))
+                OutlinedTextField(
+                    value = participants,
+                    onValueChange = { participants = it },
+                    label = { Text("Group participants, comma separated") },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Row(
+                    Modifier.fillMaxWidth().clickableRow { group = !group }.padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    androidx.compose.material3.Checkbox(checked = group, onCheckedChange = { group = it })
+                    Text("Group chat", fontSize = 13.sp)
+                }
+                Text(
+                    when (selected) {
+                        "whatsapp" -> "Cloud API sends as your business number; replies arrive by webhook."
+                        "messenger" -> "Messenger has no group send API; groups are delivered one by one."
+                        "rcs" -> "Prism RCS travels over the mesh, sealed with your wallet, and reaches " +
+                            "your own Prism devices. Carrier RCS is not used."
+                        else -> "Signal needs a linked signal-cli bridge in Settings."
+                    },
+                    fontSize = 11.sp,
+                    color = LocalPrismColors.current.faint,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = selected.isNotBlank() && recipient.isNotBlank(),
+                onClick = {
+                    val thread = com.prism.launcher.messaging.MessagingApi.startThread(
+                        appId = selected,
+                        title = title.ifBlank { recipient },
+                        recipient = recipient.trim(),
+                        group = group,
+                        participants = participants.split(',', ';').map { it.trim() }.filter { it.isNotBlank() },
+                    )
+                    onStart(thread)
+                },
+            ) { Text("Start", color = LocalPrismColors.current.accent) }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 @Composable

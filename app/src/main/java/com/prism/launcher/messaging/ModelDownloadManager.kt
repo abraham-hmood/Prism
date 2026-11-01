@@ -41,11 +41,17 @@ object ModelDownloadManager {
      * first completion look like a stranger's download and it was never imported. A map, keyed by
      * the id the system gives back, lets several finish in any order.
      */
-    private data class Pending(val name: String, val isImage: Boolean)
+    private data class Pending(val name: String, val modelType: String)
 
     private val pending = java.util.concurrent.ConcurrentHashMap<Long, Pending>()
 
-    fun download(context: Context, name: String, url: String, isImageModel: Boolean = false) {
+    fun download(
+        context: Context,
+        name: String,
+        url: String,
+        isImageModel: Boolean = false,
+        modelType: String = if (isImageModel) PrismSettings.MODEL_TYPE_IMAGE else PrismSettings.MODEL_TYPE_TEXT,
+    ) {
         val appContext = context.applicationContext
         // THE EXTENSION COMES FROM THE URL. It used to be `task` or, for everything else, `bin` --
         // so a .gguf arrived named "model.bin", which the loader's format detection then had to
@@ -62,13 +68,24 @@ object ModelDownloadManager {
             .setAllowedOverRoaming(true)
             .addRequestHeader("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36")
 
+        // THE FILTER IS REMEMBERED BY THE REGISTRY, ON DISK. The completion receiver can run in a
+        // process that never saw this call, and `pending`/the single ai_download_type setting are
+        // both lost by then -- which is how an image model downloaded from the Image tab ended up
+        // registered as a text one. Writing the decision against the destination path means the
+        // receiver's `install` reads the same answer minutes or hours later.
+        val destination = File(
+            appContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "$name.$extension",
+        )
+        com.prism.launcher.messaging.ModelRegistry.expect(destination, modelType)
+
         val dm = appContext.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
         val downloadId = dm.enqueue(request)
-        pending[downloadId] = Pending(name, isImageModel)
+        pending[downloadId] = Pending(name, modelType)
         // Still recorded, because a process that dies mid-download loses `pending` but the
         // DownloadManager keeps going and delivers the completion to a fresh process.
         PrismSettings.setAiDownloadId(downloadId)
         PrismSettings.setAiDownloadIsImage(isImageModel)
+        PrismSettings.setAiDownloadType(modelType)
 
         Toast.makeText(appContext, "Download started: $name", Toast.LENGTH_SHORT).show()
     }
@@ -85,7 +102,6 @@ object ModelDownloadManager {
 
     private fun checkDownloadStatus(context: Context, id: Long) {
         val entry = pending[id]
-        val isImage = entry?.isImage ?: PrismSettings.getAiDownloadIsImage()
         val q = DownloadManager.Query().setFilterById(id)
         val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
         dm.query(q)?.use { cursor ->
@@ -98,12 +114,25 @@ object ModelDownloadManager {
                     val uriString = cursor.getString(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_LOCAL_URI))
                     val downloadedFile = uriString?.let { Uri.parse(it).path }?.let { File(it) }
 
+                    // THE FILTER, IN ORDER OF AUTHORITY. The in-memory entry first (same process),
+                    // then the type the store recorded against this destination BEFORE enqueueing --
+                    // which is the one that survives the process being killed mid-download, and the
+                    // reason an image model cannot come back as a text one -- then the single
+                    // legacy setting, and only then a guess.
+                    val modelType = entry?.modelType
+                        ?: downloadedFile?.let { PrismSettings.takePendingModelType(it.absolutePath) }
+                        ?: PrismSettings.getAiDownloadType().ifEmpty {
+                            if (PrismSettings.getAiDownloadIsImage()) PrismSettings.MODEL_TYPE_IMAGE
+                            else PrismSettings.MODEL_TYPE_TEXT
+                        }
+                    val isImage = modelType == PrismSettings.MODEL_TYPE_IMAGE
+
                     pending.remove(id)
                     if (downloadedFile == null || !downloadedFile.exists() || downloadedFile.length() <= 0L) {
                         downloadedFile?.delete()
                         Toast.makeText(context, "Download finished but the file is missing or empty. Please try again.", Toast.LENGTH_LONG).show()
                     } else {
-                        importDownloadedModel(context, downloadedFile, downloadedFile.name, isImage)
+                        importDownloadedModel(context, downloadedFile, downloadedFile.name, isImage, modelType)
                     }
                 } else if (status == DownloadManager.STATUS_FAILED) {
                     val reason = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON))
@@ -119,7 +148,10 @@ object ModelDownloadManager {
      * an application-scoped BroadcastReceiver with no Activity window to host a dialog in (the
      * download itself already has its own OS notification progress); the eager preload inside
      * [registerImportedModel] still happens, just silently. */
-    private fun importDownloadedModel(context: Context, sourceFile: File, fileName: String, isImageModel: Boolean) {
+    private fun importDownloadedModel(
+        context: Context, sourceFile: File, fileName: String, isImageModel: Boolean,
+        modelType: String = if (isImageModel) PrismSettings.MODEL_TYPE_IMAGE else PrismSettings.MODEL_TYPE_TEXT,
+    ) {
         // THE REGISTRY'S DIRECTORY, not filesDir/models. These were two different folders, so a
         // model downloaded here was invisible to the Models page (and reconciled away) while one
         // fetched over the mesh landed somewhere this code never looked.
@@ -144,7 +176,7 @@ object ModelDownloadManager {
 
             if (errorMessage == null) {
                 sourceFile.delete() // no longer need the app-external-storage copy
-                registerImportedModel(context, targetFile, fileName, isImageModel)
+                registerImportedModel(context, targetFile, fileName, isImageModel, modelType)
             } else {
                 targetFile.delete()
                 toastOnMain(context, "Import failed: $errorMessage Please try again.", Toast.LENGTH_LONG)
@@ -205,6 +237,11 @@ object ModelDownloadManager {
         // on the first message the user sent -- by which point the failure looked like a problem
         // with the model rather than with its download. Text models are checked here because they
         // are the ones with a magic to check; an audio or image model is left alone.
+        // A TEXT MODEL THAT IS NOT A GGUF IS KEPT BUT NOT ACTIVATED. Safetensors and `.task`
+        // bundles are legitimate files the user asked to download or import, but llama.cpp reads
+        // GGUF only -- so registering one as the active text model would make every message fail
+        // at load. It is stored, listed and explained instead.
+        var runnableAsText = true
         if (modelType == PrismSettings.MODEL_TYPE_TEXT) {
             val detection = ModelFormat.detect(targetFile)
             if (!detection.isUsable) {
@@ -217,6 +254,7 @@ object ModelDownloadManager {
                 toastOnMain(context, detection.explain(targetFile), Toast.LENGTH_LONG)
                 return
             }
+            runnableAsText = detection.kind == ModelFormat.Kind.GGUF
         }
 
         when (modelType) {
@@ -227,7 +265,11 @@ object ModelDownloadManager {
                 // changed. Without this the next thing spoken would still come from the old engine.
                 com.prism.launcher.speech.PrismSpeaker.invalidate()
             }
-            else -> {
+            PrismSettings.MODEL_TYPE_AUDIO_GEN ->
+                PrismSettings.setLocalAudioGenModelPath(targetFile.absolutePath)
+            PrismSettings.MODEL_TYPE_INTERPOLATION ->
+                PrismSettings.setLocalInterpolationModelPath(targetFile.absolutePath)
+            else -> if (runnableAsText) {
                 PrismSettings.setLocalAiModelPath(targetFile.absolutePath)
                 AiManager.onLocalTextModelActivated(context, targetFile.absolutePath)
             }
@@ -247,15 +289,31 @@ object ModelDownloadManager {
                 }
                 // Nothing to warm up: whether this file can be driven at all is a question about
                 // its format, and ImportedAudioEngine answers it when something asks to speak.
-                PrismSettings.MODEL_TYPE_AUDIO -> null
-                else -> GgufInferenceService.preload(targetFile.absolutePath, onStage)
+                PrismSettings.MODEL_TYPE_AUDIO,
+                PrismSettings.MODEL_TYPE_AUDIO_GEN,
+                PrismSettings.MODEL_TYPE_INTERPOLATION -> null
+                // Stored, listed, and explained rather than warmed up: llama.cpp cannot open a
+                // safetensors or .task container, and pretending to preload one would report a
+                // load failure for a file that is perfectly fine.
+                else -> if (runnableAsText) {
+                    GgufInferenceService.preload(targetFile.absolutePath, onStage)
+                } else null
             }
         } catch (e: Exception) {
             e.message ?: "Unknown error"
         }
 
         if (loadError == null) {
-            toastOnMain(context, "Intelligence Acquired: $fileName")
+            if (modelType == PrismSettings.MODEL_TYPE_TEXT && !runnableAsText) {
+                toastOnMain(
+                    context,
+                    "$fileName saved as a text model, but text generation reads GGUF only \u2014 " +
+                        "convert it to GGUF to run it here.",
+                    Toast.LENGTH_LONG,
+                )
+            } else {
+                toastOnMain(context, "Intelligence Acquired: $fileName")
+            }
         } else {
             // Not treated as an import failure -- the file is safely on disk and registered
             // either way; only the eager warm-up didn't work. The exact same load will simply be

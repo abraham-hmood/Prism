@@ -9,7 +9,9 @@ import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.prism.launcher.nora.IosUi
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -67,6 +69,11 @@ class DiagnosticsActivity : PrismBaseActivity() {
         setContentView(root)
 
         lifecycleScope.launch {
+            // What happened BEFORE this process started is on disk, not in the live feed. Loading it
+            // is what makes a crash from a previous run -- the one that killed the app the user is
+            // trying to diagnose -- appear here at all.
+            val persisted = withContext(Dispatchers.IO) { PrismLogger.recentEntries(400) }
+            adapter.addEntries(persisted)
             PrismLogger.logFlow.collect { entry -> adapter.addEntry(entry) }
         }
 
@@ -100,11 +107,30 @@ class DiagnosticsActivity : PrismBaseActivity() {
 
         private val days = ArrayList<Day>()
         private val byKey = HashMap<String, Day>()
+        // Replayed live entries overlap the ones just read from the file; the same line twice helps
+        // nobody. Keyed on the whole entry so a genuinely repeated message at a different time shows.
+        private val seen = HashSet<String>()
 
         /** Flattened rows: a header per day, plus its entries when it is open. */
         private val rows = ArrayList<Any>()
 
         fun addEntry(entry: PrismLogger.LogEntry) {
+            if (insert(entry)) rebuild()
+        }
+
+        /**
+         * Bulk insert for the entries read back from disk: one rebuild, not one per line, and the
+         * newest day opens so a crash is visible without a second tap.
+         */
+        fun addEntries(items: List<PrismLogger.LogEntry>) {
+            for (entry in items) insert(entry)
+            days.firstOrNull()?.expanded = true
+            rebuild()
+        }
+
+        private fun insert(entry: PrismLogger.LogEntry): Boolean {
+            val identity = "${entry.timestamp}\u0000${entry.level}\u0000${entry.tag}\u0000${entry.message}"
+            if (!seen.add(identity)) return false
             val key = entry.timestamp.take(10)
             val day = byKey.getOrPut(key) {
                 Day(key).also {
@@ -115,7 +141,7 @@ class DiagnosticsActivity : PrismBaseActivity() {
             }
             day.entries.add(entry)
             day.lastTime = entry.timestamp.substringAfter(' ').substringBefore('.')
-            rebuild()
+            return true
         }
 
         private fun rebuild() {

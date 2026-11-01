@@ -6,6 +6,7 @@
     buttons are circular and translucent, which is the iOS call layout this imitates.
 -->
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/callRoot"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="#FF0B0B0D">
@@ -87,8 +88,8 @@
 
                 <ImageButton
                     android:id="@+id/callMute"
-                    android:layout_width="64dp"
-                    android:layout_height="64dp"
+                    android:layout_width="46dp"
+                    android:layout_height="46dp"
                     android:background="@drawable/bg_call_button"
                     android:contentDescription="Mute"
                     android:scaleType="centerInside"
@@ -112,8 +113,8 @@
 
                 <ImageButton
                     android:id="@+id/callSpeaker"
-                    android:layout_width="64dp"
-                    android:layout_height="64dp"
+                    android:layout_width="46dp"
+                    android:layout_height="46dp"
                     android:background="@drawable/bg_call_button"
                     android:contentDescription="Speaker"
                     android:scaleType="centerInside"
@@ -137,8 +138,8 @@
 
                 <ImageButton
                     android:id="@+id/callRecord"
-                    android:layout_width="64dp"
-                    android:layout_height="64dp"
+                    android:layout_width="46dp"
+                    android:layout_height="46dp"
                     android:background="@drawable/bg_call_button"
                     android:contentDescription="Record call"
                     android:scaleType="centerInside"
@@ -164,19 +165,71 @@
 
                 <ImageButton
                     android:id="@+id/callVoicemail"
-                    android:layout_width="64dp"
-                    android:layout_height="64dp"
+                    android:layout_width="46dp"
+                    android:layout_height="46dp"
                     android:background="@drawable/bg_call_button"
                     android:contentDescription="Send to meshvoice"
                     android:scaleType="centerInside"
-                    android:src="@android:drawable/ic_btn_speak_now" />
+                    android:src="@drawable/ic_call_meshvoice_24" />
 
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="8dp"
                     android:text="meshvoice"
-                    android:textSize="12sp"
+                    android:textSize="11sp"
+                    android:textColor="#99FFFFFF" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical"
+                android:gravity="center">
+
+                <ImageButton
+                    android:id="@+id/callTranscribe"
+                    android:layout_width="46dp"
+                    android:layout_height="46dp"
+                    android:background="@drawable/bg_call_button"
+                    android:contentDescription="Live transcript"
+                    android:scaleType="centerInside"
+                    android:src="@drawable/ic_call_transcribe_24"
+                    android:tint="#FFFFFFFF" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="transcript"
+                    android:textSize="11sp"
+                    android:textColor="#99FFFFFF" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical"
+                android:gravity="center">
+
+                <ImageButton
+                    android:id="@+id/callDialpad"
+                    android:layout_width="46dp"
+                    android:layout_height="46dp"
+                    android:background="@drawable/bg_call_button"
+                    android:contentDescription="Show keypad"
+                    android:scaleType="centerInside"
+                    android:src="@drawable/ic_call_dialpad_24"
+                    android:tint="#FFFFFFFF" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="keypad"
+                    android:textSize="11sp"
                     android:textColor="#99FFFFFF" />
             </LinearLayout>
         </LinearLayout>

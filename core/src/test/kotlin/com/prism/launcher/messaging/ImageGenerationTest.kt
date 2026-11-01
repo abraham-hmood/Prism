@@ -1,7 +1,11 @@
 package com.prism.launcher.messaging
 
+import com.prism.core.JvmHost
+import com.prism.core.PlatformHost
 import com.prism.core.PrismImage
+import com.prism.core.PrismPlatform
 import com.prism.launcher.PrismSettings
+import com.prism.launcher.diffusion.LocalDiffusionGenerator
 import java.io.File
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
@@ -31,9 +35,22 @@ class ImageGenerationTest {
         "prism-imagegen-test-${System.nanoTime()}",
     ).apply { mkdirs() }
 
-    /** Registered engines are process-wide, so each test starts from a known set. */
+    private lateinit var previousHost: PlatformHost
+
+    /**
+     * Each test starts from a known set of engines AND from empty settings.
+     *
+     * THE SETTINGS ARE PART OF IT. A test asserting that the cloud engine refuses when nothing is
+     * configured only holds on a machine where nothing is configured -- and the developer's own
+     * prefs (a real endpoint with a real key, which is exactly what a working install has) are not
+     * empty. Reading them made the suite's result depend on whose laptop it ran on, which is how
+     * this assertion failed on a machine that had an image model set up while passing everywhere
+     * else. A temporary root makes the answer the test's own.
+     */
     @BeforeTest
     fun reset() {
+        previousHost = PrismPlatform.host
+        PrismPlatform.host = JvmHost(rootOverride = scratch)
         ImageGeneration.reset()
         PrismSettings.setImageEngineId("")
     }
@@ -42,6 +59,7 @@ class ImageGenerationTest {
     fun cleanUp() {
         ImageGeneration.reset()
         PrismSettings.setImageEngineId("")
+        PrismPlatform.host = previousHost
         scratch.deleteRecursively()
     }
 
@@ -55,15 +73,25 @@ class ImageGenerationTest {
         override val description = "fake"
         var calls = 0
 
+        /** The size the registry handed down, so the plumbing can be asserted rather than assumed. */
+        var requestedSize: ImageSize? = null
+
         fun setReady(value: Boolean) { ready = value }
 
         override fun availability(): ImageGenerator.Availability =
             if (ready) ImageGenerator.Availability.Ready
             else ImageGenerator.Availability.Unavailable("not today")
 
-        override fun generate(prompt: String, onStage: ((String) -> Unit)?): PrismImage? {
+        override fun generate(
+            prompt: String,
+            onStage: ((String) -> Unit)?,
+            onProgress: ((Float) -> Unit)?,
+            size: ImageSize?,
+        ): PrismImage? {
             calls++
+            requestedSize = size
             onStage?.invoke("working")
+            onProgress?.invoke(0.5f)
             if (throws) error("boom")
             if (returnsNull) return null
             return PrismImage.blank(8, 8, 0xFF00FF00.toInt())
@@ -191,6 +219,44 @@ class ImageGenerationTest {
         assertEquals(0, engine.calls, "a blank prompt should not cost a generation")
     }
 
+    // ── Size, and progress ─────────────────────────────────────────────────
+
+    @Test
+    fun `the requested size reaches the engine`() {
+        val engine = Fake("sizer")
+        ImageGeneration.register(engine)
+        val size = ImageSize(512, 768)
+
+        ImageGeneration.generate("x", size = size)
+
+        // The setting has to survive the registry: a size that stopped here would leave the page's
+        // resolution row doing nothing at all, which is the sort of thing that looks like the model
+        // ignoring it.
+        assertEquals(size, engine.requestedSize)
+    }
+
+    @Test
+    fun `no size asked for is null, not a guessed default`() {
+        val engine = Fake("sizer")
+        ImageGeneration.register(engine)
+        ImageGeneration.generate("x")
+
+        // Null means "use your own judgement", and each engine's judgement differs: a checkpoint has
+        // a trained size, a MediaPipe bundle has whatever it was exported with. Substituting 512 here
+        // would be this registry deciding something it cannot know.
+        assertNull(engine.requestedSize)
+    }
+
+    @Test
+    fun `progress from the engine reaches the caller`() {
+        ImageGeneration.register(Fake("stepper"))
+        val seen = mutableListOf<Float>()
+
+        ImageGeneration.generate("x", onProgress = { fraction -> seen.add(fraction) })
+
+        assertEquals(listOf(0.5f), seen)
+    }
+
     @Test
     fun `generating by explicit id ignores the stored preference`() {
         val a = Fake("a")
@@ -246,11 +312,25 @@ class ImageGenerationTest {
         )
     }
 
+    /**
+     * The local diffusion engine reports why it cannot run rather than pretending it can.
+     *
+     * IT USED TO BE A PLACEHOLDER CLASS THAT ALWAYS SAID "NOT BUILT". Now the library is built, and
+     * what makes this engine unavailable is the absence of a checkpoint -- so the assertion is on the
+     * REASON naming what to do about it, not on the engine being unbuilt. In a JVM test there is no
+     * `sd_bridge` on the library path either, which is the other honest reason it reports.
+     */
     @Test
-    fun `the unbuilt diffusion engine is registered but never claims to be ready`() {
-        val engine = StableDiffusionCppGenerator()
-        assertTrue(engine.availability() is ImageGenerator.Availability.Unavailable)
-        // Registered rather than hidden, so the UI can show what desktop is missing.
+    fun `the local diffusion engine explains what it is missing`() {
+        val engine = LocalDiffusionGenerator()
+        val availability = engine.availability()
+        assertTrue(availability is ImageGenerator.Availability.Unavailable)
+        val reason = (availability as ImageGenerator.Availability.Unavailable).reason
+        assertTrue(
+            reason.contains("diffusion", ignoreCase = true) ||
+                reason.contains("image model", ignoreCase = true),
+            "the reason should name the engine or the missing model, was: $reason",
+        )
         ImageGeneration.register(engine)
         assertEquals(1, ImageGeneration.all().size)
         assertTrue(ImageGeneration.available().isEmpty())

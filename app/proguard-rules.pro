@@ -99,6 +99,9 @@
 # absence is deliberate rather than let the release build fail.
 -dontwarn java.lang.management.ManagementFactory
 -dontwarn java.lang.management.OperatingSystemMXBean
+# TaskManager.currentPid() asks android.os.Process first and only falls back to the MX bean's
+# "pid@host" name on a desktop JVM, so this interface is genuinely unreachable on a device.
+-dontwarn java.lang.management.RuntimeMXBean
 -dontwarn javax.lang.model.SourceVersion
 -dontwarn javax.lang.model.element.Element
 -dontwarn javax.lang.model.element.ElementKind

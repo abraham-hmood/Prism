@@ -42,7 +42,13 @@ class ModelStoreView @JvmOverloads constructor(
             binding.modelStoreBackBtn.visibility = if (value != null) View.VISIBLE else View.GONE
         }
 
-    private val tabs = listOf("Text" to "text", "Image" to "generative", "All" to "all")
+    private val tabs = listOf(
+        "Text" to "text",
+        "Image" to "generative",
+        "Audio" to "audio",
+        "Interpolation" to "interpolation",
+        "All" to "all",
+    )
     private var currentCategory = tabs.first().second
     private var searchJob: kotlinx.coroutines.Job? = null
 
@@ -149,7 +155,11 @@ class ModelStoreView @JvmOverloads constructor(
             binding.modelStoreLoading.visibility = View.GONE
             cardAdapter.submitList(results)
             binding.modelStoreEmpty.visibility = if (results.isEmpty()) View.VISIBLE else View.GONE
-            if (results.isEmpty() && category != "text") {
+            if (results.isEmpty() && category == "interpolation") {
+                binding.modelStoreEmpty.text = "No frame interpolation models matched. Searches look for ONNX exports; you can also import one you already have."
+            } else if (results.isEmpty() && category == "audio") {
+                binding.modelStoreEmpty.text = "No audio models matched. Try an ONNX speech or music export, or import one from storage."
+            } else if (results.isEmpty() && category != "text") {
                 binding.modelStoreEmpty.text = "Few image models are packaged for on-device use (MediaPipe .task bundles only) — try Text, or search directly."
             } else if (results.isEmpty()) {
                 binding.modelStoreEmpty.text = "No models found. Try a different search term."
@@ -162,13 +172,20 @@ class ModelStoreView @JvmOverloads constructor(
         // classifiers -- face landmarker, object detector, image classifier -- and every one of
         // them was installed as the image GENERATOR, so choosing one replaced the generator with a
         // file that cannot make an image and left vision itself with nothing.
-        val isImageModel = when (currentCategory) {
-            "text", "vision" -> false
-            "generative", "enhancement" -> true
-            else -> model.category in listOf("generative", "enhancement") ||
-                model.name.contains("diffusion", ignoreCase = true)
+        val modelType = when (currentCategory) {
+            "audio" -> PrismSettings.MODEL_TYPE_AUDIO_GEN
+            "interpolation" -> PrismSettings.MODEL_TYPE_INTERPOLATION
+            "generative", "enhancement" -> PrismSettings.MODEL_TYPE_IMAGE
+            "vision" -> PrismSettings.MODEL_TYPE_TEXT
+            else -> if (model.name.contains("diffusion", ignoreCase = true)) {
+                PrismSettings.MODEL_TYPE_IMAGE
+            } else PrismSettings.MODEL_TYPE_TEXT
         }
-        ModelDownloadManager.download(context, model.name, model.downloadUrl, isImageModel)
+        ModelDownloadManager.download(
+            context, model.name, model.downloadUrl,
+            isImageModel = modelType == PrismSettings.MODEL_TYPE_IMAGE,
+            modelType = modelType,
+        )
     }
 }
 

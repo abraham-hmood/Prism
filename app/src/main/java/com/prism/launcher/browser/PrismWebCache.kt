@@ -159,7 +159,7 @@ object PrismWebCache {
             "Needs VPN tunnelling — turn on Enable VPN Tunneling above."
         PrismSettings.getVpnMode() != PrismSettings.VPN_MODE_PRISM ->
             "Only for the Prism P2P VPN — VPN Mode is set to External VPN."
-        PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_CLIENT &&
+        PrismSettings.isPrismClientRole() &&
             PrismSettings.getPrismServers().isEmpty() ->
             "No Prism server saved yet — add one under Manage Prism Servers, or switch the role to Server."
         !tunnelReady() ->
