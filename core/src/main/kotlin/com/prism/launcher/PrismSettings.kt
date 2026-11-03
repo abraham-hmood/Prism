@@ -1425,6 +1425,21 @@ object PrismSettings {
     fun setMeshEnabled(value: Boolean) =
         prefs().edit().putBoolean(KEY_MESH_ENABLED, value).apply()
 
+    /**
+     * Whether this device hosts a Prism directory server.
+     *
+     * Only meaningful for the Server role. [com.prism.launcher.vpn.DirectoryServer.refresh] checks the
+     * role rather than trusting this flag, so a stored true cannot keep a listener open after the role
+     * changes -- the checkbox is a request, not a switch on the socket.
+     */
+    fun getHostDirectoryServer(): Boolean =
+        prefs().getBoolean(KEY_HOST_DIRECTORY_SERVER, false)
+
+    fun setHostDirectoryServer(value: Boolean) {
+        prefs().edit().putBoolean(KEY_HOST_DIRECTORY_SERVER, value).apply()
+        com.prism.launcher.vpn.DirectoryServer.refresh()
+    }
+
     /** Which VPN Mode is selected: "prism" | "external" */
     fun getVpnMode(): String =
         prefs().getString(KEY_VPN_MODE, VPN_MODE_PRISM) ?: VPN_MODE_PRISM
@@ -1574,6 +1589,150 @@ object PrismSettings {
         val chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*"
         return (1..30).map { chars.random() }.joinToString("")
     }
+
+    // ── Server directory & VPN page ─────────────────────────────────────────
+
+    private const val KEY_PRISM_DIRECTORIES = "prism_directories"
+    private const val KEY_MY_COUNTRY = "vpn_my_country"
+    private const val KEY_VPN_COUNTRY = "vpn_country"
+    private const val KEY_VPN_BOUNCE = "vpn_bounce"
+    private const val KEY_VPN_PAY_WHEN_YOU_CAN = "vpn_pay_when_you_can"
+    private const val KEY_VPN_EXIT_NODE = "vpn_exit_node"
+    private const val KEY_VPN_SESSION_STARTED = "vpn_session_started"
+    private const val KEY_VPN_SESSION_PATH = "vpn_session_path"
+
+    /**
+     * A server that publishes other Prism servers.
+     *
+     * A third way to find a server, beside typing one in and beside the LAN scan: a directory is a
+     * server the operator already trusts to answer "which Prism servers do you know about". It is
+     * additive -- the fleet is still [getPrismServers], and nothing here changes the active server.
+     */
+    data class PrismDirectory(
+        val id: String = java.util.UUID.randomUUID().toString(),
+        val name: String,
+        val address: String,
+        val port: Int,
+        val username: String = "",
+        val password: String = "",
+        /**
+         * An HTTP directory, for a host that is not a Prism server at all.
+         *
+         * A cloud machine has no mesh listener and no port this device dials; what it
+         * has is a URL. When this is set, [address] and [port] are unused.
+         */
+        val url: String = "",
+        var isEnabled: Boolean = true,
+    )
+
+    /** Unit and record separators: a password may hold a colon or a comma, never these. */
+    private const val DIRECTORY_FIELD = "\u001F"
+    private const val DIRECTORY_ROW = "\u001E"
+
+    fun getDirectoryServers(): List<PrismDirectory> {
+        val raw = prefs().getString(KEY_PRISM_DIRECTORIES, "") ?: ""
+        if (raw.isEmpty()) return emptyList()
+        return raw.split(DIRECTORY_ROW).filter { it.isNotBlank() }.mapNotNull { row ->
+            val p = row.split(DIRECTORY_FIELD)
+            if (p.size < 4 || p[2].isBlank()) return@mapNotNull null
+            val port = p[3].toIntOrNull() ?: return@mapNotNull null
+            PrismDirectory(
+                id = p[0],
+                name = p[1],
+                address = p[2],
+                port = port,
+                username = p.getOrNull(4).orEmpty(),
+                password = p.getOrNull(5).orEmpty(),
+                // Eighth field. A list written before HTTP directories has no URL.
+                url = p.getOrNull(7).orEmpty(),
+                isEnabled = p.getOrNull(6) != "0",
+            )
+        }
+    }
+
+    fun setDirectoryServers(value: List<PrismDirectory>) {
+        // THE BUILT-IN DIRECTORIES ARE NEVER STORED. ServerDirectory.allDirectories() prepends them,
+        // so writing one back here would create a second, removable copy -- and then a later save
+        // could drop or disable the shipped one for good.
+        val rows = value.filterNot { com.prism.launcher.vpn.ServerDirectory.isBuiltIn(it.id) }
+        val raw = rows.joinToString(DIRECTORY_ROW) { d ->
+            listOf(
+                d.id, d.name, d.address, d.port.toString(),
+                d.username, d.password, if (d.isEnabled) "1" else "0", d.url,
+            ).joinToString(DIRECTORY_FIELD)
+        }
+        prefs().edit().putString(KEY_PRISM_DIRECTORIES, raw).apply()
+    }
+
+    private const val KEY_DIRECTORY_TOKEN = "prism_directory_token"
+
+    /** The token this device presents to directory servers; empty until one is generated. */
+    fun getDirectoryToken(): String = prefs().getString(KEY_DIRECTORY_TOKEN, "")?.trim().orEmpty()
+
+    /**
+     * The credential this device signs its directory announcements with, made on first use.
+     *
+     * GENERATED RATHER THAN ASKED FOR. A directory needs a token per announcing server to tell one
+     * device's row from another's, and making every user invent one -- then type it into a phone --
+     * produces weak strings and support questions. So the app makes a 32-character URL-safe random
+     * token the first time it needs one and keeps it: STABLE ACROSS RESTARTS is the whole point,
+     * because that stability is what lets a directory recognise this device on later announcements
+     * instead of treating each one as a new server. SecureRandom rather than Random, since the value
+     * is a bearer credential for this device's row.
+     */
+    fun getOrCreateDirectoryToken(): String {
+        val existing = getDirectoryToken()
+        if (existing.isNotEmpty()) return existing
+        val bytes = ByteArray(24)
+        java.security.SecureRandom().nextBytes(bytes)
+        val token = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+        prefs().edit().putString(KEY_DIRECTORY_TOKEN, token).apply()
+        return token
+    }
+
+    /**
+     * The country this device announces.
+     *
+     * Declared rather than derived: a geolocator is wrong behind a VPN, and the locale is only a
+     * first guess. The VPN page lets the user correct it.
+     */
+    fun getMyCountryCode(): String {
+        val stored = prefs().getString(KEY_MY_COUNTRY, "") ?: ""
+        if (stored.isNotBlank()) return stored
+        return runCatching { java.util.Locale.getDefault().country }.getOrDefault("").trim().uppercase()
+    }
+
+    fun setMyCountryCode(value: String) =
+        prefs().edit().putString(KEY_MY_COUNTRY, value.trim().uppercase()).apply()
+
+    fun getVpnCountry(): String = prefs().getString(KEY_VPN_COUNTRY, "") ?: ""
+
+    fun setVpnCountry(value: String) =
+        prefs().edit().putString(KEY_VPN_COUNTRY, value.trim().uppercase()).apply()
+
+    fun getVpnBounceEnabled(): Boolean = prefs().getBoolean(KEY_VPN_BOUNCE, false)
+
+    fun setVpnBounceEnabled(value: Boolean) = prefs().edit().putBoolean(KEY_VPN_BOUNCE, value).apply()
+
+    fun getVpnPayWhenYouCan(): Boolean = prefs().getBoolean(KEY_VPN_PAY_WHEN_YOU_CAN, false)
+
+    fun setVpnPayWhenYouCan(value: Boolean) =
+        prefs().edit().putBoolean(KEY_VPN_PAY_WHEN_YOU_CAN, value).apply()
+
+    /** Node id of the exit the live session uses; empty when no session is running. */
+    fun getVpnExitNode(): String = prefs().getString(KEY_VPN_EXIT_NODE, "") ?: ""
+
+    fun setVpnExitNode(value: String) = prefs().edit().putString(KEY_VPN_EXIT_NODE, value).apply()
+
+    fun getVpnSessionStartedAt(): Long = prefs().getLong(KEY_VPN_SESSION_STARTED, 0L)
+
+    fun setVpnSessionStartedAt(value: Long) =
+        prefs().edit().putLong(KEY_VPN_SESSION_STARTED, value).apply()
+
+    /** Up to three node ids the session passes through, comma separated, exit first. */
+    fun getVpnSessionPath(): String = prefs().getString(KEY_VPN_SESSION_PATH, "") ?: ""
+
+    fun setVpnSessionPath(value: String) = prefs().edit().putString(KEY_VPN_SESSION_PATH, value).apply()
 
     // ── Prism Server Fleet ──────────────────────────────────────────────────
 
@@ -2071,6 +2230,7 @@ object PrismSettings {
         KIND_IMAGE -> KEY_ACTIVE_CLOUD_IMAGE_MODEL_ID
         KIND_AUDIO -> KEY_ACTIVE_CLOUD_AUDIO_MODEL_ID
         KIND_INTERPOLATION -> KEY_ACTIVE_CLOUD_INTERPOLATION_MODEL_ID
+        KIND_VIDEO -> KEY_ACTIVE_CLOUD_VIDEO_MODEL_ID
         else -> null
     }
 
@@ -2270,6 +2430,13 @@ object PrismSettings {
     fun setLocalInterpolationModelPath(value: String) =
         prefs().edit().putString(KEY_LOCAL_INTERPOLATION_MODEL_PATH, value).apply()
 
+    /** The clip model VideoCraft draws whole shots with when one is active. */
+    fun getLocalVideoModelPath(): String =
+        prefs().getString(KEY_LOCAL_VIDEO_MODEL_PATH, "") ?: ""
+
+    fun setLocalVideoModelPath(value: String) =
+        prefs().edit().putString(KEY_LOCAL_VIDEO_MODEL_PATH, value).apply()
+
     /** True when the text side of VideoCraft has an engine (local, cloud or Ollama). */
     fun hasTextGenerator(): Boolean = when (getAiMode()) {
         AI_MODE_CLOUD -> getActiveCloudModel() != null
@@ -2280,6 +2447,18 @@ object PrismSettings {
     /** True when an image generator is selected, local or cloud. */
     fun hasImageGeneratorForVideo(): Boolean =
         getLocalImageModelPath().isNotEmpty() || getActiveCloudModel(KIND_IMAGE) != null
+
+    /**
+     * True when a clip model is selected, local or cloud.
+     *
+     * AN ACTIVE VIDEO MODEL REPLACES FOUR OF THE FIVE FAMILIES. A film drawn by a clip model needs no
+     * image generator, no interpolator, no ambience synth and no voice for its frames -- the model
+     * supplies the motion, and requiring the other four refused the one configuration that needs only
+     * two. The text model stays required, because the bible, the scene list and the shot list are
+     * still written by it.
+     */
+    fun hasVideoModelForVideo(): Boolean =
+        getLocalVideoModelPath().isNotEmpty() || getActiveCloudModel(KIND_VIDEO) != null
 
     /** True when a soundtrack generator is selected. */
     fun hasAudioGenerator(): Boolean =
@@ -2305,6 +2484,7 @@ object PrismSettings {
      */
     fun videoCraftBlocker(needsSpeech: Boolean = true): String? = when {
         !hasTextGenerator() -> "Set an active text model first"
+        hasVideoModelForVideo() -> null
         !hasImageGeneratorForVideo() -> "Set an active image model first"
         !hasFrameInterpolator() -> "Set an active frame interpolation model first"
         !hasAudioGenerator() -> "Set an active audio generator first"
@@ -2893,6 +3073,21 @@ object PrismSettings {
     fun setMaxTokens(value: Int) =
         prefs().edit().putInt(KEY_MAX_TOKENS, value).apply()
 
+    // ── Sam context compaction ────────────────────────────────────────────────
+
+    /**
+     * "<turns folded> / <recap>" for one conversation thread; empty when it was never compacted.
+     *
+     * One string rather than two keys because the two halves are written together and a turn count
+     * without its recap (or the reverse) describes a state that never existed. See
+     * [com.prism.launcher.messaging.SamCompaction], which owns and parses both.
+     */
+    fun getSamCompaction(threadKey: String): String =
+        prefs().getString("sam_compaction_$threadKey", "") ?: ""
+
+    fun setSamCompaction(threadKey: String, value: String) =
+        prefs().edit().putString("sam_compaction_$threadKey", value).apply()
+
     // ── Prism Swap ────────────────────────────────────────────────────────────
     // ONE setting for one file. Sam's GGUF weights and KV cache, Nora's tensors, Aether's staging
     // buffers, VideoCraft's frame scratch and the inactive-page offloader all map slices of
@@ -3003,6 +3198,16 @@ object PrismSettings {
     const val MODEL_TYPE_INTERPOLATION = "interpolation"
 
     /**
+     * A model that draws a whole clip: the video family.
+     *
+     * Kept apart from IMAGE for the same reason AUDIO_GEN is kept apart from AUDIO. A clip model is
+     * asked for a shot and a length and answers a take; an image model is asked for one frame and
+     * knows nothing about the frame before it. Listing one under the other would offer a download that
+     * cannot be used and let a film quietly lose its motion.
+     */
+    const val MODEL_TYPE_VIDEO = "video"
+
+    /**
      * A game asset model: something AssetCraft can load and turn into a mesh.
      *
      * Kept apart from IMAGE for the same reason AUDIO_GEN is kept apart from AUDIO: a texture model
@@ -3037,15 +3242,17 @@ object PrismSettings {
     const val KIND_IMAGE = "image"
     const val KIND_AUDIO = "audio"
     const val KIND_INTERPOLATION = "interpolation"
+    const val KIND_VIDEO = "video"
 
     /** Every kind, in the order the Add Cloud Model dialog offers them. */
-    val CLOUD_KINDS = listOf(KIND_TEXT, KIND_IMAGE, KIND_AUDIO, KIND_INTERPOLATION)
+    val CLOUD_KINDS = listOf(KIND_TEXT, KIND_IMAGE, KIND_AUDIO, KIND_INTERPOLATION, KIND_VIDEO)
 
     /** What to call a kind in the UI. */
     fun cloudKindLabel(kind: String): String = when (normalizedCloudKind(kind)) {
         KIND_IMAGE -> "Image"
         KIND_AUDIO -> "Audio"
         KIND_INTERPOLATION -> "Frame interpolation"
+        KIND_VIDEO -> "Video"
         else -> "Text"
     }
 
@@ -3054,6 +3261,7 @@ object PrismSettings {
         KIND_IMAGE, "image_gen", "imagegen", "diffusion" -> KIND_IMAGE
         KIND_AUDIO, "audio_gen", "audiogen", "music" -> KIND_AUDIO
         KIND_INTERPOLATION, "frame_interpolation", "frameinterpolation", "interp" -> KIND_INTERPOLATION
+        KIND_VIDEO, "video_gen", "videogen", "text2video", "t2v", "image2video", "i2v" -> KIND_VIDEO
         else -> KIND_TEXT
     }
 
@@ -3599,6 +3807,8 @@ object PrismSettings {
     private const val KEY_CLOUD_AI_MODEL     = "cloud_ai_model"
     private const val KEY_CLOUD_MODELS       = "cloud_models"
     private const val KEY_ACTIVE_CLOUD_MODEL_ID = "active_cloud_model_id"
+    private const val KEY_ACTIVE_CLOUD_VIDEO_MODEL_ID = "active_cloud_video_model_id"
+    private const val KEY_LOCAL_VIDEO_MODEL_PATH = "local_video_model_path"
     private const val KEY_ACTIVE_CLOUD_IMAGE_MODEL_ID = "active_cloud_image_model_id"
     private const val KEY_ACTIVE_CLOUD_AUDIO_MODEL_ID = "active_cloud_audio_model_id"
     private const val KEY_ACTIVE_CLOUD_INTERPOLATION_MODEL_ID =
@@ -3653,6 +3863,7 @@ object PrismSettings {
     private const val KEY_DNS_PROXY_MODE     = "dns_proxy_mode"
     
     private const val KEY_MESH_ENABLED       = "mesh_enabled"
+    private const val KEY_HOST_DIRECTORY_SERVER = "host_directory_server"
 
     private const val KEY_AETHER_BIOTRAIN    = "aether_biotrain_enabled"
     private const val KEY_AETHER_BIOGEN      = "aether_biogen_enabled"

@@ -341,18 +341,21 @@ object GgufInferenceService {
         maxTokens: Int = 512,
     ): String {
         if (handle == 0L) return ""
+        // THE MESH PATH USES THE CHOSEN MODE TOO. This bypassed the cached load and hard-coded
+        // STANDARD, so a generation split across peers silently ignored the mode the user picked.
+        val mode = InferenceMode.fromId(PrismSettings.getInferenceMode())
         inFlight.incrementAndGet()
         return runCatching {
             val raw = if (onToken != null) {
                 val splitter = ThinkTagSplitter(onAnswer = onToken, onReasoning = null)
                 val result = nativeGenerateStreaming(
                     handle, userText, maxTokens, 0.7f, 0.05f,
-                    TokenCallback { splitter.feed(it) }, InferenceMode.STANDARD.nativeId,
+                    TokenCallback { splitter.feed(it) }, mode.nativeId,
                 )
                 splitter.flush()
                 result
             } else {
-                nativeGenerate(handle, userText, maxTokens, 0.7f, 0.05f, InferenceMode.STANDARD.nativeId)
+                nativeGenerate(handle, userText, maxTokens, 0.7f, 0.05f, mode.nativeId)
             }
             stripThinkTags(raw)
         }.also { inFlight.decrementAndGet() }.getOrDefault("")

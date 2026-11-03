@@ -101,10 +101,17 @@ object GameTrainer {
         val validationLoss: Double,
         val metadata: JSONObject,
     ) {
-        fun sample(prompt: String, seed: Long): GameMesh {
+        /**
+         * Builds a mesh from [prompt].
+         *
+         * [steps] is the denoising budget: 0 keeps this head's own default. AssetCraft passes the
+         * user's mode through it, which is how a settings choice that was only ever read by the
+         * chat decoder reaches a generated game asset.
+         */
+        fun sample(prompt: String, seed: Long, steps: Int = 0): GameMesh {
             val random = Random(seed)
             val condition = conditionOf(prompt)
-            val normalised = head.sample(random, condition)
+            val normalised = head.sample(random, condition, steps)
             val shape = DoubleArray(SHAPE_DIM) { index ->
                 ((normalised[index] * std[index]) + mean[index]).coerceIn(-1.0, 1.0)
             }
@@ -687,7 +694,7 @@ object GameTrainer {
         fun zero()
         fun step(target: DoubleArray, condition: DoubleArray, random: Random): Double
         fun loss(target: DoubleArray, condition: DoubleArray, random: Random): Double
-        fun sample(random: Random, condition: DoubleArray): DoubleArray
+        fun sample(random: Random, condition: DoubleArray, steps: Int = 0): DoubleArray
         fun parameterCount(): Int
     }
 
@@ -734,14 +741,16 @@ object GameTrainer {
 
         override fun parameterCount(): Int = parameters.sumOf { it.data.size }
 
-        override fun sample(random: Random, condition: DoubleArray): DoubleArray {
+        override fun sample(random: Random, condition: DoubleArray, steps: Int): DoubleArray {
             val x = DoubleArray(dim) { random.nextGaussian().coerceIn(-3.0, 3.0) }
-            val steps = 12
-            for (step in 0 until steps) {
-                val t = 1.0 - step.toDouble() / steps
+            // THE MODE'S PASS BUDGET, when one was supplied. Fewer Euler steps is the same trade the
+            // block modes make on a picture: a coarser shape, produced in fewer model passes.
+            val count = if (steps > 0) steps else 12
+            for (step in 0 until count) {
+                val t = 1.0 - step.toDouble() / count
                 val contexts = attention?.Forward(coordInputs(x, t, condition))?.contexts
                 val velocity = forward(x, t, condition, contexts)
-                val dt = 1.0 / steps
+                val dt = 1.0 / count
                 for (index in 0 until dim) x[index] = (x[index] - velocity[index] * dt).coerceIn(-4.0, 4.0)
             }
             return x
@@ -1003,8 +1012,11 @@ object GameTrainer {
             return loss(target, condition, random)
         }
 
-        override fun sample(random: Random, condition: DoubleArray): DoubleArray {
+        override fun sample(random: Random, condition: DoubleArray, steps: Int): DoubleArray {
             val tokens = IntArray(dim) { bins }
+            // An autoregressive head has no denoising schedule to shorten: it predicts one token at
+            // a time, so the mode's step budget has nothing to act on here and the output is the
+            // same in every mode. Stated rather than silently accepted as if it worked.
             for (position in 0 until dim) {
                 // The attention is causal, so the prefix built so far is all it needs; recomputing
                 // it for each position is what makes sampling use the same masks as training.

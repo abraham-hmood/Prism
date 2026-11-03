@@ -100,6 +100,23 @@ class ModelCraftPageView(context: Context) : FrameLayout(context), com.prism.lau
     private var fieldEditors = linkedMapOf<String, EditText>()
 
     /**
+     * Redraws every input from the model.
+     *
+     * The advisor writes values onto the model, not onto the boxes; without this the form would keep
+     * showing the numbers it just replaced, and the next edit would write them straight back.
+     */
+    private fun refreshFieldValues(model: CraftedModel) {
+        ModelCraft.fields[model.kind].orEmpty().forEach { field ->
+            fieldEditors[field.key]?.setText(model.param(field.key))
+            val spinner = fieldChoices[field.key] as? android.widget.Spinner ?: return@forEach
+            val index = field.choices.indexOf(model.param(field.key))
+            if (index >= 0) spinner.setSelection(index)
+        }
+        applyCreation(model)
+        persistForm()
+    }
+
+    /**
      * The dropdowns, by recipe key.
      *
      * Separate from [fieldEditors] because there is no text to read: the selection IS the value, and
@@ -1117,6 +1134,138 @@ class ModelCraftPageView(context: Context) : FrameLayout(context), com.prism.lau
         // the box is touched.
         applyCreation(target)
 
+        // ── The technique smoke test ─────────────────────────────────────────────────────────
+        //
+        // Under the fields and above the Train button: it writes the technique dropdown above it,
+        // and the run below it is what the choice is for.
+        column.addView(section("TECHNIQUE SMOKE TEST"))
+        val smokeNote = TextView(context).apply {
+            text = "Reads the loaded dataset, times this device, then adopts the fastest technique " +
+                "that keeps the most quality."
+            textSize = 11f
+            setTextColor(palette.muted.toInt())
+            setPadding(dp(18), dp(4), dp(18), dp(4))
+        }
+        column.addView(smokeNote)
+        // ── The two lengths ────────────────────────────────────────────────────────────────
+        //
+        // Both buttons ask first. A quick test is seconds and a lengthy one is 50 epochs of the
+        // same measurement, so the difference is minutes -- not something to discover by pressing.
+        lateinit var paramNote: TextView
+
+        fun chooseLength(title: String, onChoice: (Int) -> Unit) {
+            android.app.AlertDialog.Builder(context)
+                .setTitle(title)
+                .setItems(arrayOf("Quick test", "Lengthy test (50 epochs)")) { _, which ->
+                    onChoice(if (which == 0) 1 else 50)
+                }
+                .setNegativeButton("Cancel", null)
+                .show()
+        }
+
+        fun runSmoke(epochs: Int) {
+            persistForm()
+            val target = model ?: return
+            smokeNote.text = if (epochs > 1) {
+                "Running a $epochs-epoch smoke test over the dataset…"
+            } else {
+                "Measuring this machine and the dataset…"
+            }
+            scope.launch(Dispatchers.IO) {
+                val report = runCatching {
+                    TrainingTechniqueSmokeTest.run(target, epochs).also {
+                        TrainingTechniqueSmokeTest.apply(target, it)
+                    }
+                }.getOrNull()
+                launch(Dispatchers.Main) {
+                    smokeNote.text = report?.summary ?: "The smoke test could not run."
+                    // The dropdown was written behind the spinner's back, so point it at the value
+                    // the test just chose rather than leaving it showing the old one.
+                    val chosen = TrainingTechniques.choices.indexOf(TrainingTechniques.of(target).label)
+                    (fieldChoices[TrainingTechniques.KEY] as? android.widget.Spinner)
+                        ?.setSelection(chosen.coerceAtLeast(0))
+                }
+            }
+        }
+
+        fun runParameters(epochs: Int) {
+            persistForm()
+            val target = model ?: return
+            paramNote.text = if (epochs > 1) {
+                "Testing every input over $epochs epochs…"
+            } else {
+                "Measuring the dataset to propose inputs…"
+            }
+            scope.launch(Dispatchers.IO) {
+                val report = runCatching {
+                    ParameterAdvisor.run(target, epochs) { stage ->
+                        android.os.Handler(android.os.Looper.getMainLooper()).post {
+                            paramNote.text = stage
+                        }
+                    }.also { ParameterAdvisor.apply(target, it) }
+                }.getOrNull()
+                launch(Dispatchers.Main) {
+                    paramNote.text = report?.let {
+                        it.summary + System.lineSeparator() +
+                            it.lines.joinToString(System.lineSeparator())
+                    }
+                        ?: "The parameter test could not run on this dataset."
+                    // Every proposed value is on the model now; the boxes are redrawn from it so the
+                    // form shows the answer instead of the numbers the advice replaced.
+                    refreshFieldValues(target)
+                }
+            }
+        }
+
+        val smokeButton = pill("Run smoke test").apply {
+            setOnClickListener {
+                chooseLength("Run smoke test") { epochs -> runSmoke(epochs) }
+            }
+        }
+        column.addView(smokeButton, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(44),
+        ).apply { setMargins(dp(16), dp(6), dp(16), 0) })
+
+        val autoButton = pill("Auto-determine parameters").apply {
+            setOnClickListener {
+                chooseLength("Auto-determine parameters") { epochs -> runParameters(epochs) }
+            }
+        }
+        column.addView(autoButton, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(44),
+        ).apply { setMargins(dp(16), dp(2), dp(16), 0) })
+
+        paramNote = TextView(context).apply {
+            text = "Proposes a value for every input this model type has, from the dataset and this device."
+            textSize = 11f
+            setTextColor(palette.muted.toInt())
+            setPadding(dp(18), dp(4), dp(18), dp(4))
+        }
+        column.addView(paramNote)
+
+        // Video kinds carry one input of their own: whether a clip is consumed whole.
+        if (target.kind == ModelCraft.Kind.VIDEO) {
+            val whole = android.widget.CheckBox(context).apply {
+                text = "Train on the whole video"
+                textSize = 14f
+                setTextColor(palette.text.toInt())
+                buttonTintList = ColorStateList.valueOf(palette.accent.toInt())
+                isChecked = ModelCraft.wholeVideo(target)
+                setOnCheckedChangeListener { _, value ->
+                    ModelCraft.setWholeVideo(target, value)
+                    persistForm()
+                }
+            }
+            column.addView(whole, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { setMargins(dp(16), dp(8), dp(16), 0) })
+            column.addView(
+                hint(
+                    "On: every frame of a clip is used before the next clip, and extraction keeps " +
+                        "the whole recording. Off: the first few seconds, stopping at the frame cap.",
+                ),
+            )
+        }
         column.addView(section("TRAINING"))
         progressBar = ProgressBar(context, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = 100
@@ -1165,7 +1314,7 @@ class ModelCraftPageView(context: Context) : FrameLayout(context), com.prism.lau
                         val message = if (exported == null) {
                             "The export could not be written."
                         } else {
-                            "Exported to ${exported.absolutePath} — " +
+                            "Exported to ${exported.absolutePath} â€” " +
                                 "${ModelCraftExport.scriptName(target)} rebuilds this model on any " +
                                 "machine with Python."
                         }
@@ -1203,6 +1352,7 @@ class ModelCraftPageView(context: Context) : FrameLayout(context), com.prism.lau
             setTextColor(palette.faint.toInt())
             setPadding(dp(18), dp(6), dp(18), 0)
         })
+
         validationView = TextView(context).apply {
             textSize = 11f
             setTextColor(palette.destructive.toInt())

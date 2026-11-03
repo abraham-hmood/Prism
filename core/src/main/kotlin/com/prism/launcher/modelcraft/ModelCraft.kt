@@ -312,6 +312,24 @@ object ModelCraft {
      */
     val quantizations: List<String> = PrismQuantizer.Level.entries.map { it.fileSuffix }
 
+    /**
+     * Recipe key: train on every frame of every clip rather than a window of each.
+     *
+     * Off by default, because a clip is usually minutes long and the first seconds are enough to
+     * learn a frame relation from. On, the trainer walks one clip to its end before starting the
+     * next, which is what "the entire video" has to mean for the option to be worth a checkbox.
+     */
+    const val KEY_WHOLE_VIDEO = "video_whole_clip"
+
+    /** Whether video training is set to consume whole clips. */
+    fun wholeVideo(model: CraftedModel): Boolean =
+        model.param(KEY_WHOLE_VIDEO).trim().equals("true", ignoreCase = true)
+
+    /** Writes the video whole-clip choice. */
+    fun setWholeVideo(model: CraftedModel, value: Boolean) {
+        model.params[KEY_WHOLE_VIDEO] = value.toString()
+    }
+
     /** The recipe key the quantization dropdown writes. Shared by every kind. */
     const val KEY_QUANTIZATION = "quantization"
 
@@ -335,6 +353,19 @@ object ModelCraft {
     fun setQuantization(model: CraftedModel, label: String) {
         val match = quantizationLevel(label)
         model.params[KEY_QUANTIZATION] = match?.fileSuffix ?: DEFAULT_QUANTIZATION
+    }
+
+    /**
+     * The training technique the dropdown is showing.
+     *
+     * A label rather than the enum so the same string is what the form displays, what the recipe
+     * records and what a trainer matches on -- three places that must not drift apart.
+     */
+    fun technique(model: CraftedModel): String = TrainingTechniques.of(model).label
+
+    /** Writes the dropdown's choice, falling back to the default for a value it cannot place. */
+    fun setTechnique(model: CraftedModel, label: String) {
+        TrainingTechniques.set(model, label)
     }
 
     /**
@@ -371,6 +402,14 @@ object ModelCraft {
             // it is the precision the trainer writes. Always in the recipe, including from scratch:
             // unlike the base fields this one still means something with no base to load.
             Field(KEY_QUANTIZATION, "Model quantization", DEFAULT_QUANTIZATION, quantizations),
+            // Every kind declares this, because it is about the training loop rather than
+            // about what the model makes. The list is the nine processor techniques.
+            Field(
+                TrainingTechniques.KEY,
+                "Training technique",
+                TrainingTechniques.DEFAULT.label,
+                TrainingTechniques.choices,
+            ),
             Field("batch_size", "Batch size", "2"),
             Field("grad_accumulation", "Gradient accumulation steps", "8"),
             Field("learning_rate", "Learning rate", "0.0001"),
@@ -422,6 +461,14 @@ object ModelCraft {
             Field("lora_targets", "LoRA target modules", "to_q,to_k,to_v,to_out.0"),
             Field("train_text_encoder", "Also train the text encoder", "false"),
             Field(KEY_QUANTIZATION, "Model quantization", DEFAULT_QUANTIZATION, quantizations),
+            // Every kind declares this, because it is about the training loop rather than
+            // about what the model makes. The list is the nine processor techniques.
+            Field(
+                TrainingTechniques.KEY,
+                "Training technique",
+                TrainingTechniques.DEFAULT.label,
+                TrainingTechniques.choices,
+            ),
             Field("snr_gamma", "Min-SNR gamma", "5.0"),
             Field("prediction_type", "Prediction type", "epsilon"),
             Field("use_ema", "EMA of the weights", "false"),
@@ -469,6 +516,14 @@ object ModelCraft {
             Field("grad_clip", "Gradient clipping", "1.0"),
             Field("precision", "Mixed precision", "fp16"),
             Field(KEY_QUANTIZATION, "Model quantization", DEFAULT_QUANTIZATION, quantizations),
+            // Every kind declares this, because it is about the training loop rather than
+            // about what the model makes. The list is the nine processor techniques.
+            Field(
+                TrainingTechniques.KEY,
+                "Training technique",
+                TrainingTechniques.DEFAULT.label,
+                TrainingTechniques.choices,
+            ),
             Field("dataloader_workers", "Dataloader workers", "8"),
             Field("save_step", "Checkpoint every N steps", "10000"),
             Field("save_n_checkpoints", "Checkpoints to keep", "1"),
@@ -522,6 +577,14 @@ object ModelCraft {
             Field("ema", "Weight averaging (EMA)", "false"),
             Field("precision", "Mixed precision", "fp32"),
             Field(KEY_QUANTIZATION, "Model quantization", DEFAULT_QUANTIZATION, quantizations),
+            // Every kind declares this, because it is about the training loop rather than
+            // about what the model makes. The list is the nine processor techniques.
+            Field(
+                TrainingTechniques.KEY,
+                "Training technique",
+                TrainingTechniques.DEFAULT.label,
+                TrainingTechniques.choices,
+            ),
             Field("seed", "Seed", "42"),
             Field("distributed_backend", "Distributed backend", "none"),
             Field("world_size", "Processes", "1"),
@@ -566,6 +629,14 @@ object ModelCraft {
             Field("gradient_checkpointing", "Gradient checkpointing", "true"),
             Field("slicing", "Enable slicing / tiling", "true"),
             Field(KEY_QUANTIZATION, "Model quantization", DEFAULT_QUANTIZATION, quantizations),
+            // Every kind declares this, because it is about the training loop rather than
+            // about what the model makes. The list is the nine processor techniques.
+            Field(
+                TrainingTechniques.KEY,
+                "Training technique",
+                TrainingTechniques.DEFAULT.label,
+                TrainingTechniques.choices,
+            ),
             Field("seed", "Seed", "42"),
             Field("checkpointing_steps", "Checkpoint every N steps", "1000"),
             Field("validation_prompt", "Validation prompt", ""),
@@ -578,6 +649,14 @@ object ModelCraft {
         Kind.GAME to listOf(
             Field("base_model", "Base game model or checkpoint", ""),
             Field(KEY_QUANTIZATION, "Model quantization", DEFAULT_QUANTIZATION, quantizations),
+            // Every kind declares this, because it is about the training loop rather than
+            // about what the model makes. The list is the nine processor techniques.
+            Field(
+                TrainingTechniques.KEY,
+                "Training technique",
+                TrainingTechniques.DEFAULT.label,
+                TrainingTechniques.choices,
+            ),
             Field("model_config", "Model config", "same as base"),
             Field("training_method", "Training method", "lora"),
             Field("lora_rank", "LoRA rank", "16"),
@@ -1100,6 +1179,9 @@ object ModelCraft {
                 }
                 Kind.INTERPOLATION -> PixelTrainer.trainInterpolation(model, recipe)
                 Kind.VIDEO -> PixelTrainer.trainVideo(model, recipe)
+                Kind.VIDEO -> PixelTrainer.trainVideo(model, recipe)?.also {
+                    activateVideoArtifact(model)
+                }
                 Kind.GAME -> GameTrainer.train(model, recipe)
             }
         }
@@ -1128,6 +1210,43 @@ object ModelCraft {
             "ModelCraft",
             "Image model ${model.name} is available as the ModelCraft image engine at " +
                 directory.absolutePath,
+        )
+    }
+
+    /**
+     * Makes a just-trained video model the one VideoCraft draws with, once.
+     *
+     * Mirrors [activateImageArtifact] for the video family. The Models page, both import buttons and
+     * [com.prism.launcher.videocraft.VideoCraftVideoRouter] all read this same local-video path, so
+     * writing it here IS the import. This is the step that was missing: a clip model trained in
+     * ModelCraft wrote its artifacts into its dataset folder and nothing ever told VideoCraft they
+     * existed, so the render carried on with text, image, audio and speech as if no video model had
+     * been selected at all.
+     *
+     * It does not steal a deliberate choice: a user who has already pointed the family at a clip
+     * checkpoint of their own keeps it, and the new run stays listed in its folder and on the
+     * ModelCraft list.
+     */
+    private fun activateVideoArtifact(model: CraftedModel) {
+        val directory = Store.datasetDir(model.id)
+        val metadata = File(directory, PixelTrainer.Task.VIDEO.metadataFile)
+        val weights = File(directory, PixelTrainer.Task.VIDEO.weightsFile)
+        if (!metadata.isFile || !weights.isFile) return
+        val current = PrismSettings.getLocalVideoModelPath()
+        // ANOTHER MODELCRAFT CLIP MODEL IS STILL A DEFAULT, not a choice: the newest run wins, the
+        // same rule the image family follows.
+        // The Models page stores the weights FILE, not the folder; both name a ModelCraft model, and
+        // reading only the folder form made every such selection look deliberate, so a new run was
+        // never activated over it.
+        val currentFolder = File(current).let { if (it.isFile) it.parentFile else it }
+        val currentIsCrafted = current.isNotEmpty() && currentFolder != null &&
+            File(currentFolder, PixelTrainer.Task.VIDEO.metadataFile).isFile
+        if (current.isBlank() || currentIsCrafted) {
+            PrismSettings.setLocalVideoModelPath(directory.absolutePath)
+        }
+        PrismPlatform.log.info(
+            "ModelCraft",
+            "Video model ${model.name} is available to VideoCraft at " + directory.absolutePath,
         )
     }
 
@@ -1400,7 +1519,16 @@ object ModelCraft {
      * @return how many frames were written, or 0 when the file could not be read.
      */
     @Volatile
-    var frameExtractor: ((video: File, destination: File) -> Int)? = null
+    /**
+     * Turns one clip into frames.
+     *
+     * [onFrame] is called after each frame with the number written and the number this clip will
+     * produce, and `total` is 0 where the decoder cannot know it in advance. Preparation reports both
+     * so a long recording says which file it is on and how much of it is left, rather than sitting on
+     * one unchanging line while a decoder works through it.
+     */
+    var frameExtractor:
+        ((video: File, destination: File, wholeClip: Boolean, onFrame: (done: Int, total: Int) -> Unit) -> Int)? = null
 
     /**
      * Runs a prepared recipe. Set by the platform when it has a trainer for that kind.
@@ -1958,16 +2086,24 @@ object ModelCraft {
      * dataset is a trainer that silently makes a bad model), and the result is written to
      * `dataset.json` alongside links to the frame folders.
      */
-    fun prepare(model: CraftedModel): String {
+    fun prepare(model: CraftedModel, onStage: (String, Float) -> Unit = { _, _ -> }): String {
         val dir = Store.datasetDir(model.id)
         val spec = datasets.getValue(model.kind)
+        onStage("Reading the dataset folder…", 0.02f)
         // A CSV IN THIS FOLDER MAY STILL NAME FILES SOMEWHERE ELSE. This is where a hand-copied
         // manifest, or one whose import ran before the reference resolver did, gets its files: every
         // row that resolves is brought in before the folder is read. For every kind, because a text
         // corpus names its chapters the same way a speech dataset names its clips.
-        dir.listFiles()
+        val manifestCsvs = dir.listFiles()
             ?.filter { it.isFile && it.extension.equals("csv", true) && it.name !in GENERATED_FILES }
-            ?.forEach { csv -> importCsvMedia(model, csv, dir) }
+            .orEmpty()
+        manifestCsvs.forEachIndexed { index, csv ->
+            onStage(
+                "Bringing in the files ${csv.name} names (${index + 1} of ${manifestCsvs.size})…",
+                0.04f,
+            )
+            importCsvMedia(model, csv, dir)
+        }
         // THE FILES THIS PIPELINE WROTE ARE NOT PART OF THE DATASET. vocal_features.csv is a row per
         // clip and dataset_merged.csv is the dataset's own CSV again with those columns beside it, so
         // counting either as a dataset CSV would double every row and make a second run merge a
@@ -1982,7 +2118,14 @@ object ModelCraft {
         var csvRows = 0
         var missing = 0
         if (spec.csv) {
-            for (csv in files.filter { it.extension.equals("csv", true) }) {
+            val csvFiles = files.filter { it.extension.equals("csv", true) }
+            for ((csvIndex, csv) in csvFiles.withIndex()) {
+                // WHICH FILE'S ROWS ARE BEING READ, and which one of how many: a corpus of one CSV
+                // per chapter is minutes of work, and the row count only arrives at the end of it.
+                onStage(
+                    "Reading the rows in ${csv.name} (${csvIndex + 1} of ${csvFiles.size})…",
+                    0.05f + 0.05f * csvIndex / csvFiles.size.coerceAtLeast(1),
+                )
                 val parsed = parseCsv(csv)
                 csvRows += parsed.size
                 for (row in parsed) {
@@ -2011,7 +2154,7 @@ object ModelCraft {
                 }
             }
         }
-        val frames = if (spec.frames) extractFrames(model, media) else 0
+        val frames = if (spec.frames) extractFrames(model, media, onStage) else 0
         // A GAME DATASET IS CLASSIFIED, not just listed. Extension says what a .png is and says
         // nothing about a .fbx or a .uasset, so the same classifier DatasetCraft uses fills in each
         // row's type, format, material and engine. The trainer reads meshes directly; the manifest is
@@ -2096,7 +2239,7 @@ object ModelCraft {
         if (model.kind != Kind.AUDIO || isMusic(model)) return emptyList()
         if (model.dataset.isEmpty()) return emptyList()
         if (voicePreparationReady(model)) return VoicePack.proposal(model)
-        prepare(model)
+        prepare(model, onStage)
         val note = measureVoices(model, onStage)
         preparedVoicesFor = model.id
         preparedVoiceCount = voiceCount(model) ?: 0
@@ -2123,13 +2266,25 @@ object ModelCraft {
         model.status = STATUS_TRAINING
         Store.save(model)
         _state.value = State(running = true, stage = "Preparing the dataset…", modelId = model.id)
+        // PREPARATION REPORTS ITSELF. It is the longest silent part of a run -- a folder of clips can
+        // take minutes -- and "Preparing the dataset…" with no filename is indistinguishable from a
+        // hang. The gate is there because a frame extractor can call back thousands of times a minute
+        // and every call would otherwise be a state write the page has to redraw.
+        var preparationReportedAt = 0L
+        val onPreparation: (String, Float) -> Unit = { stage, progress ->
+            val now = System.currentTimeMillis()
+            if (now - preparationReportedAt >= 150) {
+                preparationReportedAt = now
+                _state.value = _state.value.copy(stage = stage, progress = progress)
+            }
+        }
         // A new run never inherits the previous one's graph: a failed preparation would otherwise
         // leave a playhead for a model that is no longer being trained.
         VoiceTrainingMonitor.clear()
 
         job = scope.launch {
             try {
-                val summary = prepare(model)
+                val summary = prepare(model, onPreparation)
                 if (cancelled) return@launch
 
                 // THE VOICE IS MEASURED BEFORE THE RECIPE IS WRITTEN, because the recipe has to
@@ -2151,7 +2306,19 @@ object ModelCraft {
                     stage = "Writing the recipe…",
                     progress = 0.4f,
                 )
-                val recipe = recipeFile(model)
+                // THE WRITE SAYS WHAT IT IS DOING, STEP BY STEP. It re-checks the dataset (and, on a
+                // video model, re-reads frames), which is minutes of the same work as preparation and
+                // used to happen under one unchanging sentence. The run has already prepared the
+                // dataset above, so the second pass is skipped rather than paid for twice.
+                var recipeReportedAt = 0L
+                val onRecipe: (String, Float) -> Unit = { stage, progress ->
+                    val now = System.currentTimeMillis()
+                    if (now - recipeReportedAt >= 150) {
+                        recipeReportedAt = now
+                        _state.value = _state.value.copy(stage = stage, progress = progress)
+                    }
+                }
+                val recipe = recipeFile(model, onRecipe, prepareDataset = false)
                 // Local training is the user's switch. With it off this build writes the recipe and
                 // the export and touches no trainer, which is what a user who trains elsewhere asks
                 // for -- and the only honest thing to do when there is no trainer is to say so.
@@ -2159,6 +2326,16 @@ object ModelCraft {
                 // features this reads, and only when a local trainer will actually report steps.
                 val graph = model.kind == Kind.AUDIO && !isMusic(model) && trainsLocally(model)
                 if (graph) VoiceTrainingMonitor.start(model)
+                // NAMED BEFORE THE TRAINER RUNS. A trainer loads its examples before it reports its
+                // first step -- a video model decodes every clip's frames first -- so without this
+                // the page sat on "Writing the recipe…" for the longest part of the run.
+                if (trainsLocally(model)) {
+                    _state.value = _state.value.copy(
+                        stage = "Training ${model.family.ifBlank { model.architecture }} — loading " +
+                            "the dataset…",
+                        progress = 0.5f,
+                    )
+                }
                 val trained = try {
                     if (trainsLocally(model)) runner?.invoke(model, recipe) else null
                 } finally {
@@ -2437,16 +2614,35 @@ object ModelCraft {
      * frameworks this vocabulary comes from read (`train.py --config recipe.json`). The dataset
      * manifest is named, not inlined, so a large dataset does not become a large recipe.
      */
-    fun recipeFile(model: CraftedModel): File {
+    fun recipeFile(
+        model: CraftedModel,
+        onStage: (String, Float) -> Unit = { _, _ -> },
+        prepareDataset: Boolean = true,
+    ): File {
         // THE DATASET SUMMARY IS NOT THIS FUNCTION'S TO OVERWRITE. `prepare` is called here because
         // the recipe names the manifest it writes, but for an audio model the summary on the record
         // was written by the speech preparation and says what the run MEASURED -- how many clips,
         // which languages, how many voice types. Re-preparing would replace all of that with a file
         // count, which is how a run that had just measured a dataset reported "3 files · 2 CSV rows"
         // as its result.
+        //
+        // [onStage] EXISTS BECAUSE THIS IS NOT QUICK. The check below re-lists the dataset and, on a
+        // video model, re-reads the frames it extracts -- the same work as preparation, on the same
+        // kind of slow storage. It used to run silently under a single unchanging sentence, which is
+        // indistinguishable from a hung run. Every step is named, including the frame-by-frame line
+        // the extraction already knows how to produce.
+        //
+        // [prepareDataset] is false when the caller has just prepared: a training run does, and paying
+        // for a second full pass, frames included, was the longest unexplained wait in the pipeline.
         val summary = model.datasetSummary
-        prepare(model)
+        if (prepareDataset) {
+            onStage("Writing the recipe — checking the dataset…", 0.40f)
+            prepare(model) { stage, fraction ->
+                onStage("Writing the recipe — $stage", 0.40f + 0.04f * fraction.coerceIn(0f, 1f))
+            }
+        }
         model.datasetSummary = summary
+        onStage("Writing the recipe — ${model.family.ifBlank { model.architecture }} settings…", 0.46f)
         val recipe = JSONObject().apply {
             put("kind", model.kind.name)
             put("model_type", model.kind.modelType)
@@ -2487,6 +2683,31 @@ object ModelCraft {
                         "saving does not repay.",
                 )
             }
+
+            // ── The processor technique this run asks the trainer to exploit. The field above
+            // already wrote the chosen label under its own key; this object adds what the choice
+            // MEANS -- the core idea, the training analogue, and the recipe keys a trainer can
+            // honour. A trainer that knows none of those keys runs exactly as it did before.
+            val technique = TrainingTechniques.of(model)
+            put(
+                "training_plan",
+                JSONObject().apply {
+                    put("id", technique.id)
+                    put("name", technique.label)
+                    put("core_idea", technique.coreIdea)
+                    put("training_analogue", technique.analogue)
+                    put("feasibility", technique.feasibility)
+                    put("estimated_speedup", technique.speedup)
+                    put("estimated_quality_retained", technique.quality)
+                    put(
+                        "knobs",
+                        JSONObject().apply {
+                            TrainingTechniques.knobs(technique, TrainingTechniques.cores())
+                                .forEach { (key, value) -> put(key, value) }
+                        },
+                    )
+                },
+            )
 
             val schedule = schedule(model)
             put(KEY_EPOCHS, schedule.epochs)
@@ -2738,6 +2959,7 @@ object ModelCraft {
                 )
             }
         }
+        onStage("Writing the recipe — recipe.json", 0.49f)
         val file = Store.recipeFile(model.id)
         file.writeText(recipe.toString())
         model.recipePath = file.absolutePath
@@ -2745,19 +2967,57 @@ object ModelCraft {
         return file
     }
 
-    private fun extractFrames(model: CraftedModel, media: List<File>): Int {
+    private fun extractFrames(
+        model: CraftedModel,
+        media: List<File>,
+        onStage: (String, Float) -> Unit = { _, _ -> },
+    ): Int {
         val extractor = frameExtractor ?: return 0
         val videos = media.filter { VIDEO_EXTENSIONS.any { ext -> it.extension.equals(ext, true) } }
         if (videos.isEmpty()) return 0
         val out = Store.framesDir(model.id)
         var frames = 0
-        for (video in videos) {
+        // Extraction owns 0.10..0.35 of the bar: the recipe and the export report after it, and a bar
+        // that went to 0.5 here would slide backwards the moment the next stage set 0.4.
+        val span = 0.25f / videos.size
+        for ((clipIndex, video) in videos.withIndex()) {
             val folder = File(out, video.nameWithoutExtension)
             folder.mkdirs()
-            frames += runCatching { extractor(video, folder) }.getOrDefault(0)
+            val base = 0.1f + span * clipIndex
+            onStage(frameStage(video, clipIndex, videos.size, 0, 0), base)
+            frames += runCatching {
+                extractor(video, folder, wholeVideo(model)) { done, total ->
+                    onStage(
+                        frameStage(video, clipIndex, videos.size, done, total),
+                        base + span * frameFraction(done, total),
+                    )
+                }
+            }.getOrDefault(0)
         }
         return frames
     }
+
+    /**
+     * The preparation line for one clip: its name, its place in the list, and the frames still to go.
+     *
+     * The remaining count is the part that answers "is this stuck?": a decoder working through a
+     * ten-minute recording has no other way to say that it is moving.
+     */
+    private fun frameStage(
+        video: File,
+        clipIndex: Int,
+        clips: Int,
+        done: Int,
+        total: Int,
+    ): String {
+        val head = "Frames from ${video.name} (clip ${clipIndex + 1} of $clips)"
+        if (done <= 0 || total <= 0) return "$head — decoding…"
+        val left = (total - done).coerceAtLeast(0)
+        return "$head — $done of $total frames, $left left"
+    }
+
+    private fun frameFraction(done: Int, total: Int): Float =
+        if (total <= 0) 0f else (done.toFloat() / total).coerceIn(0f, 1f)
 
     /**
      * A CSV, read as rows of named columns.

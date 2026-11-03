@@ -152,6 +152,9 @@ class VideoCraftService : Service() {
             image = com.prism.launcher.videocraft.VideoCraftImageRouter(),
             interpolator = AndroidVideoCraftInterpolators.create(),
             speech = AndroidVideoCraftSpeech(),
+            // AN ACTIVE CLIP MODEL SUPPLIES THE WHOLE FRAME PIPELINE. This stays null when none is
+            // selected, and then the engine draws keyframes and interpolates between them as before.
+            video = com.prism.launcher.videocraft.VideoCraftVideoRouter.create(),
             cancelled = { cancelled.get() },
         )
         try {

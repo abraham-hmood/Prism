@@ -113,6 +113,26 @@ object MeshBridges {
 
     fun miningCoin(): String = runCatching { mining?.coin }.getOrNull().orEmpty()
 
+    /**
+     * A mesh peer as a page may see it.
+     *
+     * The transports keep their own richer records -- sockets, leases, ban lists -- and none of
+     * that belongs to a settings screen. This is the dozen fields a feature asks about, so the
+     * VPN page can rank exits without reaching into an Android service from `:core`.
+     */
+    data class PeerSummary(
+        val ip: String,
+        val nodeId: String = "",
+        val name: String = "",
+        val latencyMs: Long = 9999L,
+        val serverPort: Int? = null,
+        val country: String = "",
+        val payout: String = "",
+    )
+
+    /** Set by whichever transport is running; empty when nothing has been discovered. */
+    var peers: () -> List<PeerSummary> = { emptyList() }
+
     // ── Sockets ────────────────────────────────────────────────────────────
 
     /**
@@ -192,6 +212,12 @@ object MeshBridges {
                 val chunk = String(buffer, 0, read, Charsets.UTF_8)
                 answer.append(chunk)
                 onToken(chunk)
+                // A PEER IS NOT TOLD HOW MUCH THIS DEVICE WILL HOLD. The read loop was unbounded, so a
+                // peer that never stopped writing filled the heap of the device that asked.
+                if (answer.length > MAX_PEER_ANSWER_CHARS) {
+                    PrismPlatform.log.warn(TAG, peerIp + " exceeded the answer cap; truncated")
+                    break
+                }
             }
             answer.toString().ifBlank { null }
         } catch (e: Exception) {
@@ -209,10 +235,18 @@ object MeshBridges {
             if (next < 0) return if (out.isEmpty()) null else out.toString()
             if (next == '\n'.code) return out.toString().trimEnd('\r')
             out.append(next.toChar())
+            // A status line is a line, not a stream: a peer that never sends a newline must not
+            // make this device's buffer grow without bound.
+            if (out.length > MAX_HEADER_LINE) return out.toString()
         }
     }
 
     private const val MODEL_HOST_PORT = 8080
+
+    /** Four million characters is far more than any answer worth showing, and bounded. */
+    private const val MAX_PEER_ANSWER_CHARS = 4 * 1024 * 1024
+
+    private const val MAX_HEADER_LINE = 8 * 1024
 
     /** What is wired up here, for a diagnostics page. */
     fun describe(): String = buildString {

@@ -96,6 +96,16 @@ sealed class SlotAssignment {
     /** The mesh-gated app catalogue and the publisher upload flow. */
     data object AppStore : SlotAssignment()
 
+    /**
+     * Bills the mesh can pay toward: ask for part of one, or pay into somebody else's.
+     *
+     * A page rather than a panel in the Wallet because giving is somewhere a user returns to,
+     * and because both halves -- the ask and the list of asks -- need this device's help
+     * identity and the requests its peers posted, which the wallet knows nothing about.
+     */
+    data object Helper : SlotAssignment()
+    data object Vpn : SlotAssignment()
+
     /** Running processes and the files they hold open, as a page of its own. */
     data object TaskManager : SlotAssignment()
 
@@ -136,6 +146,8 @@ sealed class SlotAssignment {
         is TimeMachine -> "time_machine"
         is Journal -> "journal"
         is AppStore -> "app_store"
+        is Helper -> "helper"
+        is Vpn -> "vpn"
         is TaskManager -> "task_manager"
         is Custom -> "custom|$packageName|$viewClassName"
     }
@@ -178,6 +190,8 @@ sealed class SlotAssignment {
             if (raw == "time_machine") return TimeMachine
             if (raw == "journal") return Journal
             if (raw == "app_store") return AppStore
+            if (raw == "helper") return Helper
+            if (raw == "vpn") return Vpn
             if (raw == "task_manager") return TaskManager
             val parts = raw.split("|")
             if (parts.size == 3 && parts[0] == "custom") {

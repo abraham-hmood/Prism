@@ -59,6 +59,8 @@ object PrismMeshService {
         var serverProtocol: String? = null,
         var serverPublicKey: String? = null,
         var wireGuardPort: Int? = null,
+        var country: String = "",
+        var payout: String = "",
     )
 
     /**
@@ -160,6 +162,10 @@ object PrismMeshService {
             return
         }
         if (listenerJob?.isActive == true || gossipJob?.isActive == true) return
+
+        // Pages read exits through this hook. Set on every start, so a restart after the
+        // process was reclaimed does not leave the VPN page looking at an empty list.
+        com.prism.launcher.mesh.MeshBridges.peers = { peerSnapshot() }
 
         val context = PrismApp.instance
         val meshPort = try { PrismSettings.getMeshBootstrapPort().toInt() } catch(e: Exception) { DEFAULT_MESH_PORT }
@@ -461,6 +467,8 @@ object PrismMeshService {
             info.serverProtocol = it.serverProtocol
             info.serverPublicKey = it.serverPublicKey
             info.wireGuardPort = it.wireGuardPort
+                info.country = it.country
+                info.payout = it.payout
             info.port = it.meshPort
         }
         
@@ -530,6 +538,16 @@ object PrismMeshService {
             MeshComputeRegistry.OPCODE_RPC_READY -> MeshComputeRegistry.ingestRpcReady(peerIp, payload)
 
             MeshComputeRegistry.OPCODE_DEBT_ANNOUNCE -> ComputeDebtLedger.ingestDebtAnnouncement(payload)
+
+            // Helper bills. Off the dispatch thread: both branches read and rewrite the
+            // request file, and this thread is the one every other peer's packets queue
+            // behind.
+            com.prism.launcher.helper.HelpMesh.OPCODE_REQUESTS,
+            com.prism.launcher.helper.HelpMesh.OPCODE_CONTRIBUTIONS -> {
+                Thread({
+                    com.prism.launcher.helper.HelpMesh.ingest(peerIp, payload)
+                }, "helper-mesh").apply { isDaemon = true }.start()
+            }
 
             // Relayed texts (PHASE 39). A phone SENDS these; another phone receiving one stores it too,
             // because a user with two handsets wants the relay both ways. Off the dispatch thread: it
@@ -793,6 +811,12 @@ object PrismMeshService {
         } catch (e: Exception) {}
     }
 
+/** Where this device wants Prism Coin for traffic it carries; null when it has no wallet. */
+    private fun payoutAddress(): String? = runCatching {
+        val coin = com.prism.launcher.wallet.CoinRegistry.bySymbol("PSC") ?: return@runCatching null
+        com.prism.launcher.wallet.WalletVault.addressFor(coin)
+    }.getOrNull()
+
     private fun localAnnouncement(meshPort: Int): String {
         val advertisesProxy = PrismSettings.getVpnTunnelingEnabled() &&
             PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM &&
@@ -809,6 +833,8 @@ object PrismMeshService {
             meshPort = meshPort,
             serverPort = serverPort,
             serverProtocol = if (serverPort == null) null else "proxy",
+            country = PrismSettings.getMyCountryCode(),
+            payout = payoutAddress(),
         )
     }
 
@@ -827,13 +853,22 @@ object PrismMeshService {
         payload.split(",").filter { it.isNotBlank() }.forEach { entry ->
             try {
                 val parts = entry.split(":")
-                val ip = parts[0]
-                val port = parts.getOrNull(1)?.toInt() ?: DEFAULT_MESH_PORT
+                val ip = parts[0].trim()
+                // A HINT IS AN ADDRESS, NEVER A NAME. This string arrived in a packet, and probing it
+                // handed whatever it said to InetAddress.getByName -- which resolves names in DNS.
+                if (!MeshUtils.isIpv4Literal(ip)) return@forEach
+                val port = parts.getOrNull(1)?.trim()?.toIntOrNull() ?: DEFAULT_MESH_PORT
+                if (port !in 1..65535) return@forEach
                 // HEARSAY IS NOT PRESENCE. This used to insert every listed address into the peer
                 // table with a fresh timestamp, which is what kept a device whose Prism was closed
                 // showing as online as long as any third device still mentioned it. A listed
                 // address is only a hint to probe; it becomes a peer when it answers itself.
                 if (myIps.contains(ip) || isPeer(ip)) return@forEach
+                // A forged list of thousands of addresses must not become a map of thousands.
+                if (probedAt.size >= MAX_PROBED_ADDRESSES) {
+                    probedAt.filterValues { now - it > PROBE_INTERVAL_MS }.keys.forEach { probedAt.remove(it) }
+                }
+                if (probedAt.size >= MAX_PROBED_ADDRESSES) return@forEach
                 val lastProbe = probedAt[ip] ?: 0L
                 if (now - lastProbe < PROBE_INTERVAL_MS) return@forEach
                 probedAt[ip] = now
@@ -845,6 +880,8 @@ object PrismMeshService {
     /** The last time an address heard through a peer list was probed, to cap the traffic. */
     private val probedAt = ConcurrentHashMap<String, Long>()
     private const val PROBE_INTERVAL_MS = 30_000L
+    private const val MAX_PROBED_ADDRESSES = 1_024
+    private const val MAX_PENDING_REQUESTS = 1_024
 
     private fun handleModelAnnounce(payload: String, peerIp: String) {
         try {
@@ -1058,6 +1095,15 @@ object PrismMeshService {
     }
 
     fun sendPacket(targetIp: String, targetPort: Int, command: Byte, payload: String) {
+        // A TARGET IS A LITERAL OR A CONFIGURED BOOTSTRAP NAME. What arrives from the network never
+        // gets here unvalidated -- the peer list refuses any hint that is not an IPv4 literal -- so
+        // this refuses only what no endpoint can be: blank, overlong, or carrying control bytes.
+        if (targetPort !in 1..65535 || targetIp.isBlank() || targetIp.length > 253 ||
+            targetIp.any { it.code < 33 || it.code > 126 }
+        ) {
+            noteSendFailure("refusing to send to \"$targetIp:$targetPort\": not a literal address")
+            return
+        }
         meshScope.launch {
             try {
                 val payloadBytes = payload.toByteArray()
@@ -1067,7 +1113,9 @@ object PrismMeshService {
                 payloadBytes.copyInto(data, 6)
                 
                 // Track sending time for latency measurement
-                if (command == 0x01.toByte() || command == 0x02.toByte() || command == 0x08.toByte()) {
+                if ((command == 0x01.toByte() || command == 0x02.toByte() || command == 0x08.toByte()) &&
+                    pendingRequests.size < MAX_PENDING_REQUESTS
+                ) {
                     pendingRequests["$targetIp:$command"] = System.currentTimeMillis()
                 }
                 
@@ -1113,6 +1161,30 @@ object PrismMeshService {
         return healthyPeers.minByOrNull { it.value.latency }?.key
     }
     
+    /**
+     * The peer table as pages see it.
+     *
+     * `MeshBridges.peers` is the hook the VPN page reads through: `:core` cannot reach this service,
+     * and a VPN exit is a peer, so the list has to leave Android through something that both sides
+     * know. Filtered by the same lease the count above uses, so a dead device cannot be chosen.
+     */
+    fun peerSnapshot(): List<com.prism.launcher.mesh.MeshBridges.PeerSummary> {
+        val cutoff = System.currentTimeMillis() - com.prism.core.MeshCore.PEER_LEASE_MS
+        return activePeers.entries
+            .filter { it.value.lastSeen > cutoff }
+            .map { (ip, info) ->
+                com.prism.launcher.mesh.MeshBridges.PeerSummary(
+                    ip = ip,
+                    nodeId = info.nodeId,
+                    name = info.name,
+                    latencyMs = info.latency,
+                    serverPort = info.serverPort,
+                    country = info.country,
+                    payout = info.payout,
+                )
+            }
+    }
+
     fun getPeerCount(): Int {
         val cutoff = System.currentTimeMillis() - com.prism.core.MeshCore.PEER_LEASE_MS
         return activePeers.count { it.value.lastSeen > cutoff }

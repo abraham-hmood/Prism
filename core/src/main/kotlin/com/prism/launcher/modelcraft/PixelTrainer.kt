@@ -153,8 +153,22 @@ object PixelTrainer {
         val baseConfig = readRecipeConfig(recipe, task)
         val examples = when (task) {
             Task.IMAGE -> imageExamples(directory, baseConfig)
-            Task.INTERPOLATION -> interpolationExamples(ModelCraft.Store.framesDir(model.id), baseConfig.side)
-            Task.VIDEO -> videoExamples(ModelCraft.Store.framesDir(model.id), baseConfig.side)
+            // CAPTIONS REACH THE FRAME KINDS NOW. Neither of these read the dataset's CSV, so every
+            // extracted frame trained with an empty caption and a video model learned one clip's
+            // pixels and nothing about what is in them. The caption is looked up by the media's own
+            // name, which is what the frames folder is named after.
+            Task.INTERPOLATION -> interpolationExamples(
+                ModelCraft.Store.framesDir(model.id),
+                baseConfig.side,
+                captionsFor(directory, baseConfig.captionColumn),
+            )
+            Task.VIDEO -> videoExamples(
+                ModelCraft.Store.framesDir(model.id),
+                baseConfig.side,
+                ModelCraft.wholeVideo(model),
+                baseConfig.framesPerClip,
+                captionsFor(directory, baseConfig.captionColumn),
+            )
         }
         if (examples.isEmpty()) {
             PrismPlatform.log.warn(
@@ -168,6 +182,14 @@ object PixelTrainer {
             )
             return null
         }
+
+        // Said once per run: a caption-less run trains fine and generates the same thing for every
+        // prompt, so this line is the only place the difference shows before generation.
+        PrismPlatform.log.info(
+            "ModelCraft",
+            "${task.label} run: ${examples.size} example(s), " +
+                "${examples.count { it.caption.isNotBlank() }} with a caption",
+        )
 
         val diffusion = task == Task.IMAGE && diffusionObjective(model)
         // A dataset of grey pictures is modelled as one channel. Modelling MNIST as RGB gives the
@@ -523,14 +545,23 @@ object PixelTrainer {
             val header = parseCsvLine(lines.first()).map { it.trim().lowercase() }
             val fileColumn = header.indexOfFirst { it in FILE_COLUMNS }
             if (fileColumn < 0) continue
-            val captionColumn = header.indexOfFirst {
-                it == configuredColumn.trim().lowercase()
-            }.takeIf { it >= 0 }
-                ?: header.indexOfFirst { it in CAPTION_COLUMNS }
+            // THE FILE COLUMN IS NEVER THE CAPTION. A table whose file column is called `source`
+            // or `media` and whose caption column is missing used to read the file name back as its
+            // own description; excluding the column already chosen as the file makes that impossible.
+            val records = lines.drop(1).filter { it.isNotBlank() }.map(::parseCsvLine)
+            // AN EMPTY COLUMN IS NOT A CAPTION COLUMN. A DatasetCraft video dataset always carries a
+            // `caption` column, and the recipe names `caption` by default -- so a dataset whose words
+            // live in `description` trained every clip on an empty caption, and the prompt changed
+            // nothing about what the model drew. The named column wins only when it holds something;
+            // otherwise the first filled column in [CAPTION_COLUMNS]' order does.
+            fun filled(index: Int): Boolean =
+                index >= 0 && index != fileColumn && records.any { !it.getOrNull(index).isNullOrBlank() }
+            val captionColumn = header.indexOfFirst { it == configuredColumn.trim().lowercase() }
+                .takeIf(::filled)
+                ?: CAPTION_COLUMNS.map { name -> header.indexOf(name) }.firstOrNull(::filled)
+                ?: -1
             val splitColumn = header.indexOfFirst { it == "split" || it == "subset" }
-            for (line in lines.drop(1)) {
-                if (line.isBlank()) continue
-                val cells = parseCsvLine(line)
+            for (cells in records) {
                 val file = cells.getOrNull(fileColumn)?.trim() ?: continue
                 if (file.isEmpty()) continue
                 val caption = captionColumn.takeIf { it >= 0 }?.let { cells.getOrNull(it) }?.trim().orEmpty()
@@ -542,7 +573,7 @@ object PixelTrainer {
                         else -> null
                     }
                 }
-                rows[file.substringAfterLast('/').substringAfterLast('\\').lowercase()] =
+                rows[file.substringAfterLast('/').substringAfterLast(File.separatorChar).lowercase()] =
                     CaptionRow(caption, split)
             }
         }
@@ -575,12 +606,49 @@ object PixelTrainer {
         return cells
     }
 
-    private val FILE_COLUMNS = setOf("file", "filename", "file_name", "image", "img", "path", "media", "audio")
+    /**
+     * The columns that name a row's media file.
+     *
+     * A VIDEO DATASET NAMES ITS COLUMN `video`, which this list did not know. Every row of a
+     * `video,description` CSV was dropped for having no file column, which is how a description
+     * ended up attached to nothing -- or, when a later column was guessed as the file, to the wrong
+     * clip. The same held for `clip`, `movie` and the path spellings a spreadsheet export produces.
+     */
+    private val FILE_COLUMNS = setOf(
+        "file", "filename", "file_name", "image", "img", "path", "media", "audio",
+        "video", "clip", "movie", "filepath", "file_path", "image_path", "audio_path",
+        "video_path", "media_path", "source",
+    )
     private val CAPTION_COLUMNS = setOf(
         "caption", "text", "description", "prompt", "label", "transcript", "tags",
     )
 
-    private fun interpolationExamples(framesDir: File, side: Int): List<Example> {
+    /**
+     * The caption written for one clip, matched on the media's name and then on its stem.
+     *
+     * A frames folder is named after the video file WITHOUT its extension while the CSV names the
+     * file with one, so an exact-name lookup alone finds nothing and the caption is lost.
+     */
+    private fun captionOf(clip: String, captions: Map<String, CaptionRow>): String {
+        if (captions.isEmpty()) return ""
+        val name = clip.lowercase()
+        captions[name]?.let { return it.caption }
+        val stem = name.substringBeforeLast('.')
+        captions[stem]?.let { return it.caption }
+        return captions.entries.firstOrNull { (key, _) ->
+            key.substringBeforeLast('.').substringAfterLast('/').substringAfterLast(File.separatorChar) == stem
+        }?.value?.caption.orEmpty()
+    }
+
+    /** The dataset's captions, read once per run rather than once per clip. */
+    private fun captionsFor(directory: File, configuredColumn: String): Map<String, CaptionRow> =
+        captionsByFile(directory, configuredColumn)
+
+    private fun interpolationExamples(
+        framesDir: File,
+        side: Int,
+        captions: Map<String, CaptionRow> = emptyMap(),
+    ): List<Example> {
         val examples = mutableListOf<Example>()
         for (clip in loadFrameFolders(framesDir, side)) {
             val frames = clip.frames
@@ -589,6 +657,7 @@ object PixelTrainer {
                     listOf(frames[index - 1], frames[index + 1]),
                     frames[index],
                     clip.name,
+                    caption = captionOf(clip.name, captions),
                 )
                 if (examples.size >= MAX_EXAMPLES) return examples
             }
@@ -596,26 +665,64 @@ object PixelTrainer {
         return examples
     }
 
-    private fun videoExamples(framesDir: File, side: Int): List<Example> {
+    /**
+     * Training pairs from the extracted clips.
+     *
+     * [wholeClip] is what the form's checkbox asks for: every frame of a clip is used before the
+     * next clip starts, rather than [framesPerClip] of each. The example cap still
+     * applies, because a dataset of hour-long clips would otherwise build a list the device cannot
+     * hold -- but the cap is now the only bound, and the first clip is the one it consumes.
+     */
+    private fun videoExamples(
+        framesDir: File,
+        side: Int,
+        wholeClip: Boolean,
+        framesPerClip: Int = MAX_FRAMES_PER_CLIP,
+        captions: Map<String, CaptionRow> = emptyMap(),
+    ): List<Example> {
+        val clips = loadFrameFolders(framesDir, side, if (wholeClip) Int.MAX_VALUE else framesPerClip)
+        if (clips.isEmpty()) return emptyList()
+        // EVERY CLIP GETS A SHARE. This used to take windows in folder order until the cap, so a
+        // hundred-clip dataset trained on its first two thirds and never saw the rest at all.
+        val quota = max(PREVIOUS_FRAMES + 1, MAX_EXAMPLES / clips.size)
         val examples = mutableListOf<Example>()
-        for (clip in loadFrameFolders(framesDir, side)) {
+        for (clip in clips) {
             val frames = clip.frames
-            for (index in PREVIOUS_FRAMES until frames.size) {
+            val caption = captionOf(clip.name, captions)
+            val blank = DoubleArray(frames.first().size)
+            // THE START OF A CLIP, FROM THE CAPTION ALONE. Without these the model only ever learned
+            // "two real frames -> the next", so a generation had nothing to begin from: it was seeded
+            // with a made-up frame, the caption could not choose the scene, and two equal seed frames
+            // said "nothing is moving" for the whole take. Blank frames stand for "before the clip",
+            // and the generator starts from exactly these.
+            for (index in 0 until min(PREVIOUS_FRAMES, frames.size)) {
+                val window = List(PREVIOUS_FRAMES - index) { blank } + frames.subList(0, index)
+                examples += Example(window, frames[index], clip.name, caption = caption)
+            }
+            val continuing = (PREVIOUS_FRAMES until frames.size).toList()
+            val room = (quota - PREVIOUS_FRAMES).coerceAtLeast(1)
+            val picked = if (continuing.size <= room) continuing
+            else List(room) { continuing[it * continuing.size / room] }
+            for (index in picked) {
                 examples += Example(
                     frames.subList(index - PREVIOUS_FRAMES, index).toList(),
                     frames[index],
                     clip.name,
+                    caption = caption,
                 )
-                if (examples.size >= MAX_EXAMPLES) return examples
             }
         }
-        return examples
+        return examples.take(MAX_EXAMPLES)
     }
 
     private class FrameFolder(val name: String, val frames: List<DoubleArray>)
 
     /** Every clip's frames, one list per clip folder, decoded at [side]. */
-    private fun loadFrameFolders(framesDir: File, side: Int): List<FrameFolder> {
+    private fun loadFrameFolders(
+        framesDir: File,
+        side: Int,
+        maxFramesPerClip: Int = MAX_FRAMES_PER_CLIP,
+    ): List<FrameFolder> {
         val folders = framesDir.listFiles()?.filter { it.isDirectory }?.sortedBy { it.name }.orEmpty()
         val clips = mutableListOf<FrameFolder>()
         for (folder in folders) {
@@ -625,7 +732,7 @@ object PixelTrainer {
                 .orEmpty()
             val frames = mutableListOf<DoubleArray>()
             for (file in files) {
-                if (frames.size >= MAX_FRAMES_PER_CLIP) break
+                if (frames.size >= maxFramesPerClip) break
                 val image = PrismPlatform.images.decode(file, side)
                     ?: continue
                 frames += pixelsOf(image, side)
@@ -673,6 +780,14 @@ object PixelTrainer {
         val captionColumn: String = "text",
         /** Whether training mirrors an image horizontally for augmentation. */
         val flip: Boolean = false,
+        /**
+         * Frames of each clip a video run reads.
+         *
+         * THE FORM'S "Frames per clip" FIELD, read from the recipe's `max_frames`. It used to be a
+         * constant here, so the number a person typed changed nothing about what was trained. The
+         * whole-clip checkbox overrides it, because that box is a request for every frame.
+         */
+        val framesPerClip: Int = MAX_FRAMES_PER_CLIP,
         /** 1 for a greyscale dataset, 3 for a colour one. Detected from the images, not the form. */
         val channels: Int = 3,
     )
@@ -718,6 +833,8 @@ object PixelTrainer {
             testSplit = json?.optString("test_split", "test")?.ifBlank { "test" } ?: "test",
             captionColumn = json?.optString("caption_column", "text")?.ifBlank { "text" } ?: "text",
             flip = json?.optBoolean("random_flip", false) == true,
+            framesPerClip = (json?.optInt("max_frames", 0) ?: 0)
+                .takeIf { it > 0 }?.coerceIn(3, MAX_FRAMES_PER_CLIP) ?: MAX_FRAMES_PER_CLIP,
             window = if (sliding) {
                 (json?.optInt(ModelCraft.KEY_SLIDING_WINDOW_SIZE, 0) ?: 0).coerceIn(1, 16 * 16 * 8)
             } else 0,
@@ -1397,6 +1514,15 @@ object PixelTrainer {
         /** The container files the run wrote; empty until [writeArtifacts]. Read by the summary. */
         var artifactFiles: List<File> = emptyList()
             private set
+
+        /**
+         * The last picture this model produced, for a self-speculative start.
+         *
+         * Volatile rather than locked: a lost race means one render starts from noise instead of the
+         * previous result, which is slower and no less correct, and a lock here would serialise
+         * concurrent renders that are otherwise allowed.
+         */
+        @Volatile private var lastSample: DoubleArray? = null
         /** The network's output for one prepared input. */
         fun predict(input: DoubleArray): DoubleArray = net.Forward(input).output
 
@@ -1423,6 +1549,10 @@ object PixelTrainer {
             random: java.util.Random,
             steps: Int = SAMPLE_STEPS,
             guidance: Double = GUIDANCE,
+            plan: com.prism.launcher.messaging.InferencePlan =
+                com.prism.launcher.messaging.InferencePlan.of(
+                    com.prism.launcher.messaging.InferenceMode.STANDARD,
+                ),
         ): DoubleArray {
             val side = config.side
             val plane = side * side
@@ -1430,12 +1560,30 @@ object PixelTrainer {
             val caption = CaptionEncoder.encode(prompt)
             val empty = DoubleArray(CAPTION_DIM)
             val useGuidance = conditional && guidance > 1.0 && prompt.isNotBlank()
+            // THE MODE REACHES THE SAMPLER HERE. A picture is denoised in passes exactly as text is
+            // decoded in passes, so the modes apply: a parallel mode spends fewer, wider passes, and
+            // recurrent depth spends more. `steps` is the surface's own budget; the plan scales it.
             var x = DoubleArray(size) { random.nextGaussian() }
-            val count = steps.coerceAtLeast(1)
+            val reuse = plan.reusePrevious
+            val previous = lastSample
+            if (reuse && previous != null && previous.size == size) {
+                System.arraycopy(previous, 0, x, 0, size)
+            }
+            val count = plan.stepsFor(steps).coerceAtLeast(1)
+            var lastVelocity: DoubleArray? = null
             for (step in 0 until count) {
                 val t = 1.0 - step.toDouble() / count
-                val velocity = velocity(x, t, caption)
-                if (useGuidance) {
+                // SELF-SPECULATIVE: the previous step's velocity is the best available guess for
+                // this one, so the model is consulted only every few steps instead of every step.
+                val reuseStep = reuse && lastVelocity != null &&
+                    step % (plan.blockWidth + 1).coerceAtLeast(2) != 0
+                val velocity = if (reuseStep) lastVelocity!!.copyOf() else velocity(x, t, caption)
+                lastVelocity = velocity.copyOf()
+
+                // SPECULATIVE: only some steps get the second, unconditioned model pass that
+                // guidance needs. The rest use the conditional velocity as-is.
+                val verify = plan.verifyEvery <= 0 || step % plan.verifyEvery == 0
+                if (useGuidance && verify) {
                     val unconditioned = velocity(x, t, empty)
                     for (index in velocity.indices) {
                         velocity[index] = unconditioned[index] +
@@ -1443,10 +1591,25 @@ object PixelTrainer {
                     }
                 }
                 val delta = -1.0 / count
+                var change = 0.0
                 for (index in 0 until size) {
-                    x[index] = (x[index] + velocity[index] * delta).coerceIn(-1.6, 1.6)
+                    val next = (x[index] + velocity[index] * delta).coerceIn(-1.6, 1.6)
+                    change += kotlin.math.abs(next - x[index])
+                    x[index] = next
                 }
+                // RECURRENT DEPTH: extra corrections over the block that was just produced.
+                repeat(plan.refinePasses) {
+                    val correction = velocity(x, t, caption)
+                    val small = delta * 0.5
+                    for (index in 0 until size) {
+                        x[index] = (x[index] + correction[index] * small).coerceIn(-1.6, 1.6)
+                    }
+                }
+                // LOOKAHEAD / JACOBI: a block that has stopped moving is converged, and finishing
+                // the schedule would spend passes on a picture that is already decided.
+                if (plan.convergence > 0 && step >= 2 && change / size < plan.convergence) break
             }
+            lastSample = x.copyOf()
             for (index in x.indices) x[index] = x[index].coerceIn(-1.0, 1.0)
             // The page draws RGB. A one-channel model's grey plane is repeated into three channels
             // here, so every caller gets a picture and no caller has to know how many channels the
@@ -1491,6 +1654,25 @@ object PixelTrainer {
         /** The frame after the given ones, for a video model. */
         fun nextFrame(frames: List<DoubleArray>): DoubleArray =
             predict(withEmptyCaption(frames))
+
+        /**
+         * The frame after [frames], as [prompt] describes it.
+         *
+         * The video task is trained as a next-frame predictor with its caption dropped on some steps,
+         * so both halves of classifier-free guidance exist: above 1, [guidance] pushes the prediction
+         * from what the dataset usually does next toward what these words do next.
+         */
+        fun nextFrame(frames: List<DoubleArray>, prompt: String, guidance: Double = 1.0): DoubleArray {
+            val unconditioned = withEmptyCaption(frames)
+            val offset = frames.sumOf { it.size }
+            if (prompt.isBlank() || unconditioned.size - offset < CAPTION_DIM) return predict(unconditioned)
+            val conditioned = unconditioned.copyOf()
+            System.arraycopy(CaptionEncoder.encode(prompt), 0, conditioned, offset, CAPTION_DIM)
+            val withWords = predict(conditioned)
+            if (guidance <= 1.0) return withWords
+            val without = predict(unconditioned)
+            return DoubleArray(withWords.size) { without[it] + guidance * (withWords[it] - without[it]) }
+        }
 
         /**
          * The frames followed by an empty caption vector when the network was built to read one.

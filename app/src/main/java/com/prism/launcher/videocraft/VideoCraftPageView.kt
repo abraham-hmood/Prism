@@ -65,6 +65,8 @@ class VideoCraftPageView(context: Context) : FrameLayout(context), com.prism.lau
     private var libraryList: RecyclerView? = null
     private var emptyView: View? = null
     private var blockerView: View? = null
+    /** Which chain this page is on; the gate, the Create button and the engine all follow it. */
+    private var mode = VideoCraftModels.mode()
 
     // Creator widgets kept for reading back on Create.
     private var promptField: EditText? = null
@@ -192,11 +194,12 @@ class VideoCraftPageView(context: Context) : FrameLayout(context), com.prism.lau
         videoView = null
         content.removeAllViews()
         content.addView(header(), LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
+        content.addView(tabRow(), LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT))
 
         val projects = VideoCraftStore.list().map(::reconcile)
         // A film can be score-only, so a missing speech model must not shut the library: the
         // creator is where the user ticks "No dialogue" and makes the film anyway.
-        val blocker = VideoCraftModels.blockingReason(needsSpeech = false)
+        val blocker = VideoCraftModels.blockingReason(needsSpeech = false, tab = mode)
         val subtitle = TextView(context).apply {
             text = if (blocker == null) {
                 "${projects.size} film${if (projects.size == 1) "" else "s"} · every required model is ready"
@@ -281,7 +284,7 @@ class VideoCraftPageView(context: Context) : FrameLayout(context), com.prism.lau
         create.setOnClickListener {
             // Creating a score-only film is allowed without a speech model; the creator's own
             // Create button checks again with the dialogue switch in hand.
-            val blocker = VideoCraftModels.blockingReason(needsSpeech = false)
+            val blocker = VideoCraftModels.blockingReason(needsSpeech = false, tab = mode)
             if (blocker != null) {
                 Toast.makeText(context, blocker, Toast.LENGTH_LONG).show()
                 showLibrary()
@@ -294,6 +297,38 @@ class VideoCraftPageView(context: Context) : FrameLayout(context), com.prism.lau
     }
 
     private fun gateCard(blocker: String): View {
+        // THE TWO TABS, above the gate they explain. Each tab reports only the chain it renders,
+        // so a missing image model is never a complaint on the tab that has no use for one.
+        return buildGateCard(blocker)
+    }
+
+    private fun tabRow(): View {
+        val row = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(16), 0, dp(16), dp(10))
+        }
+        val frames = pill(
+            "Text + image + frames",
+            accent = mode == VideoCraftModels.MODE_FRAMES,
+        ).apply { setOnClickListener { selectMode(VideoCraftModels.MODE_FRAMES) } }
+        val video = pill("Text + video", accent = mode == VideoCraftModels.MODE_VIDEO).apply {
+            setOnClickListener { selectMode(VideoCraftModels.MODE_VIDEO) }
+        }
+        (video.layoutParams as? LinearLayout.LayoutParams)?.setMargins(dp(8), 0, 0, 0)
+        row.addView(frames)
+        row.addView(video)
+        return row
+    }
+
+    /** Switching tabs re-checks the page: the gate and Create belong to one chain at a time. */
+    private fun selectMode(next: String) {
+        if (next == mode) return
+        mode = next
+        VideoCraftModels.setMode(next)
+        showLibrary()
+    }
+
+    private fun buildGateCard(blocker: String): View {
         val card = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             background = rounded(palette.raised.toInt(), 16)
@@ -305,26 +340,40 @@ class VideoCraftPageView(context: Context) : FrameLayout(context), com.prism.lau
         lp.setMargins(dp(16), dp(4), dp(16), dp(12))
         card.layoutParams = lp
         card.addView(TextView(context).apply {
-            text = "VideoCraft needs its four models"
+            text = if (mode == VideoCraftModels.MODE_VIDEO) "This tab needs a video model"
+            else "This tab needs its five models"
             textSize = 15f
             setTextColor(palette.text.toInt())
             setTypeface(typeface, android.graphics.Typeface.BOLD)
         })
         card.addView(TextView(context).apply {
-            text = "A film is planned by the text model, drawn by the image model, smoothed by the " +
-                "interpolator and scored by the audio generator. Dialogue needs Kokoro or your own " +
-                "speech model."
+            // EACH TAB ASKS FOR ITS OWN CHAIN, and only its own: the gate exists to say what this
+            // chain is missing, not to list the other tab's models as unmet needs.
+            text = if (mode == VideoCraftModels.MODE_VIDEO)
+                "The video tab plans the film with the text model and hands each shot to the video " +
+                    "model, which supplies every frame -- no keyframes, no interpolation and no voice."
+            else
+                "The frames tab plans the film with the text model, draws keyframes with the image " +
+                    "model, smooths them with the interpolator and scores them with the audio model. " +
+                    "Dialogue needs Kokoro or your own speech model."
             textSize = 12f
             setTextColor(palette.muted.toInt())
             setPadding(0, dp(4), 0, dp(6))
         })
-        val rows = listOf(
-            "Text" to VideoCraftModels.summaryText(),
-            "Image" to VideoCraftModels.summary(VideoCraftModels.Kind.IMAGE),
-            "Interpolation" to VideoCraftModels.summary(VideoCraftModels.Kind.INTERPOLATION),
-            "Audio" to VideoCraftModels.summary(VideoCraftModels.Kind.AUDIO_GEN),
-            "Speech" to VideoCraftModels.summary(VideoCraftModels.Kind.SPEECH),
-        )
+        val rows = if (mode == VideoCraftModels.MODE_VIDEO) {
+            listOf(
+                "Text" to VideoCraftModels.summaryText(),
+                "Video" to VideoCraftModels.summary(VideoCraftModels.Kind.VIDEO),
+            )
+        } else {
+            listOf(
+                "Text" to VideoCraftModels.summaryText(),
+                "Image" to VideoCraftModels.summary(VideoCraftModels.Kind.IMAGE),
+                "Interpolation" to VideoCraftModels.summary(VideoCraftModels.Kind.INTERPOLATION),
+                "Audio" to VideoCraftModels.summary(VideoCraftModels.Kind.AUDIO_GEN),
+                "Speech" to VideoCraftModels.summary(VideoCraftModels.Kind.SPEECH),
+            )
+        }
         rows.forEach { (label, value) ->
             val row = LinearLayout(context).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -530,6 +579,21 @@ class VideoCraftPageView(context: Context) : FrameLayout(context), com.prism.lau
         })
         column.addView(bar)
 
+        // The video tab never builds the frames-only widgets, so a previous form's would otherwise
+        // still be read back on Create.
+        keyframesField = null
+        denoiseField = null
+        thresholdField = null
+        manualKeyframesField = null
+        flowQualityField = null
+        characterSwitch = null
+        scopeSpinner = null
+        dialogueRow = null
+        musicRow = null
+        ambienceRow = null
+        noDialogueSwitch = null
+        autoVoiceSwitch = null
+
         column.addView(editorSection("Story"))
         promptField = editorField(
             project.prompt,
@@ -566,17 +630,25 @@ class VideoCraftPageView(context: Context) : FrameLayout(context), com.prism.lau
         dimensions.addView(fieldWithLabel("Height", heightField))
         dimensions.addView(fieldWithLabel("FPS", fpsField))
         column.addView(dimensions)
+        // THE CHAIN DECIDES THE FORM. Keys/sec and denoise place and redraw keyframes, and the clip
+        // chain draws whole shots: a form asking for them asked a question the render never reads,
+        // on a tab whose whole point is that no image model takes part.
+        val clip = mode == VideoCraftModels.MODE_VIDEO
         val timing = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
         durationField = compactNumber(project.durationSeconds.roundToInt().toString())
-        keyframesField = compactDecimal(project.keyframesPerSecond.toString())
-        denoiseField = compactDecimal(project.denoise.toString())
         timing.addView(fieldWithLabel("Seconds", durationField))
-        timing.addView(fieldWithLabel("Keys/sec", keyframesField))
-        timing.addView(fieldWithLabel("Denoise", denoiseField))
+        if (!clip) {
+            keyframesField = compactDecimal(project.keyframesPerSecond.toString())
+            denoiseField = compactDecimal(project.denoise.toString())
+            timing.addView(fieldWithLabel("Keys/sec", keyframesField))
+            timing.addView(fieldWithLabel("Denoise", denoiseField))
+        }
         column.addView(timing)
         column.addView(editorSection("Direction"))
-        thresholdField = compactDecimal(project.clipThreshold.toString())
-        column.addView(fieldWithLabel("CLIP match threshold", thresholdField))
+        if (!clip) {
+            thresholdField = compactDecimal(project.clipThreshold.toString())
+            column.addView(fieldWithLabel("CLIP match threshold", thresholdField))
+        }
         adaptiveSwitch = Switch(context).apply {
             text = "Adaptive keyframes and clips"
             textSize = 13f
@@ -606,21 +678,26 @@ class VideoCraftPageView(context: Context) : FrameLayout(context), com.prism.lau
         manualClipsField = compactNumber(project.manualClipsPerScene.toString()).apply {
             isEnabled = !project.adaptive
         }
-        manual.addView(fieldWithLabel("Keys / clip", manualKeyframesField))
+        if (!clip) manual.addView(fieldWithLabel("Keys / clip", manualKeyframesField))
         manual.addView(fieldWithLabel("Clips / scene", manualClipsField))
         column.addView(manual)
 
-        column.addView(editorSection("Image model"))
+        // THE MODEL CARD IS THE CHAIN'S OWN. Steps, guidance and seed are the clip request too; flow
+        // quality and character cutouts belong to keyframes this tab never draws.
+        column.addView(editorSection(if (clip) "Video model" else "Image model"))
         val imageRow = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
         stepsField = compactNumber(project.imageSteps.toString())
         guidanceField = compactDecimal(project.imageGuidance.toString())
         seedField = compactNumber(project.seed.toString())
-        flowQualityField = compactNumber(project.interpolationQuality.toString())
         imageRow.addView(fieldWithLabel("Steps", stepsField))
         imageRow.addView(fieldWithLabel("Guidance", guidanceField))
         imageRow.addView(fieldWithLabel("Seed", seedField))
-        imageRow.addView(fieldWithLabel("Flow quality", flowQualityField))
+        if (!clip) {
+            flowQualityField = compactNumber(project.interpolationQuality.toString())
+            imageRow.addView(fieldWithLabel("Flow quality", flowQualityField))
+        }
         column.addView(imageRow)
+        if (!clip) {
         characterSwitch = Switch(context).apply {
             text = "Experimental — cut characters into keyframes"
             textSize = 13f
@@ -636,8 +713,19 @@ class VideoCraftPageView(context: Context) : FrameLayout(context), com.prism.lau
                 "Off: characters are named in the prompt and cast as reference stills the shot " +
                 "interpolates between."
         ))
-        column.addView(note("Generating with " + VideoCraftModels.summary(VideoCraftModels.Kind.IMAGE)))
+        }
+        // THE NOTE NAMES THE CHAIN THIS TAB RUNS, not always the image model: on the video tab the
+        // image model is never touched.
+        val generating = if (mode == VideoCraftModels.MODE_VIDEO)
+            VideoCraftModels.summary(VideoCraftModels.Kind.VIDEO)
+        else VideoCraftModels.summary(VideoCraftModels.Kind.IMAGE)
+        column.addView(note("Generating with $generating"))
 
+        // ── FRAMES CHAIN ONLY ────────────────────────────────────────────────────
+        // The clip chain has no voice and no mixer: its take plays over a Prism Score bed. The
+        // dialogue scope, the volume sliders and the voice picker below describe nothing it does, on
+        // a tab that does not require an audio generator or a speech model at all.
+        if (!clip) {
         column.addView(editorSection("Sound"))
         scopeSpinner = themedSpinner(
             labels = listOf("Dialogue per shot", "Dialogue per scene"),
@@ -654,7 +742,9 @@ class VideoCraftPageView(context: Context) : FrameLayout(context), com.prism.lau
         column.addView(ambienceRow!!.root)
         column.addView(note("Score: " + VideoCraftAudioModel.describeSelection() +
             " · Voice: " + VideoCraftModels.summary(VideoCraftModels.Kind.SPEECH)))
+        }
 
+        if (!clip) {
         column.addView(editorSection("Dialogue and voices"))
         chosenVoices.clear()
         chosenVoices.addAll(project.voiceIds)
@@ -693,6 +783,7 @@ class VideoCraftPageView(context: Context) : FrameLayout(context), com.prism.lau
         }
         column.addView(voiceHint)
         updateVoiceControls()
+        }
 
         column.addView(editorSection("Language model"))
         val language = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
@@ -724,8 +815,9 @@ class VideoCraftPageView(context: Context) : FrameLayout(context), com.prism.lau
 
     private fun startRender() {
         val base = currentProject ?: VideoCraftProject.fromSettings()
-        val needsSpeech = noDialogueSwitch?.isChecked != true
-        val blocker = VideoCraftModels.blockingReason(needsSpeech)
+        // The clip chain has no voice, so speech is never part of what this tab needs.
+        val needsSpeech = mode != VideoCraftModels.MODE_VIDEO && noDialogueSwitch?.isChecked != true
+        val blocker = VideoCraftModels.blockingReason(needsSpeech, tab = mode)
         if (blocker != null) {
             Toast.makeText(context, blocker, Toast.LENGTH_LONG).show()
             return
@@ -749,32 +841,40 @@ class VideoCraftPageView(context: Context) : FrameLayout(context), com.prism.lau
         project.width = (widthField?.text?.toString()?.toIntOrNull() ?: 768).coerceIn(128, 2160)
         project.height = (heightField?.text?.toString()?.toIntOrNull() ?: 432).coerceIn(128, 2160)
         project.fps = (fpsField?.text?.toString()?.toIntOrNull() ?: 24).coerceIn(8, 60)
-        project.keyframesPerSecond = (keyframesField?.text?.toString()?.toFloatOrNull() ?: 3f)
+        project.keyframesPerSecond = (keyframesField?.text?.toString()?.toFloatOrNull() ?: project.keyframesPerSecond)
             .coerceIn(0.5f, 12f)
-        project.denoise = (denoiseField?.text?.toString()?.toFloatOrNull() ?: 0.4f)
+        project.denoise = (denoiseField?.text?.toString()?.toFloatOrNull() ?: project.denoise)
             .coerceIn(0.05f, 0.95f)
-        project.clipThreshold = (thresholdField?.text?.toString()?.toFloatOrNull() ?: 0.28f)
+        project.clipThreshold = (thresholdField?.text?.toString()?.toFloatOrNull() ?: project.clipThreshold)
             .coerceIn(0f, 1f)
         project.adaptive = adaptiveSwitch?.isChecked ?: true
         project.manualKeyframesPerClip = (manualKeyframesField?.text?.toString()?.toIntOrNull() ?: 3)
             .coerceIn(1, 12)
         project.manualClipsPerScene = (manualClipsField?.text?.toString()?.toIntOrNull() ?: 1)
             .coerceIn(1, 12)
-        project.audioScope = if ((scopeSpinner?.selectedItemPosition ?: 0) == 1) {
-            PrismSettings.AUDIO_SCOPE_SCENE
-        } else PrismSettings.AUDIO_SCOPE_SHOT
-        project.noDialogue = noDialogueSwitch?.isChecked ?: false
-        project.autoVoices = autoVoiceSwitch?.isChecked ?: true
-        project.voiceIds.clear()
-        project.voiceIds.addAll(chosenVoices)
-        project.dialogueVolume = dialogueRow?.value?.invoke() ?: 1f
-        project.musicVolume = musicRow?.value?.invoke() ?: 0.55f
-        project.ambienceVolume = ambienceRow?.value?.invoke() ?: 0.5f
+        // Absent widgets belong to the other tab's form: keep the film's values rather than defaults.
+        scopeSpinner?.let { spinner ->
+            project.audioScope = if (spinner.selectedItemPosition == 1) {
+                PrismSettings.AUDIO_SCOPE_SCENE
+            } else PrismSettings.AUDIO_SCOPE_SHOT
+        }
+        // A FILM FROM THE CLIP TAB IS SCORE-ONLY BY DEFINITION: its chain has no mouths, so the
+        // script must not be written with lines nothing will speak.
+        project.noDialogue = if (mode == VideoCraftModels.MODE_VIDEO) true
+            else noDialogueSwitch?.isChecked ?: false
+        project.autoVoices = autoVoiceSwitch?.isChecked ?: project.autoVoices
+        if (autoVoiceSwitch != null) {
+            project.voiceIds.clear()
+            project.voiceIds.addAll(chosenVoices)
+        }
+        project.dialogueVolume = dialogueRow?.value?.invoke() ?: project.dialogueVolume
+        project.musicVolume = musicRow?.value?.invoke() ?: project.musicVolume
+        project.ambienceVolume = ambienceRow?.value?.invoke() ?: project.ambienceVolume
         project.imageSteps = (stepsField?.text?.toString()?.toIntOrNull() ?: 20).coerceIn(1, 60)
         project.imageGuidance = (guidanceField?.text?.toString()?.toFloatOrNull() ?: 7f)
             .coerceIn(0f, 20f)
         project.interpolationQuality =
-            (flowQualityField?.text?.toString()?.toIntOrNull() ?: 2).coerceIn(1, 3)
+            (flowQualityField?.text?.toString()?.toIntOrNull() ?: project.interpolationQuality).coerceIn(1, 3)
         project.seed = (seedField?.text?.toString()?.toLongOrNull() ?: 1L)
         project.temperature = (temperatureField?.text?.toString()?.toFloatOrNull() ?: 0.7f)
             .coerceIn(0f, 2f)
@@ -789,7 +889,7 @@ class VideoCraftPageView(context: Context) : FrameLayout(context), com.prism.lau
         PrismSettings.setVideoCraftVideoType(project.videoType)
         PrismSettings.setVideoCraftClipThreshold(project.clipThreshold)
         PrismSettings.setVideoCraftAdaptive(project.adaptive)
-        PrismSettings.setVideoCraftCharacterInjection(characterSwitch?.isChecked ?: false)
+        characterSwitch?.let { PrismSettings.setVideoCraftCharacterInjection(it.isChecked) }
         PrismSettings.setVideoCraftManualKeyframes(project.manualKeyframesPerClip)
         PrismSettings.setVideoCraftManualClips(project.manualClipsPerScene)
         PrismSettings.setVideoCraftAudioScope(project.audioScope)

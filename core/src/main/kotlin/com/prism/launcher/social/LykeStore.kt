@@ -94,6 +94,8 @@ object LykeStore {
             hosts = listOf(userId()),
         )
         writeVideos(readVideos() + video)
+        // The mesh hears about a new video within seconds rather than at the next timed announce.
+        SocialMeshSync.markChanged()
         return video
     }
 
@@ -251,6 +253,21 @@ object LykeStore {
 
     /** Everyone who follows this device's user, as learned from mesh sync. */
     fun followers(): Set<String> = PrismSettings.getLykeFollowers().toSet()
+
+    /**
+     * Unions a peer's follow list into this device's channels.
+     *
+     * A UNION, for the same reason likes are: two devices each hold part of the picture, and taking
+     * the peer's list wholesale would unsubscribe the user from channels that peer had simply not
+     * heard about yet. The Channels feed is the people this user follows, so merging the list is
+     * exactly what makes a channel followed on one device appear on the other.
+     */
+    fun mergeFollowing(ids: List<String>) {
+        val incoming = ids.filter { it.isNotBlank() && it != userId() }
+        if (incoming.isEmpty()) return
+        val current = following().toMutableSet()
+        if (current.addAll(incoming)) PrismSettings.setLykeFollowing(current.toList())
+    }
 
     /** Records that someone follows this device's user, learned from their own follow list. */
     fun rememberFollower(authorId: String) {

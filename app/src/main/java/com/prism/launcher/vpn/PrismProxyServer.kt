@@ -192,6 +192,27 @@ class PrismProxyServer(
                 return@withContext
             }
 
+            // 0b. Server-directory handshake. LIST or ADD, one reply line, then close -- it never
+            // becomes a tunnel. Same credential as a bridge: an operator who lets a peer read
+            // this server's names can also let it publish, and one password is easier to keep.
+            if (firstLine.startsWith(com.prism.launcher.vpn.ServerDirectory.HANDSHAKE + " ")) {
+                val push = if (firstLine.contains(" ADD ")) {
+                    runCatching { readLine(input) }.getOrNull()
+                } else {
+                    null
+                }
+                val reply = com.prism.launcher.vpn.ServerDirectory.serve(firstLine, push) { supplied ->
+                    bridgeAuthorized(supplied)
+                }
+                val bytes = reply.toByteArray(Charsets.UTF_8)
+                output.write(bytes)
+                output.write(13)
+                output.write(10)
+                output.flush()
+                clientSocket.close()
+                return@withContext
+            }
+
             // 1. Mesh Node Handshake (PRISM_CONNECT)
             if (firstLine.startsWith("PRISM_CONNECT")) {
                 if (isProxyMode) {

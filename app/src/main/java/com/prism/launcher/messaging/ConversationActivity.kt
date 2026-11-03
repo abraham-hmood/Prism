@@ -29,6 +29,9 @@ class ConversationActivity : AppCompatActivity() {
 
         /** Only reached if a theme somehow declares no prismAccent; matches @color/prism_accent. */
         private const val FALLBACK_ACCENT = 0xFF7C9EFF.toInt()
+
+        /** Preferences key for Sam's persisted recap. Sam is one pseudo-thread, so one key. */
+        private const val SAM_RECAP_KEY = "sam"
     }
 
     private lateinit var binding: ActivityConversationBinding
@@ -56,6 +59,14 @@ class ConversationActivity : AppCompatActivity() {
 
     /** Drives Sam's context meter while a reply streams; null when nothing is running. */
     private var samMeterJob: Job? = null
+
+    /** True while a reply is streaming, so a tap on the meter cannot compact mid-answer. */
+    @Volatile
+    private var samBusy = false
+
+    /** Guards against a second compaction while one is already summarising. */
+    @Volatile
+    private var compacting = false
 
     /** Nora's slash-command palette. Created lazily, only in her thread. */
     private var commandPopup: com.prism.launcher.nora.NoraCommandPopup? = null
@@ -145,6 +156,76 @@ class ConversationActivity : AppCompatActivity() {
         refreshSamMeter()
     }
 
+    /**
+     * Folds the older part of Sam's thread into a recap, leaving the transcript on screen.
+     *
+     * ## Why it runs between turns rather than on the meter's tick
+     *
+     * The meter fills DURING a decode, and the one thing compaction must do on a local model is
+     * [GgufInferenceService.resetConversation] -- clearing the context the running reply is still
+     * writing into. So the automatic case is triggered at the start of [sendToSam], the first
+     * moment the old context is not in use, and the manual case is refused while a reply streams.
+     *
+     * ## Why the summarisation is a real model call
+     *
+     * "Compact the context" means "keep what mattered", and deciding that is what the model is
+     * for. It costs one extra generation per compaction; the alternative is a prompt truncated
+     * from the front by the engine, which drops the intent of the conversation first and the
+     * current question last.
+     */
+    private suspend fun compactSam(manual: Boolean): Boolean {
+        if (compacting) return false
+        val spoken = dbMessages.filterNot { it.isThinking }.map { it.text.trim() }.filter { it.isNotEmpty() }
+        val plan = SamCompaction.plan(spoken)
+        if (!plan.canCompact) {
+            if (manual) withContext(Dispatchers.Main) {
+                Toast.makeText(
+                    this@ConversationActivity,
+                    "This thread is too short to compact yet.",
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+            return false
+        }
+
+        compacting = true
+        return try {
+            val summary = AiManager.getResponse(
+                this@ConversationActivity,
+                SamCompaction.request(plan.older),
+                history = emptyList(),
+                allowOffload = false,
+                plainText = true,
+            ).first.trim()
+            val failed = summary.isBlank() ||
+                summary.startsWith("Error:") ||
+                summary.startsWith("P2P Model Error:")
+            withContext(Dispatchers.Main) {
+                if (failed) {
+                    Toast.makeText(
+                        this@ConversationActivity,
+                        "Could not compact the conversation: ${summary.ifBlank { "nothing came back" }}".take(220),
+                        Toast.LENGTH_LONG,
+                    ).show()
+                } else {
+                    SamCompaction.store(SAM_RECAP_KEY, summary, plan.older.size)
+                    // The turns this recap replaces are still in the engine's context; keeping
+                    // them would pay for the same text twice on every later turn.
+                    runCatching { GgufInferenceService.resetConversation() }
+                    refreshSamMeter()
+                    Toast.makeText(
+                        this@ConversationActivity,
+                        SamCompaction.describe(plan.older.size),
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                }
+            }
+            !failed
+        } finally {
+            compacting = false
+        }
+    }
+
     // OpenDocument (not GetContent) so the read grant can be persisted -- GetContent's grant is
     // ephemeral and doesn't survive a process restart, which meant any attachment became
     // unreadable (and crashed MessagesAdapter) the next time the app launched.
@@ -194,6 +275,16 @@ class ConversationActivity : AppCompatActivity() {
         if (isSamThread) {
             GgufInferenceService.resetLiveStats()
             showSamMeter()
+        }
+
+        // TAPPING THE PILL COMPACTS NOW. The same routine the automatic path uses, so the recap and
+        // the engine reset happen identically whether the user or the context window asked for it.
+        binding.samContextMeter.setOnClickListener {
+            if (samBusy || compacting) {
+                Toast.makeText(this, "Wait for this reply to finish first.", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            lifecycleScope.launch { compactSam(manual = true) }
         }
 
         binding.conversationMessagesList.layoutManager = LinearLayoutManager(this).apply {
@@ -819,6 +910,7 @@ class ConversationActivity : AppCompatActivity() {
 
     private fun sendToSam(text: String, uri: Uri?, mime: String?) {
         lifecycleScope.launch(Dispatchers.IO) {
+            samBusy = true
             withContext(Dispatchers.Main) { startSamMeter() }
             val db = com.prism.launcher.AppDatabase.get()
             val dao = db.aiMessageDao()
@@ -856,6 +948,14 @@ class ConversationActivity : AppCompatActivity() {
             // the model must not be given its own unfinished sentence as context.
             val dialogSoFar = dbMessages.filterNot { it.isThinking }.map { it.text }
 
+            // AUTO-COMPACTION, at the seam between turns. liveStats still describes the PREVIOUS
+            // reply, which is the measurement that matters: if that turn ended near the top of the
+            // window, this prompt would be truncated from the front by the engine, so the recap
+            // has to be in place before the prompt is built rather than after it is damaged.
+            if (SamCompaction.needsCompaction(GgufInferenceService.liveStats.contextFraction)) {
+                compactSam(manual = false)
+            }
+
             val response = try {
                 AiManager.getResponse(
                 this@ConversationActivity, text, uri,
@@ -874,10 +974,12 @@ class ConversationActivity : AppCompatActivity() {
                     }
                 },
                 history = dialogSoFar,
+                recap = SamCompaction.recap(SAM_RECAP_KEY),
                 )
             } finally {
                 // The meter is a live view of a decode that has finished; the last snapshot stays
                 // visible so the user can still see what the turn cost.
+                samBusy = false
                 withContext(Dispatchers.Main) { stopSamMeter() }
             }
             val (aiText, aiMedia) = response

@@ -52,6 +52,14 @@ object MeshDnsServer {
     var upstream: String = "1.1.1.1"
 
     @Volatile private var socket: DatagramSocket? = null
+
+    /** Eight at a time, sixty-four waiting, the rest dropped. */
+    private val workers = java.util.concurrent.ThreadPoolExecutor(
+        2, 8, 30L, java.util.concurrent.TimeUnit.SECONDS,
+        java.util.concurrent.ArrayBlockingQueue<Runnable>(64),
+        { runnable -> Thread(runnable, "mesh-dns-query").apply { isDaemon = true } },
+        java.util.concurrent.ThreadPoolExecutor.DiscardPolicy(),
+    )
     @Volatile private var running = false
 
     /** The port it is actually on, or 0. */
@@ -111,10 +119,12 @@ object MeshDnsServer {
             val query = packet.data.copyOf(packet.length)
             val from = packet.socketAddress
 
-            // One thread per query: a forwarded lookup can take a second, and a resolver that handled
-            // them one at a time would stall every other name on the machine behind the slowest one.
-            thread(name = "mesh-dns-query", isDaemon = true) {
-                val reply = answer(query)
+            // A BOUNDED POOL, NOT A THREAD PER QUERY. A forwarded lookup can take seconds, so it
+            // cannot run on the receive loop -- but one thread per datagram let a query flood, or a
+            // slow upstream, create threads until the process died. Excess queries are dropped, which
+            // is correct for UDP: the client retries.
+            workers.execute {
+                val reply = runCatching { answer(query) }.getOrNull()
                 if (reply != null) {
                     runCatching { server.send(DatagramPacket(reply, reply.size, from)) }
                 }
@@ -125,8 +135,11 @@ object MeshDnsServer {
     /** Builds the reply for one query: a mesh answer, or whatever upstream says. */
     internal fun answer(query: ByteArray): ByteArray? {
         val name = questionName(query)
-        if (name != null) {
-            val ip = MeshDns.resolve(name, onlyP2p = false)
+        // ANY NAME WITH A VERIFIED CHAIN IS ANSWERED HERE, whatever its suffix. The old rule was
+        // `.p2p` only, which stopped a hijack by refusing to serve ordinary domains at all; the
+        // registry now proves who owns a name, so the TLD is no longer the security boundary.
+        if (name != null && MeshDns.isMeshAnswer(name)) {
+            val ip = MeshDns.resolveAuthoritative(name)
             if (ip != null && ip != "0.0.0.0") {
                 answeredLocally++
                 val built = buildAnswer(query, ip)
@@ -223,9 +236,11 @@ object MeshDnsServer {
     internal fun forward(query: ByteArray): ByteArray? = runCatching {
         DatagramSocket().use { client ->
             client.soTimeout = UPSTREAM_TIMEOUT_MS
-            client.send(
-                DatagramPacket(query, query.size, InetAddress.getByName(upstream), DEFAULT_PORT)
-            )
+            // CONNECTED, so the kernel drops replies from any other address. An unconnected socket
+            // took the first datagram that arrived, letting whoever guessed the ephemeral port answer
+            // for any name on this machine.
+            client.connect(InetAddress.getByName(upstream), DEFAULT_PORT)
+            client.send(DatagramPacket(query, query.size))
             val buffer = ByteArray(1500)
             val packet = DatagramPacket(buffer, buffer.size)
             client.receive(packet)

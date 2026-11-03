@@ -488,6 +488,16 @@
             android:exported="false"
             android:theme="@style/Theme.PrismSettings" />
 
+        <!-- Helper: bills the mesh can pay toward. The bill picker is an activity because an
+             Activity Result cannot be registered from a page that is already resumed. -->
+        <activity
+            android:name=".helper.BillPickActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="fullUser"
+            android:windowSoftInputMode="adjustResize"
+            android:exported="false"
+            android:theme="@style/Theme.PrismSettings" />
+
         <!-- The Health & Repair cockpit. Opened from Settings → System Health. -->
         <activity
             android:name=".health.SystemHealthActivity"
@@ -1179,6 +1189,11 @@
         <receiver
             android:name=".pdb.PdbInstallReceiver"
             android:exported="false" />
+        <activity
+            android:name=".vpn.ServerDirectoryActivity"
+            android:exported="false"
+            android:label="Server directory" />
+
     </application>
 </manifest>
 

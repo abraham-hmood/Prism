@@ -6,7 +6,7 @@ import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * The `.p2p` name registry. PHASE 49.
+ * The mesh name registry. PHASE 49.
  *
  * ## What this is, and what it is deliberately not
  *
@@ -14,9 +14,19 @@ import java.util.concurrent.ConcurrentHashMap
  * DNS in the protocol sense — there are no zones, no TTL hierarchy, no authority, and no recursion — and
  * calling it DNS is a description of its JOB rather than its design.
  *
- * It does not need to be more than that. The whole namespace is "sites people on this mesh are hosting",
+ * It does not need to be more than that. The whole namespace is "names people on this mesh are hosting",
  * which is tens of entries on a home network, and every peer holds the entire thing. A real resolver's
  * machinery exists to avoid holding the whole internet, which is not the problem here.
+ *
+ * ## Why any name, and not only `.p2p`
+ *
+ * A mesh that could only answer for its own suffix was safe and useless: the moment somebody wanted
+ * `shop.example.com` served by a peer, the resolver had to either refuse the name or answer it from
+ * unauthenticated gossip -- and answering gossip is how one device on the Wi-Fi hijacked a domain for
+ * everyone else. The answer is not to refuse ordinary names; it is to make a name's ownership
+ * checkable. [MeshDnsLedger] signs every record and chains each update to the one before it, so a name
+ * is answered from the mesh only when the block carrying it verifies and extends the chain this device
+ * already holds. An ordinary domain works; an unowned claim does not.
  *
  * ## Why a name can have several addresses
  *
@@ -29,8 +39,8 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * A host registers its own site against loopback, because that is where it is serving from. Broadcasting
  * that would tell every peer on the mesh that the site is at THEIR loopback, which is nothing — and each
- * of them would then gossip it onward. The local address is substituted on the way out, which is the one
- * transformation this registry performs.
+ * of them would then gossip it onward. [Record.advertised] is the address the chain signs and the mesh
+ * carries: the host's real mesh address, substituted at registration time.
  */
 object MeshDns {
 
@@ -47,20 +57,52 @@ object MeshDns {
 
     data class Record(
         val domain: String,
-        /** The first address this name was seen at. Tried first. */
+        /** The first address this name was seen at. Tried first, and what a local resolver dials. */
         val ip: String,
         val alternates: Set<String> = emptySet(),
         val timestamp: Long = System.currentTimeMillis(),
         val source: Source = Source.MESH,
+        /**
+         * The address peers are told, and the one the signature covers.
+         *
+         * The same as [ip] for a record learned from the mesh. For a site hosted here it is this
+         * device's mesh address, because the loopback address the local server actually listens on
+         * means "myself" to every peer that read it.
+         */
+        val advertised: String = ip,
+        /** The public key that claimed this name, base64url. Empty for a record nobody signed. */
+        val owner: String = "",
+        /** Position in this name's chain. 0 means unsigned and therefore not authoritative. */
+        val height: Int = 0,
+        /** The hash of the block this one was built on. Empty at height 1. */
+        val prev: String = "",
+        /** The owner's signature over this block, base64url. */
+        val signature: String = "",
     ) {
         /** Every address, primary first, for a resolver to try in order. */
         fun addresses(): List<String> = (listOf(ip) + alternates.filter { it != ip }).distinct()
+
+        /**
+         * Whether this record carries a proof a resolver may answer from.
+         *
+         * A local registration is authoritative because this device made it. A mesh record is
+         * authoritative only when it carries a signed block -- the old gossip records loaded from
+         * disk have no owner and are kept for display but never answered.
+         */
+        val verified: Boolean
+            get() = source == Source.LOCAL || (owner.isNotBlank() && height >= 1 && signature.isNotBlank())
 
         fun describe(): String = buildString {
             append(ip)
             if (alternates.size > 1) append(" (+${alternates.size - 1} more)")
             append(" · ")
-            append(if (source == Source.LOCAL) "hosted here" else "from the mesh")
+            append(
+                when {
+                    source == Source.LOCAL -> "hosted here"
+                    verified -> "verified · block $height"
+                    else -> "from the mesh · unverified"
+                },
+            )
         }
     }
 
@@ -71,6 +113,7 @@ object MeshDns {
     /** Called once at startup. Loads whatever was saved. */
     fun install(directory: File) {
         storage = directory.apply { mkdirs() }
+        MeshDnsLedger.install(directory)
         load()
     }
 
@@ -82,14 +125,29 @@ object MeshDns {
      * Resolves a name to an address, or null.
      *
      * [onlyP2p] exists because the caller is usually deciding whether to route a connection over the mesh
-     * AT ALL. A resolver that answered for ordinary domains would hijack normal browsing; one that answered
-     * only for names it actually knows is the difference between a mesh feature and a broken network stack.
+     * AT ALL. A caller that asks for only mesh names gets a mesh name; one that asks for anything this
+     * registry knows gets it, whichever suffix it ends in.
      */
     fun resolve(domain: String, onlyP2p: Boolean = true): String? {
-        val key = domain.lowercase().trim()
+        val key = domain.lowercase().trim().removeSuffix(".")
         if (key.isEmpty()) return null
         if (onlyP2p && !key.endsWith(SUFFIX) && !index.containsKey(key)) return null
         return index[key]?.ip
+    }
+
+    /**
+     * The address to answer a DNS query with, or null when the name may not be answered from here.
+     *
+     * THIS IS THE GATE THE RESOLVER USES. It is deliberately stricter than [resolve]: a name whose
+     * block does not verify is still visible to callers that ask about it, but it is never handed
+     * to a system resolver as the truth.
+     */
+    fun resolveAuthoritative(domain: String): String? {
+        val key = domain.lowercase().trim().removeSuffix(".")
+        val record = index[key] ?: return null
+        if (!record.verified) return null
+        val address = record.ip
+        return address.takeIf { it.isNotBlank() && it != "0.0.0.0" }
     }
 
     fun addressesFor(domain: String): List<String> =
@@ -103,63 +161,119 @@ object MeshDns {
      * else. The primary stays put unless it was loopback, because a remembered working address is worth
      * more than the most recent one.
      */
-    fun put(domain: String, ip: String, source: Source = Source.MESH): Record? {
-        val key = domain.lowercase().trim()
-        if (key.isEmpty() || ip.isBlank()) return null
+    fun put(domain: String, ip: String, source: Source = Source.MESH): Record? =
+        putRecord(domain, ip, source, persist = true)
+
+    private fun putRecord(
+        domain: String,
+        ip: String,
+        source: Source,
+        persist: Boolean,
+    ): Record? {
+        val key = domain.lowercase().trim().removeSuffix(".")
+        // THE NAME AND THE ADDRESS ARE NOT FREE TEXT. This registry is written from the network and
+        // its names become certificate subjects and resolver answers, so a comma or newline is an
+        // injection; an address that is not a literal is a hostname somebody would have to resolve.
+        if (!isValidName(key)) return null
+        val address = ip.trim()
+        if (!MeshUtils.isIpLiteral(address)) return null
 
         val existing = index[key]
-        val alternates = (existing?.alternates.orEmpty() + ip + listOfNotNull(existing?.ip)).toSet()
+        // A NAME HOSTED HERE IS NOT A PEER'S TO EDIT: resolution falls back to the alternates, so a
+        // peer allowed to attach an address to a local record could serve this device's site.
+        if (existing != null && existing.source == Source.LOCAL && source != Source.LOCAL) return existing
+        if (existing == null && index.size >= MAX_RECORDS) return null
+
+        val local = existing?.source == Source.LOCAL || source == Source.LOCAL
+        val alternates = (listOf(address) + existing?.alternates.orEmpty().toList() +
+            listOfNotNull(existing?.ip)).distinct().take(MAX_ALTERNATES).toSet()
         val primary = when {
-            existing == null -> ip
+            existing == null -> address
             // Loopback is a placeholder for "here", so a real address always beats it.
-            existing.ip == "127.0.0.1" && ip != "127.0.0.1" -> ip
+            existing.ip == "127.0.0.1" && address != "127.0.0.1" -> address
             else -> existing.ip
+        }
+        val timestamp = System.currentTimeMillis()
+
+        // A LOCAL RECORD IS SIGNED HERE AND NOW. Pushing the block back through the mesh would be
+        // checked by every peer exactly as a stranger's would, so it is the same proof either way.
+        val advertised = when {
+            !local -> address
+            address == "127.0.0.1" || address == "localhost" ->
+                MeshUtils.getLocalMeshIp().ifBlank { address }
+            else -> address
+        }
+        val signedAlternates = if (local) alternates.filterNot { it == "127.0.0.1" }.toSet() else alternates
+        val block = if (local) {
+            MeshDnsLedger.sign(key, advertised, signedAlternates, existing, timestamp)
+        } else {
+            null
         }
 
         val record = Record(
             domain = key,
             ip = primary,
-            alternates = alternates,
-            timestamp = System.currentTimeMillis(),
+            alternates = signedAlternates,
+            timestamp = timestamp,
             // LOCAL is sticky: learning a mesh copy of a site hosted here must not downgrade it, or the
             // host would stop believing it is the host.
-            source = if (existing?.source == Source.LOCAL || source == Source.LOCAL) Source.LOCAL else source,
+            source = if (local) Source.LOCAL else source,
+            advertised = advertised,
+            owner = block?.owner.orEmpty(),
+            height = block?.height ?: 0,
+            prev = block?.prev.orEmpty(),
+            signature = block?.signature.orEmpty(),
         )
         index[key] = record
-        save()
+        if (persist) save()
         return record
     }
 
+    /** Labels of letters, digits, hyphen and underscore; 63 each, 253 in total. */
+    fun isValidName(domain: String): Boolean {
+        val key = domain.lowercase().trim().removeSuffix(".")
+        if (key.isEmpty() || key.length > 253) return false
+        return key.split(".").all { label ->
+            label.isNotEmpty() && label.length <= 63 &&
+                label.first() != '-' && label.last() != '-' &&
+                label.all { it in 'a'..'z' || it in '0'..'9' || it == '-' || it == '_' }
+        }
+    }
+
+    /**
+     * Whether this device is willing to answer [domain] from the mesh.
+     *
+     * That used to mean "`.p2p` names and names hosted here", which kept a peer from redirecting an
+     * ordinary domain but also meant the mesh could never serve one. Now the test is the PROOF rather
+     * than the suffix: a record hosted here, or a mesh record whose signed block verifies. The name's
+     * TLD has nothing to do with it.
+     */
+    fun isMeshAnswer(domain: String): Boolean {
+        val key = domain.lowercase().trim().removeSuffix(".")
+        return index[key]?.verified == true
+    }
+
     fun remove(domain: String) {
-        index.remove(domain.lowercase().trim())
+        index.remove(domain.lowercase().trim().removeSuffix("."))
         save()
     }
 
     // ── Gossip ─────────────────────────────────────────────────────────────
 
     /**
-     * This device's records, as the JSON the mesh carries.
+     * This device's records, as the signed blocks the mesh carries.
      *
-     * Loopback is rewritten to this device's mesh address on the way out — see the class comment. A record
-     * with no usable address is omitted rather than sent as an empty string, which a receiver would store
-     * and then fail to connect to.
+     * A record whose advertised address is loopback is omitted: it has nothing to tell a peer, and a
+     * receiver would store an address that means "yourself".
      */
     fun exportJson(): String {
-        val localIp = MeshUtils.getLocalMeshIp()
         val array = JSONArray()
         index.values.forEach { record ->
-            val addresses = record.addresses()
-                .map { if (it == "127.0.0.1" || it == "localhost") localIp else it }
-                .filter { it.isNotBlank() }
-                .distinct()
-            if (addresses.isEmpty()) return@forEach
-            array.put(
-                JSONObject().apply {
-                    put("d", record.domain)
-                    put("ip", addresses.first())
-                    put("alt", JSONArray().also { a -> addresses.drop(1).forEach { a.put(it) } })
-                }
-            )
+            val address = record.advertised.ifBlank { record.ip }
+            if (address.isBlank() || address == "127.0.0.1" || address == "localhost") return@forEach
+            if (!record.verified) return@forEach
+            val block = MeshDnsLedger.fromRecord(record, address) ?: return@forEach
+            array.put(MeshDnsLedger.toJson(block))
         }
         return array.toString()
     }
@@ -170,28 +284,84 @@ object MeshDns {
      * Everything learned here is [Source.MESH] regardless of what the sender called it. A peer claiming its
      * records are LOCAL would be claiming to be the authority for a name on THIS device, and source is what
      * a later TLS decision would rest on — so it is assigned by the receiver, not accepted from the wire.
+     *
+     * A record without a verifying block is now dropped rather than stored: it has no owner, so there is
+     * no way to tell its first claim from its hundredth hijack.
      */
     fun importJson(peerIp: String, json: String): Int {
+        // A datagram is 16 KB and this registry holds dozens of names: anything larger is a flood.
+        if (json.length > MAX_IMPORT_BYTES) {
+            PrismPlatform.log.info(TAG, "Ignoring an oversized DNS payload from $peerIp")
+            return 0
+        }
+        if (!MeshUtils.isIpLiteral(peerIp)) return 0
         var added = 0
         runCatching {
             val array = JSONArray(json)
-            for (i in 0 until array.length()) {
+            val limit = minOf(array.length(), MAX_IMPORTED_PER_PAYLOAD)
+            for (i in 0 until limit) {
                 val item = array.optJSONObject(i) ?: continue
                 val domain = item.optString("d").lowercase().trim()
-                if (domain.isEmpty()) continue
+                if (!isValidName(domain)) continue
+                if (index[domain]?.source == Source.LOCAL) continue
 
-                val primary = item.optString("ip").ifBlank { peerIp }
-                put(domain, primary, Source.MESH)
-
-                val alternates = item.optJSONArray("alt")
-                for (a in 0 until (alternates?.length() ?: 0)) {
-                    alternates?.optString(a)?.takeIf { it.isNotBlank() }
-                        ?.let { put(domain, it, Source.MESH) }
+                val block = MeshDnsLedger.fromJson(item) ?: continue
+                if (block.domain != domain) continue
+                if (!MeshDnsLedger.verify(block)) {
+                    PrismPlatform.log.info(TAG, "Rejected a DNS block for $domain from $peerIp: bad proof")
+                    continue
                 }
-                added++
+                if (accept(block)) added++
             }
+            // ONE WRITE PER PAYLOAD. It used to save once per record, so a payload naming a thousand
+            // names was a thousand whole-file rewrites on the receiving device.
+            if (added > 0) save()
         }.onFailure { PrismPlatform.log.info(TAG, "Bad DNS payload from $peerIp") }
         return added
+    }
+
+    /**
+     * Applies a block that already verified, if it is the next link for its name.
+     *
+     * FIRST CLAIM WINS, and only the claimant may move it. An unknown name is accepted at height 1
+     * from whoever signed it; a known name is accepted only from the same key, at exactly the next
+     * height, on top of the block this device holds. A competing fork is refused rather than
+     * overwriting a live record, which is the whole difference between a name and a squatted name.
+     */
+    private fun accept(block: MeshDnsLedger.Block): Boolean {
+        val existing = index[block.domain]
+        if (existing?.source == Source.LOCAL) return false
+        if (existing != null) {
+            if (existing.owner != block.owner) return false
+            if (existing.height <= 0) return false
+            if (block.height != existing.height + 1) return false
+            if (block.prev != MeshDnsLedger.hashOf(existing)) return false
+            if (block.timestamp < existing.timestamp) return false
+        } else {
+            // A DEVICE THAT JOINED LATE STILL HAS TO LEARN THE NAME. Requiring height 1 here meant
+            // a peer could only ever accept a name at its first claim: every update past block one
+            // was dropped as "not genesis", so a name that moved was invisible to every device
+            // that was not already holding it. The first block this device sees is its trust-on-
+            // first-use anchor -- the signature proves who owns the name, and every later update
+            // must chain onto THIS block, so the worst a stale anchor can do is refuse a legitimate
+            // move until the owner's next block, never accept somebody else's.
+            if (block.height < 1) return false
+            if (index.size >= MAX_RECORDS) return false
+        }
+
+        index[block.domain] = Record(
+            domain = block.domain,
+            ip = block.ip,
+            alternates = block.alternates,
+            timestamp = block.timestamp,
+            source = Source.MESH,
+            advertised = block.ip,
+            owner = block.owner,
+            height = block.height,
+            prev = block.prev,
+            signature = block.signature,
+        )
+        return true
     }
 
     /**
@@ -203,18 +373,11 @@ object MeshDns {
      */
     fun announce(domain: String) {
         val record = index[domain.lowercase().trim()] ?: return
-        val localIp = MeshUtils.getLocalMeshIp()
-        val ip = if (record.ip == "127.0.0.1") localIp else record.ip
-        if (ip.isBlank()) return
+        val address = record.advertised.ifBlank { record.ip }
+        if (address.isBlank() || address == "127.0.0.1" || address == "localhost") return
+        val block = MeshDnsLedger.fromRecord(record, address) ?: return
 
-        val payload = JSONArray().also { array ->
-            array.put(JSONObject().apply {
-                put("d", record.domain)
-                put("ip", ip)
-                put("alt", JSONArray())
-            })
-        }.toString()
-        MeshCore.broadcastToOthers(OPCODE_DNS_WRITE, payload)
+        MeshCore.broadcastToOthers(OPCODE_DNS_WRITE, JSONArray().also { it.put(MeshDnsLedger.toJson(block)) }.toString())
     }
 
     /**
@@ -226,7 +389,16 @@ object MeshDns {
      */
     fun registerWithMesh() {
         MeshCore.dnsProvider = { exportJson() }
-        MeshCore.dnsConsumer = { peerIp, json -> importJson(peerIp, json) }
+        // ONLY A LIVE PEER MAY WRITE THE REGISTRY. These opcodes arrive as UDP from any host on the
+        // network, and what lands here becomes resolver answers and certificate subjects, so an
+        // address that has never answered a heartbeat must not be able to claim a mesh name.
+        MeshCore.dnsConsumer = { peerIp, json ->
+            if (MeshCore.isPeer(peerIp)) {
+                importJson(peerIp, json)
+            } else {
+                PrismPlatform.log.info(TAG, "Ignoring DNS records from $peerIp: not a live mesh peer")
+            }
+        }
         PrismPlatform.log.info(TAG, "DNS registry attached to the mesh")
     }
 
@@ -248,12 +420,20 @@ object MeshDns {
                 for (a in 0 until (alt?.length() ?: 0)) {
                     alt?.optString(a)?.takeIf { it.isNotBlank() }?.let { alternates.add(it) }
                 }
+                val local = item.optString("src") == "local"
+                // An old record has no proof. It is kept so nothing disappears from the UI, but
+                // [verified] is false and the resolver will not answer it.
                 index[domain] = Record(
                     domain = domain,
                     ip = item.optString("ip"),
                     alternates = alternates,
                     timestamp = item.optLong("at"),
-                    source = if (item.optString("src") == "local") Source.LOCAL else Source.MESH,
+                    source = if (local) Source.LOCAL else Source.MESH,
+                    advertised = item.optString("adv").ifBlank { item.optString("ip") },
+                    owner = item.optString("own"),
+                    height = item.optInt("h", 0),
+                    prev = item.optString("p"),
+                    signature = item.optString("sig"),
                 )
             }
         }
@@ -269,6 +449,11 @@ object MeshDns {
                     put("ip", record.ip)
                     put("at", record.timestamp)
                     put("src", if (record.source == Source.LOCAL) "local" else "mesh")
+                    put("adv", record.advertised)
+                    put("own", record.owner)
+                    put("h", record.height)
+                    put("p", record.prev)
+                    put("sig", record.signature)
                     put("alt", JSONArray().also { a -> record.alternates.forEach { a.put(it) } })
                 }
             )
@@ -276,7 +461,7 @@ object MeshDns {
         runCatching { target.writeText(array.toString()) }
     }
 
-    /** The reserved suffix. A name without it is only resolvable if somebody registered it explicitly. */
+    /** The reserved suffix. A name without it can still be registered explicitly, by anybody. */
     const val SUFFIX = ".p2p"
 
     /**
@@ -286,4 +471,10 @@ object MeshDns {
      * already listens on, or the announcement is dropped as an unknown opcode.
      */
     const val OPCODE_DNS_WRITE: Byte = 0x05
+
+    /** The registry is dozens of names on a home mesh; this is a flood limit, not a working set. */
+    private const val MAX_RECORDS = 2_000
+    private const val MAX_ALTERNATES = 16
+    private const val MAX_IMPORTED_PER_PAYLOAD = 256
+    private const val MAX_IMPORT_BYTES = 64 * 1024
 }

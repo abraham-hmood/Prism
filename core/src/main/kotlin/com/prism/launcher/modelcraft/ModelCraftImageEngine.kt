@@ -82,7 +82,14 @@ class ModelCraftImageGenerator : ImageGenerator {
             value * 31 + character.code
         }
         val pixels = runCatching {
-            trained.generate(prompt, Random(seed), steps = PixelTrainer.SAMPLE_STEPS)
+            // THE USER'S INFERENCE MODE, not a fixed schedule. A model trained here is the one
+            // image surface that runs entirely on this device, so it is the one where the mode's
+            // pass budget is actually spendable.
+            trained.generate(
+                prompt, Random(seed),
+                steps = PixelTrainer.SAMPLE_STEPS,
+                plan = com.prism.launcher.messaging.InferencePlan.current(),
+            )
         }.onFailure {
             PrismPlatform.log.warn("ModelCraft", "Image sampling failed: ${it.message}")
         }.getOrNull() ?: return null

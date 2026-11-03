@@ -90,7 +90,7 @@ object AiManager {
      * decides where the prompt goes is the user's Local / Cloud / Ollama choice -- so the feature
      * works identically on all three, which is the entire point.
      */
-    suspend fun getResponse(context: Context, userText: String, imageUri: Uri? = null, onToken: ((String) -> Unit)? = null, onReasoning: ((String) -> Unit)? = null, history: List<String> = emptyList(), allowOffload: Boolean = true, plainText: Boolean = false): Pair<String, Pair<String?, String?>> = withContext(Dispatchers.IO) {
+    suspend fun getResponse(context: Context, userText: String, imageUri: Uri? = null, onToken: ((String) -> Unit)? = null, onReasoning: ((String) -> Unit)? = null, history: List<String> = emptyList(), allowOffload: Boolean = true, plainText: Boolean = false, recap: String = ""): Pair<String, Pair<String?, String?>> = withContext(Dispatchers.IO) {
         val streaming = onToken != null && PrismSettings.getStreamingEnabled()
         val maxTokens = PrismSettings.getMaxTokens()
         val mode = PrismSettings.getAiMode()
@@ -150,7 +150,8 @@ object AiManager {
         // started -- the transcript was on screen, but none of it reached the model. Local GGUF is
         // deliberately excluded below: llama.cpp keeps its own context for the life of the loaded
         // model, and sending the turns again would duplicate every one of them.
-        val prompt = foldHistory(userText, history)
+        val recapText = recap.trim()
+        val prompt = foldHistory(userText, history, recapText)
 
         if (mode == PrismSettings.AI_MODE_CLOUD) {
             // A REAL REQUEST, WHATEVER THE PROMPT SAYS. The old branch sent anything containing
@@ -241,16 +242,30 @@ object AiManager {
             // Checked here rather than earlier because everything above is about WHICH model to
             // run; this is about WHERE. And it is deliberately last: a failure to reach the mesh
             // falls through to running locally, so a peer going to sleep costs speed, not an answer.
+            //
+            // WHEN A RECAP EXISTS, THE ENGINE'S OWN MEMORY IS NO LONGER THE CONVERSATION. The older
+            // turns were folded into that recap and llama.cpp's context was cleared at that moment
+            // (see SamCompaction and ConversationActivity.compactSam), so what it still holds is a
+            // fragment beginning mid-thread. From then on the recap and the recent turns are resent
+            // the way the stateless backends already do: a little more prompt per turn, in exchange
+            // for a model that still knows what the conversation was about.
+            val localText = if (recapText.isEmpty()) {
+                userText
+            } else {
+                runCatching { GgufInferenceService.resetConversation() }
+                prompt
+            }
+
             if (allowOffload) {
-                meshResponse(context, modelPath, userText, onToken)?.let {
+                meshResponse(context, modelPath, localText, onToken)?.let {
                     return@withContext Pair(it, Pair(null, null))
                 }
             }
 
             val response = if (streaming) {
-                LocalAiService.generateResponseStreaming(context, modelPath, userText, maxTokens, onToken!!, onReasoning)
+                LocalAiService.generateResponseStreaming(context, modelPath, localText, maxTokens, onToken!!, onReasoning)
             } else {
-                LocalAiService.generateResponse(context, modelPath, userText)
+                LocalAiService.generateResponse(context, modelPath, localText)
             }
             return@withContext Pair(response, Pair(null, null))
         }
@@ -402,10 +417,17 @@ object AiManager {
      * system framing out of the model's context window and then the question itself. Twelve turns
      * is a few screens of chat, which is what a phone conversation actually refers back to.
      */
-    private fun foldHistory(userText: String, history: List<String>): String {
+    private fun foldHistory(userText: String, history: List<String>, recap: String = ""): String {
         val recent = history.filter { it.isNotBlank() }.takeLast(12)
-        if (recent.isEmpty()) return userText
+        val briefing = SamCompaction.preamble(recap)
+        if (recent.isEmpty() && briefing.isEmpty()) return userText
         return buildString {
+            // The recap goes FIRST: it stands for everything older than the turns below it, and a
+            // model reading the transcript in order has to meet the past before the present.
+            if (briefing.isNotEmpty()) {
+                append(briefing)
+                append("\n\n")
+            }
             append("Conversation so far:\n")
             recent.forEach { line ->
                 append(line.trim())

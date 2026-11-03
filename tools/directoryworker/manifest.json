@@ -1,0 +1,11 @@
+{
+  "entrypoint": "index.js",
+  "compatibilityDate": "2026-09-01",
+  "modules": [
+    {
+      "name": "index.js",
+      "type": "esm",
+      "path": "./index.js"
+    }
+  ]
+}

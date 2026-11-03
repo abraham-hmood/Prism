@@ -108,8 +108,10 @@ object MeshConnect {
         val key = domain.lowercase()
         hosts[key]?.let { return it }
         // Longest suffix wins, so a specific `models.prism` beats a general `.prism`.
+        // ONLY A KEY THAT BEGINS WITH A DOT IS A SUFFIX. Plain endsWith let a host registered for
+        // `site.p2p` answer for `notmysite.p2p`, which is one peer serving another peer's name.
         return hosts.entries
-            .filter { key.endsWith(it.key) }
+            .filter { it.key.startsWith(".") && key.endsWith(it.key) }
             .maxByOrNull { it.key.length }
             ?.value
             ?: fallback
@@ -188,7 +190,11 @@ object MeshConnect {
             }
 
             val domain = first.split(" ").getOrNull(1)?.trim().orEmpty()
-            if (domain.isEmpty()) {
+            // The domain chooses which host serves this connection and which certificate is minted
+            // for it, so it has to be a name and nothing else.
+            if (domain.isEmpty() || domain.length > 253 ||
+                domain.any { !(it.isLetterOrDigit() || it == '.' || it == '-' || it == '_') }
+            ) {
                 client.close()
                 return@runCatching
             }
@@ -273,6 +279,13 @@ object MeshConnect {
      * several.
      */
     fun connect(peerIp: String, domain: String, timeoutMs: Int = 15_000): Socket? {
+        // A DOMAIN IS A HEADER VALUE on the handshake line: a newline in it would write a second
+        // protocol line, and the value can originate from a mesh name.
+        if (domain.isBlank() || domain.length > 253 ||
+            domain.any { it.code == 13 || it.code == 10 || it == ' ' }
+        ) return null
+        // A PEER IS AN ADDRESS. A name here would be a DNS lookup triggered by mesh traffic.
+        if (!MeshUtils.isIpLiteral(peerIp)) return null
         val target = if (MeshUtils.getAllLocalIps().contains(peerIp)) "127.0.0.1" else peerIp
 
         return runCatching {
@@ -323,6 +336,8 @@ object MeshConnect {
         timeoutMs: Int = 60_000,
         maxResponseBytes: Long = 512L * 1024 * 1024,
     ): ByteArray? {
+        // A PATH IS A REQUEST-LINE VALUE: a newline in it would append headers of its own.
+        if (path.any { it.code == 13 || it.code == 10 }) return null
         val socket = connect(peerIp, domain, timeoutMs = 15_000) ?: return null
         var partial: File? = null
         return try {
@@ -371,6 +386,7 @@ object MeshConnect {
         timeoutMs: Int = 60_000,
         maxResponseBytes: Long = 64L * 1024 * 1024,
     ): ByteArray? {
+        if (path.any { it.code == 13 || it.code == 10 }) return null
         val socket = connect(peerIp, domain, timeoutMs = 15_000) ?: return null
         return try {
             socket.soTimeout = timeoutMs

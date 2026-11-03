@@ -232,6 +232,9 @@ object MeshTls {
      */
     fun contextFor(domain: String): SSLContext? {
         val key = domain.lowercase().trim().ifBlank { return null }
+        // A NAME MINTED HERE BECOMES A CERTIFICATE SUBJECT, and this name can have arrived over the
+        // mesh: refuse anything that is not a DNS name or an address literal.
+        if (!isMintable(key)) return null
         contexts[key]?.let { return it }
 
         val leaf = leafFor(key) ?: return null
@@ -274,6 +277,7 @@ object MeshTls {
      */
     fun fallbackContextFor(domain: String): SSLContext? {
         val key = domain.lowercase().trim().ifBlank { return null }
+        if (!isMintable(key)) return null
         fallbackContexts[key]?.let { return it }
 
         return runCatching {
@@ -318,6 +322,7 @@ object MeshTls {
      */
     fun leafFor(domain: String): Leaf? {
         val key = domain.lowercase().trim().ifBlank { return null }
+        if (!isMintable(key)) return null
         leaves[key]?.let { return it }
 
         val issuerKey = caKey ?: return null
@@ -364,10 +369,19 @@ object MeshTls {
      * iPAddress entry and will reject a dNSName holding the same digits -- which is exactly the
      * "certificate name does not match" warning that made IMAP unusable in internet mode.
      */
+    /**
+     * Whether a name may be minted for: a validated DNS name or an address literal.
+     *
+     * The registry accepts names from the mesh, and a name is written into a certificate subject --
+     * where a comma would add a field of its own -- so only this restricted charset gets that far.
+     */
+    private fun isMintable(key: String): Boolean =
+        MeshDns.isValidName(key) || MeshUtils.isIpLiteral(key)
+
     private fun sanFor(key: String): Array<GeneralName> {
         val literal = key.removeSurrounding("[", "]")
-        val isIp = runCatching { java.net.InetAddress.getByName(literal) }.isSuccess &&
-            (literal.count { it == ':' } >= 2 || literal.matches(Regex("\\d{1,3}(\\.\\d{1,3}){3}")))
+        // A SYNTAX TEST, NOT A RESOLUTION: this used to call InetAddress.getByName(key).
+        val isIp = MeshUtils.isIpLiteral(literal)
         return if (isIp) {
             arrayOf(GeneralName(GeneralName.iPAddress, literal))
         } else {

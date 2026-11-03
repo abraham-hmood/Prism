@@ -153,6 +153,8 @@ object SamConversation {
         onToken: ((String) -> Unit)? = null,
         onReasoning: ((String) -> Unit)? = null,
         standalone: Boolean = false,
+        /** Older turns already folded into a recap; sent ahead of [history] on stateless backends. */
+        recap: String = "",
     ): Turn {
         val started = System.currentTimeMillis()
         if (userText.isBlank() && attachment == null) {
@@ -165,13 +167,15 @@ object SamConversation {
         // backends take their history as an argument and are already stateless, so this is a no-op there.
         if (standalone) runCatching { GgufInferenceService.resetConversation() }
 
+        val recapText = recap.trim()
+
         return when (val target = backend()) {
             Backend.NONE -> Turn("", target, 0, unavailableReason())
-            Backend.CLOUD -> cloudTurn(userText, attachment, history, onToken, started)
-            Backend.LOCAL -> localTurn(userText, attachment, history, onToken, onReasoning, started)
-            Backend.OLLAMA -> ollamaTurn(userText, history, onToken, started)
+            Backend.CLOUD -> cloudTurn(userText, attachment, history, onToken, started, recapText)
+            Backend.LOCAL -> localTurn(userText, attachment, history, onToken, onReasoning, started, recapText)
+            Backend.OLLAMA -> ollamaTurn(userText, history, onToken, started, recapText)
             Backend.CAKECHAT -> cakeChatTurn(userText, history, started)
-            Backend.MESH -> meshTurn(userText, history, started)
+            Backend.MESH -> meshTurn(userText, history, started, recapText)
         }
     }
 
@@ -182,12 +186,12 @@ object SamConversation {
      * it is answering requests, not keeping a chat. Same reason the local path builds a prompt rather
      * than relying on the engine's memory.
      */
-    private fun meshTurn(userText: String, history: List<String>, started: Long): Turn {
+    private fun meshTurn(userText: String, history: List<String>, started: Long, recap: String = ""): Turn {
         val selected = PrismSettings.getSelectedP2pModel()
             ?: return Turn("", Backend.MESH, 0, "No mesh model is selected.")
 
         val host = MeshModels.Hosted(selected.peerIp, selected.modelName)
-        val answer = MeshModels.generate(host, withHistory(userText, history))
+        val answer = MeshModels.generate(host, withHistory(userText, history, recap))
             ?: return Turn(
                 "", Backend.MESH, System.currentTimeMillis() - started,
                 selected.modelName + " on " + selected.peerIp + " did not answer. That device may be " +
@@ -208,6 +212,7 @@ object SamConversation {
         history: List<String>,
         onToken: ((String) -> Unit)?,
         started: Long,
+        recap: String = "",
     ): Turn {
         val model = PrismSettings.getActiveCloudModel()
             ?: return Turn("", Backend.CLOUD, 0, "No cloud model is configured.")
@@ -215,7 +220,7 @@ object SamConversation {
         val base64 = attachment?.takeIf { it.isFile && Vision.isSupported(it) }?.let { file ->
             runCatching { Base64.getEncoder().encodeToString(file.readBytes()) }.getOrNull()
         }
-        val prompt = withHistory(userText, history)
+        val prompt = withHistory(userText, history, recap)
 
         return runCatching {
             val answer = if (onToken != null && PrismSettings.getStreamingEnabled()) {
@@ -255,10 +260,11 @@ object SamConversation {
         history: List<String>,
         onToken: ((String) -> Unit)?,
         started: Long,
+        recap: String = "",
     ): Turn {
         val endpoint = PrismSettings.getSelectedOllamaEndpoint()
             ?: return Turn("", Backend.OLLAMA, 0, "No Ollama server is selected.")
-        val prompt = withHistory(userText, history)
+        val prompt = withHistory(userText, history, recap)
 
         return runCatching {
             val answer = if (onToken != null && PrismSettings.getStreamingEnabled()) {
@@ -310,6 +316,7 @@ object SamConversation {
         onToken: ((String) -> Unit)?,
         onReasoning: ((String) -> Unit)?,
         started: Long,
+        recap: String = "",
     ): Turn {
         val path = PrismSettings.getLocalAiModelPath()
         if (path.isBlank()) return Turn("", Backend.LOCAL, 0, "No local model is active.")
@@ -351,14 +358,19 @@ object SamConversation {
      * limit until the model's context window truncates it silently from the front, which drops the
      * system framing first and the current question last.
      */
-    private fun withHistory(userText: String, history: List<String>): String {
-        if (history.isEmpty()) return userText
+    private fun withHistory(userText: String, history: List<String>, recap: String = ""): String {
+        val briefing = SamCompaction.preamble(recap)
+        if (history.isEmpty()) {
+            return if (briefing.isEmpty()) userText else listOf(briefing, userText).joinToString("\n\n")
+        }
         val recent = history.takeLast(HISTORY_TURNS)
         return buildString {
             recent.forEach { line ->
                 append(line.trim())
                 append('\n')
             }
+            // AHEAD OF THE RECENT TURNS, because the recap stands for everything older than them.
+            if (briefing.isNotEmpty()) insert(0, briefing + "\n\n")
             append(userText)
         }
     }

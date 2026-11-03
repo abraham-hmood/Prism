@@ -67,6 +67,8 @@ object PageCatalog {
         PrismPageEntry(SlotAssignment.TimeMachine, "Time Machine", "\u23F1", 0xFF8A9BB0.toInt()),
         PrismPageEntry(SlotAssignment.Journal, "Journal", "\uD83D\uDCD3", 0xFFC98A5B.toInt()),
         PrismPageEntry(SlotAssignment.AppStore, "App Store", "\uD83D\uDED2", 0xFF4FB08A.toInt()),
+        PrismPageEntry(SlotAssignment.Helper, "Helper", "🤝", 0xFFE07B6C.toInt()),
+        PrismPageEntry(SlotAssignment.Vpn, "VPN", "🛡", 0xFF5B8DEF.toInt()),
         PrismPageEntry(SlotAssignment.TaskManager, "Task Manager", "\u2699", 0xFF9A9AB0.toInt()),
     )
 

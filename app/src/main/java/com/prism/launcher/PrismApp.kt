@@ -120,6 +120,30 @@ class PrismApp : Application(), ComponentCallbacks2 {
         }
     }
 
+    /**
+     * Tells the user why this server was not announced to the directories.
+     *
+     * A DIALOG RATHER THAN A LOG LINE, because the consequence is invisible otherwise: the server
+     * keeps running and the only symptom is that no device outside this network can find it. Shown
+     * on whatever screen is in front; when none is -- a server started by a background service --
+     * the sentence is still kept in [com.prism.launcher.vpn.ServerDirectory.lastAnnouncement] and
+     * on the Server directory page, so it is not lost.
+     */
+    fun presentDirectoryNotice(message: String) {
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            val activity = recentActivity()?.takeIf { !it.isFinishing && !it.isDestroyed } ?: return@post
+            runCatching {
+                PrismDialogFactory.show(
+                    activity,
+                    "Server directory",
+                    message,
+                    positiveText = "OK",
+                    negativeText = null,
+                )
+            }
+        }
+    }
+
     private fun drainStorageChallenges() {
         if (storageChallengeDialog?.isShowing == true) return
         val activity = recentActivity()?.takeIf { !it.isFinishing && !it.isDestroyed } ?: return
@@ -1022,6 +1046,9 @@ class PrismApp : Application(), ComponentCallbacks2 {
         // for a complete site.
         com.prism.launcher.browser.PrismMirrorManager.cleanupInterrupted()
         com.prism.launcher.mesh.PrismMeshService.start()
+        // A directory the user switched on last session is started here, on the one path that
+        // already runs when the mesh comes up.
+        com.prism.launcher.vpn.DirectoryServer.refresh()
 
         // MESHVOICE THAT OUTLIVED THE LAST PROCESS. A voicemail left for a device that was away
         // is held on disk; this is where the retry loop picks it back up, in the control process

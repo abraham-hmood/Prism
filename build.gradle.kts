@@ -90,3 +90,105 @@ subprojects {
     }
 }
 
+// ── The version, and the one place it is written ──────────────────────────────────────────────────
+//
+// version.properties holds the one copy of the app's version. The APK's versionName/versionCode and
+// the desktop installers' jpackage packageVersion all read it, so a release cannot ship a phone build
+// calling itself 1.0.1 next to an installer calling itself 1.0.2 -- which is what two independently
+// maintained numbers do sooner or later.
+//
+// :app:githubRelease BUMPS IT BEFORE ANYTHING IS PACKED, and the bump runs while this project is
+// CONFIGURED rather than inside a task. That is not laziness: AGP reads defaultConfig.versionName and
+// jpackage reads packageVersion during configuration, so a doFirst bump would write the file only
+// after both had already baked the previous number into the APK and the installers. Requesting
+// githubRelease is what triggers it, so an ordinary build never moves the version.
+//
+// Two ways to keep the number where it is: -Pprism.release.bump=false (rebuild the current version)
+// and -Pprism.release.dryRun=true or Gradle's --dry-run (neither publishes anything, so neither
+// should consume a version number). Both still PACK the next version while leaving the file alone,
+// so a dry run names exactly the artifacts a real run would upload.
+data class PrismVersion(val name: String, val code: Int)
+
+val prismVersionFile: File = layout.projectDirectory.file("version.properties").asFile
+
+fun readPrismVersion(file: File): PrismVersion {
+    val properties = java.util.Properties()
+    if (file.isFile) file.inputStream().use { properties.load(it) }
+    val name = properties.getProperty("versionName")?.trim()?.takeIf { it.isNotEmpty() } ?: "1.0"
+    val code = properties.getProperty("versionCode")?.trim()?.toIntOrNull() ?: 1
+    return PrismVersion(name, code)
+}
+
+/**
+ * The next version: the patch component goes up by one, and the version code with it.
+ *
+ * 1.0 -> 1.0.1 -> 1.0.2, and 1.2.9 -> 1.2.10. A name with fewer than three components is padded
+ * rather than reinterpreted, so 1.0 does not become 1.1 -- Android's versionName and jpackage's
+ * packageVersion are both happiest as three plain numbers. A component that is not a number reads
+ * as zero rather than failing the build, so a hand-edited "1.0-beta" cannot break a release.
+ */
+fun nextPrismVersion(current: PrismVersion): PrismVersion {
+    val parts = current.name.split('.')
+    fun component(index: Int): Int = parts.getOrNull(index)
+        ?.takeWhile { it.isDigit() }
+        ?.toIntOrNull()
+        ?: 0
+    return PrismVersion("${component(0)}.${component(1)}.${component(2) + 1}", current.code + 1)
+}
+
+/**
+ * A name with all three components filled in, which is what consumers need: jpackage rejects
+ * anything that is not MAJOR.MINOR.BUILD (it fails the whole build with "Illegal version for 'Exe'")
+ * and the APK should not advertise a different number than the installer next to it. So
+ * version.properties may say 1.0, while the APK and the installers both ship as 1.0.0.
+ */
+fun padPrismVersion(name: String): String {
+    val parts = name.split('.')
+    fun component(index: Int): Int = parts.getOrNull(index)
+        ?.takeWhile { it.isDigit() }
+        ?.toIntOrNull()
+        ?: 0
+    return "${component(0)}.${component(1)}.${component(2)}"
+}
+
+fun writePrismVersion(file: File, version: PrismVersion) {
+    file.writeText(
+        "# The version both apps ship as. Bumped by :app:githubRelease; edit only to correct a " +
+            "mistake.\n" +
+            "versionName=${version.name}\n" +
+            "versionCode=${version.code}\n"
+    )
+}
+
+val prismVersionRequested = gradle.startParameter.taskNames.any {
+    it.substringBefore(" ").substringAfterLast(':').trim() == "githubRelease"
+}
+val prismVersionBump = providers.gradleProperty("prism.release.bump").orNull?.toBoolean() ?: true
+val prismVersionReleaseDryRun =
+    providers.gradleProperty("prism.release.dryRun").orNull?.toBoolean() ?: false
+
+val prismVersionCurrent = readPrismVersion(prismVersionFile)
+val prismVersion: PrismVersion = if (prismVersionRequested && prismVersionBump) {
+    nextPrismVersion(prismVersionCurrent).also { next ->
+        logger.lifecycle(
+            "Prism version ${prismVersionCurrent.name} -> ${next.name} " +
+                "(versionCode ${prismVersionCurrent.code} -> ${next.code})"
+        )
+        if (prismVersionReleaseDryRun || gradle.startParameter.isDryRun) {
+            logger.lifecycle(
+                "Dry run: ${prismVersionFile.name} stays at ${prismVersionCurrent.name}; " +
+                    "packing ${next.name} only."
+            )
+        } else {
+            writePrismVersion(prismVersionFile, next)
+            logger.lifecycle("Wrote ${prismVersionFile.name}.")
+        }
+    }
+} else {
+    prismVersionCurrent
+}
+
+// Read by :app and :desktop; both must see the same number, including the bumped one.
+extra["prismVersionName"] = padPrismVersion(prismVersion.name)
+extra["prismVersionCode"] = prismVersion.code
+

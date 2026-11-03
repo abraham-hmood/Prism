@@ -16,6 +16,11 @@ plugins {
     id("com.chaquo.python")
 }
 
+// The version lives in the root build (version.properties), which :app:githubRelease bumps before
+// anything is packed -- so the APK, its file name and the GitHub tag are all the same number.
+val prismVersionName: String by rootProject.extra
+val prismVersionCode: Int by rootProject.extra
+
 android {
     namespace = "com.prism.launcher"
     compileSdk = 35
@@ -31,8 +36,8 @@ android {
         applicationId = "com.prism.launcher"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = prismVersionCode
+        versionName = prismVersionName
 
         ndk {
             /**

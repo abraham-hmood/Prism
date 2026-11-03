@@ -137,6 +137,15 @@ object VideoCraftAudio {
         project: VideoCraftProject,
         speech: VideoCraftSpeech,
         voiceFor: (speaker: String) -> String? = { null },
+        /**
+         * The clip chain's soundtrack: Prism Score only, and never a spoken line.
+         *
+         * A FILM MADE FROM THE VIDEO TAB HAS NO VOICE. Its chain has no mouths, and that tab does not
+         * require a speech model or an audio generator -- so opening either one here would be work the
+         * user did not ask for, on models the gate said were not needed, for samples nothing shows.
+         * The built-in synth is deterministic and needs no model at all.
+         */
+        scoreOnly: Boolean = false,
         onStage: (String) -> Unit = {},
     ): AudioBuildResult {
         val clips = project.clips.ifEmpty {
@@ -146,7 +155,7 @@ object VideoCraftAudio {
         // checkbox and a script the planner wrote without lines are the same case here: the
         // soundtrack is score and ambience, the speech model is never opened, and a machine with
         // no speech model installed can still make a film.
-        val speakDialogue = !project.noDialogue &&
+        val speakDialogue = !scoreOnly && !project.noDialogue &&
             project.shots.any { shot -> shot.dialogue.any { it.text.isNotBlank() } }
         val total = max(1f, clips.maxOfOrNull { it.startSeconds + it.duration } ?: project.durationSeconds)
         val totalSamples = (total * SAMPLE_RATE).roundToInt() + SAMPLE_RATE
@@ -175,13 +184,16 @@ object VideoCraftAudio {
             // Prism Score, an imported model or the cloud entry is a real choice, and the built-in
             // synth is only what that slot falls back to when no runnable engine answers.
             val ambience = crossfadeEdges(
-                VideoCraftAudioModel.ambience(scene, bedSamples, project.seed), fadeSamples,
+                if (scoreOnly) ScoreSynth.ambience(scene, bedSamples, project.seed)
+                else VideoCraftAudioModel.ambience(scene, bedSamples, project.seed),
+                fadeSamples,
             )
             addAt(mix, ambience, (sceneStart * SAMPLE_RATE).roundToInt(), project.ambienceVolume * 0.5f)
 
             // Music: continues from the previous scene's tail.
             val music = crossfadeEdges(
-                VideoCraftAudioModel.music(scene, bedSamples, project.seed, previousTail),
+                if (scoreOnly) ScoreSynth.music(scene, bedSamples, project.seed, previousTail)
+                else VideoCraftAudioModel.music(scene, bedSamples, project.seed, previousTail),
                 fadeSamples,
             )
             addAt(mix, music, (sceneStart * SAMPLE_RATE).roundToInt(), project.musicVolume)

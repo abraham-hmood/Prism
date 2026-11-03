@@ -233,7 +233,14 @@ object AudioCraft {
             return false
         }
 
-        val chunks = scriptChunks(script)
+        // A SPEECH MODEL HAS NO SAMPLING STEPS, so the only pass it can spend less often is a
+        // synthesis call. The chosen mode decides how much text one call covers -- wider blocks for
+        // the parallel modes, shorter passages for recurrent depth -- which is the same trade the
+        // diffusion and token samplers make, expressed in the unit this engine has.
+        val chunks = scriptChunks(
+            script,
+            com.prism.launcher.messaging.InferencePlan.current().chunkCharsFor(CHUNK_CHARS),
+        )
         if (chunks.isEmpty()) return false
 
         cancelled = false
@@ -362,35 +369,36 @@ object AudioCraft {
      * paragraph, then a hard cut for a sentence that is itself too long. The newlines are kept as the
      * chunk boundaries only; the pipeline that speaks them never sees the split.
      */
-    fun scriptChunks(script: String): List<String> {
+    fun scriptChunks(script: String, chunkChars: Int = CHUNK_CHARS): List<String> {
+        val limit = chunkChars.coerceAtLeast(120)
         val chunks = mutableListOf<String>()
         val paragraphs = script.split(Regex("\\n\\s*\\n"))
         for (paragraph in paragraphs) {
             val trimmed = paragraph.trim()
             if (trimmed.isEmpty()) continue
-            if (trimmed.length <= CHUNK_CHARS) {
+            if (trimmed.length <= limit) {
                 chunks += trimmed
                 continue
             }
             var current = StringBuilder()
             val sentences = trimmed.split(Regex("(?<=[.!?…])\\s+"))
             for (sentence in sentences) {
-                if (sentence.length > CHUNK_CHARS) {
+                if (sentence.length > limit) {
                     if (current.isNotEmpty()) {
                         chunks += current.toString().trim()
                         current = StringBuilder()
                     }
                     var rest = sentence
-                    while (rest.length > CHUNK_CHARS) {
-                        val cut = rest.lastIndexOf(' ', CHUNK_CHARS).takeIf { it > CHUNK_CHARS / 2 }
-                            ?: CHUNK_CHARS
+                    while (rest.length > limit) {
+                        val cut = rest.lastIndexOf(' ', limit).takeIf { it > limit / 2 }
+                            ?: limit
                         chunks += rest.take(cut).trim()
                         rest = rest.drop(cut).trim()
                     }
                     if (rest.isNotEmpty()) current.append(rest).append(' ')
                     continue
                 }
-                if (current.length + sentence.length + 1 > CHUNK_CHARS) {
+                if (current.length + sentence.length + 1 > limit) {
                     chunks += current.toString().trim()
                     current = StringBuilder()
                 }

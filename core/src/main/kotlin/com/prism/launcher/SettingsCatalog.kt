@@ -580,6 +580,18 @@ object SettingsCatalog {
                 get = { PrismSettings.getMeshEnabled() },
                 set = { PrismSettings.setMeshEnabled(it) },
             ),
+            Switch(
+                "Host a directory server",
+                "Answer other devices asking which Prism servers exist. Server role only.",
+                get = { PrismSettings.getHostDirectoryServer() },
+                set = { PrismSettings.setHostDirectoryServer(it) },
+                // HIDDEN, not disabled, for the other roles: a client has no fleet to publish and a
+                // checkbox that cannot be used is a row the user has to rule out every time.
+                relevant = {
+                    PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_SERVER &&
+                        PrismSettings.getMeshEnabled()
+                },
+            ),
             Text(
                 "Bootstrap address", "A peer to ask when broadcast finds nobody",
                 get = { PrismSettings.getMeshBootstrapAddress() },

@@ -136,10 +136,37 @@ object ImageGeneration {
      * deleted.
      */
     fun preferred(): ImageGenerator? {
+        // THE ACTIVE MODEL NAMES THE ENGINE, before registration order gets a say. Nora and Aether
+        // are routes, not checkpoints: they draw from a connectome, so asking one of them while a
+        // diffusion checkpoint is activated was ImageCraft ignoring its own model list. Registration
+        // order (cloud, Nora, diffusion) only decides what happens when no model is selected.
+        val forModel = engineIdForActiveModel()?.let { engines[it] }
+        if (forModel != null && forModel.availability() is ImageGenerator.Availability.Ready) {
+            return forModel
+        }
         val chosen = PrismSettings.getImageEngineId()
         val picked = engines[chosen]
         if (picked != null && picked.availability() is ImageGenerator.Availability.Ready) return picked
         return available().firstOrNull()
+    }
+
+    /**
+     * Which engine can draw with the image model the Models page has active, or null when none is.
+     *
+     * The three local shapes are distinguishable by the path alone: the cloud sentinel, a folder (a
+     * ModelCraft artifact, which is a directory holding `image_model.json`), and a single file (a
+     * diffusion checkpoint).
+     */
+    fun engineIdForActiveModel(): String? {
+        val path = PrismSettings.getLocalImageModelPath()
+        return when {
+            // The registered ids, named here rather than imported from three packages: this object
+            // is the registry, so the ids it maps are its own business.
+            path == PrismSettings.CLOUD_MODEL_SENTINEL -> "cloud"
+            path.isBlank() -> null
+            File(path).isDirectory -> "modelcraft"
+            else -> "sdcpp"
+        }
     }
 
     /** Why nothing can generate, for a UI that has to say something useful. */

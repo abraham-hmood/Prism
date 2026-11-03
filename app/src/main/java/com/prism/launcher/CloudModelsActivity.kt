@@ -87,7 +87,11 @@ class CloudModelsActivity : PrismBaseActivity() {
         // will send it. A profile is only ever one kind -- the same server often serves several,
         // and that is why the user can save it more than once, once per kind.
         val kindGroup = RadioGroup(this).apply {
-            orientation = RadioGroup.HORIZONTAL
+            // ONE ROW PER KIND. Horizontal put five radios in equal weights across the dialog's
+            // width, which left about a word-fragment each and broke "Frame interpolation" into
+            // "Fra / me int / er / pol / ation". A vertical group gives every label the full width,
+            // and the list is short enough that it never needs scrolling.
+            orientation = RadioGroup.VERTICAL
             setPadding(0, 0, 0, (12 * density).toInt())
         }
         val selectedKind = existing?.resolvedKind ?: PrismSettings.KIND_TEXT
@@ -100,8 +104,11 @@ class CloudModelsActivity : PrismBaseActivity() {
                     isChecked = kind == selectedKind
                     setTextColor(resolveAttr(R.attr.prismTextPrimary))
                 },
-                RadioGroup.LayoutParams(0, RadioGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                    if (index > 0) marginStart = (4 * density).toInt()
+                RadioGroup.LayoutParams(
+                    RadioGroup.LayoutParams.MATCH_PARENT,
+                    RadioGroup.LayoutParams.WRAP_CONTENT,
+                ).apply {
+                    if (index > 0) topMargin = (2 * density).toInt()
                 },
             )
         }

@@ -254,7 +254,7 @@ class ModelCraftTest {
     @Test
     fun `frames are broken out of the video for the kinds whose trainer reads frames`() {
         var extracted = 0
-        ModelCraft.frameExtractor = { _, _ ->
+        ModelCraft.frameExtractor = { _, _, _, _ ->
             extracted++
             4
         }

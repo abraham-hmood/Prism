@@ -13,6 +13,7 @@ import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
+import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -340,6 +341,16 @@ private fun SlotPage(slot: SlotAssignment, index: Int) {
         is SlotAssignment.TimeMachine -> TimeMachinePage()
         is SlotAssignment.Journal -> JournalPage()
         is SlotAssignment.AppStore -> AppStorePage()
+        is SlotAssignment.Vpn -> UnsupportedSlot(
+            "VPN",
+            "Routes internet traffic through a device on the mesh. The desktop has no " +
+                "per-app tunnel, so this page is on Android only for now."
+        )
+        is SlotAssignment.Helper -> UnsupportedSlot(
+            "Helper",
+            "Bills the mesh can pay toward, paid in USDC. The page is on Android for now: " +
+                "uploading a bill needs a PDF picker, and that is the piece not ported yet."
+        )
         is SlotAssignment.TaskManager -> TaskManagerPage()
         is SlotAssignment.Custom -> UnsupportedSlot(
             "Plugin page",
@@ -601,6 +612,8 @@ private fun slotLabel(slot: SlotAssignment): String = when (slot) {
     is SlotAssignment.TimeMachine -> "Time Machine"
     is SlotAssignment.Journal -> "Journal"
     is SlotAssignment.AppStore -> "App Store"
+    is SlotAssignment.Helper -> "Helper"
+    is SlotAssignment.Vpn -> "VPN"
     is SlotAssignment.TaskManager -> "Task Manager"
     is SlotAssignment.Custom -> "Plugin"
 }
@@ -621,6 +634,8 @@ private fun slotIcon(slot: SlotAssignment): ImageVector = when (slot) {
     is SlotAssignment.TimeMachine -> Icons.Filled.History
     is SlotAssignment.Journal -> Icons.Filled.MenuBook
     is SlotAssignment.AppStore -> Icons.Filled.Storefront
+    is SlotAssignment.Helper -> Icons.Filled.Favorite
+    is SlotAssignment.Vpn -> Icons.Filled.Lock
     is SlotAssignment.TaskManager -> Icons.Filled.Build
     is SlotAssignment.Wallet -> Icons.Filled.AccountBalanceWallet
     is SlotAssignment.Editor -> Icons.Filled.Code

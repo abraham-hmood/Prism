@@ -106,6 +106,28 @@ fun PrismServersDialog(onDismiss: () -> Unit) {
         servers = PrismSettings.getPrismServers()
     }
 
+    var directoriesOpen by remember { mutableStateOf(false) }
+    var directoryNote by remember { mutableStateOf("") }
+
+    // AUTONOMOUS DIRECTORY DISCOVERY, ON THE SCREEN ITS RESULT LANDS ON. A client, bridge or relay
+    // asks every directory it trusts which servers they list and adds the new ones to the fleet, so
+    // this dialog fills itself instead of waiting for an address to be typed in. A server does not
+    // query: it publishes instead, which DesktopPrismProxyServer does when the listener comes up.
+    LaunchedEffect(Unit) {
+        if (!PrismSettings.isPrismClientRole()) return@LaunchedEffect
+        val reports = withContext(Dispatchers.IO) {
+            runCatching { com.prism.launcher.vpn.ServerDirectory.sync() }.getOrDefault(emptyList())
+        }
+        if (reports.isEmpty()) return@LaunchedEffect
+        reload()
+        // EACH DIRECTORY'S OWN ANSWER, not just a total. "0 server(s) listed" with no line per
+        // directory cannot tell a directory that is empty from one that refused the token, and those
+        // are fixed in different places. The messages are the same ones the phone shows.
+        directoryNote = reports.joinToString("\n") { report ->
+            (if (report.ok) "" else "failed — ") + report.label + ": " + report.message
+        }
+    }
+
     Dialog(onDismissRequest = onDismiss) {
         Surface(
             color = colors.surface,
@@ -135,6 +157,10 @@ fun PrismServersDialog(onDismiss: () -> Unit) {
                         Spacer(Modifier.width(8.dp))
                     }
                     Button(onClick = { adding = true }) { Text("+ Add Prism Server", fontSize = 12.sp) }
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedButton(onClick = { directoriesOpen = true }) {
+                        Text("Directories", fontSize = 12.sp)
+                    }
                 }
                 Spacer(Modifier.height(4.dp))
                 Text(
@@ -147,6 +173,10 @@ fun PrismServersDialog(onDismiss: () -> Unit) {
                     fontSize = 12.sp,
                     color = colors.faint,
                 )
+                if (directoryNote.isNotBlank()) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(directoryNote, fontSize = 11.sp, color = colors.faint)
+                }
                 Spacer(Modifier.height(14.dp))
 
                 if (servers.isEmpty()) {
@@ -362,6 +392,10 @@ fun PrismServersDialog(onDismiss: () -> Unit) {
                 }
             }
         }
+    }
+
+    if (directoriesOpen) {
+        PrismDirectoriesDialog(onDismiss = { directoriesOpen = false })
     }
 
     if (adding) {

@@ -2,6 +2,7 @@ package com.prism.desktop.ui
 
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -101,7 +102,8 @@ fun VideoCraftPage() {
             onCreate = {
                 // No speech model is required to REACH the creator: a score-only film needs none,
                 // and the creator's dialogue switch decides the rest.
-                val blocker = VideoCraftModels.blockingReason(needsSpeech = false)
+                VideoCraftModels.setMode(it)
+                val blocker = VideoCraftModels.blockingReason(needsSpeech = false, tab = it)
                 if (blocker != null) {
                     status = blocker
                 } else {
@@ -137,11 +139,14 @@ private fun VideoCraftLibrary(
     projects: List<VideoCraftProject>,
     run: DesktopVideoCraftRuns.State,
     status: String?,
-    onCreate: () -> Unit,
+    onCreate: (String) -> Unit,
     onOpen: (VideoCraftProject) -> Unit,
 ) {
     val colors = LocalPrismColors.current
-    val blocker = VideoCraftModels.blockingReason(needsSpeech = false)
+    // THE TAB IS THE CHAIN. Two ways to make a film, each with its own requirements, and the page
+    // says which one it is asking for instead of demanding a union nobody needs.
+    var mode by remember { mutableStateOf(VideoCraftModels.mode()) }
+    val blocker = VideoCraftModels.blockingReason(needsSpeech = false, tab = mode)
     val subtitle = when {
         blocker != null -> blocker
         projects.isEmpty() -> "Describe a film and VideoCraft will plan, draw, score and cut it"
@@ -152,8 +157,19 @@ private fun VideoCraftLibrary(
         title = "VideoCraft",
         subtitle = subtitle,
         actions = {
+            // THE TAB SWITCHER LIVES IN THE HEADER. It used to be the first row of the list, where it
+            // scrolled away and, on an empty library, read as one more piece of empty state: someone
+            // looking for "how do I use the video model I just set" found only a gate naming five
+            // models. Which chain this page builds is a header decision, so it belongs in the header.
+            VideoCraftTabs(mode) { next ->
+                mode = next
+                // Persisted because the engine reads the same value: a tab that only changed this
+                // page would resume the render with the other chain's models.
+                VideoCraftModels.setMode(next)
+            }
+            Spacer(Modifier.width(12.dp))
             Button(
-                onClick = onCreate,
+                onClick = { onCreate(mode) },
                 enabled = blocker == null,
             ) {
                 Icon(WandIcon, null, modifier = Modifier.size(17.dp))
@@ -168,7 +184,7 @@ private fun VideoCraftLibrary(
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             if (blocker != null) {
-                item { VideoCraftGate(blocker) }
+                item { VideoCraftGate(blocker, mode) }
             }
             if (status != null) {
                 item {
@@ -194,28 +210,79 @@ private fun VideoCraftLibrary(
 }
 
 @Composable
-private fun VideoCraftGate(blocker: String) {
+private fun VideoCraftTabs(mode: String, onSelect: (String) -> Unit) {
+    // Sized to its labels rather than the full width, because it now shares a row with Create.
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        ModeTab("Text + image + frames", mode == VideoCraftModels.MODE_FRAMES) {
+            onSelect(VideoCraftModels.MODE_FRAMES)
+        }
+        ModeTab("Text + video", mode == VideoCraftModels.MODE_VIDEO) {
+            onSelect(VideoCraftModels.MODE_VIDEO)
+        }
+    }
+}
+
+@Composable
+private fun ModeTab(label: String, selected: Boolean, onClick: () -> Unit) {
     val colors = LocalPrismColors.current
+    // SIZED TO ITS LABEL, NOT A Card. Card fills the width it is given, so inside the header row the
+    // first tab took the whole row and left the second tab and the Create button zero pixels: the page
+    // showed one stretched "Text + image + frames" bar and no way to reach the video tab or make a film.
+    val shape = RoundedCornerShape(50)
+    Text(
+        label,
+        fontSize = 12.sp,
+        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+        color = if (selected) colors.accent else colors.muted,
+        maxLines = 1,
+        modifier = Modifier
+            .clip(shape)
+            .background(if (selected) colors.accent.copy(alpha = 0.16f) else colors.card, shape)
+            .border(1.dp, if (selected) colors.accent else colors.divider, shape)
+            .clickableRow(onClick)
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+    )
+}
+
+@Composable
+private fun VideoCraftGate(blocker: String, mode: String) {
+    val colors = LocalPrismColors.current
+    val clip = mode == VideoCraftModels.MODE_VIDEO
     Card {
         Column(Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Filled.Warning, null, tint = colors.destructive, modifier = Modifier.size(20.dp))
                 Spacer(Modifier.width(9.dp))
-                Text("VideoCraft needs its models", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                Text(
+                    if (clip) "This tab needs a video model" else "This tab needs its five models",
+                    fontSize = 16.sp, fontWeight = FontWeight.SemiBold,
+                )
             }
             Spacer(Modifier.height(6.dp))
             Text(
-                "A film is planned by the text model, drawn by the image model, smoothed by the " +
-                    "interpolator and scored by the audio model. Dialogue needs Kokoro or your own " +
-                    "speech model. Set them on the Models page.",
+                if (clip)
+                    "The video tab plans the film with the text model and hands each shot to the " +
+                        "video model, which supplies every frame -- no keyframes, no interpolation " +
+                        "and no voice."
+                else
+                    "The frames tab plans the film with the text model, draws keyframes with the " +
+                        "image model, smooths them with the interpolator and scores them with the " +
+                        "audio model. Dialogue needs Kokoro or your own speech model.",
                 fontSize = 12.sp, color = colors.muted, lineHeight = 17.sp,
             )
             Spacer(Modifier.height(10.dp))
             GateLine("Text", VideoCraftModels.summaryText())
-            GateLine("Image", VideoCraftModels.summary(VideoCraftModels.Kind.IMAGE))
-            GateLine("Frame interpolation", VideoCraftModels.summary(VideoCraftModels.Kind.INTERPOLATION))
-            GateLine("Audio generator", VideoCraftModels.summary(VideoCraftModels.Kind.AUDIO_GEN))
-            GateLine("Speech", VideoCraftModels.summary(VideoCraftModels.Kind.SPEECH))
+            if (clip) {
+                GateLine("Video", VideoCraftModels.summary(VideoCraftModels.Kind.VIDEO))
+            } else {
+                GateLine("Image", VideoCraftModels.summary(VideoCraftModels.Kind.IMAGE))
+                GateLine(
+                    "Frame interpolation",
+                    VideoCraftModels.summary(VideoCraftModels.Kind.INTERPOLATION),
+                )
+                GateLine("Audio generator", VideoCraftModels.summary(VideoCraftModels.Kind.AUDIO_GEN))
+                GateLine("Speech", VideoCraftModels.summary(VideoCraftModels.Kind.SPEECH))
+            }
             Spacer(Modifier.height(8.dp))
             Text(blocker, fontSize = 12.sp, color = colors.destructive)
         }
@@ -354,8 +421,13 @@ private fun VideoCraftCreator(
     var draft by remember(initial.id) { mutableStateOf(Draft.from(initial)) }
     var status by remember(initial.id) { mutableStateOf<String?>(null) }
     val running = run.running && run.projectId == initial.id
-    // With dialogue off the speech model is never opened, so it is not part of the gate.
-    val blocker = VideoCraftModels.blockingReason(needsSpeech = !draft.noDialogue)
+    // THE CHAIN THIS CREATOR BUILDS. Chosen on the library's tabs and persisted, so an open creator
+    // and the engine agree about which models this film will use.
+    val mode = VideoCraftModels.mode()
+    val clip = mode == VideoCraftModels.MODE_VIDEO
+    // NEITHER CHAIN GATES ON A MODEL IT WILL NOT OPEN. The clip chain has no voice at all, and the
+    // frames chain needs none for a score-only film.
+    val blocker = VideoCraftModels.blockingReason(needsSpeech = !clip && !draft.noDialogue, tab = mode)
     val output = File(run.videoPath.ifEmpty { initial.outputPath })
 
     fun start() {
@@ -369,6 +441,9 @@ private fun VideoCraftCreator(
             return
         }
         draft.applyTo(initial)
+        // THE CLIP CHAIN HAS NO VOICE: a film made on that tab is score-only by definition, so the
+        // script must not be written with lines nothing will speak.
+        if (clip) initial.noDialogue = true
         VideoCraftStore.save(initial)
         DesktopVideoCraftRuns.start(initial)
         status = null
@@ -386,7 +461,12 @@ private fun VideoCraftCreator(
             Column(Modifier.weight(1f)) {
                 Text("Video creator", fontSize = 25.sp, fontWeight = FontWeight.Bold)
                 Text(
-                    if (running) run.stage else if (initial.complete) "Edit and render again" else "New film",
+                    when {
+                        running -> run.stage
+                        clip -> "Text + video \u00b7 one model draws every shot"
+                        initial.complete -> "Edit and render again"
+                        else -> "New film"
+                    },
                     fontSize = 12.sp, color = if (running) colors.accent else colors.faint,
                 )
             }
@@ -416,7 +496,7 @@ private fun VideoCraftCreator(
                         Modifier.weight(1f).verticalScroll(rememberScrollState())
                             .padding(bottom = 24.dp)
                     ) {
-                        CreatorForm(draft, onChange = { draft = it }, running = running)
+                        CreatorForm(draft, onChange = { draft = it }, running = running, mode = mode)
                     }
                     Column(
                         Modifier.width(340.dp).verticalScroll(rememberScrollState())
@@ -454,7 +534,7 @@ private fun VideoCraftCreator(
                         },
                     )
                     Spacer(Modifier.height(10.dp))
-                    CreatorForm(draft, onChange = { draft = it }, running = running)
+                    CreatorForm(draft, onChange = { draft = it }, running = running, mode = mode)
                 }
             }
         }
@@ -617,10 +697,27 @@ private fun PreviewPane(
             Text("MODELS THIS FILM USES", fontSize = 10.sp, fontWeight = FontWeight.SemiBold, color = colors.faint)
             Spacer(Modifier.height(5.dp))
             PreviewModelLine("Text", VideoCraftModels.summaryText())
-            PreviewModelLine("Image", VideoCraftModels.summary(VideoCraftModels.Kind.IMAGE))
-            PreviewModelLine("Interpolation", VideoCraftModels.summary(VideoCraftModels.Kind.INTERPOLATION))
-            PreviewModelLine("Audio", VideoCraftModels.summary(VideoCraftModels.Kind.AUDIO_GEN))
-            PreviewModelLine("Speech", VideoCraftModels.summary(VideoCraftModels.Kind.SPEECH))
+            val video = VideoCraftModels.summary(VideoCraftModels.Kind.VIDEO)
+            PreviewModelLine("Video", video)
+            // THE FOUR FAMILIES A CLIP MODEL REPLACES ARE NAMED AS NOT USED rather than listed as if
+            // they drew something: a preview that claims an image model and a voice when neither ran
+            // is a record of a film that was never made.
+            // THE TAB, NOT THE MERELY-ACTIVE MODEL: a clip model can be selected while the user
+            // renders the frames tab, and the preview has to describe what actually ran.
+            val clip = VideoCraftModels.mode() == VideoCraftModels.MODE_VIDEO
+            PreviewModelLine("Image", if (clip) "not used" else VideoCraftModels.summary(VideoCraftModels.Kind.IMAGE))
+            PreviewModelLine(
+                "Interpolation",
+                if (clip) "not used" else VideoCraftModels.summary(VideoCraftModels.Kind.INTERPOLATION),
+            )
+            PreviewModelLine(
+                "Audio",
+                if (clip) "not used" else VideoCraftModels.summary(VideoCraftModels.Kind.AUDIO_GEN),
+            )
+            PreviewModelLine(
+                "Speech",
+                if (clip) "not used" else VideoCraftModels.summary(VideoCraftModels.Kind.SPEECH),
+            )
         }
     }
 }
@@ -635,9 +732,19 @@ private fun PreviewModelLine(label: String, value: String) {
 }
 
 @Composable
-private fun CreatorForm(draft: Draft, onChange: (Draft) -> Unit, running: Boolean) {
+private fun CreatorForm(
+    draft: Draft,
+    onChange: (Draft) -> Unit,
+    running: Boolean,
+    mode: String,
+) {
+    // THE FORM FOLLOWS THE CHAIN. That is what picking the tab asked for: the clip chain draws whole
+    // shots, so keyframes, denoise, CLIP matching, character cutouts, interpolation and the whole
+    // voice and mixer section are questions about a render that will not happen -- and a form full of
+    // them reads as though this tab needed five models it never opens.
+    val clip = mode == VideoCraftModels.MODE_VIDEO
     var showVoices by remember { mutableStateOf(false) }
-    if (showVoices) {
+    if (showVoices && !clip) {
         VoicePickerDialog(
             selected = draft.voices,
             onDismiss = { showVoices = false },
@@ -686,12 +793,48 @@ private fun CreatorForm(draft: Draft, onChange: (Draft) -> Unit, running: Boolea
             FieldRow("Frame rate", draft.fps) { onChange(draft.copy(fps = it)) }
             FieldRow("Seed", draft.seed) { onChange(draft.copy(seed = it)) }
             Text(
-                "Width and height are the resolution of every generated keyframe and frame.",
+                if (clip) "Width and height are the clip the video model is asked for."
+                else "Width and height are the resolution of every generated keyframe and frame.",
                 fontSize = 11.sp, color = colors.faint, modifier = Modifier.padding(top = 4.dp),
             )
         }
     }
 
+    // ── THE MODEL SECTION: ONE CARD, TWO MEANINGS ─────────────────────────────
+    // The clip chain is asked for a whole shot, so it gets the two numbers that request carries and
+    // the count of shots per scene. Everything else the frames card holds -- keyframes per second,
+    // denoise, CLIP matching, character injection, manual keyframe counts -- describes keyframes
+    // this chain never draws.
+    if (clip) {
+        SectionHeader("VIDEO MODEL")
+        Card {
+            Column(Modifier.padding(14.dp)) {
+                FieldRow("Diffusion steps", draft.steps) { onChange(draft.copy(steps = it)) }
+                FieldRow("Guidance", draft.guidance) { onChange(draft.copy(guidance = it)) }
+                Text(
+                    "The clip model is asked for the shot with these and supplies every frame of it: " +
+                        "no keyframe schedule, nothing interpolated, no character cutouts.",
+                    fontSize = 11.sp, color = colors.faint, lineHeight = 15.sp,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+                Spacer(Modifier.height(8.dp))
+                ToggleRow(
+                    title = "Adaptive shot count",
+                    detail = "A scene's shot count follows its length and motion. Turning this off " +
+                        "uses the manual count below.",
+                    checked = draft.adaptive,
+                    enabled = !running,
+                    onChange = { onChange(draft.copy(adaptive = it)) },
+                )
+                FieldRow(
+                    "Clips per scene",
+                    draft.manualClips,
+                    enabled = !running && !draft.adaptive,
+                ) { onChange(draft.copy(manualClips = it)) }
+            }
+        }
+    }
+    if (!clip) {
     SectionHeader("IMAGE GENERATOR")
     Card {
         Column(Modifier.padding(14.dp)) {
@@ -728,6 +871,7 @@ private fun CreatorForm(draft: Draft, onChange: (Draft) -> Unit, running: Boolea
             }
         }
     }
+    }
 
     SectionHeader("TEXT MODEL")
     Card {
@@ -744,6 +888,10 @@ private fun CreatorForm(draft: Draft, onChange: (Draft) -> Unit, running: Boolea
         }
     }
 
+    // ── FRAMES CHAIN ONLY, TO THE END OF THIS FORM ────────────────────────────
+    // The clip chain has no voice, no mixer and no interpolator: the clip model's take plays over a
+    // Prism Score bed. These two cards are therefore not shown on that tab at all.
+    if (!clip) {
     SectionHeader("AUDIO")
     Card {
         Column(Modifier.padding(14.dp)) {
@@ -858,6 +1006,7 @@ private fun CreatorForm(draft: Draft, onChange: (Draft) -> Unit, running: Boolea
                 fontSize = 11.sp, color = colors.faint, lineHeight = 15.sp,
             )
         }
+    }
     }
 }
 

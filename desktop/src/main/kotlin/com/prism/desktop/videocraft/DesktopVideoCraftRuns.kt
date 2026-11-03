@@ -55,6 +55,15 @@ object DesktopVideoCraftRuns {
     private val cancelled = AtomicBoolean(false)
     private var job: Job? = null
 
+    /**
+     * The last stage written to the log, so the trail is one line per stage rather than per frame.
+     *
+     * A crash inside a render used to leave nothing behind but a project file mid-clip: the stage
+     * went to the page and the tray tooltip, neither of which survives the process. The last line
+     * here names the stage the render died in.
+     */
+    @Volatile private var lastLoggedStage: String = ""
+
     fun isRunning(id: String): Boolean = _state.value.running && _state.value.projectId == id
 
     /** The one line that says a render was running when this process stopped. */
@@ -82,6 +91,7 @@ object DesktopVideoCraftRuns {
         synchronized(this) {
             if (job?.isActive == true) return
             cancelled.set(false)
+            lastLoggedStage = ""
             runCatching { jobMarker().writeText(project.id) }
             VideoCraftStore.save(project)
             _state.value = State(
@@ -130,10 +140,18 @@ object DesktopVideoCraftRuns {
             image = com.prism.launcher.videocraft.VideoCraftImageRouter(),
             interpolator = DesktopVideoCraftInterpolators.create(),
             speech = DesktopVideoCraftSpeech(),
+            video = com.prism.launcher.videocraft.VideoCraftVideoRouter.create(),
             cancelled = { cancelled.get() },
         )
         try {
             engine.render(project, sink) { progress ->
+                if (progress.stage != lastLoggedStage) {
+                    lastLoggedStage = progress.stage
+                    PrismPlatform.log.info(
+                        "VideoCraft",
+                        "stage: ${progress.stage} (${(progress.fraction.coerceIn(0f, 1f) * 100).toInt()}%)",
+                    )
+                }
                 _state.value = State(
                     projectId = project.id,
                     running = true,

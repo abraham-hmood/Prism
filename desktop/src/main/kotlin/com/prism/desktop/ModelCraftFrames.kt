@@ -40,7 +40,12 @@ object ModelCraftFrames {
      * @return the number of frames written. Zero means the file could not be decoded, which the
      *         manifest then reports as such rather than as an empty dataset.
      */
-    private fun extractFrames(video: File, destination: File): Int {
+    private fun extractFrames(
+        video: File,
+        destination: File,
+        wholeClip: Boolean,
+        onFrame: (done: Int, total: Int) -> Unit,
+    ): Int {
         if (!video.isFile) return 0
         destination.mkdirs()
         var written = 0
@@ -48,7 +53,10 @@ object ModelCraftFrames {
             val grab = org.jcodec.api.awt.AWTFrameGrab.createAWTFrameGrab(
                 org.jcodec.common.io.NIOUtils.readableChannel(video),
             )
-            while (written < MAX_FRAMES) {
+            // Every frame, in order, when the whole-clip box is ticked. Without a cap a long
+            // recording writes thousands of PNGs, which is exactly what was asked for.
+            val limit = if (wholeClip) Int.MAX_VALUE else MAX_FRAMES
+            while (written < limit) {
                 // The end of a clip is an exception in this API, not a null frame, so the loop's
                 // stop is where the guard is: the next frame either exists or the read is over.
                 // WITH ORIENTATION, because a phone's clip carries its rotation in the container and
@@ -56,6 +64,7 @@ object ModelCraftFrames {
                 val image = runCatching { grab.frameWithOrientation }.getOrNull() ?: break
                 ImageIO.write(image, "png", File(destination, "frame-%05d.png".format(written)))
                 written++
+                onFrame(written, if (wholeClip) 0 else MAX_FRAMES)
             }
         }.onFailure {
             PrismPlatform.log.warn("ModelCraft", "Could not decode ${video.name}: ${it.message}")

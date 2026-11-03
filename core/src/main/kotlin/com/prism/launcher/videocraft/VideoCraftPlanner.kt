@@ -264,7 +264,60 @@ The visual style, character descriptions and locations you invent must be concre
     private fun <T> parseReply(raw: String?, parse: (JSONObject) -> T?): T? {
         if (raw.isNullOrBlank()) return null
         val objectText = VideoCraftJson.extractObject(raw) ?: return null
-        return runCatching { parse(JSONObject(objectText)) }.getOrNull()
+        return runCatching { parse(JSONObject(objectText).also(::dropEchoes)) }.getOrNull()
+    }
+
+    /**
+     * The schemas' own placeholder text, which a reply must not hand back as content.
+     *
+     * A small local model (DeepSeek R1 Distill 1.5B, in practice) fills the grammar with the schema
+     * it was shown: a style of "visual style, lens, lighting, colour treatment" and a location named
+     * "short name: beach". Both are valid JSON, so they passed every check and the whole film was
+     * planned and drawn from the instructions instead of the story.
+     */
+    private val placeholders: List<String> by lazy {
+        // Values only: a string straight after a colon or an opening bracket. Excluding keys with a
+        // lookahead instead mis-paired the quotes and read `": "` as the string.
+        Regex("[:\\[]\\s*\"([^\"]+)\"")
+            .findAll(BIBLE_SCHEMA + SCENES_SCHEMA + SHOTS_SCHEMA)
+            .map { it.groupValues[1].trim().lowercase() }
+            .filter { it.length >= 4 }
+            .distinct()
+            .sortedByDescending { it.length }
+            .toList()
+    }
+
+    /**
+     * Blanks every value that is a placeholder and strips a placeholder written as a label.
+     *
+     * Blank rather than rejected here: the validators already treat a blank field as missing, so an
+     * echoed style or name sends the reply to the repair attempt and then to the deterministic plan,
+     * exactly as a malformed one does.
+     */
+    private fun dropEchoes(node: Any?) {
+        fun clean(value: String): String {
+            var text = value.trim()
+            for (placeholder in placeholders) {
+                val lower = text.lowercase()
+                if (lower == placeholder) return ""
+                if (lower.startsWith("$placeholder:")) text = text.substring(placeholder.length + 1).trim()
+            }
+            return text
+        }
+        when (node) {
+            is JSONObject -> node.keys().forEach { key ->
+                when (val value = node.opt(key)) {
+                    is String -> node.put(key, clean(value))
+                    else -> dropEchoes(value)
+                }
+            }
+            is JSONArray -> for (index in 0 until node.length()) {
+                when (val value = node.opt(index)) {
+                    is String -> node.put(index, clean(value))
+                    else -> dropEchoes(value)
+                }
+            }
+        }
     }
 
     private fun paletteOf(obj: JSONObject): List<Int> {

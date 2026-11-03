@@ -65,6 +65,7 @@ fun ModelsPage() {
     var activeImage by remember { mutableStateOf(PrismSettings.getLocalImageModelPath()) }
     var activeAudioGen by remember { mutableStateOf(PrismSettings.getLocalAudioGenModelPath()) }
     var activeInterpolation by remember { mutableStateOf(PrismSettings.getLocalInterpolationModelPath()) }
+    var activeVideo by remember { mutableStateOf(PrismSettings.getLocalVideoModelPath()) }
     var activeSpeech by remember { mutableStateOf(PrismSettings.getLocalAudioModelPath()) }
     var cakeChatActive by remember { mutableStateOf(PrismSettings.getUseCakeChat()) }
     var cakeChatTrained by remember {
@@ -88,6 +89,9 @@ fun ModelsPage() {
     // Ollama servers on this network, and the conversions of their models into GGUFs. Scanned on
     // entering the page because a server can have been started or stopped since the last visit.
     var ollamaServers by remember { mutableStateOf<List<OllamaDiscoveryService.OllamaServer>>(emptyList()) }
+    // The report, not just the servers: when nothing answers, the page names the networks it asked.
+    var ollamaReport by remember { mutableStateOf<OllamaDiscoveryService.ScanReport?>(null) }
+    var ollamaAddress by remember { mutableStateOf("") }
     var ollamaScanning by remember { mutableStateOf(false) }
     var ollamaScanned by remember { mutableStateOf(false) }
     var ollamaScanRevision by remember { mutableStateOf(0) }
@@ -96,9 +100,25 @@ fun ModelsPage() {
 
     LaunchedEffect(ollamaScanRevision) {
         ollamaScanning = true
-        ollamaServers = withContext(Dispatchers.IO) { OllamaDiscoveryService.scan() }
+        val report = withContext(Dispatchers.IO) { OllamaDiscoveryService.scanReport() }
+        ollamaServers = report.servers
+        ollamaReport = report
         ollamaScanning = false
         ollamaScanned = true
+    }
+
+    // AN ADDRESS THE SWEEP CANNOT SEE: another VLAN, a router that drops broadcast, or a machine
+    // whose IP the user already knows. Debounced because a text field reports every keystroke and
+    // each probe opens a socket.
+    LaunchedEffect(ollamaAddress) {
+        val target = OllamaDiscoveryService.parseAddress(ollamaAddress) ?: return@LaunchedEffect
+        kotlinx.coroutines.delay(600)
+        val server = withContext(Dispatchers.IO) {
+            OllamaDiscoveryService.probeHost(target.first, target.second)
+        }
+        if (server != null) {
+            ollamaServers = (ollamaServers + server).distinctBy { it.host + ":" + it.port }
+        }
     }
 
     // A CONVERSION THAT FINISHED IS A NEW MODEL, so the list above has to be re-read. Keyed by the
@@ -135,6 +155,7 @@ fun ModelsPage() {
         activeImage = PrismSettings.getLocalImageModelPath()
         activeAudioGen = PrismSettings.getLocalAudioGenModelPath()
         activeInterpolation = PrismSettings.getLocalInterpolationModelPath()
+        activeVideo = PrismSettings.getLocalVideoModelPath()
         activeSpeech = PrismSettings.getLocalAudioModelPath()
         cakeChatActive = PrismSettings.getUseCakeChat()
         // Re-read rather than cached: training or importing a bundle happens on the CakeChat page,
@@ -152,15 +173,30 @@ fun ModelsPage() {
     }
 
     fun activate(model: PrismSettings.ImportedModel) {
-        if (!File(model.path).isFile) {
+        // EXISTS IS THE QUESTION, not IS A FILE: a safetensors pipeline -- image or video -- is a
+        // directory of shards, and the isFile test refused those silently. The row was listed, the
+        // click did nothing at all, and no status line ever said why.
+        if (!File(model.path).exists()) {
             status = "That file is gone; remove it or re-download."
             return
         }
         when (model.type) {
-            PrismSettings.MODEL_TYPE_IMAGE -> PrismSettings.setLocalImageModelPath(model.path)
+            PrismSettings.MODEL_TYPE_IMAGE -> {
+                PrismSettings.setLocalImageModelPath(model.path)
+                // AND THE ROUTE, so the Image page does not keep showing the engine the old path
+                // belonged to -- the model list and the engine picker describe one choice.
+                PrismSettings.setImageEngineId(
+                    com.prism.launcher.messaging.ImageGeneration.engineIdForActiveModel().orEmpty()
+                )
+                // THE DIFFUSION ENGINE KEEPS ITS LOADED CHECKPOINT, so a new selection has to drop
+                // it or the next render keeps drawing with the previous file -- activation that
+                // looked like it did nothing.
+                runCatching { com.prism.launcher.diffusion.StableDiffusion.unload() }
+            }
             PrismSettings.MODEL_TYPE_AUDIO_GEN -> PrismSettings.setLocalAudioGenModelPath(model.path)
             PrismSettings.MODEL_TYPE_INTERPOLATION ->
                 PrismSettings.setLocalInterpolationModelPath(model.path)
+            PrismSettings.MODEL_TYPE_VIDEO -> PrismSettings.setLocalVideoModelPath(model.path)
             PrismSettings.MODEL_TYPE_AUDIO -> {
                 PrismSettings.setLocalAudioModelPath(model.path)
                 com.prism.launcher.speech.PrismSpeaker.invalidate()
@@ -182,7 +218,9 @@ fun ModelsPage() {
      * much less legibly than it does here.
      */
     fun import(file: File, type: String, preferredName: String? = null) {
-        if (!file.isFile) {
+        // Video is the one family whose import can be a directory, for safetensors pipelines.
+        val folderOk = type == PrismSettings.MODEL_TYPE_VIDEO && file.isDirectory
+        if (!file.isFile && !folderOk) {
             status = "${file.name} is not a file"
             return
         }
@@ -206,6 +244,7 @@ fun ModelsPage() {
             val audioGenModels = installed.filter { it.type == PrismSettings.MODEL_TYPE_AUDIO_GEN }
             val interpolationModels =
                 installed.filter { it.type == PrismSettings.MODEL_TYPE_INTERPOLATION }
+            val videoModels = installed.filter { it.type == PrismSettings.MODEL_TYPE_VIDEO }
             val speechModels = installed.filter { it.type == PrismSettings.MODEL_TYPE_AUDIO }
 
             ModelSection(
@@ -244,6 +283,20 @@ fun ModelsPage() {
                 media = VideoCraftModels.entries(VideoCraftModels.Kind.INTERPOLATION)
                     .filter { it.builtIn || it.cloud },
                 emptyText = "No frame interpolation models imported yet.",
+                onActivate = ::activate,
+                onDelete = { confirmDelete = it },
+            )
+            ModelSection(
+                title = "VIDEO MODELS",
+                models = videoModels,
+                activePath = activeVideo,
+                media = VideoCraftModels.entries(VideoCraftModels.Kind.VIDEO)
+                    // CRAFTED TOO: a clip model trained in ModelCraft lives in its own dataset
+                    // folder and is not an import, so filtering to cloud alone would hide the one
+                    // model this section exists for.
+                    .filter { it.cloud || it.crafted },
+                emptyText = "No video models imported yet. A clip model replaces the image, " +
+                    "interpolation, audio and speech families in VideoCraft.",
                 onActivate = ::activate,
                 onDelete = { confirmDelete = it },
             )
@@ -399,12 +452,26 @@ fun ModelsPage() {
                 if (ollamaScanned && ollamaServers.isEmpty()) {
                     Hairline()
                     Text(
-                        "Start Ollama (it listens on port 11434) and rescan. Servers on the same " +
-                            "WiFi are found automatically, including one running on this machine.",
+                        "No answer from " + (ollamaReport?.sweptLabel() ?: "the local network") +
+                            ". Start Ollama (it listens on port 11434) and rescan. Servers on the same " +
+                            "WiFi are found automatically, including one running on this machine \u2014 " +
+                            "for a server on another machine, start it with OLLAMA_HOST=0.0.0.0 and " +
+                            "allow port 11434 in that machine's firewall, or type its address here.",
                         fontSize = 12.sp,
                         color = colors.faint,
                         modifier = Modifier.padding(16.dp),
                     )
+                    OutlinedTextField(
+                        value = ollamaAddress,
+                        onValueChange = { typed -> ollamaAddress = typed },
+                        placeholder = {
+                            Text("192.168.1.42 or 192.168.1.42:11434", fontSize = 12.sp)
+                        },
+                        singleLine = true,
+                        textStyle = LocalTextStyle.current.copy(fontSize = 12.sp),
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                    )
+                    Spacer(Modifier.height(12.dp))
                 }
 
                 ollamaServers.forEach { server ->
@@ -599,6 +666,7 @@ fun ModelsPage() {
                             "Image" to PrismSettings.MODEL_TYPE_IMAGE,
                             "Audio gen" to PrismSettings.MODEL_TYPE_AUDIO_GEN,
                             "Frames" to PrismSettings.MODEL_TYPE_INTERPOLATION,
+                            "Video" to PrismSettings.MODEL_TYPE_VIDEO,
                             "Speech" to PrismSettings.MODEL_TYPE_AUDIO,
                         ).forEach { (label, type) ->
                             OutlinedButton(
@@ -627,11 +695,14 @@ fun ModelsPage() {
                 }
             }
             SectionFooter(
-                "Image, audio and frame interpolation models can be imported here, as GGUF, " +
-                    "safetensors, ONNX or a MediaPipe .task bundle. The file is registered under the " +
-                    "family you picked \u2014 text generation reads GGUF, image generation reads GGUF " +
-                    "or safetensors, and a format an engine cannot open is stored and flagged " +
-                    "rather than silently activated."
+                "Image, audio, frame interpolation and video models can be imported here, as " +
+                    "GGUF, safetensors, ONNX or a MediaPipe .task bundle. The file is registered " +
+                    "under the family you picked \u2014 text generation reads GGUF, image generation " +
+                    "reads GGUF or safetensors, and a video model may be a GGUF file or a " +
+                    "safetensors FOLDER holding its encoder, decoder and shards. Choosing Video " +
+                    "makes VideoCraft skip the image, interpolation, audio and speech families " +
+                    "entirely and render every shot with the clip model. A format an engine cannot " +
+                    "open is stored and flagged rather than silently activated."
             )
 
             status?.let {
@@ -904,7 +975,10 @@ private fun ModelSection(
             if (row++ > 0) Hairline()
             InstalledModelRow(
                 model = model,
-                active = model.path == activePath,
+                // CASE-INSENSITIVE: on Windows the registry can hold the same file with different
+                // casing than the stored selection, and a case-sensitive compare left the radio
+                // unchecked after a successful activation -- a click that looked like it did nothing.
+                active = model.path.equals(activePath, ignoreCase = true),
                 onActivate = { onActivate(model) },
                 onDelete = { onDelete(model) },
             )
@@ -924,12 +998,12 @@ private fun InstalledModelRow(
     onDelete: () -> Unit,
 ) {
     val colors = LocalPrismColors.current
-    val exists = File(model.path).isFile
+    val exists = File(model.path).exists()
     Row(
         Modifier.fillMaxWidth()
-            .clickableRow {
-                if (exists) onActivate()
-            }
+            // ALWAYS ONACTIVATE. A row whose file has moved still has to answer the click: activate
+            // reports the missing path, where a do-nothing click looked like a broken page.
+            .clickableRow(onActivate)
             .padding(horizontal = 16.dp, vertical = 11.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -1010,6 +1084,7 @@ private fun typeLabel(type: String): String = when (type) {
     PrismSettings.MODEL_TYPE_IMAGE -> "Image"
     PrismSettings.MODEL_TYPE_AUDIO_GEN -> "Audio"
     PrismSettings.MODEL_TYPE_INTERPOLATION -> "Frames"
+    PrismSettings.MODEL_TYPE_VIDEO -> "Video"
     PrismSettings.MODEL_TYPE_AUDIO -> "Speech"
     else -> "Text"
 }
@@ -1019,6 +1094,7 @@ private fun storeType(category: String): String? = when (category) {
     "generative" -> PrismSettings.MODEL_TYPE_IMAGE
     "audio" -> PrismSettings.MODEL_TYPE_AUDIO_GEN
     "interpolation" -> PrismSettings.MODEL_TYPE_INTERPOLATION
+    "video" -> PrismSettings.MODEL_TYPE_VIDEO
     else -> null
 }
 

@@ -425,6 +425,21 @@ class ModelsPageView @JvmOverloads constructor(
             .forEach { items.add(ModelListItem.Media(it)) }
 
         items.add(ModelListItem.Header("Speech Models"))
+        // A CLIP MODEL CAN ONLY BE ACTIVATED IF IT IS LISTED. This page is the one place a model
+        // becomes active on this platform, and the family was missing from it entirely, so a video
+        // model -- trained or imported -- could not be chosen at all.
+        items.add(ModelListItem.Header("Video Generation Models"))
+        PrismSettings.getImportedModels()
+            .filter { it.type == PrismSettings.MODEL_TYPE_VIDEO }
+            .forEach {
+                items.add(ModelListItem.Model(it, it.path == PrismSettings.getLocalVideoModelPath()))
+            }
+        com.prism.launcher.videocraft.VideoCraftModels
+            .entries(com.prism.launcher.videocraft.VideoCraftModels.Kind.VIDEO)
+            .filter { it.cloud || it.crafted }
+            .forEach { items.add(ModelListItem.Media(it)) }
+
+        items.add(ModelListItem.Header("Speech Models"))
         speechModels.forEach { items.add(ModelListItem.Model(it, it.path == PrismSettings.getLocalAudioModelPath())) }
         val kokoro = com.prism.launcher.videocraft.VideoCraftModels.Entry(
             id = com.prism.launcher.videocraft.VideoCraftModels.KOKORO_ID,
@@ -449,9 +464,17 @@ class ModelsPageView @JvmOverloads constructor(
 
     private fun setActive(model: PrismSettings.ImportedModel) {
         when (model.type) {
-            PrismSettings.MODEL_TYPE_IMAGE -> PrismSettings.setLocalImageModelPath(model.path)
+            PrismSettings.MODEL_TYPE_IMAGE -> {
+                PrismSettings.setLocalImageModelPath(model.path)
+                // The model decides the route, and the Image page's engine picker has to say the same
+                // thing rather than naming whatever was selected before.
+                PrismSettings.setImageEngineId(
+                    com.prism.launcher.messaging.ImageGeneration.engineIdForActiveModel().orEmpty()
+                )
+            }
             PrismSettings.MODEL_TYPE_AUDIO_GEN -> PrismSettings.setLocalAudioGenModelPath(model.path)
             PrismSettings.MODEL_TYPE_INTERPOLATION -> PrismSettings.setLocalInterpolationModelPath(model.path)
+            PrismSettings.MODEL_TYPE_VIDEO -> PrismSettings.setLocalVideoModelPath(model.path)
             PrismSettings.MODEL_TYPE_AUDIO -> {
                 PrismSettings.setLocalAudioModelPath(model.path)
                 com.prism.launcher.speech.PrismSpeaker.invalidate()
@@ -470,7 +493,8 @@ class ModelsPageView @JvmOverloads constructor(
         refreshList()
         if (model.type == PrismSettings.MODEL_TYPE_AUDIO ||
             model.type == PrismSettings.MODEL_TYPE_AUDIO_GEN ||
-            model.type == PrismSettings.MODEL_TYPE_INTERPOLATION
+            model.type == PrismSettings.MODEL_TYPE_INTERPOLATION ||
+            model.type == PrismSettings.MODEL_TYPE_VIDEO
         ) {
             Toast.makeText(context, "${model.displayName} is now active", Toast.LENGTH_SHORT).show()
             return

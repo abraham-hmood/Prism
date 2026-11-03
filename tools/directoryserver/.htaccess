@@ -1,0 +1,12 @@
+# Keep the configuration and the store out of the web root's reach.
+<IfModule mod_authz_core.c>
+    <FilesMatch "^(config\.php|README\.md)$">
+        Require all denied
+    </FilesMatch>
+</IfModule>
+<IfModule !mod_authz_core.c>
+    <FilesMatch "^(config\.php|README\.md)$">
+        Order allow,deny
+        Deny from all
+    </FilesMatch>
+</IfModule>

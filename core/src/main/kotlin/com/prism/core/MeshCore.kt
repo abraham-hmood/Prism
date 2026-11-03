@@ -106,6 +106,10 @@ object MeshCore {
         @Volatile var serverProtocol: String? = null,
         @Volatile var serverPublicKey: String? = null,
         @Volatile var wireGuardPort: Int? = null,
+        /** Declared country, empty when this device has not said. */
+        @Volatile var country: String = "",
+        /** Prism Coin address for traffic this device carries, empty when it has none. */
+        @Volatile var payout: String = "",
     )
 
     private val activePeers = ConcurrentHashMap<String, PeerInfo>()
@@ -444,6 +448,10 @@ object MeshCore {
             val now = System.currentTimeMillis()
             // Expire before gossiping, so a dead peer is not chosen as the one to talk to.
             activePeers.entries.removeAll { now - it.value.lastSeen > PEER_LEASE_MS }
+            // A request that was never answered is not worth remembering. These used to accumulate
+            // for every address a forged peer list named.
+            pendingRequests.filterValues { now - it > REQUEST_EXPIRY_MS }.keys
+                .forEach { pendingRequests.remove(it) }
 
             if (activePeers.isEmpty()) {
                 // Nothing known: broadcast again rather than sitting idle. A device that joined a network
@@ -499,6 +507,11 @@ object MeshCore {
         if (knownNodeId in PrismSettings.getBannedPrismNodeIds()) return
         val now = System.currentTimeMillis()
 
+        // A SPOOFED-SOURCE FLOOD MUST NOT BECOME AN UNBOUNDED TABLE. At the cap the oldest entry goes,
+        // not the newest, so a busy network still converges on the devices actually talking.
+        if (!activePeers.containsKey(peerIp) && activePeers.size >= MAX_PEERS) {
+            activePeers.minByOrNull { it.value.lastSeen }?.key?.let { activePeers.remove(it) }
+        }
         val isNew = !activePeers.containsKey(peerIp)
         val info = activePeers.getOrPut(peerIp) { PeerInfo(now, packet.port) }
         info.lastSeen = now
@@ -510,6 +523,8 @@ object MeshCore {
             info.serverProtocol = it.serverProtocol
             info.serverPublicKey = it.serverPublicKey
             info.wireGuardPort = it.wireGuardPort
+            info.country = it.country
+            info.payout = it.payout
             info.port = it.meshPort
         }
         if (isNew) PrismPlatform.log.info(TAG, "Peer discovered: $peerIp")
@@ -584,6 +599,12 @@ object MeshCore {
                 val data = body.optString("data")
                 val ttl = body.optInt("ttl", 3)
                 if (target.isBlank() || inner !in 0..255 || ttl <= 0) return@runCatching
+                // ONLY FEATURE OPCODES ARE RELAYED. Forwarding anything let any peer make a relay
+                // rewrite other devices' peer tables with the built-in control messages, or nest
+                // OP_RELAY to fan one packet out across the mesh. Control state travels directly.
+                if (inner < 0x0C || inner.toByte() == OP_RELAY) return@runCatching
+                if (data.length > MAX_RELAY_PAYLOAD) return@runCatching
+                if (isPeerBanned(normalise(target))) return@runCatching
                 val hop = activePeers[normalise(target)] ?: return@runCatching
                 // Only forward when the next hop is not the peer that sent it: echoing straight
                 // back is the smallest possible loop.
@@ -639,8 +660,17 @@ object MeshCore {
             runCatching {
                 val parts = entry.split(":")
                 val ip = normalise(parts[0].trim())
+                // A MESH HINT IS AN ADDRESS, NEVER A NAME: this is a string that arrived in a packet,
+                // and probing it used to mean resolving whatever it said.
+                if (!MeshUtils.isIpv4Literal(ip)) return@runCatching
                 val port = parts.getOrNull(1)?.trim()?.toIntOrNull() ?: DEFAULT_PORT
-                if (ip.isEmpty() || myIps.contains(ip) || isPeer(ip)) return@runCatching
+                if (port !in 1..65535) return@runCatching
+                if (myIps.contains(ip) || isPeer(ip)) return@runCatching
+                if (probedAt.size >= MAX_PROBED_ADDRESSES) {
+                    val stale = probedAt.filterValues { now - it > PROBE_INTERVAL_MS }.keys
+                    stale.forEach { probedAt.remove(it) }
+                }
+                if (probedAt.size >= MAX_PROBED_ADDRESSES) return@runCatching
                 val lastProbe = probedAt[ip] ?: 0L
                 if (now - lastProbe < PROBE_INTERVAL_MS) return@runCatching
                 probedAt[ip] = now
@@ -722,7 +752,9 @@ object MeshCore {
             data[5] = command
             payloadBytes.copyInto(data, 6)
 
-            if (command == OP_HEARTBEAT || command == OP_PEER_LIST_REQ || command == OP_DNS_SYNC_REQ) {
+            if ((command == OP_HEARTBEAT || command == OP_PEER_LIST_REQ || command == OP_DNS_SYNC_REQ) &&
+                pendingRequests.size < MAX_PENDING_REQUESTS
+            ) {
                 pendingRequests["$targetIp:$command"] = System.currentTimeMillis()
             }
             live.send(DatagramPacket(data, data.size, InetAddress.getByName(targetIp), targetPort))
@@ -751,6 +783,12 @@ object MeshCore {
         }
     }
 
+    /** Where this device wants Prism Coin for traffic it carries; null when it has no wallet. */
+    private fun payoutAddress(): String? = runCatching {
+        val coin = com.prism.launcher.wallet.CoinRegistry.bySymbol("PSC") ?: return@runCatching null
+        com.prism.launcher.wallet.WalletVault.addressFor(coin)
+    }.getOrNull()
+
     private fun localAnnouncement(): String {
         val endpoint = runCatching { serverEndpoint() }.getOrNull()
         return if (endpoint != null) {
@@ -760,9 +798,15 @@ object MeshCore {
                 serverProtocol = endpoint.protocol,
                 serverPublicKey = endpoint.publicKey,
                 wireGuardPort = endpoint.wireGuardPort,
+                country = PrismSettings.getMyCountryCode(),
+                payout = payoutAddress(),
             )
         } else {
-            PrismNodeWire.announcement(boundPort)
+            PrismNodeWire.announcement(
+                boundPort,
+                country = PrismSettings.getMyCountryCode(),
+                payout = payoutAddress(),
+            )
         }
     }
 
@@ -784,6 +828,10 @@ object MeshCore {
         // code here only handled the compressed one -- so a device saw its OWN link-local broadcast come
         // back in the expanded spelling, failed to recognise it, and entered itself in its own peer table.
         // It then gossiped with itself and reported one peer more than existed.
+        // NEVER RESOLVED. This used to call getByName unconditionally, which looks a NAME up in DNS --
+        // and the strings arriving here come from peer lists, relay bodies and packet payloads. A peer
+        // list naming an attacker's hostname therefore made every receiver resolve it.
+        if (!MeshUtils.isIpLiteral(bare)) return bare.trim().lowercase()
         return runCatching {
             val bytes = InetAddress.getByName(bare).address
             if (bytes.size == 16 && isV4Mapped(bytes)) {
@@ -806,6 +854,13 @@ object MeshCore {
 
     /** How often an address heard through the peer list may be probed. */
     private const val PROBE_INTERVAL_MS = 30_000L
+
+    /** Limits that keep a flood of forged packets from growing the tables without bound. */
+    private const val MAX_PEERS = 512
+    private const val MAX_PROBED_ADDRESSES = 1_024
+    private const val MAX_PENDING_REQUESTS = 1_024
+    private const val REQUEST_EXPIRY_MS = 120_000L
+    private const val MAX_RELAY_PAYLOAD = 8 * 1024
 
     /** Short enough that a newly discovered peer has a real latency figure almost immediately. */
     private const val FIRST_GOSSIP_DELAY_MS = 1_200L

@@ -136,6 +136,20 @@ fun main(args: Array<String>) {
     // adapters for the same slots -- the difference is the measure of how much of Prism is
     // genuinely Android-specific.
     val log = DesktopLog(quiet = System.getenv("PRISM_VERBOSE") == null)
+    // A HARD DEATH HAS TO LEAVE A TRACE. Exceptions that Prism catches itself already reach the log;
+    // one that escapes -- a coroutine dispatcher, a render thread, an AWT callback -- prints to
+    // stderr, which a windowed run does not show, and the process ends with the diagnostics page
+    // reporting nothing. Writing it here is what turns "it just crashed" into a name and a stack.
+    Thread.setDefaultUncaughtExceptionHandler { thread, error ->
+        runCatching {
+            log.error(
+                "Crash",
+                "Uncaught ${error.javaClass.name} on thread '${thread.name}'",
+                error,
+            )
+        }
+        error.printStackTrace()
+    }
     com.prism.core.PrismPlatform.install(
         com.prism.core.JvmHost(), log, AwtImageCodec,
         notifier = DesktopNotifier(),
@@ -481,6 +495,7 @@ fun main(args: Array<String>) {
         java.io.File(com.prism.core.PrismPlatform.host.dataDir(), "mesh")
     )
     com.prism.core.MeshDns.registerWithMesh()
+    com.prism.launcher.vpn.DirectoryServer.refresh()
 
     // Folders served as websites (PHASE 52), and this device's model offered to peers (PHASE 53).
     com.prism.launcher.browser.MeshMirror.install(
@@ -553,6 +568,10 @@ fun main(args: Array<String>) {
     // desktop that is on the same mesh and holds the same wallet receives into MessagingStore.
     runCatching { com.prism.launcher.messaging.RcsChat.install() }
     com.prism.core.MeshConnect.startServer()
+    // DIRECTORY DISCOVERY STARTS WITH THE APP, not with a dialog being opened: a client, bridge or
+    // relay that trusts a directory should already hold the servers it lists by the time anyone
+    // looks. The object checks the role itself and refreshes on its own.
+    com.prism.desktop.net.DesktopDirectories.start()
 
     // RE-ANNOUNCE THE LOCAL NAMES. The registry announces as each name is added, and the search and
     // mirror hosts add theirs during install -- which happens above, before the socket exists. Those
@@ -764,6 +783,7 @@ fun main(args: Array<String>) {
         "sizes" -> sizes()
         "bench" -> bench(args.getOrNull(1)?.toFloatOrNull() ?: 1f)
         "selftest" -> selfTest(args.getOrNull(1))
+        "videocraft-e2e" -> VideoCraftEndToEnd.run(args.drop(1))
         "train" -> train(args.getOrNull(1)?.toIntOrNull() ?: 4)
         "generate" -> generate(args.drop(1).joinToString(" ").ifBlank { "a red circle" })
         "expose" -> expose(args.drop(1).joinToString(" ").ifBlank { "a red circle" })

@@ -179,6 +179,15 @@ class VideoCraftEngine(
     private val image: VideoCraftImageModel,
     private val interpolator: VideoCraftInterpolator,
     private val speech: VideoCraftSpeech,
+    /**
+     * The clip model, when one is active.
+     *
+     * OPTIONAL, and null means the frame route: keyframes, then interpolation. When it is present the
+     * engine draws every clip with it instead, and the image, interpolation, audio and speech models
+     * are never opened for that film. The text model is unaffected -- it still writes the bible, the
+     * scene list and the shot list before a single frame exists.
+     */
+    private val video: VideoCraftVideoModel? = null,
     private val cancelled: () -> Boolean = { false },
 ) {
 
@@ -235,7 +244,14 @@ class VideoCraftEngine(
             checkCancelled()
             ensurePlan(project, onProgress)
             checkCancelled()
-            ensureReferences(project, onProgress)
+            // REFERENCES ARE KEYFRAME CONDITIONING, AND THE CLIP MODEL HAS NO KEYFRAMES. Nothing in
+            // renderWithVideoModel reads `project.references`, yet the video tab still opened the
+            // image pipeline and drew a reference for every character and location before the first
+            // take -- minutes inside the diffusion engine, a second native context beside the clip
+            // model, and on a machine with no image model active a pile of procedural stills nobody
+            // looked at. On a tab whose whole point is that no image model takes part, that stage was
+            // pure cost and the likeliest place for the process to die.
+            if (!rendersWithVideoModel()) ensureReferences(project, onProgress)
             checkCancelled()
 
             val signature = VideoCraftTimeline.signature(project)
@@ -281,8 +297,11 @@ class VideoCraftEngine(
 
                 // The mouths of this scene, built before its frames are: the dialogue is synthesized
                 // here (and remembered for the mixer), placed at the film times the soundtrack will use,
-                // and indexed per speaker.
-                val mouths = sceneMouths(project, scene, planned)
+                // and indexed per speaker. NOT FOR THE CLIP MODEL: a take comes back as pixels with no
+                // mouths to open, so synthesising the scene's lines here would run a speech engine the
+                // video tab does not even require -- and then throw the samples away. The soundtrack
+                // still speaks them later, through the same cached engine.
+                val mouths = if (rendersWithVideoModel()) emptyMap() else sceneMouths(project, scene, planned)
 
                 for ((inScene, fresh) in planned.withIndex()) {
                     checkCancelled()
@@ -313,7 +332,10 @@ class VideoCraftEngine(
                     val base = sceneBase + sceneSpan * (inScene.toFloat() / planned.size.coerceAtLeast(1))
                     onProgress(
                         Progress(
-                            "Scene ${scene.number} · shot ${shot.number} · drawing keyframes",
+                            // The clip chain draws no keyframes; saying so on that tab was a
+                            // frames-chain leftover.
+                            "Scene ${scene.number} · shot ${shot.number} · " +
+                                if (rendersWithVideoModel()) "drawing the clip" else "drawing keyframes",
                             base, previous, index, project.clips.size,
                         ),
                     )
@@ -373,6 +395,9 @@ class VideoCraftEngine(
                     onProgress(Progress("Building the soundtrack", 0.88f, previous, globalIndex, globalIndex))
                     val built = VideoCraftAudio.build(
                         project, spoken, voices::voiceFor,
+                        // The clip chain's soundtrack is a Prism Score bed: no speech engine, no
+                        // audio generator, nothing that tab's gate did not ask for.
+                        scoreOnly = rendersWithVideoModel(),
                     ) { stage ->
                         onProgress(Progress(stage, 0.89f, previous, globalIndex, globalIndex))
                     }
@@ -487,7 +512,10 @@ class VideoCraftEngine(
                     seed = project.seed xor key.hashCode().toLong(),
                     init = null,
                     denoise = 0.9,
-                    steps = min(project.imageSteps, REFERENCE_STEPS),
+                    // THE MODE SCALES THEFRAME BUDGET. A film draws dozens of images, so a mode
+                    // that spends fewer passes matters here more than anywhere else.
+                    steps = com.prism.launcher.messaging.InferencePlan.current()
+                        .stepsFor(min(project.imageSteps, REFERENCE_STEPS)),
                     guidance = project.imageGuidance,
                     onProgress = { fraction ->
                         onProgress(
@@ -632,6 +660,16 @@ class VideoCraftEngine(
         return max(8, width) to max(8, height)
     }
 
+    /**
+     * Whether THIS render draws its clips with a clip model.
+     *
+     * One question, asked in three places that must not disagree: which branch draws a clip, whether
+     * the reference images have to be drawn at all, and whether a scene's dialogue needs a mouth
+     * track. It used to be a copy of the same condition at each site.
+     */
+    private fun rendersWithVideoModel(): Boolean =
+        video != null && VideoCraftModels.mode() == VideoCraftModels.MODE_VIDEO
+
     private fun renderClip(
         project: VideoCraftProject,
         clip: ClipPlan,
@@ -641,6 +679,20 @@ class VideoCraftEngine(
         mouths: Map<String, VideoCraftLipSync.MouthTrack>,
         emit: (PrismImage, Int, Int) -> Unit,
     ): Int {
+        // THE VIDEO MODEL REPLACES THE WHOLE FRAME PIPELINE. No keyframes are drawn, nothing is
+        // interpolated between them, and no character is composited: the shot is handed over and a
+        // take comes back. This is checked before anything else so an active clip model cannot be
+        // partly overridden by whatever image model happens to still be selected -- that fallback is
+        // exactly what the user asked not to happen.
+        video?.let { model ->
+            // THE TAB DECIDES WHICH CHAIN DRAWS THE FILM. A clip model and a full frame chain can be
+            // selected at the same time; the tab the user is on is the instruction for which one
+            // runs, so the frames tab must not silently render with the video model that also
+            // happens to be active.
+            if (rendersWithVideoModel()) {
+                return renderWithVideoModel(project, clip, scene, shot, previous, model, emit)
+            }
+        }
         // Openness carried frame to frame, per character: the release is a property of the mouth, not of
         // the frame, so it has to survive the loop.
         val openness = mutableMapOf<String, Float>()
@@ -766,7 +818,8 @@ class VideoCraftEngine(
                         init = starter,
                         denoise = if (attempt == 0) effectiveStrength
                         else (effectiveStrength + 0.1).coerceAtMost(0.9),
-                        steps = project.imageSteps,
+                        steps = com.prism.launcher.messaging.InferencePlan.current()
+                            .stepsFor(project.imageSteps),
                         guidance = project.imageGuidance,
                     ),
                 )
@@ -892,6 +945,86 @@ class VideoCraftEngine(
 
     // ── Keyframe cache ─────────────────────────────────────────────────────
 
+    /**
+     * Draws one clip with a clip model.
+     *
+     * The prompt is the same one the first keyframe would have used, so the shot's text is unchanged by
+     * which family draws it -- the bible, the scene, the camera and the action all still reach the model.
+     * What changes is what it is asked for: a whole take rather than a still.
+     *
+     * WHEN THE MODEL CANNOT DRAW, the clip is drawn by the procedural renderer, one frame at a time.
+     * That is deliberately not a fall back to the image model: a user who chose a video model asked for
+     * nothing else to be used, and the film still has to finish.
+     */
+    private fun renderWithVideoModel(
+        project: VideoCraftProject,
+        clip: ClipPlan,
+        scene: Scene,
+        shot: Shot,
+        previous: PrismImage?,
+        model: VideoCraftVideoModel,
+        emit: (PrismImage, Int, Int) -> Unit,
+    ): Int {
+        val frameCount = max(2, clip.frameCount)
+        val prompt = clipPrompt(project, scene, shot)
+        val seed = project.seed + clip.clipIndex * 7919L
+        val request = VideoCraftVideoRequest(
+            prompt = prompt,
+            width = project.width,
+            height = project.height,
+            frameCount = frameCount,
+            fps = project.fps,
+            seed = seed,
+            guidance = project.imageGuidance.toDouble(),
+            steps = project.imageSteps,
+            previous = previous,
+        )
+        // EACH FRAME GOES STRAIGHT TO THE SINK. Only the newest frame is held, for the clip's
+        // last-frame PNG; the take never exists in memory as a whole.
+        var made = 0
+        var last: PrismImage? = null
+        fun write(frame: PrismImage) {
+            checkCancelled()
+            emit(frame, made, max(frameCount, made + 1))
+            last = frame
+            made++
+        }
+        runCatching { model.clip(request, ::write) }
+            .onFailure {
+                if (it is VideoCraftCancelled) throw it
+                PrismPlatform.log.warn(
+                    "VideoCraft",
+                    "clip ${clip.clipIndex}: ${model.label()} failed (${it.message}), drawing it on-device",
+                )
+            }
+        PrismPlatform.log.info(
+            "VideoCraft",
+            "clip ${clip.clipIndex}: ${if (made == 0) "procedural take" else "${model.label()}, $made frames"} " +
+                "-- $frameCount frames, no keyframes and no interpolation",
+        )
+        // A model that stopped early leaves the rest of the shot to the procedural renderer, from the
+        // frame it reached, so the clip still runs its planned length.
+        val palette = project.bible?.palette ?: VideoCraftPlanner.fallbackPalette(project.seed)
+        while (made < frameCount) {
+            write(
+                VideoCraftRenderer.render(
+                    "$prompt, frame ${made + 1} of $frameCount, continuous motion",
+                    project.width,
+                    project.height,
+                    palette,
+                    seed + made * 7331L,
+                ),
+            )
+        }
+        last?.let {
+            PrismPlatform.images.encodePng(
+                it,
+                File(VideoCraftStore.framesDir(project.id), "clip-${clip.clipIndex}-last.png"),
+            )
+        }
+        return made
+    }
+
     private fun keyframeFile(project: VideoCraftProject, clip: ClipPlan, k: Int): File =
         File(VideoCraftStore.keyframesDir(project.id), "clip-${clip.clipIndex}-k$k.png")
 
@@ -960,6 +1093,22 @@ class VideoCraftEngine(
             append("Keyframe ${key + 1}; consistent faces, wardrobe, palette and light across shots.")
         }
     }
+
+    /**
+     * What a clip model is asked for: the film's own words, then the shot.
+     *
+     * NOT [buildPrompt]. That is a keyframe prompt for an image model -- "Film still", camera, palette,
+     * "Keyframe 1; consistent faces, wardrobe..." -- and a clip model conditioned on a caption learned
+     * from sentences that describe a clip. Handed the keyframe prompt, the user's words were a few
+     * among dozens the model never saw, and a beach film came back as whichever scene the
+     * instructions happened to hash closest to.
+     */
+    private fun clipPrompt(project: VideoCraftProject, scene: Scene, shot: Shot): String = buildString {
+        append(project.prompt.trim().trimEnd('.'))
+        append(". ")
+        shot.description.trim().takeIf { it.isNotEmpty() }?.let { append(it.trimEnd('.')).append(". ") }
+        scene.location.trim().takeIf { it.isNotEmpty() }?.let { append("At ").append(it).append('.') }
+    }.trim()
 
     private fun savePreview(project: VideoCraftProject, frame: PrismImage) {
         val preview = if (frame.width > 640) VideoCraftImageOps.resizeBilinear(

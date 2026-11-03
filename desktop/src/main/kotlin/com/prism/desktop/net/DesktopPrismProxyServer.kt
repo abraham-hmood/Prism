@@ -3,6 +3,7 @@ package com.prism.desktop.net
 import com.prism.core.PrismPlatform
 import com.prism.core.ProxyBasicAuth
 import com.prism.launcher.PrismSettings
+import com.prism.launcher.vpn.ServerDirectory
 import java.io.ByteArrayOutputStream
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
@@ -44,6 +45,32 @@ object DesktopPrismProxyServer {
         }
         val message = "Prism HTTP CONNECT proxy is listening on TCP $port."
         PrismPlatform.log.success(TAG, message)
+        // ANNOUNCED FROM HERE, NOT FROM THE SETTINGS BUTTON. Every path that starts a Prism server
+        // ends in this method -- the button, `prism vpn serve up`, and the window at launch -- so
+        // this is the one place an automatic announcement cannot be forgotten. announceOnStart
+        // checks the role itself and publishes only after the public port answers.
+        thread(name = "prism-directory-announce", isDaemon = true) {
+            val announcement = runCatching { ServerDirectory.announceOnStart(port) }.getOrNull()
+                ?: return@thread
+            // A REACHABLE PORT IS NOT A SUCCESSFUL ANNOUNCEMENT. The probe can pass while a
+            // directory refuses the token or answers an error, and that is exactly the case where the
+            // row the user expects to see never appears -- so a failed publication is shown too,
+            // with the directory's own reply in [announcement]'s message.
+            if (announcement.message.isBlank()) return@thread
+            if (announcement.reachable && announcement.reports.all { it.ok }) return@thread
+            PrismPlatform.log.warn(TAG, announcement.message)
+            if (java.awt.GraphicsEnvironment.isHeadless()) return@thread
+            javax.swing.SwingUtilities.invokeLater {
+                runCatching {
+                    javax.swing.JOptionPane.showMessageDialog(
+                        null,
+                        announcement.message,
+                        "Server directory",
+                        javax.swing.JOptionPane.WARNING_MESSAGE,
+                    )
+                }
+            }
+        }
         return Result(true, message)
     }
 

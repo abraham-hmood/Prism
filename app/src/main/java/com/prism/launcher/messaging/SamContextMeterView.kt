@@ -82,6 +82,9 @@ class SamContextMeterView @JvmOverloads constructor(
         rate = tokensPerSecond
         contextSize = contextWindow
         contentDescription = buildString {
+            // Says what a tap does: a pill that reacts to touch but announces nothing is invisible
+            // to anybody reading the screen through a screen reader.
+            append("Tap to compact the conversation. ")
             append("${(fraction * 100).roundToInt()}% of context used")
             if (contextWindow > 0) append(", $tokens of $contextWindow tokens")
             if (rate > 0.0) append(", ${"%.1f".format(rate)} tokens per second")

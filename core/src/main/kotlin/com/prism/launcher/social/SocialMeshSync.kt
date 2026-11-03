@@ -62,11 +62,13 @@ object SocialMeshSync {
     /**
      * How many ids go in one announcement.
      *
-     * A datagram is 1500 bytes at best and mesh payloads are UTF-8 JSON. 120 ids of 36 characters is
-     * already more than fits comfortably, so the newest are announced and older content spreads as it is
-     * asked for rather than all at once.
+     * A DATAGRAM IS 1500 BYTES AT BEST, and this used to put sixty post ids AND sixty video ids in one
+     * payload -- about four kilobytes of JSON, which never reaches a peer. The failure is silent: the
+     * send call succeeds, the announcement is dropped on the way, and no video or post is ever asked
+     * for. Each kind is announced in its own datagram now, and this bound keeps one kind comfortably
+     * inside the path MTU even with 36-character ids.
      */
-    private const val ANNOUNCE_LIMIT = 60
+    private const val ANNOUNCE_LIMIT = 24
 
     /** How many records one delivery carries, for the same reason. */
     private const val DELIVER_LIMIT = 12
@@ -131,13 +133,32 @@ object SocialMeshSync {
         }
         scope.launch {
             runCatching {
-                val payload = JSONObject().apply {
-                    put("posts", JSONArray().also { array -> postIds().forEach { array.put(it) } })
-                    put("videos", JSONArray().also { array -> videoIds().forEach { array.put(it) } })
-                }.toString()
-                MeshTransport.announce(OPCODE_ANNOUNCE, payload)
+                val posts = postIds().take(ANNOUNCE_LIMIT)
+                val videos = videoIds().take(ANNOUNCE_LIMIT)
+                // Posts and follows travel together -- both are small id lists -- but videos get their
+                // own datagram, which is what keeps either one under the MTU.
+                MeshTransport.announce(
+                    OPCODE_ANNOUNCE,
+                    JSONObject().apply {
+                        put("posts", JSONArray().also { array -> posts.forEach { array.put(it) } })
+                        put(
+                            "following",
+                            JSONArray().also { array ->
+                                LykeStore.following().take(ANNOUNCE_LIMIT).forEach { array.put(it) }
+                            },
+                        )
+                    }.toString(),
+                )
+                if (videos.isNotEmpty()) {
+                    MeshTransport.announce(
+                        OPCODE_ANNOUNCE,
+                        JSONObject().apply {
+                            put("videos", JSONArray().also { array -> videos.forEach { array.put(it) } })
+                        }.toString(),
+                    )
+                }
                 dirty = false
-                lastStatus = "announced"
+                lastStatus = "announced " + posts.size + " post(s), " + videos.size + " video(s)"
             }.onFailure { lastStatus = "announce failed: " + it.message }
         }
     }
@@ -163,6 +184,12 @@ object SocialMeshSync {
         scope.launch {
             runCatching {
                 val json = JSONObject(payload)
+                // CHANNELS ARE THE FOLLOW LIST, so a channel the user follows on the phone has to
+                // exist on the desktop for its videos to appear in that tab there. Follows were never
+                // on the wire, which is why channels looked like they only half-synced even when the
+                // videos themselves arrived.
+                val follows = ids(json.optJSONArray("following"))
+                if (follows.isNotEmpty()) LykeStore.mergeFollowing(follows)
                 val wantedPosts = ids(json.optJSONArray("posts")).filterNot { knowsPost(it) }
                 val wantedVideos = ids(json.optJSONArray("videos")).filterNot { LykeStore.knowsVideo(it) }
                 if (wantedPosts.isEmpty() && wantedVideos.isEmpty()) return@runCatching
@@ -176,6 +203,10 @@ object SocialMeshSync {
                 MeshTransport.sendToPeer(peerIp, OPCODE_REQUEST, request)
                 lastStatus = "asked " + peerIp + " for " +
                     (wantedPosts.size + wantedVideos.size) + " item(s)"
+            }.onFailure {
+                // A TRUNCATED DATAGRAM IS UNREADABLE JSON, and saying so is the only way the reason a
+                // peer's content never arrives is visible, rather than looking like an empty mesh.
+                lastStatus = "unreadable announcement from " + peerIp + ": " + it.message
             }
         }
     }

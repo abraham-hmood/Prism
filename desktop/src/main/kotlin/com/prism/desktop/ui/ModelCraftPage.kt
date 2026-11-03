@@ -69,6 +69,7 @@ import com.prism.core.PrismPlatform
 import com.prism.launcher.modelcraft.CraftedModel
 import com.prism.launcher.modelcraft.DatasetVoiceEngine
 import com.prism.launcher.modelcraft.ModelCraft
+import com.prism.launcher.modelcraft.TrainingTechniqueSmokeTest
 import com.prism.launcher.modelcraft.ModelCraftExport
 import com.prism.launcher.modelcraft.ModelCraftTest
 import com.prism.launcher.modelcraft.ModelFiles
@@ -305,6 +306,14 @@ private fun CreatorPanel(
     var contextWindow by remember(model.id) {
         mutableStateOf(ModelCraft.capacity(model).effectiveContext.toString())
     }
+
+    // The smoke test's own state. Its result is a paragraph rather than a dialog because the answer
+    // -- which technique won, and why -- is what the user needs to see beside the dropdown it just
+    // changed, not in a window they have to dismiss first.
+    var smokeBusy by remember(model.id) { mutableStateOf(false) }
+    var smokeNote by remember(model.id) { mutableStateOf("") }
+    var paramNote by remember(model.id) { mutableStateOf("") }
+    var choosing by remember(model.id) { mutableStateOf("") }
 
     val spec = ModelCraft.datasets.getValue(kind)
     val families = ModelCraft.archTypes.getValue(kind)
@@ -1079,6 +1088,91 @@ private fun CreatorPanel(
                 }
                 if (pair.size == 1) Spacer(Modifier.weight(1f).padding(end = 12.dp))
             }
+        }
+
+        // ── The smoke test ────────────────────────────────────────────────────────────────────
+        //
+        // Beside the dropdown it sets, and above the Train button, because that is the order the
+        // decision is made in: pick a technique, or let this pick one, then run.
+        Spacer(Modifier.height(14.dp))
+        Text(
+            "Not sure which technique to pick? The smoke test reads the loaded dataset and times " +
+                "this machine, ranks all nine, and adopts the fastest one that keeps the most quality.",
+            fontSize = 12.sp,
+            color = colors.muted,
+            lineHeight = 17.sp,
+        )
+        Spacer(Modifier.height(8.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            ActionButton(
+                Icons.Filled.PlayArrow,
+                if (smokeBusy) "Working…" else "Run smoke test",
+                enabled = !smokeBusy && !running && model.dataset.isNotEmpty(),
+            ) { focus.clearFocus(); choosing = "smoke" }
+        }
+        Spacer(Modifier.height(8.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            ActionButton(
+                Icons.Filled.PlayArrow,
+                if (smokeBusy) "Working…" else "Auto-determine parameters",
+                enabled = !smokeBusy && !running,
+            ) { focus.clearFocus(); choosing = "parameters" }
+        }
+        if (choosing.isNotEmpty()) {
+            val isSmoke = choosing == "smoke"
+            androidx.compose.material3.AlertDialog(
+                onDismissRequest = { choosing = "" },
+                title = { Text(if (isSmoke) "Run smoke test" else "Auto-determine parameters") },
+                text = { Text("Quick takes seconds; the lengthy test runs 50 epochs.", fontSize = 13.sp) },
+                confirmButton = {
+                    androidx.compose.material3.TextButton(onClick = {
+                        val kind = choosing
+                        choosing = ""
+                        scope.launch {
+                            smokeBusy = true
+                            runModelTest(model, kind, 1)?.let { if (kind == "smoke") smokeNote = it else paramNote = it }
+                            smokeBusy = false
+                        }
+                    }) { Text("Quick test") }
+                },
+                dismissButton = {
+                    androidx.compose.material3.TextButton(onClick = {
+                        val kind = choosing
+                        choosing = ""
+                        scope.launch {
+                            smokeBusy = true
+                            runModelTest(model, kind, 50)?.let { if (kind == "smoke") smokeNote = it else paramNote = it }
+                            smokeBusy = false
+                        }
+                    }) { Text("Lengthy test (50 epochs)") }
+                },
+            )
+        }
+        if (paramNote.isNotBlank()) {
+            Spacer(Modifier.height(8.dp))
+            Text(paramNote, fontSize = 12.sp, color = colors.muted, lineHeight = 17.sp)
+        }
+        if (model.kind == ModelCraft.Kind.VIDEO) {
+            Spacer(Modifier.height(10.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                androidx.compose.material3.Checkbox(
+                    checked = ModelCraft.wholeVideo(model),
+                    onCheckedChange = {
+                        ModelCraft.setWholeVideo(model, it)
+                        ModelCraft.Store.save(model)
+                    },
+                )
+                Text("Train on the whole video", fontSize = 13.sp, color = colors.onSurface)
+            }
+            Text(
+                "On: every frame of a clip is used before the next clip.",
+                fontSize = 11.sp,
+                color = colors.muted,
+            )
+        }
+        if (smokeNote.isNotBlank()) {
+            Spacer(Modifier.height(8.dp))
+            Text(smokeNote, fontSize = 12.sp, color = colors.muted, lineHeight = 17.sp)
         }
 
         // What still has to be filled in, said before the button rather than after it is pressed:
@@ -2538,4 +2632,33 @@ private fun pickFiles(title: String = "Import dataset files"): List<File> {
         }
     }
     return picked
+}
+
+/**
+ * Runs one of the two tests and returns the paragraph the page shows.
+ *
+ * The lengthy option is 50 epochs of the same measurement rather than a different test: the ranking
+ * of techniques, or the proposed inputs, come out of the same code, and what the extra epochs buy is
+ * a number that includes the storage's steady state instead of a single warm pass.
+ */
+private suspend fun runModelTest(
+    model: com.prism.launcher.modelcraft.CraftedModel,
+    kind: String,
+    epochs: Int,
+): String? = withContext(Dispatchers.IO) {
+    if (kind == "smoke") {
+        runCatching {
+            com.prism.launcher.modelcraft.TrainingTechniqueSmokeTest.run(model, epochs).also {
+                com.prism.launcher.modelcraft.TrainingTechniqueSmokeTest.apply(model, it)
+            }.summary
+        }.getOrNull()
+    } else {
+        runCatching {
+            com.prism.launcher.modelcraft.ParameterAdvisor.run(model, epochs).also {
+                com.prism.launcher.modelcraft.ParameterAdvisor.apply(model, it)
+            }.let {
+                it.summary + System.lineSeparator() + it.lines.joinToString(System.lineSeparator())
+            }
+        }.getOrNull()
+    }
 }

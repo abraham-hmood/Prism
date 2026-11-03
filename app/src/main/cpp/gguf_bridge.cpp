@@ -230,17 +230,19 @@ llama_sampler* build_sampler_chain(float minP, float temperature,
                                    const llama_vocab* vocab = nullptr,
                                    const char* grammar = nullptr) {
     llama_sampler* sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    // GRAMMAR FIRST, over the whole vocabulary. After top-k it only ever saw the 40 likeliest
+    // tokens, and a reasoning model (DeepSeek R1 distills) puts "<think>" prose there, not "{": every
+    // candidate was masked, dist picked a forbidden token anyway, and the grammar's accept threw
+    // through JNI -- a SIGABRT with no Java trace, mid-way through VideoCraft's planning.
+    if (grammar != nullptr && *grammar != '\0' && vocab != nullptr) {
+        llama_sampler* g = llama_sampler_init_grammar(vocab, grammar, "root");
+        if (g != nullptr) llama_sampler_chain_add(sampler, g);
+    }
     llama_sampler_chain_add(sampler, llama_sampler_init_penalties(64, 1.1f, 0.0f, 0.0f));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_k(40));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_p(0.95f, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_min_p(minP, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
-    // Grammar BEFORE the distribution sampler: it masks logits to tokens the grammar can accept,
-    // then dist samples from what remains. Adding it after dist would have no effect at all.
-    if (grammar != nullptr && *grammar != '\0' && vocab != nullptr) {
-        llama_sampler* g = llama_sampler_init_grammar(vocab, grammar, "root");
-        if (g != nullptr) llama_sampler_chain_add(sampler, g);
-    }
     llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
     return sampler;
 }
@@ -1841,9 +1843,18 @@ Java_com_prism_launcher_messaging_GgufInferenceService_nativeGenerateJson(
     std::string grammar(grammarChars);
     env->ReleaseStringUTFChars(jGrammar, grammarChars);
 
-    std::string response = run_generation(
-            env, gguf, userText, maxTokens, temperature, minP,
-            nullptr, nullptr, nullptr, IM_NORMAL, grammar.c_str());
+    // llama.cpp's grammar code reports a dead end by throwing. Uncaught, that is std::terminate and the
+    // whole app dies with nothing in the Java log; caught, the planner gets an error string and falls
+    // back to its deterministic plan.
+    std::string response;
+    try {
+        response = run_generation(
+                env, gguf, userText, maxTokens, temperature, minP,
+                nullptr, nullptr, nullptr, IM_NORMAL, grammar.c_str());
+    } catch (const std::exception& e) {
+        llama_memory_clear(llama_get_memory(gguf->ctx), true);
+        response = std::string("Error: Grammar-constrained generation failed: ") + e.what();
+    }
     return env->NewStringUTF(response.c_str());
 }
 

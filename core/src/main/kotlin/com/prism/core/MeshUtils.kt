@@ -44,6 +44,49 @@ object MeshUtils {
         return "127.0.0.1"
     }
 
+    /** Interface names that are, or look like, a cable or Wi-Fi link to a real network. */
+    private val LAN_PREFIXES = listOf("wlan", "wlp", "wl", "eth", "en", "swlan")
+
+    /** Interfaces that carry a tunnel or a hypervisor's private switch, never the user's LAN. */
+    private val VIRTUAL_PREFIXES = listOf(
+        "rmnet", "ccmni", "tun", "tap", "wg", "vethernet", "vmnet", "vboxnet",
+        "docker", "br-", "virbr", "wsl", "dummy", "ip6tnl", "sit", "clat",
+    )
+
+    /**
+     * Every IPv4 address this device holds, with a real LAN link ahead of a virtual one.
+     *
+     * [getLocalMeshIp] answers a different question: ONE address, and it prefers a VPN tunnel
+     * because the mesh wants the tunnel. LAN discovery needs the opposite -- every network the
+     * device is actually on, Wi-Fi or Ethernet first, because that is where the other machines are.
+     * A phone with mobile data up enumerates `rmnet` as readily as `wlan0`, and Windows adds Hyper-V
+     * (vEthernet), WSL and VirtualBox adapters; taking whichever interface came first swept a subnet
+     * with nothing on it, which is how a phone failed to see an Ollama server on the same Wi-Fi.
+     */
+    fun lanIpv4Addresses(): List<String> {
+        val ranked = mutableListOf<Pair<Int, String>>()
+        try {
+            for (intf in NetworkInterface.getNetworkInterfaces()) {
+                if (!intf.isUp || intf.isLoopback) continue
+                val name = intf.name.lowercase()
+                val rank = when {
+                    LAN_PREFIXES.any { name.startsWith(it) } -> 0
+                    VIRTUAL_PREFIXES.any { name.startsWith(it) } -> 2
+                    else -> 1
+                }
+                for (addr in intf.inetAddresses) {
+                    if (addr is Inet4Address && !addr.isLoopbackAddress) {
+                        addr.hostAddress?.let { ranked += rank to it }
+                    }
+                }
+            }
+        } catch (ex: Exception) {
+            ex.printStackTrace()
+        }
+        // sortedBy is stable, so within one rank the enumeration order is kept.
+        return ranked.sortedBy { it.first }.map { it.second }.distinct()
+    }
+
     /**
      * Returns all IPv4 addresses assigned to this device across all interfaces.
      */
@@ -88,6 +131,30 @@ object MeshUtils {
             e.printStackTrace()
         }
         return broadcastList.distinct()
+    }
+
+    /**
+     * A dotted-quad IPv4 literal, and nothing else. Never resolves anything.
+     */
+    fun isIpv4Literal(value: String): Boolean {
+        val parts = value.trim().split(".")
+        if (parts.size != 4) return false
+        return parts.all { p ->
+            p.isNotEmpty() && p.length <= 3 && p.all { it in '0'..'9' } &&
+                (p.toIntOrNull() ?: return false) in 0..255
+        }
+    }
+
+    /**
+     * An IPv4 or IPv6 LITERAL, never a name, so no caller can be talked into a DNS lookup.
+     */
+    fun isIpLiteral(value: String): Boolean {
+        val text = value.trim().substringBefore('%')
+        if (text.isEmpty()) return false
+        if (isIpv4Literal(text)) return true
+        if (!text.contains(':')) return false
+        return text.length <= 45 &&
+            text.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' || it == ':' || it == '.' }
     }
 
     /**

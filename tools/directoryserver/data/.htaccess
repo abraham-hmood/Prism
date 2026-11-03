@@ -1,0 +1,11 @@
+# Nothing in this folder is served directly.
+#
+# The store is read and written by index.php, which authenticates first. A web server that hands
+# out data/servers.json itself would publish the fleet list to anybody who guessed the path.
+<IfModule mod_authz_core.c>
+    Require all denied
+</IfModule>
+<IfModule !mod_authz_core.c>
+    Order allow,deny
+    Deny from all
+</IfModule>

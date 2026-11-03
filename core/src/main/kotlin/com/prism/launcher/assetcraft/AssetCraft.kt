@@ -342,7 +342,10 @@ object AssetCraft {
         val choice = activeGame() ?: return null
         return when (val loaded = load(choice) ?: return null) {
             is Loaded.Trained -> {
-                val mesh = loaded.model.sample(prompt, seed)
+                val mesh = loaded.model.sample(
+                    prompt, seed,
+                    com.prism.launcher.messaging.InferencePlan.current().stepsFor(12),
+                )
                 Sampled(
                     mesh = mesh,
                     // Trained is what makes a model scene-capable, not where its folder sits. A
@@ -437,7 +440,10 @@ object AssetCraft {
                 val existing = _state.value.scene
                 val seed = seedOf(typed) + existing.nodes.size * 7_919L
                 val mesh = when (loaded) {
-                    is Loaded.Trained -> loaded.model.sample(typed, seed)
+                    is Loaded.Trained -> loaded.model.sample(
+                        typed, seed,
+                        com.prism.launcher.messaging.InferencePlan.current().stepsFor(12),
+                    )
                     is Loaded.Mesh -> rename(loaded.mesh, typed)
                 }
                 val random = java.util.Random(seed)

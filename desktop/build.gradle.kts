@@ -1,6 +1,11 @@
 import org.jetbrains.compose.desktop.application.dsl.TargetFormat
 import java.io.File
 
+// The same version the APK carries. jpackage will not accept a version it cannot parse, and two
+// hand-maintained numbers drift the moment one release forgets to touch both, so this reads the
+// root build's version.properties instead of naming a version here.
+val prismVersionName: String by rootProject.extra
+
 /**
  * Prism for Windows and Linux.
  *
@@ -189,7 +194,7 @@ compose.desktop {
                 TargetFormat.AppImage,
             )
             packageName = "Prism"
-            packageVersion = "1.0.1"
+            packageVersion = prismVersionName
             description = "Prism"
             vendor = "Prism"
 

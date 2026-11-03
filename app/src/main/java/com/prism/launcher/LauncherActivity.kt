@@ -1634,6 +1634,8 @@ class LauncherActivity : PrismBaseActivity() {
             PagePickChoice.EmailClient -> SlotAssignment.EmailClient
             PagePickChoice.AppStore -> SlotAssignment.AppStore
             PagePickChoice.TaskManager -> SlotAssignment.TaskManager
+            PagePickChoice.Helper -> SlotAssignment.Helper
+            PagePickChoice.Vpn -> SlotAssignment.Vpn
             is PagePickChoice.PluginPage -> SlotAssignment.Custom(
                 choice.info.packageName,
                 choice.info.viewClassName,

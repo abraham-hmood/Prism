@@ -125,6 +125,11 @@ object DisplayPageFactory {
             // The store can be browsed from a television; publishing needs a file picker and is
             // therefore a phone or desktop action, which the page gates on its own.
             SlotAssignment.AppStore -> com.prism.launcher.appstore.AppStorePageView(context)
+            // Helper takes a plain Context too: a display can watch a bill fill up and read
+            // who paid. Uploading needs a PDF picker, which only a real window has, and the
+            // page says so rather than failing when it is pressed.
+            SlotAssignment.Helper -> com.prism.launcher.helper.HelperPageView(context)
+            SlotAssignment.Vpn -> com.prism.launcher.vpn.VpnPageView(context)
             // A television can inspect the same process table and files as the phone; the kill
             // result is reported on the page either way.
             SlotAssignment.TaskManager -> com.prism.launcher.taskmanager.TaskManagerPageView(context)

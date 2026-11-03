@@ -20,6 +20,10 @@ object PrismNodeWire {
         val serverProtocol: String?,
         val serverPublicKey: String?,
         val wireGuardPort: Int?,
+        /** Two-letter country the device declares, or empty. Used by the VPN page. */
+        val country: String = "",
+        /** Where this device wants Prism Coin sent for traffic it carries. Empty when it has none. */
+        val payout: String = "",
     )
 
     fun announcement(
@@ -28,6 +32,8 @@ object PrismNodeWire {
         serverProtocol: String? = null,
         serverPublicKey: String? = null,
         wireGuardPort: Int? = null,
+        country: String? = null,
+        payout: String? = null,
     ): String = JSONObject()
         .put("nodeId", PrismSettings.getPrismNodeId())
         .put("nodeName", PrismSettings.getPrismNodeName())
@@ -37,6 +43,10 @@ object PrismNodeWire {
             if (!serverProtocol.isNullOrBlank()) put("serverProtocol", serverProtocol)
             if (!serverPublicKey.isNullOrBlank()) put("serverPublicKey", serverPublicKey)
             if (wireGuardPort != null) put("wireGuardPort", wireGuardPort)
+            // Both are optional on the wire: an older peer ignores them, and a peer that has not set
+            // a country is simply not offered as a VPN exit rather than being guessed at.
+            if (!country.isNullOrBlank()) put("country", country.trim().uppercase())
+            if (!payout.isNullOrBlank()) put("payout", payout.trim())
         }
         .toString()
 
@@ -52,6 +62,8 @@ object PrismNodeWire {
             serverProtocol = json.optString("serverProtocol").trim().ifBlank { null },
             serverPublicKey = json.optString("serverPublicKey").trim().ifBlank { null },
             wireGuardPort = json.optInt("wireGuardPort", 0).takeIf { it in 1..65535 },
+            country = json.optString("country").trim().uppercase(),
+            payout = json.optString("payout").trim(),
         )
     }.getOrNull()
 }

@@ -407,6 +407,10 @@ class PrismTunnelEngine(private val context: Context) {
             proxyServer = localServer
             localServer.setCredentials(user, pass)
             localServer.start()
+            // THE SERVER IS NOW LISTENING, SO THE DIRECTORIES ARE TOLD. announceToDirectories
+            // publishes the public address only after proving the port is forwarded; when it is
+            // not, the user is told once, in a dialog, while the server keeps running.
+            announceToDirectories()
             Thread({
                 if (localServer.awaitListening() && routingActive && proxyServer === localServer) {
                     val boundPort = localServer.listeningPort()
@@ -433,8 +437,52 @@ class PrismTunnelEngine(private val context: Context) {
         }
     }
 
+    /** Discovery runs once per engine, not once per reconnect. */
+    @Volatile
+    private var directorySynced = false
+
+    /**
+     * Tells the directories where this server is, once it is actually listening.
+     *
+     * IT WAITS FOR THE LISTENER. The check a directory depends on is "can the world reach this
+     * port", and running it before the socket is bound would report a closed port on a server that
+     * is about to work. [ServerDirectory.announceOnStart] probes the public address and publishes
+     * only when the probe succeeds, which is the one failure worth a dialog: the server runs fine,
+     * but nobody outside this network will find it.
+     */
+    private fun announceToDirectories() {
+        if (PrismSettings.getPrismVpnRole() != PrismSettings.PRISM_ROLE_SERVER) return
+        Thread({
+            val local = proxyServer ?: return@Thread
+            if (!local.awaitListening()) return@Thread
+            val port = local.listeningPort() ?: PrismSettings.getPrismVpnPort().toIntOrNull() ?: 0
+            val announcement = runCatching {
+                com.prism.launcher.vpn.ServerDirectory.announceOnStart(port)
+            }.getOrNull() ?: return@Thread
+            // SHOWN WHEN THE PROBE FAILS OR A DIRECTORY REFUSED THE PUBLICATION. A phone whose
+            // public port answers while the directory returns 401 used to say nothing at all, which
+            // is the one case where the user is waiting for a row that will never appear.
+            val failed = !announcement.reachable || announcement.reports.any { !it.ok }
+            if (failed && announcement.message.isNotBlank()) {
+                runCatching { com.prism.launcher.PrismApp.instance }
+                    .getOrNull()
+                    ?.presentDirectoryNotice(announcement.message)
+            }
+        }, "prism-directory-announce").apply { isDaemon = true; start() }
+    }
+
     private fun startP2pClientMode() {
         PrismProxyClient.start(context)
+        // DISCOVERY WITHOUT A BUTTON. A client, bridge or relay that trusts a directory should end
+        // up with the servers published there on its own; the Server directory screen's button stays
+        // for a manual refresh. Once per engine, because a reconnect is not a reason to re-ask every
+        // directory for the same list.
+        if (!directorySynced) {
+            directorySynced = true
+            Thread({
+                runCatching { com.prism.launcher.vpn.ServerDirectory.sync() }
+            }, "prism-directory-sync").apply { isDaemon = true; start() }
+        }
         // A bridge's job starts where the tunnel does: ask every selected server for its names and
         // listings. Off the main thread, because a fleet can contain a server that is simply down.
         if (PrismSettings.isPrismBridgeRole()) {

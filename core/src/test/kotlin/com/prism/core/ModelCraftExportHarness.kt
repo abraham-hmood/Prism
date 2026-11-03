@@ -45,7 +45,7 @@ class ModelCraftExportHarness {
         ModelCraft.runner = null
         // No frame extractor on the JVM: the interpolator's dataset here is the clips plus the frame
         // folders the harness's own datasets provide.
-        ModelCraft.frameExtractor = { _, _ -> 0 }
+        ModelCraft.frameExtractor = { _, _, _, _ -> 0 }
         try {
             val sources = File("build/export-check/src")
             ModelCraft.Kind.entries.forEach { kind ->

@@ -43,6 +43,8 @@ sealed interface PagePickChoice {
     data object EmailClient : PagePickChoice
     data object AppStore : PagePickChoice
     data object TaskManager : PagePickChoice
+    data object Helper : PagePickChoice
+    data object Vpn : PagePickChoice
 }
 
 class PositionPickerAdapter(
@@ -202,6 +204,8 @@ class VerticalPageOptionsAdapter(
         add(Option("Email", "Inbox, folders, filters, several accounts and text alerts", PagePickChoice.EmailClient))
         add(Option("App Store", "Mesh-gated apps, games, tools and your publisher listings", PagePickChoice.AppStore))
         add(Option("Task Manager", "Running tasks, their memory, and the files they hold open", PagePickChoice.TaskManager))
+        add(Option("Helper", "Bills the mesh can pay toward — ask for part of one, or help someone else", PagePickChoice.Helper))
+        add(Option("VPN", "Route through the fastest devices in a country, paid in PrismCoin", PagePickChoice.Vpn))
         for (p in plugins) add(Option(p.label, p.packageName, PagePickChoice.PluginPage(p)))
     }
 

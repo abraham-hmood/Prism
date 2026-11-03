@@ -53,6 +53,7 @@ import com.prism.launcher.PrismSettings
 import com.prism.launcher.messaging.AiMessageEntity
 import com.prism.launcher.messaging.Dictation
 import com.prism.launcher.messaging.GgufInferenceService
+import com.prism.launcher.messaging.SamCompaction
 import com.prism.launcher.messaging.SamConversation
 import com.prism.launcher.messaging.Vision
 import kotlinx.coroutines.Dispatchers
@@ -131,6 +132,11 @@ fun ConversationPage() {
         }.getOrDefault(false)
     }
 
+    // The recap a compaction wrote for this thread, if any. Held in state so the send path does
+    // not read preferences on every turn.
+    var recap by remember { mutableStateOf(SamCompaction.recap(RECAP_KEY)) }
+    var compacting by remember { mutableStateOf(false) }
+
     val listState = rememberLazyListState()
 
     LaunchedEffect(streaming, metered) {
@@ -175,6 +181,48 @@ fun ConversationPage() {
         }
     }
 
+    /**
+     * Folds the older part of the thread into a recap, leaving the transcript alone.
+     *
+     * The transcript is what the user reads; what has to shrink is the text resent to the model on
+     * the next turn. The local engine's own context is cleared as well, because the turns it still
+     * holds are the ones the recap now stands for and paying for both would defeat the purpose.
+     */
+    suspend fun compactNow() {
+        if (compacting) return
+        val spoken = messages.map { (if (it.isSent) "User: " else "Sam: ") + it.text }
+        val plan = SamCompaction.plan(spoken)
+        if (!plan.canCompact) {
+            status = "This thread is too short to compact yet."
+            return
+        }
+        compacting = true
+        status = "Compacting…"
+        val summary = withContext(Dispatchers.IO) {
+            runCatching {
+                SamConversation.send(SamCompaction.request(plan.older), standalone = true).text
+            }.getOrDefault("")
+        }.trim()
+        compacting = false
+        if (summary.isEmpty()) {
+            status = "Compaction returned nothing — the model did not answer."
+            return
+        }
+        SamCompaction.store(RECAP_KEY, summary, plan.older.size)
+        recap = summary
+        runCatching { GgufInferenceService.resetConversation() }
+        contextFraction = 0f
+        contextTokens = 0
+        tokenRate = 0.0
+        status = SamCompaction.describe(plan.older.size)
+    }
+
+    /** What a tap on the meter runs. Refused mid-answer, like the phone's. */
+    fun compact() {
+        if (streaming || compacting) return
+        scope.launch { compactNow() }
+    }
+
     fun send() {
         val text = draft.trim()
         val file = attachment
@@ -213,6 +261,13 @@ fun ConversationPage() {
             messages.add(sent)
             withContext(Dispatchers.IO) { runCatching { dao?.insert(sent) } }
 
+            // The previous reply left the window nearly full, so fold the older turns BEFORE this
+            // prompt is built: one that does not fit is truncated from the front by the engine,
+            // which drops the intent of the conversation first and this question last.
+            if (metered && SamCompaction.needsCompaction(GgufInferenceService.liveStats.contextFraction)) {
+                compactNow()
+            }
+
             // The history handed to the model is the transcript so far, oldest first, EXCLUDING the
             // message just added -- SamConversation appends that itself, and sending it twice makes the
             // model answer a question it can see asked two ways.
@@ -225,6 +280,7 @@ fun ConversationPage() {
                     userText = text,
                     attachment = file,
                     history = history,
+                    recap = recap,
                     onToken = { delta -> partial += delta },
                     onReasoning = { delta -> thinking += delta },
                 )
@@ -396,7 +452,7 @@ fun ConversationPage() {
                     horizontalArrangement = Arrangement.End,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    SamMeter(contextFraction, contextTokens, tokenRate, contextWindow, colors)
+                    SamMeter(contextFraction, contextTokens, tokenRate, contextWindow, colors) { compact() }
                 }
             }
 
@@ -464,6 +520,9 @@ fun ConversationPage() {
 /** How much of a reasoning trace to show. It can run to thousands of tokens; the tail is the useful end. */
 private const val THINKING_TAIL = 600
 
+/** Sam is a single thread, so one key identifies its recap. */
+private const val RECAP_KEY = "sam"
+
 /**
  * The corner readout on Sam's thread: context ring, tokens spent, live decode rate.
  *
@@ -479,6 +538,7 @@ private fun SamMeter(
     rate: Double,
     window: Int,
     colors: PrismColors,
+    onCompact: () -> Unit,
 ) {
     val safe = fraction.coerceIn(0f, 1f)
     val ringColor = when {
@@ -490,6 +550,7 @@ private fun SamMeter(
         Modifier
             .clip(RoundedCornerShape(20.dp))
             .background(colors.background)
+            .clickableRow { onCompact() }
             .padding(horizontal = 10.dp, vertical = 5.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {

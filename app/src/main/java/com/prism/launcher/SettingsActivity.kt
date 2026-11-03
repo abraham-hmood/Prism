@@ -793,21 +793,120 @@ class SettingsActivity : PrismBaseActivity() {
     
     private var isPickingImageModel = false
 
+    /**
+     * The picker for a safetensors video pipeline, which is a directory.
+     *
+     * THE TREE IS REFERENCED, NOT COPIED. A clip pipeline is several gigabytes of shards that already
+     * live on this device; copying them into the app's private storage would double the disk cost of
+     * every import and take minutes on a phone. The path is registered instead, and the model is opened
+     * from where the user keeps it -- the same way a ModelCraft artifact is.
+     */
+    private val videoBundlePicker =
+        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+            if (uri != null) importVideoBundle(uri)
+        }
+
+    private fun importVideoBundle(uri: Uri) {
+        val folder = runCatching {
+            val raw = uri.path ?: return@runCatching null
+            val relative = raw.substringAfter("tree/", "")
+            val volume = relative.substringBefore(':', "")
+            val rest = relative.substringAfter(':', "")
+            when {
+                volume.isEmpty() || rest.isEmpty() -> java.io.File(raw)
+                volume == "primary" -> java.io.File("/storage/emulated/0", rest)
+                else -> java.io.File("/storage/$volume", rest)
+            }
+        }.getOrNull()
+        if (folder == null || !folder.isDirectory) {
+            Toast.makeText(
+                this,
+                "That folder could not be read. Move the pipeline into shared storage and pick it again.",
+                Toast.LENGTH_LONG,
+            ).show()
+            return
+        }
+        val model = PrismSettings.ImportedModel(
+            path = folder.absolutePath,
+            displayName = folder.name,
+            type = PrismSettings.MODEL_TYPE_VIDEO,
+        )
+        PrismSettings.addImportedModel(model)
+        // A model the user just chose is the one they mean to use; requiring a second trip to the
+        // Models page to activate it would look like the import did nothing.
+        PrismSettings.setLocalVideoModelPath(model.path)
+        refresh()
+        Toast.makeText(this, "${folder.name} added as a video model", Toast.LENGTH_SHORT).show()
+    }
+
     private var ollamaScanResults: List<com.prism.launcher.messaging.OllamaDiscoveryService.OllamaServer> = emptyList()
     private var ollamaScanning = false
+    private var manualOllamaHost = ""
+    private var manualOllamaProbe: kotlinx.coroutines.Job? = null
 
     private fun rescanOllama() {
         ollamaScanning = true
         refresh()
         lifecycleScope.launch(Dispatchers.IO) {
-            val results = com.prism.launcher.messaging.OllamaDiscoveryService.scan()
+            val report = com.prism.launcher.messaging.OllamaDiscoveryService.scanReport()
             withContext(Dispatchers.Main) {
-                ollamaScanResults = results
+                ollamaScanResults = report.servers
                 ollamaScanning = false
                 refresh()
-                if (results.isEmpty()) {
-                    Toast.makeText(this@SettingsActivity, "No Ollama servers found on this network", Toast.LENGTH_SHORT).show()
+                // NAMING THE SWEPT NETWORKS IS THE DIAGNOSIS. "Not found" on its own reads as a bug;
+                // "nothing on 192.168.1.0/24" points at the two real causes, a server bound to its
+                // own loopback or a firewall refusing the port.
+                val models = report.servers.sumOf { it.models.size }
+                Toast.makeText(
+                    this@SettingsActivity,
+                    if (report.servers.isEmpty())
+                        "Nothing answered on " + report.sweptLabel() +
+                            ". For a server on another machine, start it with OLLAMA_HOST=0.0.0.0 " +
+                            "and allow port 11434, or type its address above."
+                    else
+                        "$models model" + (if (models == 1) "" else "s") + " on " +
+                            report.servers.size + " server" + (if (report.servers.size == 1) "" else "s"),
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
+    }
+
+    /**
+     * Probes an address the sweep cannot reach -- another VLAN, a router that drops broadcast, or a
+     * machine whose address the user already knows.
+     *
+     * DEBOUNCED, because a text field reports every keystroke and this opens a socket each time.
+     */
+    private fun probeManualOllama(raw: String) {
+        manualOllamaHost = raw
+        manualOllamaProbe?.cancel()
+        val target = com.prism.launcher.messaging.OllamaDiscoveryService.parseAddress(raw) ?: return
+        manualOllamaProbe = lifecycleScope.launch(Dispatchers.IO) {
+            kotlinx.coroutines.delay(600)
+            val server = com.prism.launcher.messaging.OllamaDiscoveryService.probeHost(target.first, target.second)
+            withContext(Dispatchers.Main) {
+                if (server == null) {
+                    Toast.makeText(
+                        this@SettingsActivity,
+                        "Nothing answered at " + target.first + ":" + target.second,
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                    return@withContext
                 }
+                ollamaScanResults = (ollamaScanResults + server).distinctBy { it.host + ":" + it.port }
+                server.models.firstOrNull()?.let { model ->
+                    PrismSettings.setSelectedOllamaEndpoint(
+                        PrismSettings.OllamaEndpoint(server.host, server.port, model)
+                    )
+                }
+                refresh()
+                Toast.makeText(
+                    this@SettingsActivity,
+                    server.models.size.toString() + " model" +
+                        (if (server.models.size == 1) "" else "s") + " on " + server.host,
+                    Toast.LENGTH_SHORT,
+                ).show()
             }
         }
     }
@@ -1690,9 +1789,36 @@ class SettingsActivity : PrismBaseActivity() {
                     // Swapping role swaps which listeners should be bound, so the engine has to be
                     // told; it tears the old role down before building the new one.
                     runCatching { (application as PrismApp).tunnelEngine.start() }
+                    // A directory listener is gated on the role, so swapping to or away from Server
+                    // has to open or close it now rather than at the next launch.
+                    com.prism.launcher.vpn.DirectoryServer.refresh()
                     refresh()
                 },
                 isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM
+            ),
+            SettingItem.Toggle(
+                "Host a directory server",
+                "Answer other devices asking which Prism servers exist. Server role only; requires a Proxy Auth Password.",
+                PrismSettings.getHostDirectoryServer() &&
+                    PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_SERVER,
+                { enabled ->
+                    PrismSettings.setHostDirectoryServer(enabled)
+                    if (enabled) {
+                        val bound = com.prism.launcher.vpn.DirectoryServer.start()
+                        Toast.makeText(
+                            this,
+                            if (bound > 0) "Directory server listening on port $bound"
+                            else "Could not start the directory server",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    } else {
+                        com.prism.launcher.vpn.DirectoryServer.stop()
+                    }
+                    refresh()
+                },
+                isEnabled = PrismSettings.getVpnTunnelingEnabled() &&
+                    PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM &&
+                    PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_SERVER
             ),
             SettingItem.Picker(
                 "VPN Protocol",
@@ -1756,6 +1882,25 @@ class SettingsActivity : PrismBaseActivity() {
                 "${PrismSettings.getPrismServers().size} servers saved (Auto-failover active)",
                 { showServerFleetManager() },
                 isEnabled = PrismSettings.getVpnTunnelingEnabled() && PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM && PrismSettings.isPrismClientRole()
+            ),
+            SettingItem.Nav(
+                "Prism server directories",
+                if (PrismSettings.getDirectoryServers().isEmpty())
+                    "Publish this server, or pull a fleet list from a trusted server"
+                else
+                    "${PrismSettings.getDirectoryServers().size} director" +
+                        (if (PrismSettings.getDirectoryServers().size == 1) "y" else "ies") +
+                        " saved — sync or publish",
+                {
+                    startActivity(
+                        android.content.Intent(
+                            this@SettingsActivity,
+                            com.prism.launcher.vpn.ServerDirectoryActivity::class.java,
+                        ),
+                    )
+                },
+                isEnabled = PrismSettings.getVpnTunnelingEnabled() &&
+                    PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM
             ),
             SettingItem.Header("Mesh Bootstrap Server"),
             SettingItem.Toggle(
@@ -2245,6 +2390,16 @@ class SettingsActivity : PrismBaseActivity() {
                 { if (!ollamaScanning) rescanOllama() },
                 isEnabled = PrismSettings.getAiMode() == PrismSettings.AI_MODE_LOCAL_CLOUD && !ollamaScanning
             ),
+            SettingItem.TextInput(
+                "Ollama server address",
+                "192.168.1.42 or 192.168.1.42:11434. For a server on another machine, start it with " +
+                    "OLLAMA_HOST=0.0.0.0 and allow port 11434 through that machine's firewall; a " +
+                    "server bound to its own loopback cannot be reached from this phone.",
+                manualOllamaHost,
+                { value -> probeManualOllama(value) },
+                isEnabled = PrismSettings.getAiMode() == PrismSettings.AI_MODE_LOCAL_CLOUD,
+                isSingleLine = true
+            ),
             run {
                 val entries = ollamaScanResults.flatMap { server -> server.models.map { m -> server to m } }
                 val selected = PrismSettings.getSelectedOllamaEndpoint()
@@ -2315,6 +2470,23 @@ class SettingsActivity : PrismBaseActivity() {
                         com.prism.launcher.videocraft.VideoCraftModels.Kind.INTERPOLATION,
                     ),
                 { pickLocalModelOfType(PrismSettings.MODEL_TYPE_INTERPOLATION) }
+            ),
+
+            // TWO ROWS BECAUSE A CLIP MODEL COMES IN TWO SHAPES. A GGUF is one file and goes through
+            // the ordinary picker; a safetensors pipeline is a FOLDER of encoder, transformer and
+            // decoder shards, and a file picker cannot express it.
+            SettingItem.Nav(
+                "Import Video Model (GGUF)",
+                "Add a single-file clip model for VideoCraft — " +
+                    com.prism.launcher.videocraft.VideoCraftModels.summary(
+                        com.prism.launcher.videocraft.VideoCraftModels.Kind.VIDEO,
+                    ),
+                { pickLocalModelOfType(PrismSettings.MODEL_TYPE_VIDEO) }
+            ),
+            SettingItem.Nav(
+                "Import Video Model (safetensors)",
+                "Pick the FOLDER holding a clip pipeline — encoder, decoder and shards together",
+                { videoBundlePicker.launch(null) }
             ),
 
             SettingItem.Header("Speech"),
