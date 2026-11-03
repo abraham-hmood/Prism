@@ -3082,6 +3082,34 @@ object PrismSettings {
      * without its recap (or the reverse) describes a state that never existed. See
      * [com.prism.launcher.messaging.SamCompaction], which owns and parses both.
      */
+    // ── Phone and meshnet calls ───────────────────────────────────────────────
+    //
+    // The device choices are stored as a stable description ("type|address|name" for a microphone,
+    // the camera id for a camera) rather than an index: the list a dropdown shows changes as
+    // headsets come and go, and an index would silently point at a different device. Blank means
+    // "the system's choice". Ringtones are content or file URIs; blank is the system ringtone.
+
+    fun getCallMicrophone(): String = prefs().getString("call_microphone", "") ?: ""
+    fun setCallMicrophone(value: String) = prefs().edit().putString("call_microphone", value).apply()
+
+    fun getCallCamera(): String = prefs().getString("call_camera", "") ?: ""
+    fun setCallCamera(value: String) = prefs().edit().putString("call_camera", value).apply()
+
+    fun getCallRingtone(): String = prefs().getString("call_ringtone", "") ?: ""
+    fun setCallRingtone(value: String) = prefs().edit().putString("call_ringtone", value).apply()
+
+    /** When true, meshnet voice and video calls ring with [getMeshRingtone] instead of [getCallRingtone]. */
+    fun getSeparateMeshRingtone(): Boolean = prefs().getBoolean("call_ringtone_mesh_separate", false)
+    fun setSeparateMeshRingtone(value: Boolean) =
+        prefs().edit().putBoolean("call_ringtone_mesh_separate", value).apply()
+
+    fun getMeshRingtone(): String = prefs().getString("call_ringtone_mesh", "") ?: ""
+    fun setMeshRingtone(value: String) = prefs().edit().putString("call_ringtone_mesh", value).apply()
+
+    /** The ringtone a call of this kind actually uses, after the split setting is applied. */
+    fun ringtoneFor(mesh: Boolean): String =
+        if (mesh && getSeparateMeshRingtone()) getMeshRingtone() else getCallRingtone()
+
     fun getSamCompaction(threadKey: String): String =
         prefs().getString("sam_compaction_$threadKey", "") ?: ""
 

@@ -79,6 +79,9 @@ class CallAudio(private val context: Context) : MeshCalls.Audio {
             return false
         }
 
+        // Every meshnet call -- voice, video, one-to-one or group -- listens through this, so this is
+        // where the microphone chosen in Settings → Phone and Meshnet Calls takes effect for them.
+        CallDevices.applyTo(context, recorder)
         record = recorder
         capturing = true
         recorder.startRecording()
@@ -168,12 +171,18 @@ class CallAudio(private val context: Context) : MeshCalls.Audio {
             @Suppress("DEPRECATION")
             manager.isSpeakerphoneOn = false
         }
+        // A carrier call's audio is the platform's, so the chosen microphone reaches it by routing
+        // the call to that microphone's device (headset, Bluetooth) rather than by an AudioRecord.
+        CallDevices.routeCommunication(context)
     }
 
     fun leaveCallMode() {
         runCatching {
             val manager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
             manager.mode = AudioManager.MODE_NORMAL
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+                manager.clearCommunicationDevice()
+            }
         }
     }
 

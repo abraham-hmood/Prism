@@ -123,6 +123,7 @@ object PrismTelecom {
             calls.clear()
             listener?.invoke(null)
             cancelNotification()
+            followRinging()
         }
     }
 
@@ -154,6 +155,7 @@ object PrismTelecom {
             stopRecording()
             listener?.invoke(null)
             cancelNotification()
+            followRinging()
         } else {
             publish()
         }
@@ -168,6 +170,26 @@ object PrismTelecom {
         val current = snapshot()
         listener?.invoke(current)
         updateNotification(current)
+        followRinging()
+    }
+
+    @Volatile private var ringing = false
+
+    /**
+     * Rings while a carrier call is ringing, with the ringtone chosen in Settings → Phone and
+     * Meshnet Calls, and stops the moment none is -- answered, rejected or hung up by the caller.
+     * As the default phone app Prism is the only thing that would ring for it.
+     */
+    private fun followRinging() {
+        val context = appContext ?: return
+        val now = calls.any { it.state == Call.STATE_RINGING }
+        if (now && !ringing) {
+            ringing = true
+            CallRinger.start(context, mesh = false, owner = "carrier")
+        } else if (!now && ringing) {
+            ringing = false
+            CallRinger.stopIf(context, "carrier")
+        }
     }
 
     /** The call a screen should be showing: active first, then ringing, then dialing. */

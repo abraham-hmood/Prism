@@ -87,6 +87,29 @@ class ModelCraftSpeechEngine private constructor(
         }, "modelcraft-speech").apply { isDaemon = true; start() }
     }
 
+    /**
+     * Renders [text] without playing it: the samples and their rate, or null when nothing came out.
+     *
+     * The same synthesis [speak] runs, minus the speaker -- for a meshvoice greeting, which is a file
+     * the user keeps rather than a sentence said once.
+     */
+    fun render(text: String, speed: Float = 1f): Pair<FloatArray, Int>? {
+        if (text.isBlank()) return null
+        val samples = runCatching {
+            trained.synthesize(
+                text = text,
+                language = language,
+                gender = trained.config.defaultGender,
+                reference = if (task == ModelCraft.AudioType.VOICE_CLONING) reference else null,
+                speed = speed,
+            )
+        }.getOrElse { error ->
+            PrismPlatform.log.warn("ModelCraftSpeech", "Rendering failed: ${error.message}")
+            return null
+        }
+        return if (samples.isEmpty()) null else samples to trained.outputRate
+    }
+
     override fun stop() {
         generation++
         PrismPlatform.audio.stop()

@@ -46,6 +46,27 @@ class MeshvoiceActivity : PrismBaseActivity() {
         pendingPick = null
     }
 
+    private var pendingPermission: ((Boolean) -> Unit)? = null
+
+    /** The microphone, for recording a greeting on the page's greeting layout. */
+    private val permission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        pendingPermission?.invoke(granted)
+        pendingPermission = null
+    }
+
+    /** Back closes the greeting layout before it leaves Meshvoice, as backing out of a sub-screen does. */
+    private val closeGreetingOnBack = object : androidx.activity.OnBackPressedCallback(true) {
+        override fun handleOnBackPressed() {
+            if (!page.closeGreeting()) {
+                isEnabled = false
+                onBackPressedDispatcher.onBackPressed()
+                isEnabled = true
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         page = MeshvoicePageView(this)
@@ -58,6 +79,17 @@ class MeshvoiceActivity : PrismBaseActivity() {
             pendingPick = onResult
             pickAudio.launch(arrayOf("audio/*"))
         }
+        page.onRequestPermission = { name, onResult ->
+            if (androidx.core.content.ContextCompat.checkSelfPermission(this, name) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) {
+                onResult(true)
+            } else {
+                pendingPermission = onResult
+                permission.launch(name)
+            }
+        }
+        onBackPressedDispatcher.addCallback(this, closeGreetingOnBack)
         page.findViewById<ImageButton>(R.id.meshvoiceBack).visibility = android.view.View.VISIBLE
         setContentView(page)
 

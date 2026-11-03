@@ -372,8 +372,23 @@ object GgufInferenceService {
      * For callers that generate independent things rather than hold a conversation -- see the native
      * function's comment. A no-op when nothing is loaded, so a caller does not have to check.
      */
+    /**
+     * Changes whenever the native conversation changes in a way its owner did not do itself:
+     * a reset, a model load or unload, or ANY generation.
+     *
+     * The model keeps ONE conversation in llama.cpp, shared by everything that talks to it -- Sam,
+     * every character, the language tutor, a compaction summary. A chat that sends only its new
+     * message is relying on that context still being ITS conversation; this is how it can tell.
+     * A chat records the value right after its own turn, and if it is unchanged at the next turn
+     * nothing else has touched the context in between. See AiManager's local path.
+     */
+    @Volatile
+    var sessionEpoch: Long = 0L
+        private set
+
     @Synchronized
     fun resetConversation() {
+        sessionEpoch++
         resetLiveStats()
         if (handle == 0L) return
         runCatching { nativeResetConversation(handle) }
@@ -396,6 +411,7 @@ object GgufInferenceService {
     fun generateResponse(modelPath: String, userText: String): String {
         val loadError = ensureLoaded(modelPath)
         if (loadError != null) return loadError
+        sessionEpoch++
 
         inFlight.incrementAndGet()
         val mode = InferenceMode.fromId(PrismSettings.getInferenceMode())
@@ -479,6 +495,7 @@ object GgufInferenceService {
             onToken(loadError)
             return loadError
         }
+        sessionEpoch++
 
         val splitter = ThinkTagSplitter(onAnswer = onToken, onReasoning = onReasoning)
         inFlight.incrementAndGet()
@@ -646,6 +663,7 @@ object GgufInferenceService {
             onStage?.invoke("Freeing previous model...")
             nativeFreeModel(handle)
             handle = 0L
+            sessionEpoch++
             currentModelPath = null
         }
 
@@ -892,6 +910,7 @@ object GgufInferenceService {
             "Loaded $modelPath in ${lastLoadMillis} ms"
         )
         handle = loaded
+        sessionEpoch++
         currentModelPath = modelPath
         currentKvCacheMode = kvCacheMode
         currentGpuMode = gpuMode
@@ -1020,6 +1039,7 @@ object GgufInferenceService {
             val size = currentModelPath?.let { runCatching { File(it).length() }.getOrDefault(0L) } ?: 0L
             nativeFreeModel(handle)
             handle = 0L
+            sessionEpoch++
             currentModelPath = null
             return size
         }
@@ -1031,6 +1051,7 @@ object GgufInferenceService {
         if (handle != 0L && currentModelPath == path) {
             nativeFreeModel(handle)
             handle = 0L
+            sessionEpoch++
             currentModelPath = null
             currentKvCacheMode = -1
             currentGpuMode = -1

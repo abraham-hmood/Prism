@@ -86,6 +86,8 @@ class CallRecorder(
                 )
             }.getOrNull()
             if (attempt != null && attempt.state == AudioRecord.STATE_INITIALIZED) {
+                // The microphone chosen in Settings → Phone and Meshnet Calls, where it applies.
+                CallDevices.applyTo(context, attempt)
                 // Initialising is not permission to record: some devices construct a VOICE_CALL
                 // source and only refuse when it starts. Start here so a refusal can fall through
                 // to the microphone rather than crashing the call screen.

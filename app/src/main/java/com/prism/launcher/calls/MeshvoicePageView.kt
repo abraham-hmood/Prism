@@ -61,7 +61,15 @@ class MeshvoicePageView(context: Context) : FrameLayout(context) {
 
     var onBack: (() -> Unit)? = null
 
+    /**
+     * Asks for a runtime permission. Supplied by a host activity; otherwise the launcher's page
+     * permission helper is used, the same way [onPickAudio] falls back to it.
+     */
+    var onRequestPermission: ((permission: String, onResult: (Boolean) -> Unit) -> Unit)? = null
+
     private val root: LinearLayout
+    private val greetingRow: TextView
+    private var greeting: MeshGreetingView? = null
     private val tabCarrier: TextView
     private val tabMesh: TextView
     private val list: RecyclerView
@@ -129,7 +137,96 @@ class MeshvoicePageView(context: Context) : FrameLayout(context) {
         // not float over the list and does not scroll away with it.
         root.addView(actions, 3)
 
+        // The way into setting your own greeting, on the Meshvoice tab only: a carrier mailbox's
+        // greeting belongs to the carrier, and this one is Prism's.
+        greetingRow = TextView(context).apply {
+            textSize = 14f
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(d(16), d(12), d(16), d(12))
+            isClickable = true
+            setOnClickListener { openGreeting() }
+        }
+        root.addView(greetingRow, 4, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply {
+            leftMargin = d(12)
+            rightMargin = d(12)
+            topMargin = d(6)
+        })
+
+        applyTheme()
         applyTabs()
+    }
+
+    /**
+     * The page in the user's theme, in its light or dark mode.
+     *
+     * The page used to be transparent, so in the launcher it showed whatever happened to be behind
+     * it and in its own activity the stock window colour -- neither of which was the theme. Re-read on
+     * every refresh, because the theme and the mode can both change while the page stays alive.
+     */
+    private fun applyTheme() {
+        setBackgroundColor(IosUi.groupedBackground(context))
+        title.setTextColor(IosUi.label(context))
+        empty.setTextColor(IosUi.secondaryLabel(context))
+        findViewById<View>(R.id.meshvoiceTabUnderline)?.setBackgroundColor(IosUi.separator(context))
+        findViewById<ImageButton>(R.id.meshvoiceBack)?.imageTintList =
+            android.content.res.ColorStateList.valueOf(IosUi.label(context))
+        greetingRow.background = GradientDrawable().apply {
+            cornerRadius = d(12).toFloat()
+            setColor(IosUi.cardBackground(context))
+        }
+        greetingRow.setTextColor(IosUi.accent(context))
+        export.background = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(IosUi.accent(context))
+        }
+    }
+
+    // ── Your greeting ──────────────────────────────────────────────────────
+
+    /** Whether the greeting layout is on screen, so a host's back button can close it first. */
+    val greetingOpen: Boolean get() = greeting != null
+
+    /** Slides the greeting layout in over the mailbox. */
+    private fun openGreeting() {
+        if (greeting != null) return
+        val request = onRequestPermission ?: { permission: String, onResult: (Boolean) -> Unit ->
+            val activity = context as? LauncherActivity
+            if (activity != null) activity.requestPermission(permission, onResult) else onResult(
+                androidx.core.content.ContextCompat.checkSelfPermission(context, permission) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED,
+            )
+        }
+        stopPlayback()
+        val view = MeshGreetingView(context, request)
+        view.onClose = { closeGreeting() }
+        greeting = view
+        addView(view, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+        view.translationX = width.takeIf { it > 0 }?.toFloat() ?: resources.displayMetrics.widthPixels.toFloat()
+        view.animate().translationX(0f).setDuration(240).start()
+    }
+
+    /** Slides it back out. Returns false when it was not open, so a host knows to handle back itself. */
+    fun closeGreeting(): Boolean {
+        val view = greeting ?: return false
+        greeting = null
+        view.release()
+        view.animate().translationX(width.toFloat()).setDuration(200)
+            .withEndAction { removeView(view) }
+            .start()
+        renderGreetingRow()
+        return true
+    }
+
+    private fun renderGreetingRow() {
+        val info = runCatching { MeshGreeting.info() }.getOrNull()
+        greetingRow.text = if (info == null) {
+            "Set your voicemail greeting  ›"
+        } else {
+            val seconds = (info.durationMs / 1000).toInt()
+            "Your voicemail greeting · %d:%02d  ›".format(seconds / 60, seconds % 60)
+        }
     }
 
     override fun onAttachedToWindow() {
@@ -150,10 +247,14 @@ class MeshvoicePageView(context: Context) : FrameLayout(context) {
     /** Stops playback when the host is destroyed rather than merely detached. */
     fun release() {
         stopPlayback()
+        greeting?.release()
     }
 
     /** Re-reads the plan, the mesh and both mailboxes, keeping the current tab when it still exists. */
-    fun refresh() = applyTabs()
+    fun refresh() {
+        applyTheme()
+        applyTabs()
+    }
 
     /** Lets an activity opened with a tab extra start on it. */
     fun showTab(which: String) {
@@ -239,6 +340,8 @@ class MeshvoicePageView(context: Context) : FrameLayout(context) {
         // The carrier actions only make sense on the carrier tab. Keeping them visible on the
         // mesh tab suggests an import would add to a mailbox that cannot receive it.
         actions.visibility = if (tab == TAB_CARRIER && planActive) View.VISIBLE else View.GONE
+        greetingRow.visibility = if (tab == TAB_MESH) View.VISIBLE else View.GONE
+        renderGreetingRow()
     }
 
     private fun reload() {

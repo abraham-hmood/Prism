@@ -729,6 +729,11 @@ object PrismMeshService {
                 }, "meshvoice-ingest").start()
             }
 
+            // Video call frames. Inline: reassembly is string bookkeeping, and MeshVideo already
+            // opens and hands off each complete frame on its own worker thread.
+            com.prism.launcher.calls.MeshVideo.OPCODE_VIDEO ->
+                com.prism.launcher.calls.MeshVideo.receive(peerIp, payload)
+
             // Trusted-device positions and find requests. Both decrypt a sealed payload and write a
             // file, so both are off the dispatch thread for the same reason.
             com.prism.launcher.trusted.TrustedLocations.OPCODE_LOCATION -> {

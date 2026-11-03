@@ -217,7 +217,17 @@ object TrustedDevices {
          * a record; the pairing code or a proven pair secret is still what authorises anything.
          */
         val aliases: List<String> = emptyList(),
+        /**
+         * The key this pair agreed on while pairing, base64; blank for a pairing made before link
+         * keys existed. See [PairLink]: it is what lets two devices with different wallets seal
+         * calls, video and voicemail to each other. Kept as a string so the data class still
+         * compares by value.
+         */
+        val linkKey: String = "",
     ) {
+        /** The link key as bytes, or null when this pairing predates them. */
+        fun linkKeyBytes(): ByteArray? = PairLink.decode(linkKey)
+
         /** Whether this record is the device that presents [fingerprint], now or at any time before. */
         fun answersTo(fingerprint: String): Boolean =
             fingerprint.isNotBlank() && (fingerprint == this.fingerprint || fingerprint in aliases)
@@ -404,6 +414,7 @@ object TrustedDevices {
                     incoming = kinds(item.optJSONArray("in")),
                     confirmed = item.optBoolean("confirmed"),
                     aliases = aliases(aliasArray),
+                    linkKey = item.optString("lk"),
                 )
             }.filter { it.fingerprint.isNotBlank() && it.confirmed }
         }.getOrDefault(emptyList())
@@ -555,6 +566,7 @@ object TrustedDevices {
                     put("in", JSONArray().also { a -> device.incoming.forEach { a.put(it.id) } })
                     put("confirmed", device.confirmed)
                     put("alias", JSONArray().also { a -> device.aliases.forEach { a.put(it) } })
+                    if (device.linkKey.isNotBlank()) put("lk", device.linkKey)
                 }
             )
         }
@@ -650,6 +662,8 @@ object TrustedDevices {
             outgoing = target.outgoing + source.outgoing,
             incoming = target.incoming + source.incoming,
             aliases = (target.aliases + retired).distinct().takeLast(MAX_ALIASES),
+            // Both rows are the same device; whichever holds the pair's link key keeps it.
+            linkKey = target.linkKey.ifBlank { source.linkKey },
         )
         save(devices.filterNot { it == source || it == target } + merged)
     }
@@ -671,6 +685,10 @@ object TrustedDevices {
         synchronized(writeLock) {
             save(all().filterNot { it == device || it.fingerprint == fingerprint })
         }
+        // SAID OUT LOUD. This was the one removal that left no trace: a desktop emptied its list
+        // and told the phone, and the only evidence was the phone's "revoked trust" -- which made a
+        // single click look like trust detection failing on its own.
+        PrismPlatform.log.info(TAG, "Stopped trusting ${device?.name ?: fingerprint}")
         if (device != null && device.lastIp.isNotBlank()) {
             runCatching {
                 sender(
@@ -711,6 +729,8 @@ object TrustedDevices {
          * than refusing, because refusing would break pairing with a phone that has not updated.
          */
         val id: String = "",
+        /** The offering device's ephemeral public key for the link key; blank from an older build. */
+        val epk: String = "",
     ) {
         /** Whether this offer will ask for a code. */
         val needsCode: Boolean get() = salt.isNotEmpty()
@@ -734,6 +754,8 @@ object TrustedDevices {
         val at: Long = System.currentTimeMillis(),
         /** Names THIS offer, so an answer cannot be mistaken for the answer to a later one. */
         val id: String = java.util.UUID.randomUUID().toString(),
+        /** This side of the link-key exchange; it never leaves memory. See [PairLink]. */
+        val keyPair: java.security.KeyPair? = runCatching { PairLink.newKeyPair() }.getOrNull(),
     )
 
     private val outgoingPairings =
@@ -759,6 +781,10 @@ object TrustedDevices {
         val wantsWallet: Boolean = false,
         /** The offer this answers, so its confirmation and retries carry the right one. */
         val offerId: String = "",
+        /** This side's public key, sent again with every retry of the answer. */
+        val epk: String = "",
+        /** The link key this side derived, written to the record when the confirmation lands. */
+        val linkKey: String = "",
     )
 
     private val acceptances =
@@ -818,6 +844,8 @@ object TrustedDevices {
             put("kinds", JSONArray().also { a -> kinds.forEach { a.put(it.id) } })
             put("salt", java.util.Base64.getEncoder().encodeToString(salt))
             put("id", pairing.id)
+            // Public by design: the link key needs this AND the code key, which never travels.
+            pairing.keyPair?.let { put("epk", PairLink.publicOf(it)) }
         }.toString()
 
         val sent = runCatching {
@@ -947,6 +975,7 @@ object TrustedDevices {
             arrivedAt = System.currentTimeMillis(),
             salt = salt,
             id = json.optString("id"),
+            epk = json.optString("epk"),
         )
         PrismPlatform.log.info(TAG, "Trust offered by ${json.optString("name")} ($peerIp)")
         true
@@ -966,6 +995,8 @@ object TrustedDevices {
         // derives to, and the far side either opens it or does not -- so a wrong code fails there rather
         // than being judged here, and nothing about the code goes on the wire either way.
         var proof: ByteArray? = null
+        var epk = ""
+        var linkKey = ""
         if (offer.needsCode && accepted.isNotEmpty()) {
             val typed = code?.trim().orEmpty()
             if (typed.isEmpty()) {
@@ -977,6 +1008,16 @@ object TrustedDevices {
             // Both kept so the wallet handoff, if one comes, can be opened with the same key and salt.
             acceptedKeys[fingerprint] = key
             pendingSalts[fingerprint] = offer.salt
+            // THE PAIR'S OWN KEY. Derived now, from the offer's public key and the code just typed,
+            // and written to the record only when the offering side confirms the code was right.
+            if (offer.epk.isNotBlank()) {
+                runCatching { PairLink.newKeyPair() }.getOrNull()?.let { own ->
+                    PairLink.derive(own, offer.epk, key, offer.salt)?.let { derived ->
+                        epk = PairLink.publicOf(own)
+                        linkKey = PairLink.encode(derived)
+                    }
+                }
+            }
         }
 
         pending.remove(fingerprint)
@@ -1001,8 +1042,10 @@ object TrustedDevices {
             proof = proof,
             wantsWallet = wantsWallet,
             offerId = offer.id,
+            epk = epk,
+            linkKey = linkKey,
         )
-        sendReply(offer.ip, accepted, proof, wantsWallet = wantsWallet, offerId = offer.id)
+        sendReply(offer.ip, accepted, proof, wantsWallet = wantsWallet, offerId = offer.id, epk = epk)
         retryReply(fingerprint)
         return true
     }
@@ -1032,6 +1075,7 @@ object TrustedDevices {
                     waiting.proof,
                     waiting.wantsWallet,
                     waiting.offerId,
+                    waiting.epk,
                 )
             }
         }
@@ -1043,6 +1087,7 @@ object TrustedDevices {
         proof: ByteArray?,
         wantsWallet: Boolean = false,
         offerId: String = "",
+        epk: String = "",
     ) {
         runCatching {
             sender(
@@ -1060,6 +1105,7 @@ object TrustedDevices {
                     // ASKED FOR RATHER THAN PUSHED. A device that already has a wallet must not be sent
                     // another one -- that would replace an identity, and everything it holds.
                     if (wantsWallet) put("needsWallet", true)
+                    if (epk.isNotBlank()) put("epk", epk)
                 }.toString(),
             )
         }
@@ -1202,6 +1248,13 @@ object TrustedDevices {
             return false
         }
 
+        // The same link key the answering side derived: its public key, this side's private one,
+        // and the code key only these two devices hold. Blank when the far side is an older build.
+        val peerEpk = json.optString("epk")
+        val linkKey = if (peerEpk.isNotBlank() && offered.keyPair != null) {
+            PairLink.derive(offered.keyPair, peerEpk, key, challenge.salt)?.let { PairLink.encode(it) }.orEmpty()
+        } else ""
+
         save(all().filterNot { it.answersTo(fingerprint) || it.fingerprint == provisional })
         upsert(
             Trust(
@@ -1213,6 +1266,7 @@ object TrustedDevices {
                 outgoing = agreed,
                 incoming = agreed,
                 confirmed = true,
+                linkKey = linkKey,
             )
         )
         outgoingPairings.remove(provisional)
@@ -1338,6 +1392,7 @@ object TrustedDevices {
                 outgoing = accepted,
                 incoming = accepted,
                 confirmed = true,
+                linkKey = pending.linkKey,
             )
         )
         PrismPlatform.log.info(TAG, "Trust confirmed by ${pending.name} ($peerIp)")

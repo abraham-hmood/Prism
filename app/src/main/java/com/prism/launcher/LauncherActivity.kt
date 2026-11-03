@@ -383,6 +383,35 @@ class LauncherActivity : PrismBaseActivity() {
             .onFailure { documentCreateCallback = null }
     }
 
+    /**
+     * Asks for one runtime permission on behalf of a page view.
+     *
+     * Pages are views, not activities, so they cannot register a result launcher of their own; this
+     * is the same shape as [pickDocument] for the same reason. The Meshvoice page uses it for the
+     * microphone, to record a greeting.
+     */
+    fun requestPermission(permission: String, onResult: (granted: Boolean) -> Unit) {
+        if (androidx.core.content.ContextCompat.checkSelfPermission(this, permission) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            onResult(true)
+            return
+        }
+        permissionCallback = onResult
+        runCatching { pagePermissionLauncher.launch(permission) }
+            .onFailure { permissionCallback = null; onResult(false) }
+    }
+
+    private var permissionCallback: ((Boolean) -> Unit)? = null
+
+    private val pagePermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        val callback = permissionCallback
+        permissionCallback = null
+        callback?.invoke(granted)
+    }
+
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { /* result is informational; VPN notification works regardless */ }

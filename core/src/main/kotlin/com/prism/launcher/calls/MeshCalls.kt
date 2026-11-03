@@ -49,14 +49,25 @@ object MeshCalls {
 
     private const val TAG = "PrismCalls"
 
+    // ── Opcodes ────────────────────────────────────────────────────────────
+    //
+    // 0x37-0x39, NOT 0x30-0x32. Those values were also Aether's announce (0x30), Nebula's announce
+    // (0x31) and the social feed's announce (0x32), and the phone's dispatcher is a `when` that takes
+    // the FIRST match -- with Aether and Nebula listed above calls. Every call signal a phone
+    // received was therefore parsed as an Aether announcement and dropped, every audio frame went to
+    // Nebula and every voicemail chunk to the social feed: a phone could ring a desktop but never
+    // hear its answer, never saw a call from it, and never received a single frame of sound. The
+    // desktop registers no Aether or Nebula handler, which is why it alone appeared to work.
+    // MeshOpcodesTest now fails the build if any two features share a value again.
+
     /** Invite, answer, decline, end. JSON, sealed when the peer is trusted. */
-    const val OPCODE_SIGNAL: Byte = 0x30
+    const val OPCODE_SIGNAL: Byte = 0x37
 
     /** One encrypted or plaintext audio frame, base64. */
-    const val OPCODE_AUDIO: Byte = 0x31
+    const val OPCODE_AUDIO: Byte = 0x38
 
     /** A meshnet voicemail chunk. */
-    const val OPCODE_VOICE: Byte = 0x32
+    const val OPCODE_VOICE: Byte = 0x39
 
     const val SAMPLE_RATE = 16_000
     const val FRAME_MS = 20
@@ -64,18 +75,40 @@ object MeshCalls {
 
     enum class State { IDLE, DIALING, RINGING, ACTIVE, RECORDING, ENDED }
 
-    /** One side of a call. */
+    /**
+     * One side of a call.
+     *
+     * [id] is what makes a repeated invitation recognisable as the SAME call. The caller repeats its
+     * invite until it is answered (one UDP datagram is all it takes for a call to vanish), and the
+     * receiver must treat the repeats as one ringing call rather than as a second caller to refuse.
+     * It also scopes "answer" and "end": a late `end` from a previous call must not hang up this one.
+     *
+     * [peerIp] is a `var` because a trusted device can answer from a different address than the one
+     * that was dialled -- a desktop with several adapters, or a phone that took a new lease mid-ring.
+     * A sealed answer carrying this call's id proves it is the same device.
+     */
     data class Call(
-        val peerIp: String,
+        var peerIp: String,
         val peerName: String,
         val trusted: Boolean,
         var state: State = State.DIALING,
         var startedAt: Long = 0L,
         var encryptedFrames: Long = 0L,
         var plainFrames: Long = 0L,
+        val id: String = newCallId(),
+        val video: Boolean = false,
+        /** True while a voicemail call is playing the other device's greeting, before recording. */
+        @Volatile var playingGreeting: Boolean = false,
     ) {
         val secure: Boolean get() = trusted
     }
+
+    /** Random and unguessable: it is the only thing tying an answer to the invitation it answers. */
+    fun newCallId(): String = java.util.UUID.randomUUID().toString().replace("-", "").take(16)
+
+    /** How long a caller keeps ringing before giving up, and how often the invite is repeated. */
+    private const val RING_MS = 45_000L
+    private const val INVITE_REPEAT_MS = 1_500L
 
     /**
      * The platform's audio path.
@@ -255,9 +288,14 @@ object MeshCalls {
             MeshVoice.accept(peerIp, payload)
             true
         }
+        MeshCore.register(MeshVideo.OPCODE_VIDEO) { peerIp, payload ->
+            MeshVideo.receive(peerIp, payload)
+            true
+        }
         // Resume anything the previous process was still holding. Desktop reaches this from
         // Main; Android calls MeshVoice.startOutbox from its own main-process startup.
         MeshVoice.startOutbox()
+        MeshGreeting.start()
         PrismPlatform.log.info(TAG, "Mesh call opcodes registered")
     }
 
@@ -269,24 +307,34 @@ object MeshCalls {
      * [trusted] is not a hint: it decides whether the audio is encrypted at all. The caller (the UI)
      * must have shown the one-time warning for an untrusted call before reaching here.
      */
-    fun call(peerIp: String, peerName: String, trusted: Boolean): Call {
+    fun call(peerIp: String, peerName: String, trusted: Boolean, video: Boolean = false): Call {
         end(notify = false)
         lastError = null
+        // EVERY REFUSAL GOES THROUGH notify(), NOT onState. Nothing assigns onState any more -- every
+        // screen registers a listener -- so a refusal reported only there reached nobody, and the
+        // call screen sat on "Calling over the mesh…" forever while the other device showed nothing.
         if (peerIp.isBlank()) {
             lastError = "${peerName.ifBlank { "That device" }} has no known address on the mesh yet."
-            onState?.invoke(null)
-            return Call(peerIp, peerName, trusted, state = State.ENDED)
+            notify(null)
+            return Call(peerIp, peerName, trusted, state = State.ENDED, video = video)
         }
         if (!meshReady() && !MeshTransport.isOnMesh()) {
             lastError = "Not on a Prism meshnet, so there is nowhere for the call to go."
-            onState?.invoke(null)
-            return Call(peerIp, peerName, trusted, state = State.ENDED)
+            notify(null)
+            return Call(peerIp, peerName, trusted, state = State.ENDED, video = video)
         }
-        val call = Call(peerIp = peerIp, peerName = peerName, trusted = trusted)
+        if (MeshGroupCalls.isBusy()) {
+            lastError = "A group call is still in progress. Leave it before starting another call."
+            notify(null)
+            return Call(peerIp, peerName, trusted, state = State.ENDED, video = video)
+        }
+        val call = Call(peerIp = peerIp, peerName = peerName, trusted = trusted, video = video)
         active = call
         activeSince = System.currentTimeMillis()
         pendingInvite = null
-        callKey = if (trusted) CloudVault.keyFor(CloudVault.Purpose.CALLS) else null
+        // The pair's own link key when it has one -- see PairLink for why the wallet key alone
+        // left two trusted devices on different wallets unable to hear each other at all.
+        callKey = if (trusted) peerKey(peerIp) else null
         if (trusted && callKey == null) {
             // Trusted encryption without a wallet is impossible, and silently falling back to
             // plaintext would be the worst possible answer. Refuse and say why.
@@ -296,21 +344,46 @@ object MeshCalls {
             active = null
             audio?.stopCapture()
             audio?.stopPlayback()
-            onState?.invoke(null)
+            notify(null)
             return call
         }
 
-        signal(call, JSONObject().apply {
+        val invite = JSONObject().apply {
             put("t", "invite")
             put("from", TrustedDevices.localFingerprint())
             put("name", localName())
             put("secure", trusted)
-        })
+            put("video", video)
+        }
+        signal(call, invite)
         notify(call)
-        // A trusted device that is not answering is treated as offline by the UI, which offers
-        // voicemail instead. The invite itself is harmless: it is sealed and ignored by a device
-        // that is not there.
+        repeatInvite(call, invite)
         return call
+    }
+
+    /**
+     * Repeats the invitation until it is answered, refused or times out.
+     *
+     * ONE DATAGRAM WAS THE WHOLE CALL. A phone's Wi-Fi in power-save drops the odd packet, a desktop
+     * that has just woken has not finished re-joining the mesh, and either is enough to lose a
+     * single invite -- after which the caller heard ringing and the far side never saw anything.
+     * The receiver recognises a repeat by [Call.id] and keeps ringing the same call, so repeating is
+     * free. The far side's own ring timeout is longer than [RING_MS], so it never outlives the caller.
+     */
+    private fun repeatInvite(call: Call, invite: JSONObject) {
+        Thread({
+            val deadline = System.currentTimeMillis() + RING_MS
+            while (true) {
+                runCatching { Thread.sleep(INVITE_REPEAT_MS) }.onFailure { return@Thread }
+                if (active !== call || call.state != State.DIALING) return@Thread
+                if (System.currentTimeMillis() > deadline) {
+                    lastError = "${call.peerName.ifBlank { call.peerIp }} did not answer."
+                    end(notify = true)
+                    return@Thread
+                }
+                signal(call, invite)
+            }
+        }, "meshcall-invite-repeat").apply { isDaemon = true; start() }
     }
 
     /** Records and sends a meshnet voicemail instead of calling. */
@@ -329,28 +402,86 @@ object MeshCalls {
         val call = Call(peerIp, peerName, true, state = State.RECORDING, startedAt = System.currentTimeMillis())
         active = call
         activeSince = System.currentTimeMillis()
-        callKey = CloudVault.keyFor(CloudVault.Purpose.CALLS) ?: run {
+        callKey = peerKey(peerIp) ?: run {
             active = null
-            onState?.invoke(null)
+            notify(null)
             return false
         }
         voicemailBuffer.reset()
+
+        // THEIR GREETING FIRST, when they have handed us one (see MeshGreeting): the device being
+        // called is away, so the copy it shared earlier is the only one that can play. Then a beep,
+        // then the recording -- the order every voicemail has, so nobody talks over the greeting.
+        val greeting = TrustedDevices.byIp(peerIp)?.fingerprint
+            ?.let { MeshGreeting.greetingOf(it) }
+            ?.let { MeshGreeting.pcmOf(it) }
+        if (greeting != null && audio != null) {
+            call.playingGreeting = true
+            notify(call)
+            Thread({
+                playGreeting(greeting)
+                call.playingGreeting = false
+                if (active !== call || call.state != State.RECORDING) return@Thread
+                call.startedAt = System.currentTimeMillis()
+                if (!beginVoicemailCapture(call, seconds)) {
+                    active = null
+                    notify(null)
+                }
+            }, "meshvoice-greeting").apply { isDaemon = true; start() }
+            return true
+        }
+
+        if (!beginVoicemailCapture(call, seconds)) {
+            active = null
+            notify(null)
+            return false
+        }
+        return true
+    }
+
+    /** Starts recording a voicemail and the timer that ends it. False when the microphone will not open. */
+    private fun beginVoicemailCapture(call: Call, seconds: Int): Boolean {
         val started = audio?.startCapture { frame ->
             synchronized(voicemailBuffer) { voicemailBuffer.write(frame) }
         } ?: false
-        if (!started) {
-            active = null
-            onState?.invoke(null)
-            return false
-        }
+        if (!started) return false
         notify(call)
         // Bounded by a timer rather than unbounded: a voicemail is a message, not a recording of
         // whatever happens in the room until somebody remembers to press stop.
         Thread({
             runCatching { Thread.sleep(seconds * 1000L) }
-            finishVoicemail()
+            if (active === call) finishVoicemail()
         }, "meshvoice-timeout").apply { isDaemon = true; start() }
         return true
+    }
+
+    /**
+     * Plays [pcm] (16 kHz mono) and then a short beep, returning once both have been heard.
+     *
+     * Written frame by frame: both platforms' playback writes block while their buffer is full, so
+     * the loop runs at the speed of playback, and stops early if the caller hangs up.
+     */
+    private fun playGreeting(pcm: ByteArray) {
+        val engine = audio ?: return
+        if (!engine.startPlayback()) return
+        val beep = ByteArray(MeshCalls.SAMPLE_RATE * 2 * 2 / 5).also { tone ->
+            for (i in 0 until tone.size / 2) {
+                val value = (kotlin.math.sin(2 * Math.PI * 880.0 * i / SAMPLE_RATE) * 9_000).toInt()
+                tone[i * 2] = (value and 0xff).toByte()
+                tone[i * 2 + 1] = ((value shr 8) and 0xff).toByte()
+            }
+        }
+        val all = pcm + ByteArray(SAMPLE_RATE / 5 * 2) + beep
+        val owner = active
+        var offset = 0
+        while (offset < all.size && active === owner) {
+            val end = minOf(all.size, offset + FRAME_BYTES)
+            engine.write(all.copyOfRange(offset, end))
+            offset = end
+        }
+        // Let what is still buffered drain before the microphone opens on top of it.
+        runCatching { Thread.sleep(250) }
+        engine.stopPlayback()
     }
 
     /** Ends a voicemail recording early and sends what was captured. */
@@ -386,15 +517,20 @@ object MeshCalls {
         // either a downgrade attempt or a device with a different wallet, and accepting it would
         // let an attacker turn a sealed call into an audible one. Untrusted peers have no shared
         // key, so their signals are plain by construction.
-        var trustedPeer = TrustedDevices.byIp(peerIp)?.confirmed == true
-        val key = CloudVault.keyFor(CloudVault.Purpose.CALLS)
+        val record = TrustedDevices.byIp(peerIp)?.takeIf { it.confirmed }
+        var trustedPeer = record != null
+        // THE KEY THIS PAIR ACTUALLY SHARES. A pairing now carries its own link key (see PairLink),
+        // which is what two devices on DIFFERENT wallets have in common -- the wallet key alone made
+        // every call between them unreadable. The wallet key is still tried after it, for pairings
+        // made before link keys and for devices that do share a wallet.
+        var key: ByteArray? = record?.let { peerKey(peerIp) } ?: walletKey()
         if (trustedPeer && key == null) {
             // SILENT UNTIL NOW. A desktop whose wallet was locked or never imported dropped every
             // sealed invitation without a log line, so the caller rang and the receiver showed
             // nothing at all -- which reads as "this machine cannot receive calls". The packet
             // genuinely cannot be opened, so the only honest fix is to say why and surface it.
             undeliverable(
-                "An encrypted call arrived from ${TrustedDevices.byIp(peerIp)?.name ?: peerIp}, " +
+                "An encrypted call arrived from ${record?.name ?: peerIp}, " +
                     "but this device's wallet is locked. Unlock it on the Wallet page.",
             )
             return
@@ -405,20 +541,31 @@ object MeshCalls {
         // This is the case that made calls from a phone to a desktop simply never arrive. Trust is
         // stored against the fingerprint, but the packet arrives from an address, and a device that
         // took a new DHCP lease -- or that the desktop had only ever seen on a different network --
-        // was no longer recognised. Its invite is sealed with the wallet-derived calls key, so the
-        // honest test is not "is this address in the list" but "can this device produce a packet".
-        // Opening it proves the shared wallet; the fingerprint inside says which trusted device it
-        // is, and the new address is recorded so the reply goes back the right way.
+        // was no longer recognised. So every key this device shares with somebody is tried: a link
+        // key that opens it names the pair outright, and the wallet key is identified by the
+        // fingerprint inside. Either way the new address is recorded so replies go back the right way.
         var json: JSONObject?
         if (trustedPeer) {
-            json = openSignal(payload, key, requireSealed = true)
+            val opened = openWithAny(payload, listOfNotNull(record?.linkKeyBytes(), walletKey()))
+            json = opened?.first
+            if (opened != null) key = opened.second
         } else if (!payload.trim().startsWith("{")) {
-            val opened = openSignal(payload, key, requireSealed = true)
-            val from = opened?.optString("from").orEmpty()
-            val known = if (from.isNotBlank()) TrustedDevices.byFingerprint(from) else null
+            val candidates = TrustedDevices.all()
+                .mapNotNull { device -> device.linkKeyBytes()?.let { it to device } } +
+                listOfNotNull(walletKey()?.let { it to null })
+            var known: TrustedDevices.Trust? = null
+            var opened: JSONObject? = null
+            for ((candidate, device) in candidates) {
+                val attempt = openSignal(payload, candidate, requireSealed = true) ?: continue
+                opened = attempt
+                key = candidate
+                known = device ?: attempt.optString("from").takeIf { it.isNotBlank() }
+                    ?.let { TrustedDevices.byFingerprint(it) }
+                break
+            }
             if (opened != null && known != null) {
                 trustedPeer = true
-                TrustedDevices.noteAddress(from, peerIp)
+                TrustedDevices.noteAddress(known.fingerprint, peerIp)
                 PrismPlatform.log.info(
                     TAG,
                     "Accepted a sealed call packet from ${known.name} at a new address ($peerIp)",
@@ -439,20 +586,45 @@ object MeshCalls {
                     "A call arrived from $peerIp but its wallet key is unavailable on this " +
                         "device. Unlock the wallet to receive encrypted calls.",
                 )
+            } else if (trustedPeer && !payload.trim().startsWith("{")) {
+                // THE KEY EXISTS AND STILL DOES NOT OPEN IT. That is two devices paired on
+                // different wallets -- each derives its own calls key -- and it used to be dropped
+                // without a word, which is the purest form of "the call never showed up".
+                undeliverableOnce(
+                    peerIp,
+                    "An encrypted call arrived from ${TrustedDevices.byIp(peerIp)?.name ?: peerIp} " +
+                        "but no key on this device opens it. The two devices are on different " +
+                        "wallets and were paired before pairing gave them a key of their own: " +
+                        "remove each other in Trusted devices and pair again.",
+                )
             }
             return
         }
-        when (json.optString("t")) {
+        when (val type = json.optString("t")) {
             "invite" -> {
+                val inviteId = json.optString("id")
                 val current = active
                 if (current != null) {
+                    // THE SAME INVITATION AGAIN. The caller repeats it until it is answered, so a
+                    // repeat is not a second caller: keep ringing, and if this side already
+                    // answered, the answer was lost -- send it again rather than refusing as busy,
+                    // which would hang up the very call this device just accepted.
+                    if (inviteId.isNotBlank() && current.id == inviteId) {
+                        if (current.state == State.ACTIVE) {
+                            signal(current, JSONObject().apply { put("t", "answer") })
+                        }
+                        return
+                    }
                     val age = System.currentTimeMillis() - activeSince
                     // A live conversation or a recording is busy. An un-answered call older than
                     // forty seconds is not a conversation, it is a leak, and refusing the new call
                     // because of it is how this machine became unreachable.
                     val live = current.state == State.ACTIVE || current.state == State.RECORDING
                     if (live || age < 40_000L) {
-                        key?.let { sendSignal(peerIp, JSONObject().apply { put("t", "busy") }, it) }
+                        reply(peerIp, trustedPeer, key, JSONObject().apply {
+                            put("t", "busy")
+                            put("id", inviteId)
+                        })
                         return
                     }
                     PrismPlatform.log.warn(
@@ -460,6 +632,13 @@ object MeshCalls {
                         "Dropping a stale ${current.state} call to ${current.peerName} to take a new one",
                     )
                     end(notify = false)
+                }
+                if (MeshGroupCalls.isBusy()) {
+                    reply(peerIp, trustedPeer, key, JSONObject().apply {
+                        put("t", "busy")
+                        put("id", inviteId)
+                    })
+                    return
                 }
                 // NOT re-derived from the address here: a device at a new lease has already been
                 // recognised above by its signature, and asking the address table again would
@@ -470,11 +649,22 @@ object MeshCalls {
                     peerName = json.optString("name").ifBlank { peerIp },
                     trusted = trusted,
                     state = State.RINGING,
+                    id = inviteId.ifBlank { newCallId() },
+                    video = json.optBoolean("video", false),
                 )
                 pendingInvite = call
                 active = call
                 activeSince = System.currentTimeMillis()
-                callKey = key
+                lastError = null
+                // THE KEY ONLY BELONGS TO A TRUSTED CALL. This used to be the local wallet key for
+                // every invitation, so answering an untrusted caller SEALED the answer with a key
+                // the caller did not have -- and with no wallet at all, accept() returned before
+                // sending anything. Either way an untrusted call could never connect.
+                callKey = if (trusted) key else null
+                PrismPlatform.log.info(
+                    TAG,
+                    "Incoming ${if (call.video) "video " else ""}mesh call from ${call.peerName} at $peerIp",
+                )
                 notifyIncoming(call)
                 notify(call)
                 // Ringing has to expire on its own. A machine whose page was not open has nobody to
@@ -486,19 +676,61 @@ object MeshCalls {
             }
             "answer" -> {
                 val call = active ?: return
-                if (call.peerIp != peerIp) return
+                if (!sameCall(call, peerIp, json, trustedPeer)) return
+                // A repeated answer (this side repeated its invite before the first answer
+                // arrived) must not restart the microphone of a call that is already live.
+                if (call.state != State.DIALING) return
                 startAudio(call)
             }
             "dtmf" -> {
                 val call = active ?: return
-                if (call.peerIp != peerIp) return
+                if (!sameCall(call, peerIp, json, trustedPeer)) return
                 val digit = json.optString("d").take(1)
                 if (digit.isNotBlank()) onDtmf?.invoke(digit)
             }
             "decline", "busy", "end" -> {
                 val call = active ?: return
-                if (call.peerIp == peerIp) end(notify = true)
+                if (!sameCall(call, peerIp, json, trustedPeer)) return
+                if (call.state == State.DIALING) {
+                    lastError = when (type) {
+                        "busy" -> "${call.peerName} is on another call."
+                        "decline" -> "${call.peerName} declined the call."
+                        else -> null
+                    }
+                }
+                end(notify = true)
             }
+            "ginvite", "gjoin", "gleave", "gdecline" ->
+                MeshGroupCalls.onSignal(peerIp, json, trustedPeer)
+        }
+    }
+
+    /**
+     * Whether a signal belongs to [call].
+     *
+     * By id when the peer sent one: a late `end` from a call that was hung up and redialled used to
+     * end the new call, because both came from the same address. A trusted peer's sealed packet with
+     * the right id may come from a new address -- the seal proves the wallet -- and the call follows
+     * it, so audio goes back the way the answer came. A peer that sends no id (an older build) is
+     * matched by address, as before.
+     */
+    private fun sameCall(call: Call, peerIp: String, json: JSONObject, trustedPeer: Boolean): Boolean {
+        val id = json.optString("id")
+        if (id.isBlank()) return call.peerIp == peerIp
+        if (id != call.id) return false
+        if (call.peerIp == peerIp) return true
+        if (!call.trusted || !trustedPeer) return false
+        PrismPlatform.log.info(TAG, "${call.peerName} answered from $peerIp; following it there")
+        call.peerIp = peerIp
+        return true
+    }
+
+    /** One reply to a peer that has no call object yet, sealed exactly when the peer is trusted. */
+    private fun reply(peerIp: String, trusted: Boolean, key: ByteArray?, body: JSONObject) {
+        if (trusted) {
+            key?.let { sendSignal(peerIp, body, it) }
+        } else {
+            runCatching { MeshTransport.sendToPeer(peerIp, OPCODE_SIGNAL, body.toString()) }
         }
     }
 
@@ -519,20 +751,24 @@ object MeshCalls {
 
     fun accept() {
         val invite = pendingInvite ?: return
-        val key = callKey ?: return
+        // Only a trusted call needs the key; an untrusted one is plain by construction and used to
+        // be impossible to answer because this line demanded a key it would never use.
+        if (invite.trusted && callKey == null) {
+            lastError = "This call is sealed with your wallet key, and the wallet is locked."
+            return
+        }
         pendingInvite = null
-        sendSignal(invite.peerIp, JSONObject().apply { put("t", "answer") }, key)
+        signal(invite, JSONObject().apply { put("t", "answer") })
         startAudio(invite)
     }
 
     fun decline() {
         val invite = pendingInvite ?: return
         pendingInvite = null
-        callKey?.let { key ->
-            sendSignal(invite.peerIp, JSONObject().apply { put("t", "decline") }, key)
-        }
+        signal(invite, JSONObject().apply { put("t", "decline") })
         invite.state = State.ENDED
         active = null
+        callKey = null
         notify(invite)
     }
 
@@ -546,10 +782,27 @@ object MeshCalls {
         inCall = true
         // A new call always starts unmuted, even if the previous one ended while muted.
         muted = false
-        engine.startPlayback()
-        engine.startCapture { frame -> sendAudio(call, frame) }
+        receivedFrames = 0L
+        // BOTH RESULTS ARE LOGGED. They used to be ignored, so a call whose microphone or speaker
+        // would not open connected anyway and was simply silent -- with nothing anywhere to say
+        // which half had failed. The call still connects (the other side may still be heard), but
+        // the reason is now on the record and on screen.
+        val playing = engine.startPlayback()
+        val capturing = engine.startCapture { frame -> sendAudio(call, frame) }
+        PrismPlatform.log.info(
+            TAG,
+            "Call ${call.id} with ${call.peerName} is live at ${call.peerIp}: " +
+                "speaker=${if (playing) "open" else "FAILED"}, microphone=${if (capturing) "open" else "FAILED"}, " +
+                if (call.trusted) "sealed" else "plain",
+        )
+        if (!capturing) lastError = "This device's microphone could not be opened, so the other side cannot hear you."
+        else if (!playing) lastError = "This device's speaker could not be opened, so you cannot hear the other side."
         notify(call)
     }
+
+    /** Frames received on the live call, for the end-of-call line in the log. */
+    @Volatile
+    private var receivedFrames = 0L
 
     private fun sendAudio(call: Call, frame: ByteArray) {
         if (!inCall) return
@@ -566,6 +819,8 @@ object MeshCalls {
     }
 
     private fun onAudio(peerIp: String, payload: String) {
+        // A group call shares the opcode; its members' frames are its own.
+        if (MeshGroupCalls.onAudio(peerIp, payload)) return
         val call = active ?: return
         if (call.peerIp != peerIp || call.state != State.ACTIVE) return
         val raw = runCatching { Base64.getDecoder().decode(payload) }.getOrNull() ?: return
@@ -574,6 +829,7 @@ object MeshCalls {
             CloudVault.open(raw, key) ?: return
         } else raw
         if (frame.size > 4096) return
+        receivedFrames++
         for (tap in audioTaps) runCatching { tap(frame, false) }
         audio?.write(frame)
     }
@@ -588,19 +844,24 @@ object MeshCalls {
         activeSince = 0L
         pendingInvite = null
         if (call != null) {
-            call.state = State.ENDED
-            val end = JSONObject().apply { put("t", "end") }
-            val key = callKey
-            if (key != null) {
-                runCatching { sendSignal(call.peerIp, end, key) }
-            } else if (!call.trusted) {
-                // Untrusted calls have no key to seal with; the end signal goes in clear so the
-                // other side stops its audio rather than playing an empty room.
-                runCatching { MeshTransport.sendToPeer(call.peerIp, OPCODE_SIGNAL, end.toString()) }
+            if (call.state == State.ACTIVE) {
+                // The line that answers "was any sound exchanged at all?" without a debugger.
+                PrismPlatform.log.info(
+                    TAG,
+                    "Call ${call.id} with ${call.peerName} ended: sent " +
+                        "${call.encryptedFrames + call.plainFrames} frame(s), received $receivedFrames",
+                )
             }
+            val wasLive = call.state != State.ENDED
+            call.state = State.ENDED
+            // Sealed for a trusted call, in clear for an untrusted one, so the other side stops its
+            // audio rather than playing an empty room. signal() makes that choice from the call.
+            if (wasLive) runCatching { signal(call, JSONObject().apply { put("t", "end") }) }
         }
         callKey = null
-        if (notify) onState?.invoke(call)
+        // LISTENERS, not just onState. The far side hanging up reached only the legacy slot, which
+        // nothing assigns, so the call screen kept counting a call that was already over.
+        if (notify) notify(call)
     }
 
     // ── Wire helpers ───────────────────────────────────────────────────────
@@ -629,6 +890,9 @@ object MeshCalls {
     }
 
     private fun signal(call: Call, body: JSONObject) {
+        // Every signal names its call, so the far side can tell this call's answer or hang-up from
+        // a previous one's.
+        if (!body.has("id")) body.put("id", call.id)
         val key = callKey
         if (call.trusted && key != null) {
             sendSignal(call.peerIp, body, key)
@@ -640,6 +904,10 @@ object MeshCalls {
     }
 
     private fun sendSignal(peerIp: String, body: JSONObject, key: ByteArray) {
+        // Every sealed signal names its sender. A receiver that does not have this address on file
+        // finds the trusted device by this fingerprint instead (see onSignal), which is what lets a
+        // join or an answer from a device on a new lease still be recognised as trusted.
+        if (!body.has("from")) body.put("from", TrustedDevices.localFingerprint())
         runCatching {
             val sealed = CloudVault.seal(body.toString().toByteArray(), key)
             MeshTransport.sendToPeer(
@@ -672,7 +940,102 @@ object MeshCalls {
         notify(active)
     }
 
-    private fun localName(): String = runCatching { PrismPlatform.host.deviceName() }.getOrDefault("Prism")
+    private val undeliverableAt = ConcurrentHashMap<String, Long>()
+
+    /**
+     * [undeliverable], at most once a minute per peer.
+     *
+     * A caller now repeats its invite every [INVITE_REPEAT_MS], so a packet this device cannot open
+     * arrives thirty times per ring. The first one is the message; the rest would be a flood of
+     * identical notifications.
+     */
+    private fun undeliverableOnce(peerIp: String, reason: String) {
+        val now = System.currentTimeMillis()
+        val last = undeliverableAt[peerIp] ?: 0L
+        if (now - last < 60_000L) return
+        undeliverableAt[peerIp] = now
+        undeliverable(reason)
+    }
+
+    // ── Per-link helpers, shared with group calls and video ────────────────
+
+    /**
+     * The key for one link, or null when the link is plain.
+     *
+     * A group call is a set of links, not one call: two trusted members seal to each other with the
+     * wallet's calls key, while a link to an untrusted member is plain. Deciding per link is what
+     * keeps a mixed group from either downgrading the trusted links or sealing for a stranger.
+     */
+    internal fun linkKey(peerIp: String, trusted: Boolean): ByteArray? =
+        if (trusted) peerKey(peerIp) else null
+
+    /** The wallet's calls key: shared only by devices on the same recovery phrase. */
+    internal fun walletKey(): ByteArray? = CloudVault.keyFor(CloudVault.Purpose.CALLS)
+
+    /**
+     * The key to seal to the trusted device at [peerIp]: the pair's own link key when the pairing
+     * made one, otherwise the wallet key (which only works when both devices share a wallet).
+     */
+    fun peerKey(peerIp: String): ByteArray? =
+        TrustedDevices.byIp(peerIp)?.takeIf { it.confirmed }?.linkKeyBytes() ?: walletKey()
+
+    /** Every key this device could open a packet from [peerIp] with, most specific first. */
+    internal fun openKeys(peerIp: String): List<ByteArray> = listOfNotNull(
+        TrustedDevices.byIp(peerIp)?.takeIf { it.confirmed }?.linkKeyBytes(),
+        walletKey(),
+    )
+
+    /** The first of [keys] that opens a sealed signal, with the key that did. */
+    private fun openWithAny(payload: String, keys: List<ByteArray>): Pair<JSONObject, ByteArray>? {
+        for (candidate in keys) {
+            openSignal(payload, candidate, requireSealed = true)?.let { return it to candidate }
+        }
+        return null
+    }
+
+    /** Sends one signal on one link: sealed when [trusted], in clear otherwise. */
+    internal fun sendLinkSignal(peerIp: String, trusted: Boolean, body: JSONObject) {
+        val key = linkKey(peerIp, trusted)
+        if (trusted) {
+            if (key != null) sendSignal(peerIp, body, key)
+        } else {
+            runCatching { MeshTransport.sendToPeer(peerIp, OPCODE_SIGNAL, body.toString()) }
+        }
+    }
+
+    /** Sends one audio frame on one link. */
+    internal fun sendLinkAudio(peerIp: String, trusted: Boolean, frame: ByteArray) {
+        val payload = if (trusted) {
+            val key = linkKey(peerIp, true) ?: return
+            Base64.getEncoder().encodeToString(CloudVault.seal(frame, key))
+        } else {
+            Base64.getEncoder().encodeToString(frame)
+        }
+        MeshTransport.sendToPeer(peerIp, OPCODE_AUDIO, payload)
+    }
+
+    /** Opens one audio frame from one link, or null when it is not a frame this device can play. */
+    internal fun openLinkAudio(peerIp: String, trusted: Boolean, payload: String): ByteArray? {
+        val raw = runCatching { Base64.getDecoder().decode(payload) }.getOrNull() ?: return null
+        return openLink(peerIp, trusted, raw)?.takeIf { it.size in 2..4096 }
+    }
+
+    /**
+     * Opens one sealed-or-plain payload from a group or video link.
+     *
+     * THE TWO ENDS OF A LINK CAN DISAGREE ABOUT TRUST. Each decides from its own trusted-device
+     * record, and a stale address on one side makes one end seal while the other expects plain --
+     * at which point ciphertext was played as PCM, which is loud noise. So the key is tried first
+     * whenever this device has one: AES-GCM cannot open by accident, so a success proves the payload
+     * was sealed for this wallet. Only a link this side considers untrusted may fall back to plain;
+     * a plain payload from a trusted link stays refused, as every other trusted path refuses it.
+     */
+    internal fun openLink(peerIp: String, trusted: Boolean, raw: ByteArray): ByteArray? {
+        for (key in openKeys(peerIp)) CloudVault.open(raw, key)?.let { return it }
+        return if (trusted) null else raw
+    }
+
+    internal fun localName(): String = runCatching { PrismPlatform.host.deviceName() }.getOrDefault("Prism")
 
     /** Wraps PCM in a WAV header so every platform can play it without a codec. */
     fun wav(pcm: ByteArray, sampleRate: Int = SAMPLE_RATE): ByteArray {
@@ -747,7 +1110,9 @@ object MeshCalls {
         }
 
         fun send(peerIp: String, wav: ByteArray, fromName: String) {
-            val key = CloudVault.keyFor(CloudVault.Purpose.CALLS) ?: return
+            // Sealed for the TRIP with the pair's link key, so a voicemail reaches a trusted device on
+            // another wallet; this device's own copy is still sealed with its wallet (see save).
+            val key = peerKey(peerIp) ?: return
             val id = java.util.UUID.randomUUID().toString()
             val sealed = CloudVault.seal(wav, key)
             val at = System.currentTimeMillis()
@@ -775,6 +1140,11 @@ object MeshCalls {
             if (!device.confirmed) return
             val json = runCatching { JSONObject(payload) }.getOrNull() ?: return
             val type = json.optString("t")
+            // The greeting travels on the voicemail opcode: same sender check, same sealed chunks.
+            if (type == "greet" || type == "greet_ack") {
+                MeshGreeting.accept(peerIp, device, json)
+                return
+            }
             if (type == ACK) {
                 // A receipt, not audio. Removing the held copy is what stops a voicemail being
                 // re-sent forever to a device that has already stored it.
@@ -812,8 +1182,7 @@ object MeshCalls {
             val encoded = builder.toString()
             incoming.remove(id); totals.remove(id)
             val sealed = runCatching { Base64.getDecoder().decode(encoded) }.getOrNull() ?: return
-            val key = CloudVault.keyFor(CloudVault.Purpose.CALLS) ?: return
-            val wav = CloudVault.open(sealed, key) ?: run {
+            val wav = openKeys(peerIp).firstNotNullOfOrNull { CloudVault.open(sealed, it) } ?: run {
                 PrismPlatform.log.warn(TAG, "A meshvoice from ${device.name} would not open")
                 return
             }

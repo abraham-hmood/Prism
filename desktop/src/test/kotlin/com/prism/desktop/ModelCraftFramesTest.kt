@@ -36,7 +36,7 @@ class ModelCraftFramesTest {
             val destination = File(scratch, "frames").apply { mkdirs() }
             ModelCraftFrames.install()
             val extractor = assertNotNull(ModelCraft.frameExtractor, "no frame extractor was installed")
-            val count = extractor.invoke(written, destination)
+            val count = extractor.invoke(written, destination, true) { _, _ -> }
 
             assertTrue(count > 0, "no frame came out of a clip this build wrote")
             val first = File(destination, "frame-00000.png")

@@ -34,9 +34,12 @@ import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.VolumeUp
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -76,6 +79,8 @@ import com.prism.desktop.DesktopCallAudio
 import com.prism.desktop.DesktopLocations
 import com.prism.launcher.calls.MeshCallConsent
 import com.prism.launcher.calls.MeshCalls
+import com.prism.launcher.calls.MeshGreeting
+import com.prism.launcher.calls.MeshGroupCalls
 import com.prism.launcher.calls.PrismPhonePlan
 import com.prism.launcher.maps.LatLon
 import com.prism.launcher.maps.MapGeo
@@ -127,12 +132,43 @@ fun DialerPage() {
     var typed by remember { mutableStateOf("") }
     var trusted by remember { mutableStateOf<List<TrustedDevices.Trust>>(emptyList()) }
     var nodes by remember { mutableStateOf<List<MeshTransport.Node>>(emptyList()) }
-    var call by remember { mutableStateOf(MeshCalls.active) }
+    // NEVER-EQUAL: the engine mutates one Call from ringing to active, so the default equality check
+    // saw no change and the card kept offering Answer for a call that was already connected.
+    var call by remember { mutableStateOf(MeshCalls.active, androidx.compose.runtime.neverEqualPolicy()) }
     // Ask the network once when the page opens, so "online" is not a value from the last time the
     // page was visited. Peer discovery is a broadcast and costs nothing.
     LaunchedEffect(Unit) { runCatching { MeshTransport.discover() } }
     var warning by remember { mutableStateOf<MeshTransport.Node?>(null) }
     var note by remember { mutableStateOf("") }
+
+    // Devices ticked for a group call, by address, in the order they were ticked.
+    val selection = remember { mutableStateMapOf<String, MeshGroupCalls.Target>() }
+    // A start that is waiting for the "not encrypted" consent of the untrusted devices in it.
+    var pendingStart by remember { mutableStateOf<Pair<List<MeshGroupCalls.Target>, Boolean>?>(null) }
+
+    // One device is a one-to-one call (with or without video); several are a group call.
+    val launch: (List<MeshGroupCalls.Target>, Boolean) -> Unit = { targets, video ->
+        selection.clear()
+        note = if (targets.size == 1) {
+            val target = targets[0]
+            MeshCalls.call(target.ip, target.name, target.trusted, video = video)
+            MeshCalls.lastError ?: "Ringing ${target.name}${if (video) " for a video call" else ""}."
+        } else {
+            MeshGroupCalls.start(targets, video)
+            MeshGroupCalls.lastError ?: "Calling ${targets.size} devices${if (video) " with video" else ""}."
+        }
+    }
+    // The same one-time warning the single-device path asks for, once for every untrusted device.
+    val start: (List<MeshGroupCalls.Target>, Boolean) -> Unit = { targets, video ->
+        if (targets.any { !it.trusted && !MeshCallConsent.warned(it.ip) }) {
+            pendingStart = targets to video
+        } else {
+            launch(targets, video)
+        }
+    }
+    val toggle: (MeshGroupCalls.Target) -> Unit = { target ->
+        if (selection.remove(target.ip) == null) selection[target.ip] = target
+    }
 
     DisposableEffect(Unit) {
         // LISTENERS, not assignments. This page used to claim MeshCalls.onIncoming for itself and
@@ -267,6 +303,36 @@ fun DialerPage() {
                 }
             }
 
+            if (selection.isNotEmpty()) {
+                Card {
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            if (selection.size == 1) selection.values.first().name
+                            else "${selection.size} devices · group call",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(onClick = { selection.clear() }) { Text("Clear") }
+                        OutlinedButton(onClick = { start(selection.values.toList(), false) }) {
+                            Icon(Icons.Filled.Call, null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("Call")
+                        }
+                        OutlinedButton(onClick = { start(selection.values.toList(), true) }) {
+                            Icon(Icons.Filled.Videocam, null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("Video call")
+                        }
+                    }
+                }
+                Spacer(Modifier.height(10.dp))
+            }
+
             SectionHeader("Trusted devices")
             Card {
                 if (trusted.isEmpty()) {
@@ -298,6 +364,18 @@ fun DialerPage() {
                             },
                             dot = if (live != null) onlineColor() else offlineColor(),
                             titleColor = if (live != null) onlineColor() else offlineColor(),
+                            selected = address != null && selection.containsKey(address),
+                            onSelect = address?.let { ip ->
+                                { toggle(MeshGroupCalls.Target(ip, device.name, trusted = true)) }
+                            },
+                            onVideo = address?.let { ip ->
+                                {
+                                    if (live != null && device.lastIp != ip) {
+                                        TrustedDevices.noteAddress(device.fingerprint, ip)
+                                    }
+                                    start(listOf(MeshGroupCalls.Target(ip, device.name, trusted = true)), true)
+                                }
+                            },
                         ) {
                             // RING FIRST, ALWAYS. This used to record a voicemail whenever the
                             // presence flag was false -- and that flag is false for a device whose
@@ -359,6 +437,16 @@ fun DialerPage() {
                             detail = "On this meshnet · not encrypted",
                             dot = colors.faint,
                             titleColor = colors.muted,
+                            selected = selection.containsKey(node.address),
+                            onSelect = {
+                                toggle(MeshGroupCalls.Target(node.address, node.name.ifBlank { node.address }, trusted = false))
+                            },
+                            onVideo = {
+                                start(
+                                    listOf(MeshGroupCalls.Target(node.address, node.name.ifBlank { node.address }, trusted = false)),
+                                    true,
+                                )
+                            },
                         ) {
                             if (MeshCallConsent.warned(node.address)) {
                                 MeshCalls.call(node.address, node.name.ifBlank { node.address }, trusted = false)
@@ -376,6 +464,32 @@ fun DialerPage() {
             }
             Spacer(Modifier.height(20.dp))
         }
+    }
+
+    pendingStart?.let { (targets, video) ->
+        val unwarned = targets.filter { !it.trusted && !MeshCallConsent.warned(it.ip) }
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { pendingStart = null },
+            title = { Text("This call is not encrypted") },
+            text = {
+                Text(
+                    "${unwarned.joinToString { it.name }} ${if (unwarned.size == 1) "is" else "are"} on your " +
+                        "meshnet but not among your trusted devices, so Prism has no shared key to seal " +
+                        "the call with them. Anyone on this network can hear it" +
+                        (if (video) " and see it" else "") + ". Links between your trusted devices stay encrypted."
+                )
+            },
+            confirmButton = {
+                androidx.compose.material3.TextButton(onClick = {
+                    unwarned.forEach { MeshCallConsent.markWarned(it.ip) }
+                    pendingStart = null
+                    launch(targets, video)
+                }) { Text(if (video) "Video call unencrypted" else "Call unencrypted") }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(onClick = { pendingStart = null }) { Text("Cancel") }
+            },
+        )
     }
 
     warning?.let { node ->
@@ -403,24 +517,42 @@ fun DialerPage() {
     }
 }
 
+/**
+ * One device. Clicking the row calls it, as before; the checkbox adds it to a group call and the
+ * camera button starts a video call. A desktop has no long-press convention, so selection is a
+ * visible checkbox rather than the phone's long-press.
+ */
 @Composable
 private fun DeviceRow(
     name: String,
     detail: String,
     dot: Color,
     titleColor: Color,
+    selected: Boolean = false,
+    onSelect: (() -> Unit)? = null,
+    onVideo: (() -> Unit)? = null,
     onClick: () -> Unit,
 ) {
     val colors = LocalPrismColors.current
     Row(
-        Modifier.fillMaxWidth().clickableRow(onClick).padding(16.dp),
+        Modifier.fillMaxWidth().clickableRow(onClick).padding(start = 4.dp, end = 8.dp, top = 6.dp, bottom = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        if (onSelect != null) {
+            Checkbox(checked = selected, onCheckedChange = { onSelect() })
+        } else {
+            Spacer(Modifier.width(48.dp))
+        }
         Box(Modifier.size(10.dp).background(dot, CircleShape))
         Spacer(Modifier.width(12.dp))
-        Column {
+        Column(Modifier.weight(1f)) {
             Text(name, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = titleColor)
             Text(detail, fontSize = 11.sp, color = colors.muted)
+        }
+        if (onVideo != null) {
+            IconButton(onClick = onVideo) {
+                Icon(Icons.Filled.Videocam, "Video call $name", tint = colors.accent)
+            }
         }
     }
 }
@@ -442,6 +574,12 @@ private fun offlineColor() = Color(0xFFFF6FB5)
 @Composable
 fun MeshvoicePage() {
     val colors = LocalPrismColors.current
+    // The greeting layout replaces the mailbox while it is open, as the phone's slides over it.
+    var greetingOpen by remember { mutableStateOf(false) }
+    if (greetingOpen) {
+        MeshvoiceGreeting(onBack = { greetingOpen = false })
+        return
+    }
     var revision by remember { mutableStateOf(0) }
     var selected by remember { mutableStateOf(setOf<String>()) }
     var playing by remember { mutableStateOf<String?>(null) }
@@ -474,6 +612,29 @@ fun MeshvoicePage() {
             }
         }
         Spacer(Modifier.height(10.dp))
+
+        // Your own greeting, on the Meshvoice tab only, as on the phone.
+        if (tab == 1) {
+            val greeting = remember(revision) { runCatching { MeshGreeting.info() }.getOrNull() }
+            Card {
+                Row(
+                    Modifier.fillMaxWidth().clickableRow { greetingOpen = true }.padding(horizontal = 16.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        if (greeting == null) "Set your voicemail greeting" else {
+                            val total = (greeting.durationMs / 1000).toInt()
+                            "Your voicemail greeting · %d:%02d".format(total / 60, total % 60)
+                        },
+                        color = colors.accent,
+                        fontSize = 14.sp,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Text("›", color = colors.accent, fontSize = 16.sp)
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+        }
 
         Column(Modifier.verticalScroll(rememberScrollState())) {
             if (tab == 0) {

@@ -32,6 +32,9 @@ class ConversationActivity : AppCompatActivity() {
 
         /** Preferences key for Sam's persisted recap. Sam is one pseudo-thread, so one key. */
         private const val SAM_RECAP_KEY = "sam"
+
+        /** Names Sam's thread to AiManager, so the local model knows whether it still holds it. */
+        const val SAM_CONVERSATION_KEY = "sam"
     }
 
     private lateinit var binding: ActivityConversationBinding
@@ -946,13 +949,23 @@ class ConversationActivity : AppCompatActivity() {
             //
             // The live bubble is excluded: it holds the placeholder or a half-streamed reply, and
             // the model must not be given its own unfinished sentence as context.
-            val dialogSoFar = dbMessages.filterNot { it.isThinking }.map { it.text }
+            //
+            // THE WHOLE CONVERSATION, with who said each line. Blank lines (a picture with no
+            // caption) are left out here exactly as the compaction plan leaves them out, so the
+            // count of lines a recap covers lines up with this list.
+            val spokenSoFar = dbMessages.filterNot { it.isThinking }.filter { it.text.isNotBlank() }
+            val dialogSoFar = spokenSoFar.map { it.text }
+            val speakersSoFar = spokenSoFar.map { it.isSent }
 
-            // AUTO-COMPACTION, at the seam between turns. liveStats still describes the PREVIOUS
-            // reply, which is the measurement that matters: if that turn ended near the top of the
-            // window, this prompt would be truncated from the front by the engine, so the recap
-            // has to be in place before the prompt is built rather than after it is damaged.
-            if (SamCompaction.needsCompaction(GgufInferenceService.liveStats.contextFraction)) {
+            // AUTO-COMPACTION, at the seam between turns: when the last turn ended near the top of
+            // the window, or when the whole conversation -- which a replay sends in one prompt --
+            // would no longer fit. Either way the recap has to be in place before the prompt is
+            // built rather than after the engine has truncated it.
+            val coveredSoFar = SamCompaction.foldedTurns(SAM_RECAP_KEY)
+            if (ChatContext.shouldCompact(
+                    dialogSoFar.drop(coveredSoFar), SamCompaction.recap(SAM_RECAP_KEY), persona = "",
+                )
+            ) {
                 compactSam(manual = false)
             }
 
@@ -975,6 +988,10 @@ class ConversationActivity : AppCompatActivity() {
                 },
                 history = dialogSoFar,
                 recap = SamCompaction.recap(SAM_RECAP_KEY),
+                conversationKey = SAM_CONVERSATION_KEY,
+                speakers = speakersSoFar,
+                assistantName = "Sam",
+                recapCovers = SamCompaction.foldedTurns(SAM_RECAP_KEY),
                 )
             } finally {
                 // The meter is a live view of a decode that has finished; the last snapshot stays

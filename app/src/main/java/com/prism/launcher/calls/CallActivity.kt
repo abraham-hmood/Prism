@@ -571,9 +571,12 @@ class CallActivity : PrismBaseActivity() {
     private fun follow(call: MeshCalls.Call?) {
         if (isFinishing || isDestroyed) return
         if (call == null) {
-            statusView.text = "Call ended"
+            // A refused call (wallet locked, no address, a group call in progress) arrives here as
+            // null; the reason is the engine's, and "Call ended" alone hid it.
+            val reason = MeshCalls.lastError
+            statusView.text = reason ?: "Call ended"
             stopTimer()
-            endButton.postDelayed({ finish() }, 700)
+            endButton.postDelayed({ finish() }, if (reason != null) 2_400 else 700)
             return
         }
         when (call.state) {
@@ -601,11 +604,17 @@ class CallActivity : PrismBaseActivity() {
                 recordButton.visibility = View.VISIBLE
                 startTimer(call.startedAt)
             }
-            MeshCalls.State.RECORDING -> statusView.text = "Recording a meshnet voicemail"
+            MeshCalls.State.RECORDING -> statusView.text = if (call.playingGreeting) {
+                "Playing ${call.peerName}’s greeting…"
+            } else {
+                "Recording a meshnet voicemail"
+            }
             MeshCalls.State.ENDED, MeshCalls.State.IDLE -> {
-                statusView.text = "Call ended"
+                // "Did not answer", "declined", "on another call": said, not swallowed.
+                val reason = MeshCalls.lastError
+                statusView.text = reason ?: "Call ended"
                 stopTimer()
-                endButton.postDelayed({ finish() }, 700)
+                endButton.postDelayed({ finish() }, if (reason != null) 2_000 else 700)
             }
         }
     }

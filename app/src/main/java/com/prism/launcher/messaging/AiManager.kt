@@ -90,7 +90,34 @@ object AiManager {
      * decides where the prompt goes is the user's Local / Cloud / Ollama choice -- so the feature
      * works identically on all three, which is the entire point.
      */
-    suspend fun getResponse(context: Context, userText: String, imageUri: Uri? = null, onToken: ((String) -> Unit)? = null, onReasoning: ((String) -> Unit)? = null, history: List<String> = emptyList(), allowOffload: Boolean = true, plainText: Boolean = false, recap: String = ""): Pair<String, Pair<String?, String?>> = withContext(Dispatchers.IO) {
+    /**
+     * [conversationKey] names the conversation [history] belongs to ("sam", "character:<id>"). With
+     * one, the WHOLE conversation is the model's context: stateless backends get all of it in every
+     * request, and a local model either continues its own native context (when that context is
+     * still exactly this conversation) or is cleared and given all of it again. Without one, this
+     * behaves as before -- the callers that compose one-off prompts pass none.
+     *
+     * [speakers] says who said each line of [history] (true = the user), so the transcript the
+     * model reads has names on it; [assistantName] is the name the other side goes by. [persona]
+     * leads every rebuilt context (a character's framing). [recapCovers] is how many of the oldest
+     * [history] lines the [recap] already stands for, so they are not sent twice.
+     */
+    suspend fun getResponse(
+        context: Context,
+        userText: String,
+        imageUri: Uri? = null,
+        onToken: ((String) -> Unit)? = null,
+        onReasoning: ((String) -> Unit)? = null,
+        history: List<String> = emptyList(),
+        allowOffload: Boolean = true,
+        plainText: Boolean = false,
+        recap: String = "",
+        conversationKey: String? = null,
+        speakers: List<Boolean>? = null,
+        assistantName: String = "Sam",
+        persona: String = "",
+        recapCovers: Int = 0,
+    ): Pair<String, Pair<String?, String?>> = withContext(Dispatchers.IO) {
         val streaming = onToken != null && PrismSettings.getStreamingEnabled()
         val maxTokens = PrismSettings.getMaxTokens()
         val mode = PrismSettings.getAiMode()
@@ -151,7 +178,18 @@ object AiManager {
         // deliberately excluded below: llama.cpp keeps its own context for the life of the loaded
         // model, and sending the turns again would duplicate every one of them.
         val recapText = recap.trim()
-        val prompt = foldHistory(userText, history, recapText)
+        // The lines the recap already stands for are not sent again: that is the whole point of
+        // having compacted them.
+        val skip = if (recapText.isEmpty()) 0 else recapCovers.coerceIn(0, history.size)
+        val liveHistory = history.drop(skip)
+        val liveSpeakers = speakers?.takeIf { it.size == history.size }?.drop(skip)
+        val prompt = foldHistory(
+            userText, liveHistory, recapText,
+            speakers = liveSpeakers,
+            assistantName = assistantName,
+            persona = persona,
+            whole = conversationKey != null,
+        )
 
         if (mode == PrismSettings.AI_MODE_CLOUD) {
             // A REAL REQUEST, WHATEVER THE PROMPT SAYS. The old branch sent anything containing
@@ -249,15 +287,41 @@ object AiManager {
             // fragment beginning mid-thread. From then on the recap and the recent turns are resent
             // the way the stateless backends already do: a little more prompt per turn, in exchange
             // for a model that still knows what the conversation was about.
-            val localText = if (recapText.isEmpty()) {
-                userText
-            } else {
-                runCatching { GgufInferenceService.resetConversation() }
-                prompt
+            //
+            // A KEYED CONVERSATION IS ALWAYS WHOLE. llama.cpp holds ONE conversation, shared by Sam,
+            // every character and every one-off caller, and it starts empty whenever the model is
+            // (re)loaded -- so "llama.cpp keeps its own context" was true only until a character
+            // spoke, the app restarted or the idle unloader ran, after which the model answered
+            // with no memory of the thread on screen. Now: if the native context is still exactly
+            // this conversation (same owner, same number of turns, same recap, and nothing else has
+            // generated or reset since -- see GgufInferenceService.sessionEpoch), only the new
+            // message is sent and the model continues where it was. Otherwise it is cleared and
+            // given the entire conversation again.
+            val localText = when {
+                conversationKey != null -> {
+                    val session = localSession
+                    val inSync = session != null &&
+                        session.key == conversationKey &&
+                        session.turns == liveHistory.size &&
+                        session.recap == recapText &&
+                        session.epoch == GgufInferenceService.sessionEpoch
+                    if (inSync) {
+                        userText
+                    } else {
+                        runCatching { GgufInferenceService.resetConversation() }
+                        prompt
+                    }
+                }
+                recapText.isEmpty() -> userText
+                else -> {
+                    runCatching { GgufInferenceService.resetConversation() }
+                    prompt
+                }
             }
 
             if (allowOffload) {
-                meshResponse(context, modelPath, localText, onToken)?.let {
+                // A peer has none of this conversation, so it always gets all of it.
+                meshResponse(context, modelPath, if (conversationKey != null) prompt else localText, onToken)?.let {
                     return@withContext Pair(it, Pair(null, null))
                 }
             }
@@ -267,6 +331,15 @@ object AiManager {
             } else {
                 LocalAiService.generateResponse(context, modelPath, localText)
             }
+            // Recorded AFTER the turn, with the epoch this turn's own generation produced: the next
+            // turn is in sync only if nothing else touched the context in between. A failed turn
+            // leaves the context in an unknown state, so the next one starts clean.
+            val failed = response.trim().let {
+                it.startsWith("Error") || it.startsWith("Local AI Error") || it.startsWith("Context window full")
+            }
+            localSession = if (conversationKey != null && !failed) {
+                LocalSession(conversationKey, liveHistory.size + 2, recapText, GgufInferenceService.sessionEpoch)
+            } else null
             return@withContext Pair(response, Pair(null, null))
         }
     }
@@ -410,30 +483,65 @@ object AiManager {
         }
     }
 
+    /** Which conversation the local model's native context currently holds; see the local path. */
+    private data class LocalSession(val key: String, val turns: Int, val recap: String, val epoch: Long)
+
+    @Volatile
+    private var localSession: LocalSession? = null
+
     /**
-     * The recent turns followed by the new message, for a backend that keeps no state.
+     * The conversation followed by the new message, for a model that has to be given all of it.
      *
-     * Bounded: this is resent on every request, and an unbounded transcript eventually pushes the
-     * system framing out of the model's context window and then the question itself. Twelve turns
-     * is a few screens of chat, which is what a phone conversation actually refers back to.
+     * With [whole] (a keyed conversation) EVERY line is included: the user asked for the entire
+     * history to be the context, and the length is managed by compaction -- the context pill, and
+     * the automatic compaction before a turn that would not fit -- rather than by silently dropping
+     * the oldest lines here. Without it, the old bound of twelve lines applies, for callers that
+     * were never keyed. Lines are named by speaker when [speakers] is given, so the model knows
+     * which of them it said.
      */
-    private fun foldHistory(userText: String, history: List<String>, recap: String = ""): String {
-        val recent = history.filter { it.isNotBlank() }.takeLast(12)
+    private fun foldHistory(
+        userText: String,
+        history: List<String>,
+        recap: String = "",
+        speakers: List<Boolean>? = null,
+        assistantName: String = "Sam",
+        persona: String = "",
+        whole: Boolean = false,
+    ): String {
+        val named = history.mapIndexed { index, line ->
+            val who = speakers?.getOrNull(index)
+            when (who) {
+                true -> "User: ${line.trim()}"
+                false -> "$assistantName: ${line.trim()}"
+                null -> line.trim()
+            }
+        }.filter { it.isNotBlank() }
+        val recent = if (whole) named else named.takeLast(12)
         val briefing = SamCompaction.preamble(recap)
-        if (recent.isEmpty() && briefing.isEmpty()) return userText
+        val framing = persona.trim()
+        if (recent.isEmpty() && briefing.isEmpty() && framing.isEmpty()) return userText
         return buildString {
-            // The recap goes FIRST: it stands for everything older than the turns below it, and a
-            // model reading the transcript in order has to meet the past before the present.
+            // Who the model is comes before what has been said, and the recap before the recent
+            // turns: it stands for everything older, and the past has to be met before the present.
+            if (framing.isNotEmpty()) {
+                append(framing)
+                append("\n\n")
+            }
             if (briefing.isNotEmpty()) {
                 append(briefing)
                 append("\n\n")
             }
-            append("Conversation so far:\n")
-            recent.forEach { line ->
-                append(line.trim())
+            if (recent.isNotEmpty()) {
+                append("Conversation so far:\n")
+                recent.forEach { line ->
+                    append(line)
+                    append('\n')
+                }
                 append('\n')
             }
-            append("\nNew message:\n")
+            // No trailing "$assistantName:" cue: every backend here wraps this in a chat template as
+            // the user's turn, and the model answers it as itself without being prompted to.
+            append(if (speakers != null) "User: " else "New message:\n")
             append(userText)
         }
     }

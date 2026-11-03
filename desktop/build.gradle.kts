@@ -98,6 +98,27 @@ dependencies {
     // every other supported container turns it into PCM. Pure Java, no native component, ~200 KB.
     implementation("com.googlecode.soundlibs:mp3spi:1.9.5.4")
 
+    // OpenCV, for the camera in a mesh video call. A JVM has no camera API at all: on Windows it
+    // would mean driving Media Foundation through COM by hand, and every other route (a webcam jar on
+    // BridJ, an ffmpeg binary) is either dead on Java 17+ or a binary to install. OpenCV's
+    // VideoCapture opens camera 0 on Windows, macOS and Linux and encodes the JPEG frames the mesh
+    // carries, natively. Only THIS machine's natives are pulled in, the same way
+    // compose.desktop.currentOs is -- the three-platform bundle is several hundred megabytes.
+    val bytedecoPlatform = run {
+        val os = System.getProperty("os.name").lowercase()
+        val arch = System.getProperty("os.arch").lowercase()
+        val cpu = if (arch.contains("aarch64") || arch.contains("arm64")) "arm64" else "x86_64"
+        when {
+            os.contains("win") -> "windows-x86_64"
+            os.contains("mac") -> "macosx-$cpu"
+            else -> "linux-$cpu"
+        }
+    }
+    implementation("org.bytedeco:opencv:4.9.0-1.5.10")
+    implementation("org.bytedeco:opencv:4.9.0-1.5.10:$bytedecoPlatform")
+    implementation("org.bytedeco:openblas:0.3.26-1.5.10:$bytedecoPlatform")
+    implementation("org.bytedeco:javacpp:1.5.10:$bytedecoPlatform")
+
     // The speech engines' tests: the parity harness runs the real engine classes on the JVM.
     testImplementation(kotlin("test"))
 

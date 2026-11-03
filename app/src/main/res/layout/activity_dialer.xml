@@ -185,6 +185,69 @@
                 android:paddingEnd="12dp"
                 android:paddingBottom="8dp" />
 
+            <!-- Shown while devices are selected by long-pressing them: one device and Call is the
+                 same as tapping it, several make a group call, and Video makes either a video call.
+                 The background is drawn in DialerActivity so it can use the theme's card colour. -->
+            <LinearLayout
+                android:id="@+id/dialerSelectionBar"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:layout_marginEnd="12dp"
+                android:layout_marginBottom="4dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingStart="6dp"
+                android:paddingTop="8dp"
+                android:paddingEnd="10dp"
+                android:paddingBottom="8dp"
+                android:visibility="gone">
+
+                <ImageButton
+                    android:id="@+id/dialerSelectionClear"
+                    android:layout_width="40dp"
+                    android:layout_height="40dp"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:contentDescription="Clear selection"
+                    android:padding="9dp"
+                    android:scaleType="fitCenter"
+                    android:src="@drawable/ic_call_close_24"
+                    android:tint="#FF8E8E93" />
+
+                <TextView
+                    android:id="@+id/dialerSelectionCount"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:layout_weight="1"
+                    android:fontFamily="sans-serif"
+                    android:maxLines="2"
+                    android:textColor="#FFFFFFFF"
+                    android:textSize="15sp" />
+
+                <ImageButton
+                    android:id="@+id/dialerSelectionCall"
+                    android:layout_width="52dp"
+                    android:layout_height="52dp"
+                    android:background="@drawable/bg_call_answer"
+                    android:contentDescription="Mesh call"
+                    android:padding="14dp"
+                    android:scaleType="fitCenter"
+                    android:src="@drawable/ic_call_phone_24"
+                    android:tint="#FFFFFFFF" />
+
+                <ImageButton
+                    android:id="@+id/dialerSelectionVideo"
+                    android:layout_width="52dp"
+                    android:layout_height="52dp"
+                    android:layout_marginStart="14dp"
+                    android:contentDescription="Mesh video call"
+                    android:padding="14dp"
+                    android:scaleType="fitCenter"
+                    android:src="@drawable/ic_call_video_24"
+                    android:tint="#FFFFFFFF" />
+            </LinearLayout>
+
             <TextView
                 android:id="@+id/dialerMeshvoice"
                 android:layout_width="match_parent"

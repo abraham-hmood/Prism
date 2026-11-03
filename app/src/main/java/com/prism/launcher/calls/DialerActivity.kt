@@ -72,7 +72,30 @@ class DialerActivity : PrismBaseActivity() {
         ResourcesCompat.getFont(this, R.font.roboto_light) ?: sans
     }
 
-    private val adapter = DeviceAdapter { row -> onDevice(row) }
+    private val adapter = DeviceAdapter(
+        onClick = { row -> onRowTapped(row) },
+        onLongClick = { row -> toggleSelection(row) },
+        isSelected = { row -> selection.containsKey(row.key) },
+    )
+
+    /**
+     * Devices picked by long-pressing them, in the order they were picked.
+     *
+     * Keyed by [DeviceRow.key] rather than by address: a trusted device can be selected before it has
+     * announced an address at all, and two rows must never collapse into one because they happen to
+     * share a stale lease.
+     */
+    private val selection = LinkedHashMap<String, DeviceRow>()
+
+    private lateinit var selectionBar: View
+    private lateinit var selectionCount: TextView
+
+    /** Back clears a selection first, the way it does in every list that has one. */
+    private val clearSelectionOnBack = object : androidx.activity.OnBackPressedCallback(false) {
+        override fun handleOnBackPressed() {
+            clearSelection()
+        }
+    }
 
     /** What to run once the call permissions have been granted. */
     private var pendingAction: (() -> Unit)? = null
@@ -163,6 +186,26 @@ class DialerActivity : PrismBaseActivity() {
             setOnClickListener { PrismCalls.openMeshvoice(this@DialerActivity, meshTab = true) }
         }
         callButton.setOnClickListener { placeCall() }
+
+        selectionBar = findViewById(R.id.dialerSelectionBar)
+        selectionCount = findViewById(R.id.dialerSelectionCount)
+        selectionBar.background = GradientDrawable().apply {
+            cornerRadius = IosUi.dp(this@DialerActivity, 18f).toFloat()
+            setColor(Color.rgb(28, 28, 30))
+        }
+        findViewById<ImageButton>(R.id.dialerSelectionVideo).background = RippleDrawable(
+            ColorStateList.valueOf(0x33FFFFFF),
+            GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(IosUi.accent(this@DialerActivity))
+            },
+            null,
+        )
+        findViewById<ImageButton>(R.id.dialerSelectionClear).setOnClickListener { clearSelection() }
+        findViewById<ImageButton>(R.id.dialerSelectionCall).setOnClickListener { callSelection(video = false) }
+        findViewById<ImageButton>(R.id.dialerSelectionVideo).setOnClickListener { callSelection(video = true) }
+        onBackPressedDispatcher.addCallback(this, clearSelectionOnBack)
+
         backspace.setOnClickListener { deleteLast() }
         backspace.setOnLongClickListener { typed.clear(); renderNumber(); true }
         renderNumber()
@@ -274,6 +317,8 @@ class DialerActivity : PrismBaseActivity() {
             else -> TAB_DIAL
         }
         tab = target
+        // A selection belongs to the mesh list; it does not follow the user to the keypad.
+        if (tab != TAB_MESH && ::selectionBar.isInitialized) clearSelection()
         keypadPane.visibility = if (tab == TAB_DIAL) View.VISIBLE else View.GONE
         meshPane.visibility = if (tab == TAB_MESH) View.VISIBLE else View.GONE
         renderTabState()
@@ -425,9 +470,26 @@ class DialerActivity : PrismBaseActivity() {
         withPermissions { startActivity(CallActivity.pstnIntent(this, number)) }
     }
 
+    /** A tap: toggles the row while a selection is open, and calls it otherwise. */
+    private fun onRowTapped(row: DeviceRow) {
+        if (selection.isNotEmpty()) toggleSelection(row) else onDevice(row)
+    }
+
     private fun onDevice(row: DeviceRow) {
         when (row) {
             is DeviceRow.Trusted -> {
+                // RING THE LIVE ADDRESS, NOT THE RECORDED ONE. The row resolves where the device is
+                // NOW from the mesh's own peer table; if that differs from the stored address, the
+                // record is moved so every other trusted feature follows it too. A device with no
+                // live address is treated as away and gets a voicemail, as before.
+                if (row.online && row.fingerprint.isNotBlank()) {
+                    runCatching { TrustedDevices.noteAddress(row.fingerprint, row.ip) }
+                }
+                if (row.ip.isBlank()) {
+                    Toast.makeText(this, "${row.name} has no address on this mesh yet", Toast.LENGTH_SHORT).show()
+                    runCatching { MeshTransport.discover() }
+                    return
+                }
                 withPermissions {
                     if (row.online) {
                         startActivity(
@@ -474,6 +536,117 @@ class DialerActivity : PrismBaseActivity() {
         }
     }
 
+    // ── Selection: group and video calls ──────────────────────────────────
+
+    private fun toggleSelection(row: DeviceRow) {
+        if (row !is DeviceRow.Trusted && row !is DeviceRow.Untrusted) return
+        if (selection.remove(row.key) == null) selection[row.key] = row
+        renderSelection()
+    }
+
+    private fun clearSelection() {
+        if (selection.isEmpty() && selectionBar.visibility != View.VISIBLE) return
+        selection.clear()
+        renderSelection()
+    }
+
+    private fun renderSelection() {
+        val count = selection.size
+        selectionBar.visibility = if (count > 0) View.VISIBLE else View.GONE
+        clearSelectionOnBack.isEnabled = count > 0
+        selectionCount.text = when (count) {
+            0 -> ""
+            1 -> selection.values.first().let { (it as? DeviceRow.Trusted)?.name ?: (it as? DeviceRow.Untrusted)?.name }
+            else -> "$count devices · group call"
+        }
+        selectionCount.typeface = sans
+        adapter.refreshSelection()
+    }
+
+    /**
+     * The selection bar's two buttons.
+     *
+     * One device and Call is exactly a tap on that device. Several devices and Call is a group call;
+     * Video is a video call either way. Untrusted devices still get the one-time "not encrypted"
+     * warning -- once, listing every one of them -- because selecting several at once is not a reason
+     * to skip the consent the single-device path asks for.
+     */
+    private fun callSelection(video: Boolean) {
+        val rows = selection.values.toList()
+        if (rows.isEmpty()) return
+        if (rows.size == 1 && !video) {
+            clearSelection()
+            onDevice(rows.first())
+            return
+        }
+
+        val targets = mutableListOf<MeshGroupCalls.Target>()
+        val unreachable = mutableListOf<String>()
+        rows.forEach { row ->
+            when (row) {
+                is DeviceRow.Trusted -> {
+                    if (row.ip.isBlank()) {
+                        unreachable += row.name
+                    } else {
+                        if (row.online && row.fingerprint.isNotBlank()) {
+                            runCatching { TrustedDevices.noteAddress(row.fingerprint, row.ip) }
+                        }
+                        targets += MeshGroupCalls.Target(row.ip, row.name, trusted = true)
+                    }
+                }
+                is DeviceRow.Untrusted -> targets += MeshGroupCalls.Target(row.ip, row.name, trusted = false)
+                else -> Unit
+            }
+        }
+        if (targets.isEmpty()) {
+            Toast.makeText(this, "None of those devices has an address on this mesh yet", Toast.LENGTH_LONG).show()
+            return
+        }
+        if (unreachable.isNotEmpty()) {
+            Toast.makeText(
+                this,
+                "Leaving out ${unreachable.joinToString()}: no address on this mesh yet",
+                Toast.LENGTH_LONG,
+            ).show()
+        }
+
+        val start = {
+            clearSelection()
+            withPermissions {
+                val single = targets.singleOrNull()
+                val intent = when {
+                    video && single != null -> VideoCallActivity.intent(this, single.ip, single.name, single.trusted)
+                    video -> VideoCallActivity.groupIntent(this, targets)
+                    targets.size == 1 -> CallActivity.meshIntent(
+                        this, targets[0].ip, targets[0].name, targets[0].trusted, voicemail = false,
+                    )
+                    else -> GroupCallActivity.intent(this, targets)
+                }
+                startActivity(intent)
+            }
+        }
+
+        val unwarned = targets.filter { !it.trusted && !MeshCallConsent.warned(it.ip) }
+        if (unwarned.isEmpty()) {
+            start()
+            return
+        }
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
+            .setTitle("This call is not encrypted")
+            .setMessage(
+                "${unwarned.joinToString { it.name }} ${if (unwarned.size == 1) "is" else "are"} on your " +
+                    "meshnet but not among your trusted devices, so Prism has no shared key to seal the " +
+                    "call with them. Anyone on this network can hear it" +
+                    (if (video) " and see it" else "") + ". Links between your trusted devices stay encrypted."
+            )
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton(if (video) "Video call unencrypted" else "Call unencrypted") { _, _ ->
+                unwarned.forEach { MeshCallConsent.markWarned(it.ip) }
+                start()
+            }
+            .show()
+    }
+
     /** Mesh calling is possible with a live mesh, or with a paired device to leave a message for. */
     private fun meshAvailable(): Boolean = meshReady || runCatching {
         TrustedDevices.all().any { it.confirmed }
@@ -486,8 +659,14 @@ class DialerActivity : PrismBaseActivity() {
             meshHint.text = buildString {
                 append(PrismCalls.meshDescription())
                 append(". Trusted calls are sealed with your wallet key.")
+                // A gesture nobody is told about is a feature nobody finds.
+                append(" Long-press devices to select them for a group or video call.")
             }
-            adapter.submit(rows())
+            val next = rows()
+            adapter.submit(next)
+            // A selected device that has left the mesh is no longer something to call.
+            val present = next.map { it.key }.toSet()
+            if (selection.keys.retainAll(present)) renderSelection()
             meshList.postDelayed(this, 2_500)
         }
     }
@@ -499,28 +678,37 @@ class DialerActivity : PrismBaseActivity() {
         // `Trust.online` is the device's own answer -- it asks the platform transport whether that
         // address is a live peer -- so the dialer and the rest of the app cannot disagree about
         // whether a device is reachable.
+        // A TRUSTED DEVICE'S RECORDED ADDRESS IS A HINT, NOT THE TRUTH. This list used to dial
+        // `lastIp` and call a device offline whenever that lease had moved -- which turned a tap on
+        // a desktop sitting right there on the mesh into a voicemail, and the desktop never saw a
+        // call. The mesh's own peer table knows where each device is now: matched by the recorded
+        // address first, then by name, exactly as the desktop dialer does.
+        val nodes = runCatching { MeshTransport.nodes() }.getOrDefault(emptyList())
         rows += DeviceRow.Header("TRUSTED DEVICES")
+        val trustedLive = mutableSetOf<String>()
         if (trusted.isEmpty()) {
             rows += DeviceRow.Empty("No trusted devices yet. Pair one from Trusted devices.")
         } else {
-            trusted.sortedByDescending { it.online }.forEach { device ->
-                rows += DeviceRow.Trusted(
+            trusted.map { device ->
+                val live = nodes.firstOrNull { it.address == device.lastIp }
+                    ?: nodes.firstOrNull { it.name.isNotBlank() && it.name.equals(device.name, ignoreCase = true) }
+                live?.address?.let { trustedLive += it }
+                DeviceRow.Trusted(
                     name = device.name,
-                    ip = device.lastIp,
-                    online = device.online,
+                    ip = live?.address?.takeIf { it.isNotBlank() } ?: device.lastIp,
+                    online = live != null || device.online,
+                    fingerprint = device.fingerprint,
                 )
-            }
+            }.sortedByDescending { it.online }.forEach { rows += it }
         }
 
         // MeshTransport.peers() is a list of addresses; the names come from the node metadata, so
         // both are read rather than trying to get a name out of an IP.
         rows += DeviceRow.Header("ON YOUR MESHNET")
-        val trustedIps = trusted.map { it.lastIp }.toSet()
-        val untrusted = runCatching {
-            MeshTransport.nodes()
-                .filter { node -> node.address !in trustedIps }
-                .map { node -> DeviceRow.Untrusted(node.name.ifBlank { node.address }, node.address) }
-        }.getOrDefault(emptyList())
+        val trustedIps = trusted.map { it.lastIp }.toSet() + trustedLive
+        val untrusted = nodes
+            .filter { node -> node.address !in trustedIps }
+            .map { node -> DeviceRow.Untrusted(node.name.ifBlank { node.address }, node.address) }
         if (untrusted.isEmpty()) {
             rows += DeviceRow.Empty(
                 if (meshReady) "No other devices on this meshnet." else "Not connected to a meshnet."
@@ -539,14 +727,32 @@ class DialerActivity : PrismBaseActivity() {
     // ── List ───────────────────────────────────────────────────────────────
 
     sealed class DeviceRow {
-        data class Header(val text: String) : DeviceRow()
-        data class Empty(val text: String) : DeviceRow()
-        data class Trusted(val name: String, val ip: String, val online: Boolean) : DeviceRow()
-        data class Untrusted(val name: String, val ip: String) : DeviceRow()
+        /** What a selection remembers this row by; stable across refreshes of the list. */
+        abstract val key: String
+
+        data class Header(val text: String) : DeviceRow() {
+            override val key: String get() = "h:$text"
+        }
+        data class Empty(val text: String) : DeviceRow() {
+            override val key: String get() = "e:$text"
+        }
+        data class Trusted(
+            val name: String,
+            val ip: String,
+            val online: Boolean,
+            val fingerprint: String = "",
+        ) : DeviceRow() {
+            override val key: String get() = "t:" + fingerprint.ifBlank { name }
+        }
+        data class Untrusted(val name: String, val ip: String) : DeviceRow() {
+            override val key: String get() = "u:$ip"
+        }
     }
 
     private class DeviceAdapter(
         private val onClick: (DeviceRow) -> Unit,
+        private val onLongClick: (DeviceRow) -> Unit,
+        private val isSelected: (DeviceRow) -> Boolean,
     ) : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
 
         private var items: List<DeviceRow> = emptyList()
@@ -558,6 +764,32 @@ class DialerActivity : PrismBaseActivity() {
             if (same) return
             items = next
             notifyDataSetChanged()
+        }
+
+        /** Repaints the rows' selected state without re-reading the mesh. */
+        @SuppressLint("NotifyDataSetChanged")
+        fun refreshSelection() = notifyDataSetChanged()
+
+        /**
+         * A selected row is tinted with the accent and its dot becomes a filled accent ring, so a
+         * selection reads at a glance on the dialer's black background.
+         */
+        private fun bindSelection(holder: Holder, row: DeviceRow) {
+            val context = holder.itemView.context
+            val selected = isSelected(row)
+            holder.itemView.background = if (selected) {
+                GradientDrawable().apply {
+                    cornerRadius = IosUi.dp(context, 14f).toFloat()
+                    setColor((IosUi.accent(context) and 0x00FFFFFF) or 0x38000000)
+                    setStroke(IosUi.dp(context, 1.5f), IosUi.accent(context))
+                }
+            } else null
+            holder.itemView.isSelected = selected
+            holder.itemView.setOnClickListener { onClick(row) }
+            holder.itemView.setOnLongClickListener {
+                onLongClick(row)
+                true
+            }
         }
 
         override fun getItemCount(): Int = items.size
@@ -648,7 +880,7 @@ class DialerActivity : PrismBaseActivity() {
                     }
                     bound.detail.setTextColor(IosUi.secondaryLabel(context))
                     (bound.dot.background as? GradientDrawable)?.setColor(colour)
-                    bound.itemView.setOnClickListener { onClick(row) }
+                    bindSelection(bound, row)
                 }
                 is DeviceRow.Untrusted -> {
                     val bound = holder as Holder
@@ -657,7 +889,7 @@ class DialerActivity : PrismBaseActivity() {
                     bound.detail.text = "On this meshnet · not encrypted"
                     bound.detail.setTextColor(IosUi.secondaryLabel(context))
                     (bound.dot.background as? GradientDrawable)?.setColor(IosUi.tertiaryLabel(context))
-                    bound.itemView.setOnClickListener { onClick(row) }
+                    bindSelection(bound, row)
                 }
             }
         }

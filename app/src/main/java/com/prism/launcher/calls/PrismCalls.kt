@@ -50,6 +50,7 @@ object PrismCalls {
     const val CHANNEL_INCOMING = "prism_calls"
     private const val NOTIFICATION_RINGING = 4711
     private const val NOTIFICATION_UNDELIVERABLE = 4712
+    private const val NOTIFICATION_GROUP_RINGING = 4713
 
     /**
      * The app-wide invitation routing, held as a field so it can be registered exactly once.
@@ -58,7 +59,36 @@ object PrismCalls {
      * second install on a new application context must not double-post the same call.
      */
     private val incomingListener: (MeshCalls.Call) -> Unit = { call ->
-        appContext?.let { announceIncoming(it, call) }
+        appContext?.let {
+            announceIncoming(it, call)
+            // Rings with the meshnet ringtone (or the shared one) until the call stops ringing.
+            CallRinger.start(it, mesh = true, owner = "mesh")
+        }
+    }
+
+    /** A one-to-one meshnet call that is no longer ringing -- answered, declined, gone -- stops ringing. */
+    private val meshStateListener: (MeshCalls.Call?) -> Unit = { call ->
+        if (call == null || call.state != MeshCalls.State.RINGING) {
+            appContext?.let { CallRinger.stopIf(it, "mesh") }
+        }
+    }
+
+    /** The same routing for a group invitation, which has its own engine and its own screens. */
+    private val groupIncomingListener: (MeshGroupCalls.Group) -> Unit = { group ->
+        appContext?.let {
+            announceGroupIncoming(it, group)
+            CallRinger.start(it, mesh = true, owner = "group")
+        }
+    }
+
+    /** An invitation that stops ringing -- answered, declined, timed out -- takes its notification with it. */
+    private val groupStateListener: (MeshGroupCalls.Group?) -> Unit = { group ->
+        if (group == null || group.state != MeshGroupCalls.GroupState.RINGING) {
+            appContext?.let {
+                clearGroupNotification(it)
+                CallRinger.stopIf(it, "group")
+            }
+        }
     }
 
     @Volatile private var appContext: Context? = null
@@ -96,6 +126,9 @@ object PrismCalls {
         // was a destroyed call screen's restored lambda, no notification was ever posted -- which is
         // how a call could ring the caller forever and show the receiver nothing.
         MeshCalls.addIncomingListener(incomingListener)
+        MeshCalls.addStateListener(meshStateListener)
+        MeshGroupCalls.addIncomingListener(groupIncomingListener)
+        MeshGroupCalls.addStateListener(groupStateListener)
         MeshCalls.onUndeliverableInvite = { reason ->
             ensureChannel(app)
             val notify = NotificationCompat.Builder(app, CHANNEL_INCOMING)
@@ -113,6 +146,10 @@ object PrismCalls {
         }
 
         ensureChannel(app)
+        // Hands this phone's meshvoice greeting to trusted devices as they come online. The desktop
+        // starts the same loop from MeshCalls.install; Android dispatches opcodes itself and never
+        // calls that, so it is started here.
+        MeshGreeting.start()
         PrismLogger.logInfo(TAG, "Mesh calls installed")
     }
 
@@ -297,7 +334,13 @@ object PrismCalls {
         // The caller's display name is the only thing in the notification. Not the address, not the
         // fingerprint: a lock screen showing who is calling is expected, one showing where they are
         // on the mesh is not.
-        val intent = CallActivity.incomingIntent(context, call.peerIp, call.peerName, call.trusted)
+        // A video invitation opens the video screen, so answering it shows the picture rather than
+        // connecting audio on a screen that has nowhere to draw one.
+        val intent = if (call.video) {
+            VideoCallActivity.incomingIntent(context, group = false)
+        } else {
+            CallActivity.incomingIntent(context, call.peerIp, call.peerName, call.trusted)
+        }
         val pending = PendingIntent.getActivity(
             context,
             NOTIFICATION_RINGING,
@@ -309,7 +352,12 @@ object PrismCalls {
             .setSmallIcon(android.R.drawable.sym_action_call)
             .setContentTitle(call.peerName)
             .setContentText(
-                if (call.trusted) "Incoming mesh call" else "Incoming unencrypted mesh call"
+                when {
+                    call.video && call.trusted -> "Incoming mesh video call"
+                    call.video -> "Incoming unencrypted mesh video call"
+                    call.trusted -> "Incoming mesh call"
+                    else -> "Incoming unencrypted mesh call"
+                }
             )
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_CALL)
@@ -329,6 +377,51 @@ object PrismCalls {
     fun clearIncomingNotification(context: Context) {
         runCatching {
             context.getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_RINGING)
+        }
+    }
+
+    /**
+     * Rings for a group call. Its own notification id, so a group invitation and a one-to-one call
+     * cannot overwrite each other's answer button.
+     */
+    private fun announceGroupIncoming(context: Context, group: MeshGroupCalls.Group) {
+        ensureChannel(context)
+        val intent = if (group.video) {
+            VideoCallActivity.incomingIntent(context, group = true)
+        } else {
+            GroupCallActivity.incomingIntent(context)
+        }
+        val pending = PendingIntent.getActivity(
+            context,
+            NOTIFICATION_GROUP_RINGING,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val others = group.members.size - 1
+        val notification = NotificationCompat.Builder(context, CHANNEL_INCOMING)
+            .setSmallIcon(android.R.drawable.sym_action_call)
+            .setContentTitle(group.hostName)
+            .setContentText(
+                (if (group.video) "Group video call" else "Group call") +
+                    if (others > 0) " with $others other${if (others == 1) "" else "s"}" else ""
+            )
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setOngoing(true)
+            .setAutoCancel(true)
+            .setFullScreenIntent(pending, true)
+            .setContentIntent(pending)
+            .addAction(0, "Answer", pending)
+            .build()
+        runCatching {
+            context.getSystemService(NotificationManager::class.java)
+                ?.notify(NOTIFICATION_GROUP_RINGING, notification)
+        }.onFailure { PrismLogger.logWarning(TAG, "Could not show the group call: ${it.message}") }
+    }
+
+    fun clearGroupNotification(context: Context) {
+        runCatching {
+            context.getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_GROUP_RINGING)
         }
     }
 

@@ -89,6 +89,11 @@ class SettingsActivity : PrismBaseActivity() {
                 listOf("System Health")
             ),
             Group(
+                "Phone and Meshnet Calls",
+                "Microphone, camera and ringtones for phone, meshnet and video calls",
+                listOf("Phone and Meshnet Calls")
+            ),
+            Group(
                 "Intelligence & Messaging",
                 "AI engine, models, image generation, Nora, Aether and response behaviour",
                 listOf(
@@ -1116,6 +1121,125 @@ class SettingsActivity : PrismBaseActivity() {
             }
             .setNegativeButton("Cancel", null)
             .show()
+    }
+
+    /**
+     * The Speech Model row: every speech model on this device, and a way to add one.
+     *
+     * THIS USED TO OPEN THE GENERIC IMPORT DIALOG -- "Text AI, Image Gen, Audio..." -- which never
+     * showed the speech models already installed, so a model imported once could only be chosen
+     * again by importing the same file a second time. Kokoro is listed first because it is what
+     * Prism speaks with when nothing else is chosen; choosing it is what "remove the imported model"
+     * used to be. The current choice is checked.
+     */
+    private fun showSpeechModelPicker() {
+        runCatching { com.prism.launcher.messaging.ModelRegistry.reconcile() }
+        val models = PrismSettings.getImportedModels()
+            .filter { it.type == PrismSettings.MODEL_TYPE_AUDIO }
+            .sortedByDescending { it.importedAt }
+        val current = PrismSettings.getLocalAudioModelPath()
+        val kokoroInstalled = runCatching {
+            com.prism.launcher.speech.KokoroInstall.isModelInstalled()
+        }.getOrDefault(false)
+
+        val labels = buildList {
+            add("Kokoro-82M — built in" + if (kokoroInstalled) "" else " (not downloaded yet)")
+            models.forEach { model ->
+                val format = when (com.prism.launcher.speech.ImportedAudioEngine.formatOf(model.path)) {
+                    com.prism.launcher.speech.ImportedAudioEngine.Format.KOKORO_ONNX -> "ONNX"
+                    com.prism.launcher.speech.ImportedAudioEngine.Format.PRISM_TTS -> "ModelCraft"
+                    com.prism.launcher.speech.ImportedAudioEngine.Format.GGUF -> "GGUF, not runnable yet"
+                    com.prism.launcher.speech.ImportedAudioEngine.Format.TFLITE -> "TFLite, not runnable yet"
+                    com.prism.launcher.speech.ImportedAudioEngine.Format.TORCH -> "PyTorch, export to ONNX"
+                    com.prism.launcher.speech.ImportedAudioEngine.Format.UNKNOWN -> "unrecognised"
+                }
+                add("${model.displayName.ifBlank { java.io.File(model.path).name }} — $format")
+            }
+            add("Import a speech model…")
+        }
+        val checked = when {
+            current.isEmpty() -> 0
+            else -> models.indexOfFirst { it.path == current }.let { if (it >= 0) it + 1 else -1 }
+        }
+
+        com.prism.launcher.theme.PrismDialogs.Builder(this)
+            .setTitle("Speech model")
+            .setSingleChoiceItems(labels.toTypedArray(), checked) { dialog, which ->
+                dialog.dismiss()
+                when {
+                    which == 0 -> {
+                        PrismSettings.setLocalAudioModelPath("")
+                        com.prism.launcher.speech.PrismSpeaker.invalidate()
+                        refresh()
+                        if (!kokoroInstalled) {
+                            // Chosen but not downloaded: the Kokoro screen is where the download is.
+                            startActivity(android.content.Intent(
+                                this, com.prism.launcher.speech.KokoroSettingsActivity::class.java,
+                            ))
+                        }
+                    }
+                    which <= models.size -> {
+                        PrismSettings.setLocalAudioModelPath(models[which - 1].path)
+                        com.prism.launcher.speech.PrismSpeaker.invalidate()
+                        refresh()
+                    }
+                    // Straight to a speech import: the user already said what kind of model this is.
+                    else -> pickLocalModelOfType(PrismSettings.MODEL_TYPE_AUDIO)
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /** Which ringtone an MP3 being imported is for: the shared/phone one, or the meshnet one. */
+    private var ringtoneImportForMesh = false
+
+    /** MP3s only: that is what the import offers, and it keeps the picker's list to ringtone files. */
+    private val ringtoneImport = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) {
+            showRingtonePicker(ringtoneImportForMesh)
+            return@registerForActivityResult
+        }
+        val mesh = ringtoneImportForMesh
+        Thread({
+            val path = com.prism.launcher.calls.RingtonePicker.importFrom(this, uri)
+            runOnUiThread {
+                if (path == null) {
+                    android.widget.Toast.makeText(this, "That file could not be played as a ringtone.", android.widget.Toast.LENGTH_LONG).show()
+                    showRingtonePicker(mesh)
+                } else {
+                    // Imported AND chosen: picking a file to ring with is choosing it.
+                    if (mesh) PrismSettings.setMeshRingtone(path) else PrismSettings.setCallRingtone(path)
+                    refresh()
+                    showRingtonePicker(mesh)
+                }
+            }
+        }, "prism-ringtone-import").apply { isDaemon = true; start() }
+    }
+
+    /**
+     * The ringtone list for phone calls ([mesh] false; also meshnet calls unless they have their own)
+     * or for meshnet voice and video calls.
+     */
+    private fun showRingtonePicker(mesh: Boolean) {
+        val separate = PrismSettings.getSeparateMeshRingtone()
+        com.prism.launcher.calls.RingtonePicker.show(
+            this,
+            title = when {
+                mesh -> "Ringtone for meshnet calls"
+                separate -> "Ringtone for phone calls"
+                else -> "Ringtone"
+            },
+            current = if (mesh) PrismSettings.getMeshRingtone() else PrismSettings.getCallRingtone(),
+            onChosen = { value ->
+                if (mesh) PrismSettings.setMeshRingtone(value) else PrismSettings.setCallRingtone(value)
+                refresh()
+            },
+            onImport = {
+                ringtoneImportForMesh = mesh
+                ringtoneImport.launch(arrayOf("audio/mpeg", "audio/mp3"))
+            },
+        )
     }
 
     /** Which of the three kinds the open picker is importing. See [pickLocalModel]. */
@@ -2489,6 +2613,57 @@ class SettingsActivity : PrismBaseActivity() {
                 { videoBundlePicker.launch(null) }
             ),
 
+            SettingItem.Header("Phone and Meshnet Calls"),
+            run {
+                // Read when the list is built, so a headset plugged in since shows up on reopening.
+                val microphones = com.prism.launcher.calls.CallDevices.microphones(this)
+                val chosen = microphones.indexOfFirst { it.key == PrismSettings.getCallMicrophone() }
+                SettingItem.Picker(
+                    "Microphone",
+                    "Used for phone calls, meshnet voice and video calls (one-to-one and group), " +
+                        "call recording and meshvoice voicemail",
+                    microphones.map { it.label },
+                    if (chosen >= 0) chosen else 0,
+                    { index -> PrismSettings.setCallMicrophone(microphones.getOrNull(index)?.key.orEmpty()) },
+                )
+            },
+            run {
+                val cameras = com.prism.launcher.calls.CallDevices.cameras(this)
+                val chosen = cameras.indexOfFirst { it.key == PrismSettings.getCallCamera() }
+                SettingItem.Picker(
+                    "Camera",
+                    "Used for meshnet video calls, one-to-one and group. Switching camera during a " +
+                        "call still flips front and back.",
+                    cameras.map { it.label },
+                    if (chosen >= 0) chosen else 0,
+                    { index -> PrismSettings.setCallCamera(cameras.getOrNull(index)?.key.orEmpty()) },
+                )
+            },
+            SettingItem.Nav(
+                if (PrismSettings.getSeparateMeshRingtone()) "Ringtone for phone calls" else "Ringtone",
+                (if (PrismSettings.getSeparateMeshRingtone()) "Phone calls · " else "Phone, meshnet and video calls · ") +
+                    com.prism.launcher.calls.RingtonePicker.nameOf(this, PrismSettings.getCallRingtone()),
+                { showRingtonePicker(mesh = false) },
+            ),
+            SettingItem.Toggle(
+                "Separate ringtone for meshnet calls",
+                "Give meshnet voice and video calls a ringtone of their own",
+                PrismSettings.getSeparateMeshRingtone(),
+                { enabled ->
+                    PrismSettings.setSeparateMeshRingtone(enabled)
+                    // The extra row appears or goes; the list is rebuilt to show it.
+                    refresh()
+                },
+            ),
+            *(if (PrismSettings.getSeparateMeshRingtone()) arrayOf<SettingItem>(
+                SettingItem.Nav(
+                    "Ringtone for meshnet calls",
+                    "Meshnet voice and video calls · " +
+                        com.prism.launcher.calls.RingtonePicker.nameOf(this, PrismSettings.getMeshRingtone()),
+                    { showRingtonePicker(mesh = true) },
+                ),
+            ) else emptyArray()),
+
             SettingItem.Header("Speech"),
             run {
                 // DISABLED, NOT HIDDEN, when a different engine is in charge.
@@ -2522,25 +2697,7 @@ class SettingsActivity : PrismBaseActivity() {
                 SettingItem.Nav(
                     "Speech Model",
                     com.prism.launcher.speech.ImportedAudioEngine.describe(path),
-                    {
-                        if (path.isEmpty()) {
-                            pickLocalModel()
-                        } else {
-                            com.prism.launcher.theme.PrismDialogs.Builder(this)
-                                .setTitle("Use Kokoro again?")
-                                .setMessage(
-                                    "Removing this model does not delete the file. Prism goes back " +
-                                        "to speaking with Kokoro-82M."
-                                )
-                                .setPositiveButton("Remove") { _, _ ->
-                                    PrismSettings.setLocalAudioModelPath("")
-                                    com.prism.launcher.speech.PrismSpeaker.invalidate()
-                                    refresh()
-                                }
-                                .setNegativeButton("Keep", null)
-                                .show()
-                        }
-                    }
+                    { showSpeechModelPicker() }
                 )
             },
 

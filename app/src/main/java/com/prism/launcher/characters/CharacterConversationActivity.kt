@@ -46,6 +46,20 @@ class CharacterConversationActivity : PrismBaseActivity() {
     private lateinit var toggle: TextView
     private val adapter = TranscriptAdapter()
 
+    /**
+     * The same context pill Sam's thread has: how full the local model's window is, the tokens in
+     * it and the live decode rate, and a tap compacts the older part of this character's chat.
+     */
+    private lateinit var meter: com.prism.launcher.messaging.SamContextMeterView
+    private var meterJob: kotlinx.coroutines.Job? = null
+
+    /** A reply is being generated; compaction and a second send wait for it. */
+    private var busy = false
+    private var compacting = false
+
+    /** This character's recap and conversation, kept apart from Sam's and every other character's. */
+    private val conversationKey: String get() = "character:${character.id}"
+
     private val exitModelStage = object : OnBackPressedCallback(false) {
         override fun handleOnBackPressed() = setModelStageVisible(false)
     }
@@ -127,6 +141,21 @@ class CharacterConversationActivity : PrismBaseActivity() {
             messages,
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
         )
+        // Where Sam's thread puts it: just above the input, at the end of the row.
+        meter = com.prism.launcher.messaging.SamContextMeterView(this).apply {
+            visibility = android.view.View.GONE
+            setOnClickListener { compactNow() }
+        }
+        column.addView(
+            meter,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply {
+                gravity = Gravity.END
+                marginEnd = IosUi.dp(this@CharacterConversationActivity, 12f)
+                bottomMargin = IosUi.dp(this@CharacterConversationActivity, 2f)
+            }
+        )
         column.addView(buildComposeRow())
 
         stack.addView(
@@ -141,6 +170,115 @@ class CharacterConversationActivity : PrismBaseActivity() {
         onBackPressedDispatcher.addCallback(this, exitModelStage)
         loadTranscript()
         primeBackend()
+        // A previous chat's numbers would be wrong here; an empty ring that fills as the first
+        // reply streams is the honest starting state, as in Sam's thread.
+        com.prism.launcher.messaging.GgufInferenceService.resetLiveStats()
+        showMeter()
+    }
+
+    // ── The context pill ───────────────────────────────────────────────────
+
+    /**
+     * Shown on exactly the condition Sam's is: a character that answers through Sam's engine, on a
+     * local model. Nora and Aether keep their own conversations, CakeChat has no context window of
+     * that kind, and a cloud model's window is not on this device to measure.
+     */
+    private fun meterApplies(): Boolean =
+        character.backend == CharacterStore.Backend.SAM &&
+            com.prism.launcher.messaging.ChatContext.isLocal() &&
+            !cakeChatAnswers()
+
+    private fun cakeChatAnswers(): Boolean =
+        character.backend == CharacterStore.Backend.SAM &&
+            PrismSettings.getUseCakeChat() &&
+            com.prism.launcher.cakechat.CakeChatEngine.isReady(applicationContext)
+
+    private fun showMeter() {
+        meter.visibility = if (meterApplies()) android.view.View.VISIBLE else android.view.View.GONE
+        refreshMeter()
+    }
+
+    private fun refreshMeter() {
+        if (meter.visibility != android.view.View.VISIBLE) return
+        val stats = com.prism.launcher.messaging.GgufInferenceService.liveStats
+        meter.update(
+            stats.contextFraction,
+            stats.contextUsed,
+            com.prism.launcher.messaging.GgufInferenceService.liveTokensPerSecond,
+            stats.contextSize,
+        )
+    }
+
+    private fun startMeter() {
+        if (meter.visibility != android.view.View.VISIBLE) return
+        com.prism.launcher.messaging.GgufInferenceService.resetLiveStats()
+        meterJob?.cancel()
+        meterJob = lifecycleScope.launch(Dispatchers.Main) {
+            while (true) {
+                refreshMeter()
+                kotlinx.coroutines.delay(250)
+            }
+        }
+    }
+
+    private fun stopMeter() {
+        meterJob?.cancel()
+        meterJob = null
+        refreshMeter()
+    }
+
+    /** Tapping the pill: compact now, exactly as Sam's does. */
+    private fun compactNow() {
+        if (busy || compacting) {
+            android.widget.Toast.makeText(this, "Wait for this reply to finish first.", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        lifecycleScope.launch { compact(manual = true) }
+    }
+
+    /**
+     * Folds the older part of this character's chat into a recap stored under its own key.
+     *
+     * The lines are named by speaker -- "User:" and the character's name -- so the briefing knows
+     * which side said what. They are the same non-blank lines the turn sends as history, so the
+     * count the recap covers lines up with what is skipped on the next turn.
+     */
+    private suspend fun compact(manual: Boolean): Boolean {
+        if (compacting) return false
+        compacting = true
+        return try {
+            val named = adapter.conversation().map { (text, fromUser) ->
+                if (fromUser) "User: $text" else "${character.name}: $text"
+            }
+            val outcome = withContext(Dispatchers.IO) {
+                com.prism.launcher.messaging.ChatContext.compact(applicationContext, conversationKey, named)
+            }
+            withContext(Dispatchers.Main) {
+                refreshMeter()
+                when (outcome) {
+                    is com.prism.launcher.messaging.ChatContext.Outcome.Compacted -> android.widget.Toast.makeText(
+                        this@CharacterConversationActivity,
+                        com.prism.launcher.messaging.SamCompaction.describe(outcome.folded),
+                        android.widget.Toast.LENGTH_SHORT,
+                    ).show()
+                    is com.prism.launcher.messaging.ChatContext.Outcome.TooShort -> if (manual) {
+                        android.widget.Toast.makeText(
+                            this@CharacterConversationActivity,
+                            "This chat is too short to compact yet.",
+                            android.widget.Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+                    is com.prism.launcher.messaging.ChatContext.Outcome.Failed -> android.widget.Toast.makeText(
+                        this@CharacterConversationActivity,
+                        "Could not compact the conversation: ${outcome.reason}".take(220),
+                        android.widget.Toast.LENGTH_LONG,
+                    ).show()
+                }
+            }
+            outcome is com.prism.launcher.messaging.ChatContext.Outcome.Compacted
+        } finally {
+            compacting = false
+        }
     }
 
     /**
@@ -156,7 +294,9 @@ class CharacterConversationActivity : PrismBaseActivity() {
                 CharacterChatStore.load(character.id)
             }
             if (stored.isEmpty()) {
-                adapter.append(Line(greeting(), fromUser = false))
+                // Shown, never sent: it is a line ABOUT the character, and handing it to the model
+                // as something the character said would put words in its mouth.
+                adapter.append(Line(greeting(), fromUser = false, greeting = true))
             } else {
                 stored.forEach { adapter.append(Line(it.text, it.fromUser)) }
             }
@@ -289,28 +429,39 @@ class CharacterConversationActivity : PrismBaseActivity() {
     private fun send() {
         val text = input.text.toString().trim()
         if (text.isEmpty()) return
+        if (busy || compacting) {
+            android.widget.Toast.makeText(this, "Wait for this reply to finish first.", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        // THE CONVERSATION BEFORE THIS TURN, both speakers, in order. Captured before the new
+        // message is shown, because it is the history and the new message is this turn.
+        val conversation = adapter.conversation()
         input.setText("")
         adapter.append(Line(text, fromUser = true))
         persist(text, fromUser = true)
         messages.scrollToPosition(adapter.itemCount - 1)
 
-        // The full roleplay framing, not just the description. See CharacterPrompt for why it is
-        // restated on every turn rather than established once.
-        val prompt = CharacterPrompt.turn(character, text)
+        // The full roleplay framing (see CharacterPrompt) leads every rebuilt context as the
+        // persona, rather than being glued to each message: the whole conversation now goes with
+        // every turn, and a framing repeated inside each line of it would be read back as dialogue.
+        val persona = CharacterPrompt.preamble(character)
 
         // WHAT ANSWERS DECIDES WHAT IS SENT. CakeChat takes a list of utterances and no
         // instructions; every other backend takes one prompt and follows them. Checked here rather
         // than inside CharacterPrompt so the decision sits next to the call that depends on it.
-        //
-        // The transcript is captured BEFORE this turn's message was appended above -- it is the
-        // history, and the new message is added by cakeChatDialog as the final turn.
-        val historyBeforeThisTurn = adapter.transcript().dropLast(1)
-        val cakeChatAnswers = character.backend == CharacterStore.Backend.SAM &&
-            PrismSettings.getUseCakeChat() &&
-            com.prism.launcher.cakechat.CakeChatEngine.isReady(applicationContext)
+        val cakeChatAnswers = cakeChatAnswers()
+        val historyBeforeThisTurn = conversation.map { it.first }
         val characterDialog =
             if (cakeChatAnswers) CharacterPrompt.cakeChatDialog(character, historyBeforeThisTurn, text)
             else emptyList()
+
+        // The reply streams into this bubble token by token when streaming is on in Settings, and
+        // is filled in once at the end when it is not. Either way it is one row, updated in place.
+        adapter.append(Line("…", fromUser = false, live = true))
+        messages.scrollToPosition(adapter.itemCount - 1)
+        val streamed = StringBuilder()
+        busy = true
+        startMeter()
 
         lifecycleScope.launch {
             val reply = withContext(Dispatchers.IO) {
@@ -327,26 +478,61 @@ class CharacterConversationActivity : PrismBaseActivity() {
                                     history = characterDialog.dropLast(1),
                                 ).first
                             } else {
+                                // Compact first when the whole conversation would not fit, or the
+                                // last turn ended with the window nearly full -- the same rule as
+                                // Sam's thread, under this character's own recap.
+                                val covered = com.prism.launcher.messaging.SamCompaction.foldedTurns(conversationKey)
+                                val recapNow = com.prism.launcher.messaging.SamCompaction.recap(conversationKey)
+                                if (com.prism.launcher.messaging.ChatContext.shouldCompact(
+                                        historyBeforeThisTurn.drop(covered), recapNow, persona,
+                                    )
+                                ) {
+                                    compact(manual = false)
+                                }
                                 AiManager.getResponse(
                                     applicationContext,
-                                    prompt,
+                                    text,
+                                    onToken = { delta ->
+                                        streamed.append(delta)
+                                        val sofar = streamed.toString()
+                                        runOnUiThread { adapter.updateLive(sofar) }
+                                    },
                                     history = historyBeforeThisTurn,
+                                    recap = com.prism.launcher.messaging.SamCompaction.recap(conversationKey),
+                                    conversationKey = conversationKey,
+                                    speakers = conversation.map { it.second },
+                                    assistantName = character.name,
+                                    persona = persona,
+                                    recapCovers = com.prism.launcher.messaging.SamCompaction.foldedTurns(conversationKey),
                                 ).first
                             }
                         CharacterStore.Backend.NORA -> {
-                            com.prism.launcher.nora.NoraService.sendChat(applicationContext, prompt)
+                            com.prism.launcher.nora.NoraService.sendChat(applicationContext, CharacterPrompt.turn(character, text))
                             "Sent to Nora — her reply appears in her own thread. " +
                                 "Per-character sessions for Nora are not built yet."
                         }
                         CharacterStore.Backend.AETHER -> {
-                            com.prism.launcher.aether.AetherService.sendChat(applicationContext, prompt)
+                            com.prism.launcher.aether.AetherService.sendChat(applicationContext, CharacterPrompt.turn(character, text))
                             "Sent to Aether — her reply appears in her own thread. " +
                                 "Per-character sessions for Aether are not built yet."
                         }
                     }
-                }.getOrElse { "Something went wrong: ${it.message}" }
+                }.getOrElse { "Error: ${it.message}" }
             }
-            adapter.append(Line(reply, fromUser = false))
+            busy = false
+            stopMeter()
+            // A FAILURE IS SHOWN, NOT KEPT. Stored as the character's reply it would look like the
+            // character said it, and the next turn would feed the error back in as dialogue --
+            // the same rule Sam's thread follows.
+            val trimmed = reply.trim()
+            val failed = trimmed.startsWith("Error:") || trimmed.startsWith("P2P Model Error:") ||
+                trimmed.startsWith("Local AI Error:")
+            if (failed) {
+                adapter.removeLive()
+                android.widget.Toast.makeText(this@CharacterConversationActivity, trimmed.take(220), android.widget.Toast.LENGTH_LONG).show()
+                return@launch
+            }
+            adapter.finishLive(reply)
             persist(reply, fromUser = false)
             messages.scrollToPosition(adapter.itemCount - 1)
         }
@@ -370,7 +556,16 @@ class CharacterConversationActivity : PrismBaseActivity() {
         modelView?.onPause()
     }
 
-    private data class Line(val text: String, val fromUser: Boolean)
+    /**
+     * One row of the transcript. [greeting] marks the opening line, which is shown but is not part
+     * of the conversation; [live] marks the reply still being written.
+     */
+    private data class Line(
+        val text: String,
+        val fromUser: Boolean,
+        val greeting: Boolean = false,
+        val live: Boolean = false,
+    )
 
     private inner class TranscriptAdapter : RecyclerView.Adapter<TranscriptAdapter.VH>() {
         private val lines = mutableListOf<Line>()
@@ -380,25 +575,78 @@ class CharacterConversationActivity : PrismBaseActivity() {
             notifyItemInserted(lines.size - 1)
         }
 
-        /** The transcript so far, oldest first -- both speakers, which is the shape CakeChat learnt. */
-        fun transcript(): List<String> = lines.map { it.text }
+        /**
+         * The conversation so far, oldest first, as (text, said by the user): both speakers, without
+         * the greeting or a half-written reply, and without blank lines -- the same lines the
+         * compaction plan counts, so a recap's coverage lines up with what is skipped.
+         */
+        fun conversation(): List<Pair<String, Boolean>> = lines
+            .filter { !it.greeting && !it.live && it.text.isNotBlank() }
+            .map { it.text.trim() to it.fromUser }
 
-        inner class VH(val bubble: TextView) : RecyclerView.ViewHolder(bubble)
+        /** Replaces the live reply's text as tokens arrive; the row is updated in place. */
+        fun updateLive(text: String) {
+            val index = lines.indexOfLast { it.live }
+            if (index < 0) return
+            lines[index] = lines[index].copy(text = text.ifEmpty { "…" })
+            notifyItemChanged(index)
+            messages.scrollToPosition(lines.size - 1)
+        }
+
+        /** The finished reply takes the live row's place. */
+        fun finishLive(text: String) {
+            val index = lines.indexOfLast { it.live }
+            if (index < 0) {
+                append(Line(text, fromUser = false))
+                return
+            }
+            lines[index] = Line(text, fromUser = false)
+            notifyItemChanged(index)
+        }
+
+        fun removeLive() {
+            val index = lines.indexOfLast { it.live }
+            if (index < 0) return
+            lines.removeAt(index)
+            notifyItemRemoved(index)
+        }
+
+        /**
+         * A full-width row holding one bubble.
+         *
+         * THE ROW, NOT THE BUBBLE, IS THE LIST ITEM. The bubble used to be the item itself at wrap
+         * width, so every bubble sat at the left edge whoever sent it -- `gravity = END` only moved
+         * the text inside it. In a full-width row the bubble's layout gravity is what puts the
+         * user's messages on the right and the character's on the left.
+         */
+        inner class VH(val row: FrameLayout, val bubble: TextView) : RecyclerView.ViewHolder(row)
 
         override fun onCreateViewHolder(parent: android.view.ViewGroup, viewType: Int): VH {
             val ctx = parent.context
-            val bubble = TextView(ctx).apply {
-                textSize = 16f
-                setPadding(IosUi.dp(ctx, 14f), IosUi.dp(ctx, 10f), IosUi.dp(ctx, 14f), IosUi.dp(ctx, 10f))
+            val row = FrameLayout(ctx).apply {
                 layoutParams = RecyclerView.LayoutParams(
-                    RecyclerView.LayoutParams.WRAP_CONTENT,
+                    RecyclerView.LayoutParams.MATCH_PARENT,
                     RecyclerView.LayoutParams.WRAP_CONTENT,
                 ).apply {
                     val margin = IosUi.dp(ctx, 4f)
                     setMargins(0, margin, 0, margin)
                 }
             }
-            return VH(bubble)
+            val bubble = TextView(ctx).apply {
+                textSize = 16f
+                setPadding(IosUi.dp(ctx, 14f), IosUi.dp(ctx, 10f), IosUi.dp(ctx, 14f), IosUi.dp(ctx, 10f))
+                // A bubble never spans the screen: the gap on the far side is what makes the side
+                // it sits on readable at a glance.
+                maxWidth = (ctx.resources.displayMetrics.widthPixels * 0.78f).toInt()
+            }
+            row.addView(
+                bubble,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+            return VH(row, bubble)
         }
 
         override fun getItemCount(): Int = lines.size
@@ -413,10 +661,10 @@ class CharacterConversationActivity : PrismBaseActivity() {
             holder.bubble.background = IosUi.filledBackground(
                 ctx, if (line.fromUser) IosUi.accent(ctx) else IosUi.cardBackground(ctx)
             )
-            (holder.bubble.layoutParams as RecyclerView.LayoutParams).let { lp ->
+            (holder.bubble.layoutParams as FrameLayout.LayoutParams).let { lp ->
+                lp.gravity = if (line.fromUser) Gravity.END else Gravity.START
                 holder.bubble.layoutParams = lp
             }
-            holder.bubble.gravity = if (line.fromUser) Gravity.END else Gravity.START
         }
     }
 }

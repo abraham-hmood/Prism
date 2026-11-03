@@ -1005,6 +1005,27 @@
             android:turnScreenOn="true"
             android:windowSoftInputMode="adjustResize" />
 
+        <!-- Group and video mesh calls. Same shape as CallActivity: they can be opened from a
+             full-screen incoming-call notification, so they show over the lock screen, and
+             singleTop keeps a second tap on that notification from stacking another call. -->
+        <activity
+            android:name=".calls.GroupCallActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:showWhenLocked="true"
+            android:theme="@style/Theme.PrismLauncher"
+            android:turnScreenOn="true" />
+
+        <activity
+            android:name=".calls.VideoCallActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:showWhenLocked="true"
+            android:theme="@style/Theme.PrismLauncher"
+            android:turnScreenOn="true" />
+
         <activity
             android:name=".calls.DialerActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"

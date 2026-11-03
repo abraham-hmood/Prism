@@ -78,6 +78,10 @@ fun TrustedDevicesPage() {
     // code, device name, and the address to stop waiting on when the code is dismissed.
     var showingCode by remember { mutableStateOf<Triple<String, String, String>?>(null) }
     var note by remember { mutableStateOf("") }
+    // ASKED, NOT DONE ON ONE CLICK. Stop ends the pairing on BOTH devices -- it tells the other side
+    // too -- and a single stray click used to do it silently, which then looked like trust detection
+    // failing on its own: the phone stopped listing this machine and calls fell back to unencrypted.
+    var confirmStop by remember { mutableStateOf<TrustedDevices.Trust?>(null) }
     var settingLocation by remember { mutableStateOf(false) }
 
     // Polled rather than observed. The trust store has no change stream -- it is written by mesh threads
@@ -92,6 +96,31 @@ fun TrustedDevicesPage() {
             offers = TrustedDevices.pendingOffers()
             delay(2_000)
         }
+    }
+
+    confirmStop?.let { device ->
+        AlertDialog(
+            onDismissRequest = { confirmStop = null },
+            title = { Text("Stop trusting ${device.name}?") },
+            text = {
+                Text(
+                    "This ends the pairing on both devices: ${device.name} is told and removes this " +
+                        "computer too. Encrypted calls, shared messages and the rest stop until you " +
+                        "pair again with a new code."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    TrustedDevices.revoke(device.fingerprint)
+                    note = "Stopped trusting " + device.name + "."
+                    confirmStop = null
+                    revision++
+                }) { Text("Stop trusting", color = Color(0xFFFF6B6B)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmStop = null }) { Text("Keep") }
+            },
+        )
     }
 
     PageScaffold("Trusted devices", "Devices you share with automatically") {
@@ -218,11 +247,7 @@ fun TrustedDevicesPage() {
                                         modifier = Modifier.padding(top = 3.dp),
                                     )
                                 }
-                                TextButton(onClick = {
-                                    TrustedDevices.revoke(device.fingerprint)
-                                    note = "Stopped trusting " + device.name + "."
-                                    revision++
-                                }) {
+                                TextButton(onClick = { confirmStop = device }) {
                                     Text("Stop", fontSize = 13.sp, color = Color(0xFFFF6B6B))
                                 }
                             }
