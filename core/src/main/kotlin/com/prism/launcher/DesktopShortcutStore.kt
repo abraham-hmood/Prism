@@ -75,6 +75,15 @@ sealed class DesktopItem {
      */
     data class Occupied(val ownerIndex: Int) : DesktopItem()
 
+    /**
+     * A website saved from the browser's "Add as shortcut", like a Chrome home-screen shortcut.
+     *
+     * Opens in Prism's own Browser page, not in an app of its own -- that is what "Install as app"
+     * is for, and it produces an ordinary [App]. The icon is the page's favicon, cached by the
+     * platform under a name derived from [url], so nothing about it needs storing here.
+     */
+    data class WebShortcut(val url: String, val title: String) : DesktopItem()
+
     fun serialize(): String {
         return when (this) {
             is App -> "app|$appId"
@@ -88,10 +97,20 @@ sealed class DesktopItem {
             // as an id and place a widget that does not exist.
             is PluginWidget -> "pluginwidget|$className|$spanX|$spanY"
             is Occupied -> "occupied|$ownerIndex"
+            // ENCODED, unlike the other branches: a URL can legitimately contain "|" and ";", the
+            // two characters this format and the grid around it split on, and a title can contain
+            // anything at all.
+            is WebShortcut -> "web|${encode(url)}|${encode(title)}"
         }
     }
 
     companion object {
+        private fun encode(value: String): String =
+            java.net.URLEncoder.encode(value, Charsets.UTF_8.name())
+
+        private fun decode(value: String): String? =
+            runCatching { java.net.URLDecoder.decode(value, Charsets.UTF_8.name()) }.getOrNull()
+
         fun deserialize(raw: String): DesktopItem? {
             val parts = raw.split("|")
             return when (parts.getOrNull(0)) {
@@ -114,6 +133,9 @@ sealed class DesktopItem {
                 }
 
                 "occupied" -> Occupied(parts.getOrNull(1)?.toIntOrNull() ?: -1)
+                "web" -> parts.getOrNull(1)?.let { decode(it) }
+                    ?.takeIf { it.startsWith("http://") || it.startsWith("https://") }
+                    ?.let { url -> WebShortcut(url, parts.getOrNull(2)?.let { decode(it) }.orEmpty().ifBlank { url }) }
                 else -> {
                     // Legacy migration: before the tagged format, a cell was a bare flattened
                     // ComponentName. `ComponentName.unflattenFromString` used to do the
@@ -322,6 +344,41 @@ class DesktopShortcutStore(private val pageIndex: Int = 1) {
                 }
             }
             return false
+        }
+
+        /**
+         * Puts [item] in the first empty cell of a RANDOM desktop page, and returns that page's slot
+         * index, or -1 when no desktop page has room.
+         *
+         * A desktop page is a slot showing the icon grid (`Default` or `DesktopGrid`); a slot showing
+         * the browser or any other page has a grid key on disk too, but nothing ever draws it, so
+         * an item written there would be invisible. Full pages are skipped rather than evicting an
+         * icon. [assignments] is for tests; by default it is the user's own slot layout.
+         */
+        fun addToRandomDesktopPage(
+            item: DesktopItem,
+            assignments: List<SlotAssignment> = runCatching { SlotPreferences().getAssignments() }
+                .getOrDefault(emptyList()),
+            random: kotlin.random.Random = kotlin.random.Random.Default,
+        ): Int {
+            val desktops = assignments.indices.filter {
+                assignments[it] is SlotAssignment.Default || assignments[it] is SlotAssignment.DesktopGrid
+            }
+            val withRoom = desktops.filter { page ->
+                DesktopShortcutStore(page).readGrid(GRID_SIZE).let { grid ->
+                    grid.size < GRID_SIZE || grid.any { it == null }
+                }
+            }
+            if (withRoom.isEmpty()) return -1
+            val page = withRoom.random(random)
+            val store = DesktopShortcutStore(page)
+            val grid = store.readGrid(GRID_SIZE)
+            while (grid.size < GRID_SIZE) grid.add(null)
+            val empty = grid.indexOfFirst { it == null }
+            if (empty < 0) return -1
+            grid[empty] = item
+            store.writeGrid(grid)
+            return page
         }
 
         /** Adds an item specifically to the given desktop page index. */

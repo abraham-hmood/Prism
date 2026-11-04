@@ -863,9 +863,46 @@ object TrustedDevices {
         // device appear trusted before its user had typed anything, and left it behind when they
         // never did. The offered kinds are kept here so the reply can only narrow them.
         outgoingPairings[provisionalFingerprint(peerIp)] = pairing
+        retryOffer(peerIp, pairing, payload)
         // Returned so the caller can SHOW it. Nothing else has it: it is not stored on disk and it is
         // not in the payload.
         return code
+    }
+
+    /**
+     * Sends the offer again while nobody has answered it.
+     *
+     * AN OFFER WAS ONE DATAGRAM. When it was lost -- a laptop's Wi-Fi dozing, a peer that had just
+     * dropped out of the table -- the offering screen showed a code and waited for an answer that
+     * could never come, and the other device never showed a prompt. The receiver recognises a
+     * repeat by the offer id and does not prompt twice (see [onOffer]), so repeating is free.
+     */
+    private fun retryOffer(peerIp: String, pairing: PendingOutgoing, payload: String) {
+        val provisional = provisionalFingerprint(peerIp)
+        kotlin.concurrent.thread(name = "trust-offer-retry", isDaemon = true) {
+            longArrayOf(1_500L, 3_500L, 7_000L, 15_000L).forEach { wait ->
+                runCatching { Thread.sleep(wait) }.onFailure { return@thread }
+                // Answered, cancelled or replaced by a newer offer: this one is finished.
+                if (outgoingPairings[provisional] !== pairing || !pendingCodes.containsKey(provisional)) {
+                    return@thread
+                }
+                runCatching { sender(peerIp, OPCODE_TRUST_OFFER, payload) }
+            }
+        }
+    }
+
+    /**
+     * Offer ids this device has already answered, so a repeated offer is not a second prompt.
+     * Bounded: only the most recent few matter, since an offer lives for minutes.
+     */
+    private val answeredOffers = java.util.Collections.synchronizedSet(LinkedHashSet<String>())
+
+    private fun rememberAnswered(offerId: String) {
+        if (offerId.isBlank()) return
+        synchronized(answeredOffers) {
+            answeredOffers += offerId
+            while (answeredOffers.size > 64) answeredOffers.remove(answeredOffers.first())
+        }
     }
 
     /** A code this device generated and is waiting to have proved back to it. */
@@ -966,6 +1003,19 @@ object TrustedDevices {
             return true
         }
 
+        // A REPEAT OF AN OFFER ALREADY HERE OR ALREADY ANSWERED. The offering side resends until it
+        // hears back (see [retryOffer]); a repeat must neither prompt a second time nor bring back a
+        // prompt the user just answered.
+        val offerId = json.optString("id")
+        if (offerId.isNotBlank()) {
+            if (offerId in answeredOffers || acceptances[fingerprint]?.offerId == offerId) return true
+            val waiting = pending[fingerprint]
+            if (waiting != null && waiting.id == offerId) {
+                if (waiting.ip != peerIp) pending[fingerprint] = waiting.copy(ip = peerIp)
+                return true
+            }
+        }
+
         pending[fingerprint] = PendingOffer(
             fingerprint = fingerprint,
             name = json.optString("name").ifBlank { peerIp },
@@ -1021,6 +1071,7 @@ object TrustedDevices {
         }
 
         pending.remove(fingerprint)
+        rememberAnswered(offer.id)
 
         // NOTHING IS ADDED YET. Typing the code proves what this device knows; it does not prove
         // the offering device accepted the proof, and only that device can check it. The offer is
@@ -1063,7 +1114,9 @@ object TrustedDevices {
     private fun retryReply(fingerprint: String) {
         val acceptance = acceptances[fingerprint] ?: return
         kotlin.concurrent.thread(name = "trust-reply-retry", isDaemon = true) {
-            intArrayOf(1_500, 4_000).forEach { wait ->
+            // Spread over about half a minute, so a peer that dozed through the first answer and
+            // its confirmation still finishes the pairing rather than leaving one side without it.
+            intArrayOf(1_500, 2_500, 4_000, 8_000, 15_000).forEach { wait ->
                 runCatching { Thread.sleep(wait.toLong()) }.onFailure { return@thread }
                 val waiting = acceptances[fingerprint] ?: return@thread
                 // A new attempt for the same device replaced this one: it owns its own retries.
@@ -1313,8 +1366,10 @@ object TrustedDevices {
         }.toString()
         runCatching { sender(peerIp, OPCODE_TRUST_ACK, payload) }
         kotlin.concurrent.thread(name = "trust-ack-retry", isDaemon = true) {
-            runCatching { Thread.sleep(1_500L) }.onFailure { return@thread }
-            runCatching { sender(peerIp, OPCODE_TRUST_ACK, payload) }
+            longArrayOf(1_500L, 3_000L).forEach { wait ->
+                runCatching { Thread.sleep(wait) }.onFailure { return@thread }
+                runCatching { sender(peerIp, OPCODE_TRUST_ACK, payload) }
+            }
         }
     }
 
@@ -1679,6 +1734,9 @@ object TrustedDevices {
         MeshCore.register(OPCODE_SHARE) { peerIp, payload -> onShare(peerIp, payload) }
         MeshCore.register(OPCODE_TRUST_WALLET) { peerIp, payload -> onWallet(peerIp, payload) }
         MeshCore.register(OPCODE_PRESENCE) { peerIp, payload -> onPresence(peerIp, payload) }
+        // Paired devices are kept in touch with by unicast even when they drop out of the peer
+        // table, so a dozing laptop is found again without toggling the mesh. See MeshCore.reconnect.
+        MeshCore.probeTargets = { all().map { it.lastIp }.filter { it.isNotBlank() } }
         startPresenceBeacon()
         PrismPlatform.log.info(TAG, "Trusted-device opcodes registered")
     }

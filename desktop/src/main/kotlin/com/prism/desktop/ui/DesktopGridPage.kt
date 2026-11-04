@@ -166,6 +166,12 @@ fun DesktopGridPage(pageIndex: Int = 1) {
             // A cell covered by a widget whose top-left is elsewhere. Never launchable on any
             // platform -- the owning Widget entry is what holds the interaction.
             is DesktopItem.Occupied -> Unit
+
+            // A website saved from the phone's browser. The desktop has no Browser page, so it
+            // opens in the system browser instead.
+            is DesktopItem.WebShortcut -> runCatching {
+                if (Desktop.isDesktopSupported()) Desktop.getDesktop().browse(java.net.URI(item.url))
+            }.onFailure { PrismPlatform.log.error("Prism/grid", "Could not open ${item.url}", it) }
         }
     }
 
@@ -1011,6 +1017,7 @@ fun labelOf(item: DesktopItem, byId: Map<String, AppEntry>): String = when (item
     // Labelled as nothing on purpose: this cell is covered by a neighbour, and drawing a caption
     // under it would put text in the middle of the widget it belongs to.
     is DesktopItem.Occupied -> ""
+    is DesktopItem.WebShortcut -> item.title
 }
 
 fun fallbackIcon(item: DesktopItem): androidx.compose.ui.graphics.vector.ImageVector = when (item) {
@@ -1022,6 +1029,7 @@ fun fallbackIcon(item: DesktopItem): androidx.compose.ui.graphics.vector.ImageVe
     is DesktopItem.Widget -> Icons.Filled.Widgets
     is DesktopItem.PluginWidget -> Icons.Filled.Extension
     is DesktopItem.Occupied -> Icons.Filled.Widgets
+    is DesktopItem.WebShortcut -> Icons.Filled.Public
 }
 
 /** Files a dropped item into a folder, when it refers to something on disk. */

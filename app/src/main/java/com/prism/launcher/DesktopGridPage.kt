@@ -64,6 +64,7 @@ class DesktopGridPage(
                     true
                 }
             },
+            onLaunchWeb = { url -> (context as? LauncherActivity)?.openWebShortcut(url) },
         )
         grid.layoutManager = GridLayoutManager(context, 4)
         grid.adapter = adapter
@@ -316,7 +317,11 @@ class DesktopGridPage(
                     }
                     is DesktopItem.NetworkedFolder -> {
                         // For networked folders, just remove the persistent shortcut
-                        adapter.removeByFilePath(item.url) 
+                        adapter.removeByFilePath(item.url)
+                    }
+                    is DesktopItem.WebShortcut -> {
+                        adapter.removeByWebUrl(item.url)
+                        com.prism.launcher.browser.WebShortcuts.iconFile(context, item.url).delete()
                     }
                 }
             }
@@ -366,6 +371,7 @@ class DesktopGridPage(
             is DesktopItem.DirectoryRef -> "dir_$id.link"
             is DesktopItem.Folder -> "nest_$id.link"
             is DesktopItem.NetworkedFolder -> "net_$id.link"
+            is DesktopItem.WebShortcut -> "web_$id.link"
         }
         val serialized = item.serialize()
         if (serialized.isNotEmpty()) {
@@ -433,7 +439,8 @@ class DesktopGridPage(
                 addItemToStorageFolder(target, dragged)
                 true
             }
-            is DesktopItem.App, is DesktopItem.FileRef, is DesktopItem.NetworkedFolder -> {
+            is DesktopItem.App, is DesktopItem.FileRef, is DesktopItem.NetworkedFolder,
+            is DesktopItem.WebShortcut -> {
                 adapter.placeAt(dstPos, combineIntoFolder(dragged, target))
                 true
             }

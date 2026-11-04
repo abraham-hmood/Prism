@@ -24,6 +24,8 @@ class DesktopGridAdapter(
     private val onDragEnded: () -> Unit = {},
     /** Opens the same app menu as the drawer. The third argument is the old long-press drag. */
     private val onShowMenu: ((DrawerAppEntry, View, () -> Boolean) -> Boolean)? = null,
+    /** Opens a web shortcut's address in the Browser page. */
+    private val onLaunchWeb: (String) -> Unit = {},
 ) : RecyclerView.Adapter<DesktopGridAdapter.VH>() {
 
     private val packageManager: PackageManager = context.packageManager
@@ -94,6 +96,10 @@ class DesktopGridAdapter(
         }
         if (i != -1) { cells[i] = null; persist(); notifyItemChanged(i) }
     }
+    fun removeByWebUrl(url: String) {
+        val i = cells.indexOfFirst { it is DesktopItem.WebShortcut && it.url == url }
+        if (i != -1) { cells[i] = null; persist(); notifyItemChanged(i) }
+    }
     fun removeByFolderId(folderId: String) {
         val i = cells.indexOfFirst { it is DesktopItem.Folder && it.folderId == folderId }
         if (i != -1) { cells[i] = null; persist(); notifyItemChanged(i) }
@@ -159,6 +165,13 @@ class DesktopGridAdapter(
                     holder.binding.icon.setImageResource(android.R.drawable.stat_sys_download_done)
                     holder.binding.icon.setColorFilter(android.graphics.Color.parseColor("#00BA7C"))
                     holder.itemView.setOnClickListener { onLaunchFolder(item) }
+                }
+                is DesktopItem.WebShortcut -> {
+                    holder.binding.label.text = item.title
+                    val favicon = com.prism.launcher.browser.WebShortcuts.icon(context, item.url)
+                    if (favicon != null) holder.binding.icon.setImageBitmap(favicon)
+                    else holder.binding.icon.setImageResource(R.drawable.ic_globe_24)
+                    holder.itemView.setOnClickListener { onLaunchWeb(item.url) }
                 }
             }
             holder.itemView.setTag(R.id.tag_prism_launcher_app_target, true)
@@ -268,12 +281,17 @@ class DesktopGridAdapter(
                 di is DesktopItem.FileRef -> ctx.getDrawable(android.R.drawable.ic_menu_crop)
                 di is DesktopItem.DirectoryRef -> ctx.getDrawable(android.R.drawable.ic_dialog_email)
                 di is DesktopItem.NetworkedFolder -> ctx.getDrawable(android.R.drawable.stat_sys_download_done)
+                di is DesktopItem.WebShortcut -> com.prism.launcher.browser.WebShortcuts.icon(ctx, di.url)
+                    ?.let { android.graphics.drawable.BitmapDrawable(ctx.resources, it) }
+                    ?: ctx.getDrawable(R.drawable.ic_globe_24)
                 else -> null
             }
 
             icon?.let {
-                // Tint only non-app icons white
-                if (di !is DesktopItem.App) it.setTint(android.graphics.Color.WHITE)
+                // Tint only non-app icons white; a favicon keeps its own colours.
+                if (di !is DesktopItem.App && !(di is DesktopItem.WebShortcut && it is android.graphics.drawable.BitmapDrawable)) {
+                    it.setTint(android.graphics.Color.WHITE)
+                }
                 val l = (idx % 2) * itemSz + (itemSz * 0.1f).toInt()
                 val t = (idx / 2) * itemSz + (itemSz * 0.1f).toInt()
                 it.setBounds(l, t, l + (itemSz * 0.8f).toInt(), t + (itemSz * 0.8f).toInt())

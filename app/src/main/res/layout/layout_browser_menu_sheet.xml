@@ -69,6 +69,21 @@
         app:iconPadding="16dp"
         app:iconTint="?attr/prismTextPrimary" />
 
+    <!-- Add as shortcut: a desktop shortcut, or the page built into an app of its own -->
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/menuAddShortcut"
+        style="@style/Widget.Material3.Button.TonalButton"
+        android:layout_width="match_parent"
+        android:layout_height="64dp"
+        android:layout_marginBottom="8dp"
+        android:gravity="start|center_vertical"
+        android:text="Add as shortcut"
+        android:textColor="?attr/prismTextPrimary"
+        app:icon="@drawable/ic_globe_24"
+        app:iconGravity="textStart"
+        app:iconPadding="16dp"
+        app:iconTint="?attr/prismTextPrimary" />
+
     <!-- Mirror Button -->
     <com.google.android.material.button.MaterialButton
         android:id="@+id/menuMirror"

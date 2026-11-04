@@ -728,7 +728,12 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
             dialog.dismiss()
             showDownloads()
         }
-        
+
+        sheetBinding.menuAddShortcut.setOnClickListener {
+            dialog.dismiss()
+            showAddShortcut(active)
+        }
+
         val hostName = try { java.net.URL(active.lastUrl).host } catch (e: Exception) { "" }
         val isP2p = P2pDnsManager.isP2pDomain(hostName)
         
@@ -743,6 +748,84 @@ class BrowserPageView(context: Context) : FrameLayout(context) {
         
         dialog.setContentView(sheetBinding.root)
         dialog.show()
+    }
+
+    /**
+     * "Add as shortcut": the choice between an app of its own and a desktop shortcut.
+     *
+     * Both land on a random desktop page. Only real web pages qualify -- a blank tab or an internal
+     * page would make a shortcut to nothing.
+     */
+    private fun showAddShortcut(tab: Tab) {
+        val url = tab.lastUrl
+        if (!url.startsWith("http://") && !url.startsWith("https://")) {
+            Toast.makeText(context, "Open a web page first", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val title = tab.webView.title?.takeIf { it.isNotBlank() && it != url }
+            ?: runCatching { java.net.URL(url).host.removePrefix("www.") }.getOrNull().orEmpty()
+        com.prism.launcher.theme.PrismDialogs.Builder(context)
+            .setTitle("Add “$title”")
+            .setMessage(url)
+            .setPositiveButton("Add as shortcut") { _, _ -> addDesktopShortcut(url, title, tab.webView.favicon) }
+            .setNegativeButton("Install as app") { _, _ -> installAsApp(url, title) }
+            .show()
+    }
+
+    private fun addDesktopShortcut(url: String, title: String, favicon: Bitmap?) {
+        val page = WebShortcuts.add(context, url, title, favicon)
+        if (page < 0) {
+            Toast.makeText(context, "No desktop page has room for a shortcut", Toast.LENGTH_LONG).show()
+            return
+        }
+        host?.refreshDesktopPage(page)
+        Toast.makeText(context, "Added $title to page ${page + 1}", Toast.LENGTH_SHORT).show()
+    }
+
+    /**
+     * Builds an app for the page and installs it, then puts it on a random desktop page.
+     *
+     * The build runs on a thread of its own (copying and signing the APK takes a second or two),
+     * and a dialog stays up meanwhile so the tap visibly did something. Android then shows its own
+     * install confirmation; nothing reaches the desktop unless the user agrees to it.
+     */
+    private fun installAsApp(url: String, title: String) {
+        val app = context.applicationContext
+        val progress = com.prism.launcher.theme.PrismDialogs.Builder(context)
+            .setTitle("Building “$title”")
+            .setMessage("Making an app for $url…")
+            .setCancelable(false)
+            .show()
+        val main = android.os.Handler(android.os.Looper.getMainLooper())
+        Thread({
+            val built = runCatching { WebAppBuilder.build(app, url, title) }
+            main.post {
+                runCatching { progress.dismiss() }
+                val apk = built.getOrElse {
+                    PrismLogger.logError("PrismWebApp", "Could not build an app for $url", it)
+                    Toast.makeText(app, "Could not build the app: ${it.message}", Toast.LENGTH_LONG).show()
+                    return@post
+                }
+                WebAppBuilder.install(app, apk, WebAppBuilder.packageFor(url)) { outcome ->
+                    when (outcome) {
+                        is WebAppBuilder.Outcome.Installed -> {
+                            val page = com.prism.launcher.DesktopShortcutStore.addToRandomDesktopPage(
+                                com.prism.launcher.desktopApp(outcome.component),
+                            )
+                            if (page >= 0) host?.refreshDesktopPage(page)
+                            Toast.makeText(
+                                app,
+                                if (page >= 0) "Installed $title on page ${page + 1}"
+                                else "Installed $title (no desktop page had room; it is in the app drawer)",
+                                Toast.LENGTH_LONG,
+                            ).show()
+                        }
+                        is WebAppBuilder.Outcome.Failed ->
+                            Toast.makeText(app, outcome.reason, Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        }, "webapp-build").start()
     }
 
     private fun closeTabsOverlay() {

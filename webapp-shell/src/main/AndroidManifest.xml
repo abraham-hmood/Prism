@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The labels are LITERAL strings, not @string resources: Prism rewrites them in the compiled
+  manifest for each site it turns into an app, and a resource would live in resources.arsc instead.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="Prism Web App"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+        <activity
+            android:name="com.prism.webshell.MainActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize|uiMode"
+            android:exported="true"
+            android:label="Prism Web App">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

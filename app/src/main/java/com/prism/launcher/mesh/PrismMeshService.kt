@@ -252,9 +252,12 @@ object PrismMeshService {
                 // ninety seconds there, and the phone's five is why a closed Prism still read as
                 // online in the trusted list.
                 activePeers.entries.removeIf {
-                    it.value.lastSeen < now - com.prism.core.MeshCore.PEER_LEASE_MS
+                    val expired = it.value.lastSeen < now - com.prism.core.MeshCore.PEER_LEASE_MS
+                    if (expired) lostPeers[it.key] = it.value.port to now
+                    expired
                 }
-                
+                probeLostAndTrusted(now, localIps)
+
                 if (activePeers.isNotEmpty()) {
                     val randomPeerIp = activePeers.keys.random()
                     val peerInfo = activePeers[randomPeerIp]
@@ -398,6 +401,7 @@ object PrismMeshService {
         try { socket?.close() } catch (e: Exception) {}
         socket = null
         activePeers.clear()
+        lostPeers.clear()
         probedAt.clear()
         pendingRequests.clear()
         // The speech HTTP port is part of what the mesh exposes. Leaving it listening after the
@@ -573,6 +577,17 @@ object PrismMeshService {
                 Thread({
                     com.prism.launcher.trusted.TrustedDevices.onReply(peerIp, payload)
                 }, "trust-reply").start()
+            }
+
+            // THE LAST HALF OF A PAIRING THIS PHONE ANSWERED. Without this branch the phone typed the
+            // code, the desktop checked it and saved the pair, and the confirmation that gives the
+            // phone its own record arrived here and was dropped -- so every pairing offered FROM a
+            // desktop showed on the desktop and never on the phone. TrustedDevicesDispatchTest fails
+            // if a trust opcode is ever missing from this `when` again.
+            com.prism.launcher.trusted.TrustedDevices.OPCODE_TRUST_ACK -> {
+                Thread({
+                    com.prism.launcher.trusted.TrustedDevices.onAck(peerIp, payload)
+                }, "trust-ack").start()
             }
 
             com.prism.launcher.trusted.TrustedDevices.OPCODE_SHARE -> {
@@ -1094,9 +1109,51 @@ object PrismMeshService {
      * Silently does nothing for a peer that is not currently active, which is the honest outcome --
      * there is no route to it, and callers of this are advisory rather than load-bearing.
      */
+    /**
+     * Sends to one peer.
+     *
+     * A PEER THAT IS MOMENTARILY OUT OF THE TABLE STILL GETS THE PACKET. This used to return
+     * silently when [targetIp] was not live, and a laptop whose Wi-Fi dozes drops out of the table
+     * for a minute at a time -- so a pairing offer sent in that minute went nowhere while the
+     * offering screen showed a code and waited for an answer that could never come. The caller
+     * always has a concrete address (a trusted device's last one, a row the user picked), so the
+     * honest thing is to send it to the port the peer last used, or the mesh port.
+     */
     fun sendToPeer(targetIp: String, command: Byte, payload: String) {
-        val info = activePeers[targetIp] ?: return
-        sendPacket(targetIp, info.port, command, payload)
+        val ip = targetIp.removePrefix("::ffff:")
+        val port = activePeers[ip]?.port ?: lostPeers[ip]?.first ?: meshPort()
+        sendPacket(ip, port, command, payload)
+    }
+
+    private fun meshPort(): Int =
+        PrismSettings.getMeshBootstrapPort().toIntOrNull() ?: DEFAULT_MESH_PORT
+
+    /**
+     * Peers whose lease ran out recently: address to (port, when it was lost).
+     *
+     * Probed by unicast for [LOST_PEER_PROBE_MS] after they go quiet. Discovery is a broadcast, and
+     * a laptop in Wi-Fi power saving misses broadcasts far more often than unicast -- which is why a
+     * Linux laptop that dropped out once stayed out until somebody toggled the mesh.
+     */
+    private val lostPeers = ConcurrentHashMap<String, Pair<Int, Long>>()
+    private const val LOST_PEER_PROBE_MS = 15 * 60_000L
+
+    /** Unicast heartbeats to recently lost peers and to every trusted device's last address. */
+    private fun probeLostAndTrusted(now: Long, localIps: Set<String>) {
+        lostPeers.entries.removeIf { now - it.value.second > LOST_PEER_PROBE_MS || activePeers.containsKey(it.key) }
+        val targets = mutableMapOf<String, Int>()
+        lostPeers.forEach { (ip, value) -> targets[ip] = value.first }
+        runCatching {
+            com.prism.launcher.trusted.TrustedDevices.all().forEach { device ->
+                val ip = com.prism.launcher.trusted.TrustedDevices.normaliseAddress(device.lastIp)
+                if (ip.isNotEmpty() && !activePeers.containsKey(ip)) targets.putIfAbsent(ip, meshPort())
+            }
+        }
+        targets.forEach { (ip, port) ->
+            if (!localIps.contains(ip) && MeshUtils.isIpv4Literal(ip)) {
+                sendPacket(ip, port, 0x0A.toByte(), localAnnouncement(meshPort()))
+            }
+        }
     }
 
     fun sendPacket(targetIp: String, targetPort: Int, command: Byte, payload: String) {

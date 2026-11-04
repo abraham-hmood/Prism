@@ -980,4 +980,37 @@ class TrustedDevicesTest {
         assertNotNull(TrustedDevices.candidateFor("10.8.0.7", "Something Else"))
         assertNull(TrustedDevices.candidateFor("10.8.0.9", "Someone Else"))
     }
+
+    // ── Lost packets ───────────────────────────────────────────────────────
+
+    private fun offerWithId(id: String) = JSONObject(offerPayload()).apply { put("id", id) }.toString()
+
+    @Test
+    fun `a repeated offer is one prompt, not two`() {
+        assertTrue(TrustedDevices.onOffer("10.8.0.7", offerWithId("offer-1")))
+        assertTrue(TrustedDevices.onOffer("10.8.0.7", offerWithId("offer-1")))
+        assertEquals(1, TrustedDevices.pendingOffers().size)
+    }
+
+    @Test
+    fun `a repeat of an offer already declined does not bring the prompt back`() {
+        TrustedDevices.onOffer("10.8.0.7", offerWithId("offer-2"))
+        assertTrue(TrustedDevices.respondToOffer("aabbccdd", emptySet()))
+        assertTrue(TrustedDevices.pendingOffers().isEmpty())
+
+        // The offering side resends until it hears back; its retry crossed the answer on the wire.
+        assertTrue(TrustedDevices.onOffer("10.8.0.7", offerWithId("offer-2")))
+        assertTrue(TrustedDevices.pendingOffers().isEmpty(), "the user already answered this offer")
+    }
+
+    @Test
+    fun `an unanswered offer is sent again`() {
+        assertNotNull(
+            TrustedDevices.offer("10.8.0.9", "My phone", "android", setOf(TrustedDevices.Kind.CLIPBOARD)),
+        )
+        Thread.sleep(2_200L)
+        val offers = synchronized(sent) { sent.count { it.opcode == TrustedDevices.OPCODE_TRUST_OFFER } }
+        assertTrue(offers >= 2, "a lost offer must not end the pairing; only $offers went out")
+        TrustedDevices.cancelOffer("10.8.0.9")
+    }
 }

@@ -32,6 +32,10 @@ android {
     // means a NINE that does not compile is a reported limitation rather than a broken Prism build.
     sourceSets.getByName("main").jniLibs.srcDir(layout.buildDirectory.dir("nineJniLibs"))
 
+    // The web-app template (:webapp-shell), copied in by stageWebAppShell below. A generated
+    // directory rather than src/main/assets, so a built APK is never checked in by accident.
+    sourceSets.getByName("main").assets.srcDir(layout.buildDirectory.dir("generated/webappShellAssets"))
+
     defaultConfig {
         applicationId = "com.prism.launcher"
         minSdk = 26
@@ -358,6 +362,11 @@ dependencies {
     implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
     implementation("org.bouncycastle:bcpkix-jdk18on:1.78.1")
 
+    // Google's own APK signer, the library behind the SDK's apksigner tool. "Install as app" in the
+    // browser signs each web app on the phone, and Android 11+ refuses an APK without a v2
+    // signature -- which is a binary format worth not reimplementing. Pinned to the AGP version.
+    implementation("com.android.tools.build:apksig:8.7.2")
+
     // Plain JVM tests, for the logic in this module that has no Android in it. WineInstaller
     // parses tar archives and Debian version strings, and both are the kind of thing that is
     // either exactly right or silently corrupts a 30,000-file root filesystem.
@@ -473,6 +482,21 @@ val buildNineNative = tasks.register("buildNineNative") {
 }
 
 tasks.matching { it.name == "preBuild" }.configureEach { dependsOn(buildNineNative) }
+
+/**
+ * Puts the web-app template into Prism's assets as `webapp-shell.apk`.
+ *
+ * The browser's "Install as app" copies this APK, rewrites its manifest for the site and signs it on
+ * the phone (see WebAppBuilder). Always the RELEASE, unsigned build of :webapp-shell: Prism replaces
+ * the signature anyway, and a debug build would carry the debuggable flag into every web app.
+ */
+val stageWebAppShell = tasks.register<Copy>("stageWebAppShell") {
+    dependsOn(":webapp-shell:assembleRelease")
+    from(rootProject.layout.projectDirectory.file("webapp-shell/build/outputs/apk/release/webapp-shell-release-unsigned.apk"))
+    into(layout.buildDirectory.dir("generated/webappShellAssets"))
+    rename { "webapp-shell.apk" }
+}
+tasks.matching { it.name == "preBuild" }.configureEach { dependsOn(stageWebAppShell) }
 
 tasks.matching { it.name.matches(Regex("generate(Debug|Release)PythonRequirements")) }.configureEach {
     doFirst {

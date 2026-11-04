@@ -32,3 +32,6 @@ include(":app")
 include(":desktop")
 include(":sample-custom-page")
 include(":sample-plugin")
+// The template every "Install as app" web app is cut from. Built with Prism and bundled into its
+// assets; see webapp-shell/build.gradle.kts.
+include(":webapp-shell")

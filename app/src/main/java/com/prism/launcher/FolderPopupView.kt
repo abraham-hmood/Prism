@@ -219,6 +219,7 @@ class FolderInternalAdapter(
                 is DesktopItem.DirectoryRef -> onLaunchFolder(item)
                 is DesktopItem.Folder -> onLaunchFolder(item)
                 is DesktopItem.NetworkedFolder -> onLaunchFolder(item)
+                is DesktopItem.WebShortcut -> (ctx as? LauncherActivity)?.openWebShortcut(item.url)
             }
         }
 
@@ -255,6 +256,12 @@ class FolderInternalAdapter(
                 b.label.text = item.name
                 b.icon.setImageResource(android.R.drawable.stat_sys_download_done)
                 b.icon.setColorFilter(android.graphics.Color.parseColor("#00BA7C"))
+            }
+            is DesktopItem.WebShortcut -> {
+                b.label.text = item.title
+                val favicon = com.prism.launcher.browser.WebShortcuts.icon(ctx, item.url)
+                if (favicon != null) b.icon.setImageBitmap(favicon)
+                else b.icon.setImageResource(R.drawable.ic_globe_24)
             }
         }
 

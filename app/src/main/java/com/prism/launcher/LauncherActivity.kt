@@ -981,6 +981,50 @@ class LauncherActivity : PrismBaseActivity() {
     fun findBrowserPosition(): Int =
         slotPreferences.getAssignments().indexOfFirst { it is SlotAssignment.Browser }
 
+    /**
+     * Opens a desktop web shortcut in the Browser page.
+     *
+     * WITH NO BROWSER PAGE ON ANY SLOT, ONE IS BORROWED: a random slot shows the browser until the
+     * user pages away, and then gets its own page back -- the same borrow [openDrawerPage] uses, and
+     * for the same reason (inserting a slot would renumber every desktop grid after it). The URL is
+     * held pending and the browser takes it as soon as it attaches; see [attachBrowserPage].
+     */
+    fun openWebShortcut(url: String) {
+        if (!url.startsWith("http://") && !url.startsWith("https://")) return
+        if (findBrowserPosition() >= 0) {
+            openWebResult(url)
+            return
+        }
+        restoreBorrowedPage()
+        val list = slotPreferences.getAssignments()
+        if (list.isEmpty()) {
+            openInDefaultBrowser(this, url)
+            return
+        }
+        val slot = list.indices.random()
+        borrowedPageSlot = slot
+        borrowedPageOriginal = list[slot]
+        browserOpenToken++
+        pendingBrowserUrl = url
+        slotPreferences.setAt(slot, SlotAssignment.Browser)
+        mainAdapter.updateAssignments(slotPreferences.getAssignments())
+        binding.desktopPager.setCurrentItem(slot, false)
+        // A browser page that was already alive (an earlier borrow the pager kept) never attaches
+        // again, so the pending URL is also handed over directly once the pager has settled.
+        binding.root.postDelayed({
+            val url2 = pendingBrowserUrl ?: return@postDelayed
+            (findPageViewAt(slot) as? BrowserPageView)?.let {
+                pendingBrowserUrl = null
+                it.openWebResult(url2)
+            }
+        }, 350L)
+    }
+
+    /** Re-reads one desktop page's grid after something outside it added an icon. */
+    fun refreshDesktopPage(page: Int) {
+        (findPageViewAt(page) as? DesktopGridPage)?.refreshFromStore()
+    }
+
     fun attachFileExplorerPage(page: com.prism.launcher.files.FileExplorerPageView?) {
         fileExplorerPage = page
     }

@@ -389,6 +389,7 @@ object MeshCore {
         runCatching { socket?.close() }
         socket = null
         activePeers.clear()
+        lostPeers.clear()
         pendingRequests.clear()
         PrismPlatform.log.info(TAG, "Mesh stopped")
     }
@@ -446,8 +447,15 @@ object MeshCore {
             if (!running) return
 
             val now = System.currentTimeMillis()
-            // Expire before gossiping, so a dead peer is not chosen as the one to talk to.
-            activePeers.entries.removeAll { now - it.value.lastSeen > PEER_LEASE_MS }
+            // Expire before gossiping, so a dead peer is not chosen as the one to talk to. An
+            // expired peer is remembered and probed by unicast for a while -- see [reconnect].
+            activePeers.entries.removeAll { entry ->
+                val expired = now - entry.value.lastSeen > PEER_LEASE_MS
+                if (expired) lostPeers[entry.key] = entry.value.port to now
+                expired
+            }
+            runCatching { reconnect(now) }
+                .onFailure { PrismPlatform.log.warn(TAG, "Reconnect round failed: " + it.message) }
             // A request that was never answered is not worth remembering. These used to accumulate
             // for every address a forged peer list named.
             pendingRequests.filterValues { now - it > REQUEST_EXPIRY_MS }.keys
@@ -471,8 +479,68 @@ object MeshCore {
             val identity = localAnnouncement()
             sendPacket(target, info.port, OP_HEARTBEAT, identity)
             sendPacket(target, info.port, OP_PEER_LIST_REQ, identity)
+            // EVERY QUIET PEER, NOT ONLY THE RANDOM ONE. With two or three peers, picking one at
+            // random each round regularly skips the same peer three rounds running -- past the
+            // lease -- and it expired while it was perfectly reachable. The phone has always done
+            // this; the desktop did not, which is a large part of why desktops dropped off.
+            activePeers.forEach { (ip, peer) ->
+                if (ip != target && now - peer.lastSeen > QUIET_PEER_MS) {
+                    sendPacket(ip, peer.port, OP_HEARTBEAT, identity)
+                }
+            }
+            // A broadcast every round as well, as the phone does: a device that joined the network
+            // while this one already had peers would otherwise only be found by hearsay.
+            sendDiscoveryBroadcast(boundPort)
 
             runCatching { Thread.sleep(GOSSIP_INTERVAL_MS) }.onFailure { return }
+        }
+    }
+
+    /**
+     * Addresses a feature wants kept in touch with even when they are not in the peer table.
+     *
+     * Trusted devices set this to their last-known addresses, so a paired laptop that dropped off is
+     * found again by unicast rather than by waiting for a broadcast it may never hear.
+     */
+    @Volatile
+    var probeTargets: () -> List<String> = { emptyList() }
+
+    /** Peers whose lease ran out recently: address to (port, when it was lost). */
+    private val lostPeers = ConcurrentHashMap<String, Pair<Int, Long>>()
+
+    /**
+     * Gets back in touch with the devices this one should be talking to.
+     *
+     * THE MESH USED TO RECOVER ONLY BY BROADCAST. The meshnet server (the bootstrap address) was
+     * contacted once, at startup, and a peer that expired was forgotten. A laptop whose Wi-Fi power
+     * saving swallowed a minute of packets therefore lost the phone, and broadcasts are exactly what
+     * a dozing Wi-Fi card drops -- so it stayed lost until the mesh was switched off and on, which
+     * re-ran the startup contact. Every round now sends a unicast discovery request to the
+     * bootstrap nodes, to peers lost in the last [LOST_PEER_PROBE_MS], and to [probeTargets]. A
+     * discovery request is answered with a heartbeat, which puts both sides back in each other's
+     * table.
+     */
+    private fun reconnect(now: Long) {
+        lostPeers.entries.removeIf { now - it.value.second > LOST_PEER_PROBE_MS || activePeers.containsKey(it.key) }
+        val targets = linkedMapOf<String, Int>()
+        runCatching { bootstrapNodes() }.getOrDefault(emptyList()).forEach { node ->
+            val parts = node.split(":")
+            val ip = normalise(parts.firstOrNull()?.trim().orEmpty())
+            if (ip.isNotEmpty()) targets[ip] = parts.getOrNull(1)?.trim()?.toIntOrNull() ?: DEFAULT_PORT
+        }
+        lostPeers.forEach { (ip, value) -> targets.putIfAbsent(ip, value.first) }
+        runCatching { probeTargets() }.getOrDefault(emptyList()).forEach { raw ->
+            val ip = normalise(raw)
+            if (ip.isNotEmpty()) targets.putIfAbsent(ip, DEFAULT_PORT)
+        }
+        if (targets.isEmpty()) return
+        val mine = localIps()
+        val announcement = localAnnouncement()
+        targets.forEach { (ip, port) ->
+            // A live peer is already heartbeated above; a name is never resolved from here.
+            if (activePeers.containsKey(ip) || mine.contains(ip) || !MeshUtils.isIpv4Literal(ip)) return@forEach
+            if (port !in 1..65535) return@forEach
+            sendPacket(ip, port, OP_DISCOVERY_REQ, announcement)
         }
     }
 
@@ -734,9 +802,19 @@ object MeshCore {
         return true
     }
 
+    /**
+     * Sends to one peer.
+     *
+     * A PEER MOMENTARILY OUT OF THE TABLE STILL GETS THE PACKET, at the port it last used or the
+     * mesh port. This used to return silently, so a pairing offer or confirmation sent during the
+     * minute a peer had dropped out went nowhere while the sending screen waited for an answer.
+     * Callers always hold a concrete address, and only literals are sent to.
+     */
     fun sendToPeer(targetIp: String, command: Byte, payload: String) {
-        val info = activePeers[normalise(targetIp)] ?: return
-        sendPacket(targetIp, info.port, command, payload)
+        val ip = normalise(targetIp)
+        if (!MeshUtils.isIpLiteral(ip)) return
+        val port = activePeers[ip]?.port ?: lostPeers[ip]?.first ?: DEFAULT_PORT
+        sendPacket(ip, port, command, payload)
     }
 
     fun sendPacket(targetIp: String, targetPort: Int, command: Byte, payload: String) {
@@ -850,6 +928,12 @@ object MeshCore {
     }
 
     private const val GOSSIP_INTERVAL_MS = 15_000L
+
+    /** A peer silent this long is heartbeated directly, well inside [PEER_LEASE_MS]. */
+    private const val QUIET_PEER_MS = 20_000L
+
+    /** How long a peer that went quiet keeps being probed by unicast. */
+    private const val LOST_PEER_PROBE_MS = 15 * 60_000L
     private const val KICK_COOLDOWN_MS = 5 * 60 * 1000L
 
     /** How often an address heard through the peer list may be probed. */
