@@ -256,6 +256,56 @@ class SmsRelayTest {
         assertTrue(SmsRelay.load(scratch).isEmpty())
     }
 
+    // ── The transport ──────────────────────────────────────────────────────
+
+    @Test
+    fun `the desktop relay listens as a mesh opcode, not a second socket`() {
+        try {
+            SmsRelay.listen(scratch)
+            assertTrue(SmsRelay.isListening)
+            assertTrue(
+                SmsRelay.OPCODE_SMS in com.prism.core.MeshCore.registeredOpcodes(),
+                "the relay must receive through MeshCore's socket",
+            )
+        } finally {
+            SmsRelay.stop()
+        }
+        assertFalse(SmsRelay.OPCODE_SMS in com.prism.core.MeshCore.registeredOpcodes())
+    }
+
+    @Test
+    fun `a relay payload from the mesh is stored, and one that will not open is counted`() {
+        val sealed = assertNotNull(SmsRelay.seal(listOf(sample("over the mesh")), "Pixel"))
+        assertEquals(1, SmsRelay.receive(scratch, SmsRelay.payloadString(sealed)))
+        assertEquals("over the mesh", SmsRelay.load(scratch).single().body)
+        assertEquals(-1, SmsRelay.receive(scratch, "not base64 at all!"))
+    }
+
+    /**
+     * ONE SOCKET ON THE MESH PORT. On Linux, two sockets sharing a UDP port with `reuseAddress` both
+     * get broadcasts but only the last one bound gets unicast, so a second listener on 8081 makes the
+     * desktop mesh deaf to every packet addressed to it while it still "shows up" by broadcast. That
+     * is how Linux desktops lost every trust offer. Windows does not behave that way, so a runtime
+     * test on a Windows machine would pass with the bug present -- hence a source check.
+     */
+    @Test
+    fun `nothing but MeshCore binds a socket on the mesh port`() {
+        var dir: File? = File("").absoluteFile
+        while (dir != null && !File(dir, "settings.gradle.kts").isFile) dir = dir.parentFile
+        val root = assertNotNull(dir, "no project root")
+        val offenders = listOf("core/src/main", "desktop/src/main")
+            .map { File(root, it) }
+            .flatMap { tree -> tree.walkTopDown().filter { it.isFile && it.extension == "kt" }.toList() }
+            .filter { it.name != "MeshCore.kt" }
+            .filter { file ->
+                val text = file.readText()
+                text.contains("DatagramSocket") && Regex("""\bbind\(""").containsMatchIn(text) &&
+                    (text.contains("8081") || text.contains("MeshCore.DEFAULT_PORT") || text.contains("meshPort"))
+            }
+            .map { it.relativeTo(root).path }
+        assertTrue(offenders.isEmpty(), "a second UDP listener on the mesh port: $offenders")
+    }
+
     @Test
     fun `the status says no wallet when there is none`() {
         WalletVault.wipe()

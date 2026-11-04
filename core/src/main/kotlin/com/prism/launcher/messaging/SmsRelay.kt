@@ -40,13 +40,11 @@ import java.util.Base64
  * That a relay packet went past, how big it was, and when. Encryption does not hide traffic and this does
  * not claim to. What is inside — the sender, the body, the thread — is sealed.
  *
- * ## Why the transport here is a bare datagram and not the mesh service
+ * ## The transport
  *
- * Because the mesh service is Android-only today (PHASE 48 moves it), and this needs to work on both
- * ends now. It speaks the SAME wire framing the mesh does — the `PRISM` header and a one-byte opcode on
- * UDP 8081 — so an Android sender can use [PrismMeshService] unchanged while a desktop listens with
- * [listen] below. When Phase 48 lands, the desktop side becomes one more opcode on the real service and
- * this listener is deleted; until then it is forty lines rather than a blocked phase.
+ * The mesh's own framing -- the `PRISM` header and a one-byte opcode on UDP 8081. Android sends and
+ * receives through `PrismMeshService`; the desktop receives through MeshCore, via [listen]. It once had
+ * a socket of its own on the same port, and that is what made Linux deaf to the mesh -- see [listen].
  */
 object SmsRelay {
 
@@ -275,75 +273,58 @@ object SmsRelay {
     // ── Receiving ──────────────────────────────────────────────────────────
 
     @Volatile private var listening = false
-    @Volatile private var socket: DatagramSocket? = null
 
     val isListening: Boolean get() = listening
 
     /**
-     * Listens for relay packets and stores what it can open.
+     * Receives relay packets through the desktop mesh ([com.prism.core.MeshCore]) and stores what it
+     * can open. Returns at once; the mesh's own listener delivers the packets.
      *
-     * Blocking; callers give it a daemon thread. Binds with `reuseAddress` so it can share the mesh port
-     * with the real mesh service on a machine that eventually runs both — without it, whichever started
-     * second would fail to bind and report a port conflict rather than a relay that is not listening.
+     * ## Why this no longer opens a socket of its own
      *
-     * Everything that is not a relay packet is ignored silently. This port carries the whole mesh gossip
-     * protocol, so the overwhelming majority of what arrives is somebody else's opcode, and logging those
-     * would fill the log with correct behaviour.
+     * It used to bind a second socket to UDP 8081 with `reuseAddress`, next to MeshCore's. On Linux
+     * two sockets sharing a UDP port that way BOTH get every broadcast, but each UNICAST datagram goes
+     * to only one of them -- the one bound last, which was this one, since it started after the mesh.
+     * It discarded everything that was not a relay packet, so a Linux desktop heard broadcasts
+     * (discovery: it "showed up" everywhere) and silently lost every packet addressed to it: trust
+     * offers, replies, heartbeats. Peers then expired it every lease and found it again by broadcast,
+     * which is the "Linux keeps disconnecting until the mesh is toggled" report -- toggling rebound
+     * MeshCore, making it the newest socket again. Windows hands unicast to the first socket bound,
+     * which is why only Linux broke. One port, one socket: the relay is an opcode on the mesh.
      */
-    fun listen(root: File, port: Int = DEFAULT_PORT, onMessages: (Int) -> Unit = {}) {
+    fun listen(root: File, onMessages: (Int) -> Unit = {}) {
         if (listening) return
         listening = true
-
-        val bound = runCatching {
-            DatagramSocket(null).apply {
-                reuseAddress = true
-                bind(java.net.InetSocketAddress(port))
-            }
-        }.getOrElse {
-            listening = false
-            PrismPlatform.log.error(TAG, "Could not bind UDP $port for the SMS relay", it)
-            return
+        com.prism.core.MeshCore.register(OPCODE_SMS) { _, payload ->
+            receive(root, payload, onMessages)
+            true
         }
-        socket = bound
-        PrismPlatform.log.info(TAG, "SMS relay listening on UDP $port")
+        PrismPlatform.log.info(TAG, "SMS relay listening on the mesh (opcode 0x28)")
+    }
 
-        val buffer = ByteArray(64 * 1024)
-        try {
-            while (listening) {
-                val packet = DatagramPacket(buffer, buffer.size)
-                // Not runCatching: a `break` inside an inline lambda is still an experimental feature,
-                // and a closed socket has to end the loop rather than spin on a failing receive.
-                try {
-                    bound.receive(packet)
-                } catch (e: Exception) {
-                    break
-                }
-
-                val sealed = unframe(packet.data, packet.length) ?: continue
-                lastPacketAt = System.currentTimeMillis()
-
-                val messages = open(sealed)
-                if (messages == null) {
-                    // A relay packet that will not open is the wrong-wallet case, and it is worth
-                    // counting rather than dropping: it is the difference between "nothing is arriving"
-                    // and "your two devices hold different recovery phrases", which need different
-                    // answers from the user.
-                    failedToOpen++
-                    continue
-                }
-                val added = store(root, messages)
-                if (added > 0) onMessages(added)
-            }
-        } finally {
-            listening = false
-            runCatching { bound.close() }
-            socket = null
+    /**
+     * Stores one relay payload -- the base64 text after the opcode byte. Returns how many messages
+     * were new, or -1 when the payload would not open.
+     */
+    fun receive(root: File, payload: String, onMessages: (Int) -> Unit = {}): Int {
+        val sealed = fromPayloadString(payload.trim()) ?: return -1
+        lastPacketAt = System.currentTimeMillis()
+        val messages = open(sealed)
+        if (messages == null) {
+            // A relay packet that will not open is the wrong-wallet case, and it is worth counting
+            // rather than dropping: it is the difference between "nothing is arriving" and "your two
+            // devices hold different recovery phrases", which need different answers from the user.
+            failedToOpen++
+            return -1
         }
+        val added = store(root, messages)
+        if (added > 0) onMessages(added)
+        return added
     }
 
     fun stop() {
         listening = false
-        runCatching { socket?.close() }
+        com.prism.core.MeshCore.unregister(OPCODE_SMS)
     }
 
     // ── Sending ────────────────────────────────────────────────────────────
