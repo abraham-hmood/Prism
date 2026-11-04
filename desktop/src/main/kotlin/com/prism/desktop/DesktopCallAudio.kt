@@ -3,12 +3,8 @@ package com.prism.desktop
 import com.prism.core.PrismPlatform
 import com.prism.launcher.calls.MeshCalls
 import java.io.ByteArrayInputStream
-import javax.sound.sampled.AudioFormat
 import javax.sound.sampled.AudioSystem
 import javax.sound.sampled.Clip
-import javax.sound.sampled.DataLine
-import javax.sound.sampled.SourceDataLine
-import javax.sound.sampled.TargetDataLine
 
 /**
  * A mesh call's microphone and speaker, on a desktop.
@@ -30,48 +26,46 @@ import javax.sound.sampled.TargetDataLine
  */
 class DesktopCallAudio : MeshCalls.Audio {
 
-    private val format = AudioFormat(
-        AudioFormat.Encoding.PCM_SIGNED,
-        MeshCalls.SAMPLE_RATE.toFloat(),
-        16,
-        1,
-        2,
-        MeshCalls.SAMPLE_RATE.toFloat(),
-        false,
-    )
-
-    @Volatile private var recordLine: TargetDataLine? = null
-    @Volatile private var playLine: SourceDataLine? = null
+    @Volatile private var input: DesktopAudioDevices.Input? = null
+    @Volatile private var output: DesktopAudioDevices.Output? = null
     @Volatile private var capturing = false
     @Volatile private var captureThread: Thread? = null
 
+    /**
+     * Opens the microphone chosen in Settings → Phone and Meshnet Calls, or the best one that
+     * opens. See [DesktopAudioDevices] for the order and why it exists.
+     */
     override fun startCapture(onFrame: (ByteArray) -> Unit): Boolean {
         if (capturing) return true
-        val info = DataLine.Info(TargetDataLine::class.java, format)
-        if (!runCatching { AudioSystem.isLineSupported(info) }.getOrDefault(false)) {
-            PrismPlatform.log.warn(TAG, "No microphone accepts 16 kHz mono PCM")
+        val opened = DesktopAudioDevices.openInput(
+            com.prism.launcher.PrismSettings.getCallMicrophone(), MeshCalls.SAMPLE_RATE,
+        ) ?: run {
+            PrismPlatform.log.warn(TAG, "No microphone could be opened for the call")
             return false
         }
-        val line = runCatching {
-            (AudioSystem.getLine(info) as TargetDataLine).apply {
-                open(format, MeshCalls.FRAME_BYTES * 8)
-                start()
-            }
-        }.getOrElse { error ->
-            PrismPlatform.log.warn(TAG, "Could not open the microphone: ${error.message}")
-            return false
-        }
-        recordLine = line
+        input = opened
         capturing = true
         captureThread = Thread({
-            val frame = ByteArray(MeshCalls.FRAME_BYTES)
+            val pending = java.io.ByteArrayOutputStream()
             while (capturing) {
-                val read = runCatching { line.read(frame, 0, frame.size) }.getOrDefault(-1)
-                if (read <= 0) {
+                val chunk = opened.read(MeshCalls.FRAME_BYTES)
+                if (chunk.isEmpty()) {
                     if (!capturing) break
                     continue
                 }
-                onFrame(if (read == frame.size) frame.copyOf() else frame.copyOf(read))
+                // Resampling does not land on frame boundaries, so whole frames are cut from a
+                // running buffer: the engine and the far side expect 20 ms frames.
+                pending.write(chunk)
+                if (pending.size() >= MeshCalls.FRAME_BYTES) {
+                    val all = pending.toByteArray()
+                    var at = 0
+                    while (all.size - at >= MeshCalls.FRAME_BYTES) {
+                        onFrame(all.copyOfRange(at, at + MeshCalls.FRAME_BYTES))
+                        at += MeshCalls.FRAME_BYTES
+                    }
+                    pending.reset()
+                    pending.write(all, at, all.size - at)
+                }
             }
         }, "prism-desktop-call-mic").apply { isDaemon = true; start() }
         return true
@@ -79,45 +73,37 @@ class DesktopCallAudio : MeshCalls.Audio {
 
     override fun stopCapture() {
         capturing = false
-        runCatching { recordLine?.stop() }
+        val current = input
+        input = null
+        runCatching { current?.line?.stop() }
         runCatching { captureThread?.join(400) }
-        runCatching { recordLine?.close() }
-        recordLine = null
+        current?.close()
         captureThread = null
     }
 
+    /** Opens the speaker chosen in Settings → Phone and Meshnet Calls, or the best one that opens. */
     override fun startPlayback(): Boolean {
-        if (playLine != null) return true
-        val info = DataLine.Info(SourceDataLine::class.java, format)
-        if (!runCatching { AudioSystem.isLineSupported(info) }.getOrDefault(false)) {
-            PrismPlatform.log.warn(TAG, "No output line accepts 16 kHz mono PCM")
+        if (output != null) return true
+        val opened = DesktopAudioDevices.openOutput(
+            com.prism.launcher.PrismSettings.getCallSpeaker(), MeshCalls.SAMPLE_RATE,
+        ) ?: run {
+            PrismPlatform.log.warn(TAG, "No speaker could be opened for the call")
             return false
         }
-        val line = runCatching {
-            (AudioSystem.getLine(info) as SourceDataLine).apply {
-                open(format, MeshCalls.FRAME_BYTES * 8)
-                start()
-            }
-        }.getOrElse { error ->
-            PrismPlatform.log.warn(TAG, "Could not open the call output: ${error.message}")
-            return false
-        }
-        playLine = line
+        output = opened
         return true
     }
 
     override fun write(frame: ByteArray) {
-        val line = playLine ?: return
+        val line = output ?: return
         if (frame.isEmpty()) return
-        runCatching { line.write(frame, 0, frame.size) }
+        runCatching { line.write(frame) }
     }
 
     override fun stopPlayback() {
-        val line = playLine ?: return
-        playLine = null
-        runCatching { line.stop() }
-        runCatching { line.flush() }
-        runCatching { line.close() }
+        val line = output ?: return
+        output = null
+        line.close()
     }
 
     companion object {
@@ -166,11 +152,10 @@ class DesktopCallAudio : MeshCalls.Audio {
             stopChime()
             val thread = Thread({
                 val sampleRate = 22_050f
-                val shape = AudioFormat(sampleRate, 16, 1, true, false)
-                val line = runCatching {
-                    (AudioSystem.getLine(DataLine.Info(SourceDataLine::class.java, shape)) as SourceDataLine)
-                        .apply { open(shape); start() }
-                }.getOrNull() ?: return@Thread
+                // Through the device helper, like calls: on Linux the first raw line may be HDMI.
+                val line = DesktopAudioDevices.openOutput(
+                    com.prism.launcher.PrismSettings.getCallSpeaker(), sampleRate.toInt(), bufferMillis = 250,
+                ) ?: return@Thread
                 val deadline = System.currentTimeMillis() + seconds * 1000L
                 var phase = 0.0
                 val chunk = ByteArray(4096)
@@ -186,11 +171,10 @@ class DesktopCallAudio : MeshCalls.Audio {
                             chunk[i * 2 + 1] = ((value shr 8) and 0xFF).toByte()
                             phase += 1
                         }
-                        line.write(chunk, 0, chunk.size)
+                        line.write(chunk)
                     }
                 }
-                runCatching { line.drain() }
-                runCatching { line.close() }
+                line.close(drain = true)
             }, "prism-find-chime").apply { isDaemon = true }
             chime = thread
             thread.start()

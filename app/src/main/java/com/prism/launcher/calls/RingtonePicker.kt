@@ -34,13 +34,14 @@ import java.io.File
 object RingtonePicker {
 
     private const val TAG = "PrismRingtones"
+    private const val STANDARD_RINGBACK = "Standard ringback"
 
     data class Tone(val value: String, val label: String)
 
     fun importedDir(context: Context): File = File(context.filesDir, "ringtones").apply { mkdirs() }
 
     /** Every choice, in the order shown: the system default, imported tones, then the phone's own. */
-    fun tones(context: Context): List<Tone> {
+    fun tones(context: Context, callTone: Boolean = false): List<Tone> {
         val imported = importedDir(context).listFiles { file -> file.isFile }
             ?.sortedBy { it.name.lowercase() }
             ?.map { Tone(it.absolutePath, it.nameWithoutExtension + "  (imported)") }
@@ -59,12 +60,13 @@ object RingtonePicker {
             PrismLogger.logWarning(TAG, "Could not list the system ringtones: ${it.message}")
             emptyList()
         }
-        return listOf(Tone("", "System default")) + imported + system
+        // For a call tone, blank is the network's ringback rather than the system ringtone.
+        return listOf(Tone("", if (callTone) STANDARD_RINGBACK else "System default")) + imported + system
     }
 
     /** A short name for a stored choice, for the Settings row. */
-    fun nameOf(context: Context, value: String): String {
-        if (value.isBlank()) return "System default"
+    fun nameOf(context: Context, value: String, callTone: Boolean = false): String {
+        if (value.isBlank()) return if (callTone) STANDARD_RINGBACK else "System default"
         if (value.startsWith("/")) {
             val file = File(value)
             return if (file.isFile) file.nameWithoutExtension else "System default (the imported tone is gone)"
@@ -84,8 +86,9 @@ object RingtonePicker {
         current: String,
         onChosen: (String) -> Unit,
         onImport: () -> Unit,
+        callTone: Boolean = false,
     ) {
-        val tones = tones(context)
+        val tones = tones(context, callTone)
         val accent = IosUi.accent(context)
         var preview: MediaPlayer? = null
         fun stopPreview() {
@@ -114,7 +117,12 @@ object RingtonePicker {
             selected = checkedId - 1
             // Hearing a tone is how one is chosen; a few seconds of it plays on selection.
             stopPreview()
-            val uri = CallRinger.uriFor(context, tones.getOrNull(selected)?.value.orEmpty())
+            val value = tones.getOrNull(selected)?.value.orEmpty()
+            if (callTone && value.isBlank()) {
+                CallTonePlayer.previewRingback()
+                return@setOnCheckedChangeListener
+            }
+            val uri = CallRinger.uriFor(context, value)
             preview = runCatching {
                 MediaPlayer().apply {
                     setAudioAttributes(

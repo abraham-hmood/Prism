@@ -55,7 +55,7 @@ object DesktopCamera {
 
     @Volatile private var worker: Thread? = null
 
-    /** Opens camera 0 and starts sending. Idempotent. */
+    /** Opens the chosen camera (camera 0 by default) and starts sending. Idempotent. */
     @Synchronized
     fun start() {
         if (running) return
@@ -76,8 +76,10 @@ object DesktopCamera {
 
     private fun captureLoop() {
         val windows = System.getProperty("os.name").lowercase().contains("win")
+        // The camera chosen in Settings → Phone and Meshnet Calls; camera 0 when none is.
+        val index = DesktopCameraDevices.chosenIndex()
         val capture = runCatching {
-            if (windows) VideoCapture(0, opencv_videoio.CAP_DSHOW) else VideoCapture(0)
+            if (windows) VideoCapture(index, opencv_videoio.CAP_DSHOW) else VideoCapture(index)
         }.getOrElse { error ->
             fail("The camera library could not load: ${error.message ?: error.javaClass.simpleName}")
             return
@@ -87,7 +89,7 @@ object DesktopCamera {
                 fail("No camera could be opened. Check that one is connected and not in use by another app.")
                 return
             }
-            PrismPlatform.log.info(TAG, "Camera open")
+            PrismPlatform.log.info(TAG, "Camera $index open")
             val frame = Mat()
             val small = Mat()
             val params = IntPointer(opencv_imgcodecs.IMWRITE_JPEG_QUALITY, JPEG_QUALITY)

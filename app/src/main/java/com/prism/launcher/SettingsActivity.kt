@@ -1191,54 +1191,71 @@ class SettingsActivity : PrismBaseActivity() {
             .show()
     }
 
-    /** Which ringtone an MP3 being imported is for: the shared/phone one, or the meshnet one. */
+    /** Which tone an MP3 being imported is for: mesh or not, ringtone or call tone. */
     private var ringtoneImportForMesh = false
+    private var ringtoneImportCallTone = false
 
     /** MP3s only: that is what the import offers, and it keeps the picker's list to ringtone files. */
     private val ringtoneImport = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        val mesh = ringtoneImportForMesh
+        val callTone = ringtoneImportCallTone
         if (uri == null) {
-            showRingtonePicker(ringtoneImportForMesh)
+            showRingtonePicker(mesh, callTone)
             return@registerForActivityResult
         }
-        val mesh = ringtoneImportForMesh
         Thread({
             val path = com.prism.launcher.calls.RingtonePicker.importFrom(this, uri)
             runOnUiThread {
                 if (path == null) {
-                    android.widget.Toast.makeText(this, "That file could not be played as a ringtone.", android.widget.Toast.LENGTH_LONG).show()
-                    showRingtonePicker(mesh)
+                    android.widget.Toast.makeText(this, "That file could not be played.", android.widget.Toast.LENGTH_LONG).show()
                 } else {
                     // Imported AND chosen: picking a file to ring with is choosing it.
-                    if (mesh) PrismSettings.setMeshRingtone(path) else PrismSettings.setCallRingtone(path)
+                    storeTone(mesh, callTone, path)
                     refresh()
-                    showRingtonePicker(mesh)
                 }
+                showRingtonePicker(mesh, callTone)
             }
         }, "prism-ringtone-import").apply { isDaemon = true; start() }
     }
 
+    private fun storeTone(mesh: Boolean, callTone: Boolean, value: String) = when {
+        callTone && mesh -> PrismSettings.setMeshCallTone(value)
+        callTone -> PrismSettings.setCallTone(value)
+        mesh -> PrismSettings.setMeshRingtone(value)
+        else -> PrismSettings.setCallRingtone(value)
+    }
+
     /**
-     * The ringtone list for phone calls ([mesh] false; also meshnet calls unless they have their own)
-     * or for meshnet voice and video calls.
+     * The tone list for phone calls ([mesh] false; also meshnet calls unless they have their own) or
+     * for meshnet voice and video calls. [callTone] picks the tone heard while placing a call
+     * rather than the ringtone; the list and the import are the same.
      */
-    private fun showRingtonePicker(mesh: Boolean) {
+    private fun showRingtonePicker(mesh: Boolean, callTone: Boolean = false) {
         val separate = PrismSettings.getSeparateMeshRingtone()
+        val noun = if (callTone) "Call tone" else "Ringtone"
         com.prism.launcher.calls.RingtonePicker.show(
             this,
             title = when {
-                mesh -> "Ringtone for meshnet calls"
-                separate -> "Ringtone for phone calls"
-                else -> "Ringtone"
+                mesh -> "$noun for meshnet calls"
+                separate -> "$noun for phone calls"
+                else -> noun
             },
-            current = if (mesh) PrismSettings.getMeshRingtone() else PrismSettings.getCallRingtone(),
+            current = when {
+                callTone && mesh -> PrismSettings.getMeshCallTone()
+                callTone -> PrismSettings.getCallTone()
+                mesh -> PrismSettings.getMeshRingtone()
+                else -> PrismSettings.getCallRingtone()
+            },
             onChosen = { value ->
-                if (mesh) PrismSettings.setMeshRingtone(value) else PrismSettings.setCallRingtone(value)
+                storeTone(mesh, callTone, value)
                 refresh()
             },
             onImport = {
                 ringtoneImportForMesh = mesh
+                ringtoneImportCallTone = callTone
                 ringtoneImport.launch(arrayOf("audio/mpeg", "audio/mp3"))
             },
+            callTone = callTone,
         )
     }
 
@@ -2628,6 +2645,20 @@ class SettingsActivity : PrismBaseActivity() {
                 )
             },
             run {
+                // Read when the list is built, like the microphones: a Bluetooth headset connected
+                // since appears on reopening.
+                val speakers = com.prism.launcher.calls.CallDevices.speakers(this)
+                val chosen = speakers.indexOfFirst { it.key == PrismSettings.getCallSpeaker() }
+                SettingItem.Picker(
+                    "Speaker",
+                    "Where meshnet voice and video calls play, one-to-one and group. The speaker " +
+                        "button during a call still switches to the loudspeaker.",
+                    speakers.map { it.label },
+                    if (chosen >= 0) chosen else 0,
+                    { index -> PrismSettings.setCallSpeaker(speakers.getOrNull(index)?.key.orEmpty()) },
+                )
+            },
+            run {
                 val cameras = com.prism.launcher.calls.CallDevices.cameras(this)
                 val chosen = cameras.indexOfFirst { it.key == PrismSettings.getCallCamera() }
                 SettingItem.Picker(
@@ -2647,7 +2678,7 @@ class SettingsActivity : PrismBaseActivity() {
             ),
             SettingItem.Toggle(
                 "Separate ringtone for meshnet calls",
-                "Give meshnet voice and video calls a ringtone of their own",
+                "Give meshnet voice and video calls a ringtone and a call tone of their own",
                 PrismSettings.getSeparateMeshRingtone(),
                 { enabled ->
                     PrismSettings.setSeparateMeshRingtone(enabled)
@@ -2661,6 +2692,21 @@ class SettingsActivity : PrismBaseActivity() {
                     "Meshnet voice and video calls · " +
                         com.prism.launcher.calls.RingtonePicker.nameOf(this, PrismSettings.getMeshRingtone()),
                     { showRingtonePicker(mesh = true) },
+                ),
+            ) else emptyArray()),
+            SettingItem.Nav(
+                if (PrismSettings.getSeparateMeshRingtone()) "Call tone for phone calls" else "Call tone",
+                (if (PrismSettings.getSeparateMeshRingtone()) "Heard while placing a phone call · "
+                else "Heard while placing a phone, meshnet or video call, one-to-one or group · ") +
+                    com.prism.launcher.calls.RingtonePicker.nameOf(this, PrismSettings.getCallTone(), callTone = true),
+                { showRingtonePicker(mesh = false, callTone = true) },
+            ),
+            *(if (PrismSettings.getSeparateMeshRingtone()) arrayOf<SettingItem>(
+                SettingItem.Nav(
+                    "Call tone for meshnet calls",
+                    "Heard while placing a meshnet voice or video call, one-to-one or group · " +
+                        com.prism.launcher.calls.RingtonePicker.nameOf(this, PrismSettings.getMeshCallTone(), callTone = true),
+                    { showRingtonePicker(mesh = true, callTone = true) },
                 ),
             ) else emptyArray()),
 

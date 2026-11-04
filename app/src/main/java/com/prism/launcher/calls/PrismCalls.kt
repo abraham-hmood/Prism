@@ -71,6 +71,9 @@ object PrismCalls {
         if (call == null || call.state != MeshCalls.State.RINGING) {
             appContext?.let { CallRinger.stopIf(it, "mesh") }
         }
+        // The call tone: while a call this phone placed rings out, voice or video.
+        if (CallTones.shouldPlay(call)) appContext?.let { CallTonePlayer.start(it, mesh = true, owner = "mesh") }
+        else CallTonePlayer.stopIf("mesh")
     }
 
     /** The same routing for a group invitation, which has its own engine and its own screens. */
@@ -89,6 +92,9 @@ object PrismCalls {
                 CallRinger.stopIf(it, "group")
             }
         }
+        // A group call this phone started rings out until somebody joins.
+        if (CallTones.shouldPlay(group)) appContext?.let { CallTonePlayer.start(it, mesh = true, owner = "group") }
+        else CallTonePlayer.stopIf("group")
     }
 
     @Volatile private var appContext: Context? = null

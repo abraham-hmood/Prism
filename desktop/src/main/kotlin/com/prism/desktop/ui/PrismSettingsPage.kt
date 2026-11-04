@@ -386,6 +386,11 @@ fun PrismSettingsPage() {
                 )
             }
 
+            // ── Phone and meshnet calls ─────────────────────────────────
+            //
+            // The phone's section of the same name, ported: devices, ringtones, the split switch.
+            CallSettingsSection()
+
 
             // Then everything the phone has, in the phone's grouping and order.
             val grouped = sections.groupBy { SettingsCatalog.groupOf(it.title) }

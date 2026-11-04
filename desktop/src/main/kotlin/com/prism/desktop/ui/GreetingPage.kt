@@ -55,10 +55,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
-import javax.sound.sampled.AudioFormat
-import javax.sound.sampled.AudioSystem
-import javax.sound.sampled.DataLine
-import javax.sound.sampled.TargetDataLine
 
 /**
  * Setting this machine's meshvoice greeting -- the desktop half of the phone's greeting layout.
@@ -321,44 +317,38 @@ private fun saveRecording(pcm: ByteArray): String {
  */
 private object DesktopGreetingRecorder {
 
-    private val format = AudioFormat(
-        AudioFormat.Encoding.PCM_SIGNED, MeshCalls.SAMPLE_RATE.toFloat(), 16, 1, 2, MeshCalls.SAMPLE_RATE.toFloat(), false,
-    )
     private val buffer = ByteArrayOutputStream()
-    @Volatile private var line: TargetDataLine? = null
+    @Volatile private var line: com.prism.desktop.DesktopAudioDevices.Input? = null
     @Volatile var running = false
         private set
     @Volatile private var startedAt = 0L
 
-    /** Starts recording; returns why it could not, or null. */
+    /**
+     * Starts recording; returns why it could not, or null. Records from the microphone chosen in
+     * Settings → Phone and Meshnet Calls, as the phone does for its greeting.
+     */
     fun start(): String? {
         stop()
-        val info = DataLine.Info(TargetDataLine::class.java, format)
-        if (!runCatching { AudioSystem.isLineSupported(info) }.getOrDefault(false)) {
-            return "No microphone on this computer accepts 16 kHz recording."
-        }
-        val opened = runCatching {
-            (AudioSystem.getLine(info) as TargetDataLine).apply { open(format, MeshCalls.FRAME_BYTES * 8); start() }
-        }.getOrElse { return "The microphone could not be opened: ${it.message}" }
+        val opened = com.prism.desktop.DesktopAudioDevices.openInput(
+            com.prism.launcher.PrismSettings.getCallMicrophone(), MeshCalls.SAMPLE_RATE,
+        ) ?: return "No microphone on this computer could be opened."
         synchronized(buffer) { buffer.reset() }
         line = opened
         running = true
         startedAt = System.currentTimeMillis()
         Thread({
-            val frame = ByteArray(MeshCalls.FRAME_BYTES)
             val limit = MeshGreeting.MAX_SECONDS * MeshCalls.SAMPLE_RATE * 2
             while (running) {
-                val read = runCatching { opened.read(frame, 0, frame.size) }.getOrDefault(-1)
-                if (read <= 0) continue
+                val chunk = opened.read(MeshCalls.FRAME_BYTES)
+                if (chunk.isEmpty()) continue
                 val full = synchronized(buffer) {
-                    buffer.write(frame, 0, read)
+                    buffer.write(chunk)
                     buffer.size() >= limit
                 }
                 if (full) break
             }
             running = false
-            runCatching { opened.stop() }
-            runCatching { opened.close() }
+            opened.close()
         }, "prism-desktop-greeting").apply { isDaemon = true; start() }
         PrismPlatform.log.info("PrismGreeting", "Recording a greeting")
         return null
@@ -366,8 +356,7 @@ private object DesktopGreetingRecorder {
 
     fun stop() {
         running = false
-        runCatching { line?.stop() }
-        runCatching { line?.close() }
+        line?.close()
         line = null
     }
 

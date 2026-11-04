@@ -3092,6 +3092,14 @@ object PrismSettings {
     fun getCallMicrophone(): String = prefs().getString("call_microphone", "") ?: ""
     fun setCallMicrophone(value: String) = prefs().edit().putString("call_microphone", value).apply()
 
+    /**
+     * Where meshnet calls play. The same description scheme as the microphone on Android; on a
+     * desktop it is the sound device's name. Blank is the system's choice. A choice written on one
+     * platform simply matches nothing on the other, which falls back to the system's choice.
+     */
+    fun getCallSpeaker(): String = prefs().getString("call_speaker", "") ?: ""
+    fun setCallSpeaker(value: String) = prefs().edit().putString("call_speaker", value).apply()
+
     fun getCallCamera(): String = prefs().getString("call_camera", "") ?: ""
     fun setCallCamera(value: String) = prefs().edit().putString("call_camera", value).apply()
 
@@ -3105,6 +3113,20 @@ object PrismSettings {
 
     fun getMeshRingtone(): String = prefs().getString("call_ringtone_mesh", "") ?: ""
     fun setMeshRingtone(value: String) = prefs().edit().putString("call_ringtone_mesh", value).apply()
+
+    /**
+     * The call tone: what plays on THIS device while a call it placed is ringing out. Stored like a
+     * ringtone; blank is the standard ringback. Split by the same switch as the ringtones.
+     */
+    fun getCallTone(): String = prefs().getString("call_tone", "") ?: ""
+    fun setCallTone(value: String) = prefs().edit().putString("call_tone", value).apply()
+
+    fun getMeshCallTone(): String = prefs().getString("call_tone_mesh", "") ?: ""
+    fun setMeshCallTone(value: String) = prefs().edit().putString("call_tone_mesh", value).apply()
+
+    /** The call tone an outgoing call of this kind uses, after the split setting is applied. */
+    fun callToneFor(mesh: Boolean): String =
+        if (mesh && getSeparateMeshRingtone()) getMeshCallTone() else getCallTone()
 
     /** The ringtone a call of this kind actually uses, after the split setting is applied. */
     fun ringtoneFor(mesh: Boolean): String =

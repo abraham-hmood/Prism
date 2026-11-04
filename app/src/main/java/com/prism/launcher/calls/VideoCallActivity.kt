@@ -164,9 +164,12 @@ class VideoCallActivity : PrismBaseActivity() {
 
         setContentView(buildLayout())
         runCatching { PrismCalls.device()?.enterCallMode() }
-        // A video call is held away from the face, so it starts on the loudspeaker, as Skype does.
-        @Suppress("DEPRECATION")
-        runCatching { audioManager.isSpeakerphoneOn = true }
+        // A video call is held away from the face, so it starts on the loudspeaker, as Skype does --
+        // unless a speaker was chosen in Settings, which enterCallMode has already routed to.
+        if (!com.prism.launcher.calls.CallDevices.hasSpeakerChoice(this)) {
+            @Suppress("DEPRECATION")
+            runCatching { audioManager.isSpeakerphoneOn = true }
+        }
 
         MeshVideo.addListener(videoListener)
         MeshCalls.addStateListener(callListener)

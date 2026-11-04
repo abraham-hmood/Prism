@@ -68,9 +68,25 @@ object CallDevices {
      * itself -- so the output that pairs with the chosen microphone is selected. Needs Android 12;
      * earlier versions keep the system's route.
      */
-    fun routeCommunication(context: Context) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
+    fun routeCommunication(context: Context, mesh: Boolean = false) {
         val manager = context.getSystemService(AudioManager::class.java) ?: return
+        // A MESHNET CALL WITH A CHOSEN SPEAKER GOES THERE. In call mode Android routes the call's
+        // audio to the communication device, so that is the lever -- a preferred device on the
+        // AudioTrack alone is overridden by it. A carrier call keeps the microphone's pairing below.
+        if (mesh) {
+            val speaker = preferredSpeaker(context)
+            if (speaker != null) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    runCatching { manager.setCommunicationDevice(speaker) }
+                        .onFailure { PrismLogger.logWarning(TAG, "Could not play the call on ${speakerLabel(speaker)}: ${it.message}") }
+                } else {
+                    @Suppress("DEPRECATION")
+                    runCatching { manager.isSpeakerphoneOn = speaker.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+                }
+                return
+            }
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
         val mic = preferredMicrophone(context)
         if (mic == null) {
             runCatching { manager.clearCommunicationDevice() }
@@ -122,6 +138,76 @@ object CallDevices {
         AudioDeviceInfo.TYPE_WIRED_HEADSET,
         AudioDeviceInfo.TYPE_USB_HEADSET,
         AudioDeviceInfo.TYPE_USB_DEVICE,
+    )
+
+    // ── Speakers ───────────────────────────────────────────────────────────
+
+    /**
+     * Every output a meshnet call could play through, the automatic choice first.
+     *
+     * On Android 12+ these are the platform's communication devices -- exactly the set a call can
+     * be routed to -- so nothing listed here is a device the call would then refuse.
+     */
+    fun speakers(context: Context): List<Choice> {
+        val manager = context.getSystemService(AudioManager::class.java) ?: return listOf(DEFAULT_SPEAKER)
+        val choices = speakerDevices(manager).map { Choice(keyOf(it), speakerLabel(it)) }.distinctBy { it.key }
+        return listOf(DEFAULT_SPEAKER) + choices
+    }
+
+    /** The chosen speaker if it is connected now, or null for the automatic choice. */
+    fun preferredSpeaker(context: Context): AudioDeviceInfo? {
+        val wanted = PrismSettings.getCallSpeaker()
+        if (wanted.isBlank()) return null
+        val manager = context.getSystemService(AudioManager::class.java) ?: return null
+        return speakerDevices(manager).firstOrNull { keyOf(it) == wanted }
+    }
+
+    /** Whether a speaker was chosen and is present, so a call screen must not override it. */
+    fun hasSpeakerChoice(context: Context): Boolean = preferredSpeaker(context) != null
+
+    private fun speakerDevices(manager: AudioManager): List<AudioDeviceInfo> = runCatching {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            manager.availableCommunicationDevices.filter { it.type in SPEAKER_TYPES }
+        } else {
+            manager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).filter { it.isSink && it.type in SPEAKER_TYPES }
+        }
+    }.getOrDefault(emptyList())
+
+    private fun speakerLabel(device: AudioDeviceInfo): String {
+        val kind = when (device.type) {
+            AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> "Phone earpiece"
+            AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "Loudspeaker"
+            AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Wired headset"
+            AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "Wired headphones"
+            AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "Bluetooth headset"
+            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "Bluetooth audio"
+            AudioDeviceInfo.TYPE_BLE_HEADSET -> "Bluetooth LE headset"
+            AudioDeviceInfo.TYPE_BLE_SPEAKER -> "Bluetooth LE speaker"
+            AudioDeviceInfo.TYPE_USB_HEADSET -> "USB headset"
+            AudioDeviceInfo.TYPE_USB_DEVICE -> "USB audio"
+            AudioDeviceInfo.TYPE_HEARING_AID -> "Hearing aid"
+            else -> "Speaker"
+        }
+        val builtIn = device.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE ||
+            device.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+        val name = device.productName?.toString().orEmpty().trim()
+        return if (name.isNotEmpty() && !builtIn) "$kind — $name" else kind
+    }
+
+    private val DEFAULT_SPEAKER = Choice("", "Automatic (earpiece; loudspeaker for video)")
+
+    private val SPEAKER_TYPES = setOf(
+        AudioDeviceInfo.TYPE_BUILTIN_EARPIECE,
+        AudioDeviceInfo.TYPE_BUILTIN_SPEAKER,
+        AudioDeviceInfo.TYPE_WIRED_HEADSET,
+        AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+        AudioDeviceInfo.TYPE_BLE_HEADSET,
+        AudioDeviceInfo.TYPE_BLE_SPEAKER,
+        AudioDeviceInfo.TYPE_USB_HEADSET,
+        AudioDeviceInfo.TYPE_USB_DEVICE,
+        AudioDeviceInfo.TYPE_HEARING_AID,
     )
 
     // ── Cameras ────────────────────────────────────────────────────────────

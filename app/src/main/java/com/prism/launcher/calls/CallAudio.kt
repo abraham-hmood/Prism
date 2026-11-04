@@ -144,6 +144,9 @@ class CallAudio(private val context: Context) : MeshCalls.Audio {
             return false
         }
 
+        // The speaker chosen in Settings → Phone and Meshnet Calls. The call's route is set in
+        // enterCallMode; this also asks the track itself, for a call played outside call mode.
+        CallDevices.preferredSpeaker(context)?.let { device -> runCatching { output.setPreferredDevice(device) } }
         output.play()
         track = output
         return true
@@ -163,8 +166,12 @@ class CallAudio(private val context: Context) : MeshCalls.Audio {
         runCatching { output.release() }
     }
 
-    /** Sets the platform audio mode for the duration of a call, and restores it after. */
-    fun enterCallMode() {
+    /**
+     * Sets the platform audio mode for the duration of a call, and restores it after. [mesh] is
+     * whether this is a meshnet call, which plays through the speaker chosen in Settings; a carrier
+     * call keeps the route that pairs with the chosen microphone.
+     */
+    fun enterCallMode(mesh: Boolean = true) {
         runCatching {
             val manager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
             manager.mode = AudioManager.MODE_IN_COMMUNICATION
@@ -173,7 +180,7 @@ class CallAudio(private val context: Context) : MeshCalls.Audio {
         }
         // A carrier call's audio is the platform's, so the chosen microphone reaches it by routing
         // the call to that microphone's device (headset, Bluetooth) rather than by an AudioRecord.
-        CallDevices.routeCommunication(context)
+        CallDevices.routeCommunication(context, mesh)
     }
 
     fun leaveCallMode() {
@@ -182,6 +189,10 @@ class CallAudio(private val context: Context) : MeshCalls.Audio {
             manager.mode = AudioManager.MODE_NORMAL
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
                 manager.clearCommunicationDevice()
+            } else {
+                // A loudspeaker chosen for the call must not outlive it on an older Android.
+                @Suppress("DEPRECATION")
+                manager.isSpeakerphoneOn = false
             }
         }
     }

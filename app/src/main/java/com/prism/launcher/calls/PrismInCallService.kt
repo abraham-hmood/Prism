@@ -190,6 +190,10 @@ object PrismTelecom {
             ringing = false
             CallRinger.stopIf(context, "carrier")
         }
+        // The call tone, while a carrier call this phone placed is dialing or connecting.
+        val outgoing = calls.any { it.state == Call.STATE_DIALING || it.state == Call.STATE_CONNECTING }
+        if (outgoing) CallTonePlayer.start(context, mesh = false, owner = "carrier")
+        else CallTonePlayer.stopIf("carrier")
     }
 
     /** The call a screen should be showing: active first, then ringing, then dialing. */

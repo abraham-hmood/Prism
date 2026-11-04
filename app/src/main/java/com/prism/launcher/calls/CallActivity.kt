@@ -158,7 +158,9 @@ class CallActivity : PrismBaseActivity() {
         // A carrier call needs the communication audio route and the microphone indicator is the
         // platform's; a mesh call needs them too. Both are restored in onDestroy, so leaving this
         // screen never leaves the next notification playing through the earpiece.
-        runCatching { PrismCalls.device()?.enterCallMode() }
+        runCatching {
+            PrismCalls.device()?.enterCallMode(mesh = mode != MODE_PSTN && mode != MODE_PSTN_INCOMING)
+        }
         PrismTelecom.uiVisible = true
         if (mode == MODE_PSTN || mode == MODE_PSTN_INCOMING) subscribePstn()
 

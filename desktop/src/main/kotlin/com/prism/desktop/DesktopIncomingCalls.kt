@@ -96,6 +96,8 @@ object DesktopIncomingCalls {
     private val incoming: (MeshCalls.Call) -> Unit = { invite ->
         PrismPlatform.log.info("PrismCalls", "Incoming mesh call from ${invite.peerName} at ${invite.peerIp}")
         publish(invite)
+        // Rings until the call stops ringing; see [state]. Video calls arrive here too.
+        DesktopRinger.ringFor(invite.peerIp, "mesh")
         PrismPlatform.notifier.notify(
             channel = "calls",
             id = 0x0CA11,
@@ -104,7 +106,17 @@ object DesktopIncomingCalls {
         )
     }
 
-    private val state: (MeshCalls.Call?) -> Unit = { current -> publish(current) }
+    private val state: (MeshCalls.Call?) -> Unit = { current ->
+        // Answered, declined, missed or gone: a call that is not ringing any more stops ringing.
+        if (current == null || current.state != MeshCalls.State.RINGING) DesktopRinger.stopIf("mesh")
+        // The call tone, while a call this computer placed rings out, voice or video.
+        if (current != null && com.prism.launcher.calls.CallTones.shouldPlay(current)) {
+            DesktopCallTone.play(current.peerIp, "mesh")
+        } else {
+            DesktopCallTone.stopIf("mesh")
+        }
+        publish(current)
+    }
 
     /**
      * The group call being offered or held, or null.
@@ -122,6 +134,7 @@ object DesktopIncomingCalls {
     private val groupIncoming: (MeshGroupCalls.Group) -> Unit = { invite ->
         PrismPlatform.log.info("PrismCalls", "Incoming group call from ${invite.hostName}")
         publishGroup(invite)
+        DesktopRinger.ringFor(invite.hostIp, "group")
         PrismPlatform.notifier.notify(
             channel = "calls",
             id = 0x0CA13,
@@ -130,7 +143,16 @@ object DesktopIncomingCalls {
         )
     }
 
-    private val groupState: (MeshGroupCalls.Group?) -> Unit = { current -> publishGroup(current) }
+    private val groupState: (MeshGroupCalls.Group?) -> Unit = { current ->
+        if (current == null || current.state != MeshGroupCalls.GroupState.RINGING) DesktopRinger.stopIf("group")
+        // A group call this computer started rings out until somebody joins.
+        if (current != null && com.prism.launcher.calls.CallTones.shouldPlay(current)) {
+            DesktopCallTone.play(current.members.firstOrNull()?.ip.orEmpty(), "group")
+        } else {
+            DesktopCallTone.stopIf("group")
+        }
+        publishGroup(current)
+    }
 
     /**
      * Frames arrive on the video worker thread. Decoded there with Skia, as the screen mirror does,
@@ -239,18 +261,22 @@ object DesktopIncomingCalls {
     }
 
     fun answer() {
+        DesktopRinger.stopIf("mesh")
         MeshCalls.accept()
     }
 
     fun decline() {
+        DesktopRinger.stopIf("mesh")
         MeshCalls.decline()
     }
 
     fun answerGroup() {
+        DesktopRinger.stopIf("group")
         MeshGroupCalls.accept()
     }
 
     fun declineGroup() {
+        DesktopRinger.stopIf("group")
         MeshGroupCalls.decline()
     }
 
