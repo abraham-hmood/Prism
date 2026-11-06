@@ -53,6 +53,9 @@ object PayLaterPolicy {
         CLOUD_COMPUTE,
         CLOUD_STORAGE,
         CLOUD_GAMING,
+
+        /** A directory introducing clients to this phone server by hole punching. See HolePunch. */
+        MESH_RENDEZVOUS,
         ;
 
         fun describe(): String = name.lowercase().replace('_', ' ')

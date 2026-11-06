@@ -534,6 +534,19 @@ class PrismTunnelEngine(private val context: Context) {
             )
             return
         }
+        // A SERVER REACHED BY HOLE PUNCHING (a phone serving from mobile data): the directory has
+        // to introduce this device first, from the port the tunnel will use, which is network I/O
+        // and so never on the caller's thread. See HolePunch.prepareClientConfig.
+        if (confData.contains(com.prism.launcher.vpn.HolePunch.CONFIG_MARKER)) {
+            Thread({
+                bringUpExternal(com.prism.launcher.vpn.HolePunch.prepareClientConfig(confData))
+            }, "prism-punch-connect").apply { isDaemon = true; start() }
+            return
+        }
+        bringUpExternal(confData)
+    }
+
+    private fun bringUpExternal(confData: String) {
         // A refusal used to be invisible: the tunnel simply was not up while the UI said
         // otherwise. Say which of the two steps failed, because they need different fixes.
         if (!WireguardController.loadProfile(ByteArrayInputStream(confData.toByteArray()))) {

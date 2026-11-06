@@ -82,6 +82,13 @@ dependencies {
     // domain needs both. See MeshTls (PHASE 51).
     api("org.bouncycastle:bcpkix-jdk18on:1.78.1")
 
+    // Drive compression (see com.prism.launcher.storage.compress). AN ARGUED-FOR ADDITION: the JDK
+    // has Deflate and nothing else, and the Files page offers BZip2, XZ/LZMA, LZ4, Snappy and the
+    // 7z and tar containers. Both are pure Java, so they run unchanged on Android and the desktop,
+    // and hand-writing an LZMA2 encoder is not a reasonable alternative.
+    implementation("org.apache.commons:commons-compress:1.27.1")
+    implementation("org.tukaani:xz:1.10")
+
     // The SQLite driver for non-Android JVMs. Android supplies its own through the framework,
     // which is why this is `compileOnly` for the core's own compilation and a real dependency
     // only where a desktop actually opens the database.

@@ -78,6 +78,7 @@ class KokoroSettingsActivity : PrismBaseActivity() {
 
         buildStatusSection()
         buildVoiceSection()
+        buildEmotionSection()
         buildSharingSection()
         buildMeshSection()
         buildModelSection()
@@ -158,6 +159,154 @@ class KokoroSettingsActivity : PrismBaseActivity() {
             )
         )
         content.addView(spacer())
+    }
+
+    // -- Emotion -------------------------------------------------------------
+
+    /**
+     * Emotion steering: two ways of moving the voice's style vector towards an emotion, and a way to
+     * hear the result. Particle swarm wins when both are wanted, so ticking it disables the other box
+     * -- the two would otherwise fight over the same vector. See EmotionSteering for what each does.
+     */
+    private fun buildEmotionSection() {
+        content.addView(IosUi.sectionHeader(this, "EMOTION"))
+        val card = IosUi.card(this)
+        val tint = android.content.res.ColorStateList.valueOf(IosUi.accent(this))
+
+        val gradient = android.widget.CheckBox(this).apply {
+            text = "Gradient descent during inference"
+            textSize = 15f
+            setTextColor(IosUi.label(this@KokoroSettingsActivity))
+            buttonTintList = tint
+            isChecked = PrismSettings.getKokoroEmotionGradient() && !PrismSettings.getKokoroEmotionPso()
+        }
+        val gradientDetail = detailLine(
+            "Estimates the gradient by simultaneous perturbation and descends it on the sentence being " +
+                "spoken, refining over the next sentences. Adapts to real text; the first line in a new " +
+                "emotion takes a few seconds longer.",
+        )
+        fun gradientEnabled(enabled: Boolean) {
+            gradient.isEnabled = enabled
+            gradient.alpha = if (enabled) 1f else 0.45f
+            gradientDetail.alpha = if (enabled) 1f else 0.45f
+        }
+        lateinit var psoDetail: TextView
+
+        val pso = android.widget.CheckBox(this).apply {
+            text = "Particle Swarm Optimization"
+            textSize = 15f
+            setTextColor(IosUi.label(this@KokoroSettingsActivity))
+            buttonTintList = tint
+            isChecked = PrismSettings.getKokoroEmotionPso()
+        }
+        fun psoEnabled(enabled: Boolean) {
+            pso.isEnabled = enabled
+            pso.alpha = if (enabled) 1f else 0.45f
+            psoDetail.alpha = if (enabled) 1f else 0.45f
+        }
+        // ONE METHOD AT A TIME, either way round: ticking one switches the other off and greys it out
+        // until it is unticked again. The two would otherwise fight over the same style vector.
+        pso.setOnCheckedChangeListener { _, checked ->
+            PrismSettings.setKokoroEmotionPso(checked)
+            if (checked) { gradient.isChecked = false; PrismSettings.setKokoroEmotionGradient(false) }
+            gradientEnabled(!checked)
+        }
+        gradient.setOnCheckedChangeListener { _, checked ->
+            PrismSettings.setKokoroEmotionGradient(checked)
+            if (checked) { pso.isChecked = false; PrismSettings.setKokoroEmotionPso(false) }
+            psoEnabled(!checked)
+        }
+        card.addView(pso)
+        psoDetail = detailLine(
+            "A swarm of candidate styles searches for the one whose pitch, range, pace, loudness and " +
+                "brightness best match the emotion. Searched once per voice and emotion, then remembered.",
+        )
+        card.addView(psoDetail)
+        card.addView(IosUi.hairline(this))
+        card.addView(gradient)
+        card.addView(gradientDetail)
+        gradientEnabled(!pso.isChecked)
+        psoEnabled(!gradient.isChecked)
+        card.addView(IosUi.hairline(this))
+
+        card.addView(android.widget.CheckBox(this).apply {
+            text = "Breathing sounds in pauses"
+            textSize = 15f
+            setTextColor(IosUi.label(this@KokoroSettingsActivity))
+            buttonTintList = tint
+            isChecked = PrismSettings.getKokoroBreathing()
+            setOnCheckedChangeListener { _, checked -> PrismSettings.setKokoroBreathing(checked) }
+        })
+        card.addView(detailLine(
+            "A quiet inhale in each pause long enough to breathe in, and before each new sentence group, " +
+                "so long readings sound like someone speaking. Works with every Kokoro voice, cloned ones too.",
+        ))
+        card.addView(IosUi.hairline(this))
+
+        val emotions = EmotionSteering.ALL
+        val chosen = emotions.indexOfFirst { it.id == PrismSettings.getKokoroTestEmotion() }.coerceAtLeast(0)
+        val sound = detailLine(emotions[chosen].sound)
+        val spinner = android.widget.Spinner(this).apply {
+            adapter = android.widget.ArrayAdapter(
+                this@KokoroSettingsActivity, android.R.layout.simple_spinner_dropdown_item, emotions.map { it.label },
+            )
+            setSelection(chosen)
+            onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long) {
+                    PrismSettings.setKokoroTestEmotion(emotions[position].id)
+                    sound.text = emotions[position].sound
+                }
+                override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+            }
+        }
+        card.addView(TextView(this).apply {
+            text = "Emotion to test"
+            textSize = 13f
+            setTextColor(IosUi.secondaryLabel(this@KokoroSettingsActivity))
+        })
+        card.addView(spinner)
+        card.addView(sound)
+
+        val test = IosUi.tintedButton(this, "Test Emotion")
+        test.setOnClickListener {
+            val emotion = emotions.firstOrNull { it.id == PrismSettings.getKokoroTestEmotion() } ?: emotions[0]
+            val method = EmotionSteering.method()
+            android.widget.Toast.makeText(
+                this,
+                when (method) {
+                    EmotionSteering.Method.NONE -> "Neither method is on, so this plays without steering."
+                    EmotionSteering.Method.PSO -> "Tuning ${PrismSettings.getKokoroVoice(PrismSettings.VOICE_SPEAKER_SAM)} for ${emotion.label.lowercase()}. The first time takes a little while."
+                    EmotionSteering.Method.GRADIENT -> "Steering towards ${emotion.label.lowercase()} while it speaks."
+                },
+                android.widget.Toast.LENGTH_LONG,
+            ).show()
+            test.isEnabled = false
+            PrismSpeaker.speakAs(emotion.sample, PrismSettings.getKokoroVoice(PrismSettings.VOICE_SPEAKER_SAM)) { error ->
+                test.isEnabled = true
+                if (error != null) android.widget.Toast.makeText(this, error, android.widget.Toast.LENGTH_LONG).show()
+            }
+        }
+        card.addView(test, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            topMargin = IosUi.dp(this@KokoroSettingsActivity, 10f)
+        })
+
+        content.addView(card)
+        content.addView(
+            IosUi.sectionFooter(
+                this,
+                "Mark a line with an emotion in brackets -- [angry], [whispering sadness], (excitedly) -- and " +
+                    "Kokoro speaks it that way when a method is on. Only the prosody half of the voice is " +
+                    "moved, so the voice stays recognisably the same person. Other speech engines ignore the marks.",
+            )
+        )
+        content.addView(spacer())
+    }
+
+    private fun detailLine(text: String): TextView = TextView(this).apply {
+        this.text = text
+        textSize = 12f
+        setTextColor(IosUi.secondaryLabel(this@KokoroSettingsActivity))
+        setPadding(IosUi.dp(this@KokoroSettingsActivity, 32f), 0, 0, IosUi.dp(this@KokoroSettingsActivity, 6f))
     }
 
     // -- Sharing -------------------------------------------------------------

@@ -4,11 +4,13 @@ import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import com.prism.core.PrismPlatform
+import com.prism.launcher.PrismSettings
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.nio.LongBuffer
+import kotlin.math.pow
 
 /**
  * Kokoro-82M, actually speaking.
@@ -89,9 +91,9 @@ class KokoroEngine private constructor(
 
             Thread({
                 try {
-                    for (chunk in chunkText(text)) {
+                    for ((index, chunk) in chunkTagged(text).withIndex()) {
                         if (mine != generation) return@Thread
-                        val rendered = runCatching { render(chunk, voice, speed) }
+                        val rendered = runCatching { render(chunk, voice, speed, first = index == 0) }
                             .getOrElse { producerErr[0] = it; events.put(DONE); return@Thread }
                         if (mine != generation) return@Thread
                         events.put(rendered ?: continue)
@@ -159,10 +161,25 @@ class KokoroEngine private constructor(
      * spoken through OpenVoice -- the only engine that ever saw it -- and refusing would break
      * every voice saved before reference recordings existed.
      */
-    private fun render(text: String, voiceId: String, speed: Float): Rendered {
+    private fun render(text: String, voiceId: String, speed: Float, first: Boolean = true): Rendered {
+        val rendered = renderVoice(text, voiceId, speed)
+        if (!PrismSettings.getKokoroBreathing()) return rendered
+        // Breaths in the pauses inside the line, and one before it when it continues a reading --
+        // the gap between two chunks is where a speaker breathes in.
+        var samples = Breath.fillPauses(rendered.samples, rendered.sampleRate)
+        if (!first) {
+            val gap = FloatArray(rendered.sampleRate * 6 / 100)
+            val breath = Breath.inhale(rendered.sampleRate, 300, Breath.levelFor(samples), seed = text.hashCode().toLong())
+            samples = gap + breath + gap + samples
+        }
+        return Rendered(samples, rendered.sampleRate)
+    }
+
+    private fun renderVoice(text: String, voiceId: String, speed: Float): Rendered {
         val clone = ClonedVoices.find(voiceId)
         // A new clone speaks through its base voice; a legacy one has its own tensor on disk.
         val styleVoice = clone?.baseVoiceId ?: voiceId
+        val method = EmotionSteering.method()
 
         // A ReferenceSpeechEngine (Pocket TTS) speaks the text itself, directly in the clone's
         // recorded voice; Kokoro is bypassed entirely, so its phrasing and pitch contours do not
@@ -175,13 +192,23 @@ class KokoroEngine private constructor(
             }
             if (direct != null) {
                 val (engine, reference) = direct
-                val spoken = engine.speakReference(text, clone.id, reference)
-                return Rendered(spoken.samples, spoken.sampleRate)
+                // No style vector exists on this path to steer, so each marked part is spoken in the
+                // recorded voice and given its emotion acoustically: pitch, pace, loudness, brightness
+                // and, for a yelled emotion, the strain of shouting.
+                var rate = 0
+                val parts = EmotionSteering.segments(text).ifEmpty { listOf(null to text) }.mapNotNull { (emotion, words) ->
+                    val spoken = EmotionSteering.strip(words)
+                    if (spoken.isBlank()) return@mapNotNull null
+                    val clip = engine.speakReference(spoken, clone.id, reference)
+                    rate = clip.sampleRate
+                    if (emotion != null && method != EmotionSteering.Method.NONE) EmotionSteering.acoustic(clip.samples, clip.sampleRate, emotion)
+                    else clip.samples
+                }
+                return Rendered(join(parts), if (rate > 0) rate else SAMPLE_RATE)
             }
         }
 
-        val synthesised = synthesize(text, styleVoice, speed)
-        if (clone == null) return Rendered(synthesised, SAMPLE_RATE)
+        if (clone == null) return Rendered(synthesizeFeeling(text, styleVoice, speed), SAMPLE_RATE)
 
         val reference = ClonedVoices.refFor(clone.id)
         val engine = if (reference == null) {
@@ -197,14 +224,52 @@ class KokoroEngine private constructor(
             CloneEngines.active()
         }
 
-        var source = synthesised
-        if (engine.preservesPitch && clone.pitchHz > 0f) {
-            source = VoicePitch.match(source, SAMPLE_RATE, clone.pitchHz)
+        // A CLONE IS STEERED PART BY PART, because each part's emotion has to survive re-voicing. The
+        // base voice is steered (tuned under the clone's own name), the pitch is matched to the
+        // speaker's -- PLUS the emotion's rise or fall, which plain matching would flatten back to
+        // the speaker's resting pitch -- and the converter re-voices it. Loudness, brightness and
+        // shouting are finished after conversion, on the clone's own voice.
+        var rate = 0
+        val parts = EmotionSteering.segments(text).ifEmpty { listOf(null to text) }.mapNotNull { (emotion, words) ->
+            val spoken = EmotionSteering.strip(words)
+            if (spoken.isBlank()) return@mapNotNull null
+            val steer = emotion?.let { steerFor(styleVoice, it, method, spoken, speed, clone.displayName) }
+            var source = synthesize(spoken, styleVoice, speed * (steer?.speedFactor ?: 1f), steer?.offset)
+            val emotionalPitch = (steer?.pitchDelta ?: 0f) + (steer?.pitchFix ?: 0f)
+            if (engine.preservesPitch && clone.pitchHz > 0f) {
+                source = VoicePitch.match(source, SAMPLE_RATE, clone.pitchHz * 2.0.pow(emotionalPitch / 12.0).toFloat())
+            }
+            val converted = engine.convert(clone.id, source, SAMPLE_RATE, reference)
+            rate = converted.sampleRate
+            when {
+                steer == null -> converted.samples
+                // A converter that imposes the speaker's own pitch loses the emotion's: put it back.
+                !engine.preservesPitch -> EmotionSteering.finish(
+                    VoicePitch.shift(converted.samples, converted.sampleRate, 2.0.pow(emotionalPitch.coerceIn(-4f, 6f) / 12.0).toFloat()),
+                    converted.sampleRate, steer, applyPitch = false,
+                )
+                else -> EmotionSteering.finish(converted.samples, converted.sampleRate, steer, applyPitch = false)
+            }
         }
-
-        val converted = engine.convert(clone.id, source, SAMPLE_RATE, reference)
-        return Rendered(converted.samples, converted.sampleRate)
+        if (parts.isEmpty()) throw IllegalStateException("Nothing to say after phonemisation")
+        return Rendered(join(parts), if (rate > 0) rate else SAMPLE_RATE)
     }
+
+    private fun join(parts: List<FloatArray>): FloatArray {
+        if (parts.size == 1) return parts[0]
+        val out = FloatArray(parts.sumOf { it.size })
+        var at = 0
+        parts.forEach { it.copyInto(out, at); at += it.size }
+        return out
+    }
+
+    /** Tunes (or recalls) [emotion] for [voiceId], never letting a failed search stop the line being spoken. */
+    private fun steerFor(voiceId: String, emotion: EmotionSteering.Emotion, method: EmotionSteering.Method, text: String, speed: Float, label: String): EmotionSteering.Steer? =
+        runCatching {
+            EmotionSteering.steer(voiceId, emotion, method, text, speed, EmotionSteering.Renderer { t, offset, s ->
+                runCatching { synthesize(t, voiceId, s, offset) }.getOrNull()
+            }, label)
+        }.onFailure { e -> PrismPlatform.log.warn(TAG, "Emotion steering failed: ${e.message}") }.getOrNull()
 
     /**
      * Renders [text] to audio without playing it.
@@ -223,10 +288,10 @@ class KokoroEngine private constructor(
     fun synthesizeToPcm(text: String, voiceId: String?, speed: Float): SpeechMeshWire.Clip? {
         val voice = voiceId?.ifBlank { null } ?: com.prism.launcher.PrismSettings.KOKORO_DEFAULT_VOICE
         return runCatching {
-            val chunks = chunkText(text)
+            val chunks = chunkTagged(text)
             if (chunks.isEmpty()) return SpeechMeshWire.Clip(FloatArray(0), SAMPLE_RATE)
-            val clips = chunks.map { chunk ->
-                val rendered = render(chunk, voice, speed)
+            val clips = chunks.mapIndexed { index, chunk ->
+                val rendered = render(chunk, voice, speed, first = index == 0)
                 SpeechMeshWire.Clip(rendered.samples, rendered.sampleRate)
             }
             SpeechMeshWire.join(clips)
@@ -269,9 +334,9 @@ class KokoroEngine private constructor(
         }
         val voice = voiceId?.ifBlank { null } ?: com.prism.launcher.PrismSettings.KOKORO_DEFAULT_VOICE
         return runCatching {
-            val chunks = chunkText(text)
+            val chunks = chunkTagged(text)
             if (chunks.isEmpty()) return SpeechMeshWire.Clip(FloatArray(0), SAMPLE_RATE)
-            val parts = chunks.map { synthesize(it, voice, speed) }
+            val parts = chunks.map { synthesizeFeeling(it, voice, speed) }
             val source = FloatArray(parts.sumOf { it.size })
             var at = 0
             for (part in parts) {
@@ -318,14 +383,39 @@ class KokoroEngine private constructor(
 
     // -- Inference ------------------------------------------------------------
 
-    private fun synthesize(text: String, voiceId: String, speed: Float): FloatArray {
+    /**
+     * Synthesises [text], steering each part marked with an emotion indicator towards that emotion
+     * when steering is switched on (see [EmotionSteering]). Unmarked text, or steering switched off,
+     * is plain synthesis with the indicators removed -- an indicator is never read aloud.
+     */
+    private fun synthesizeFeeling(text: String, voiceId: String, speed: Float): FloatArray {
+        val method = EmotionSteering.method()
+        val parts = EmotionSteering.segments(text).ifEmpty { listOf(null to text) }
+        val audio = parts.mapNotNull { (emotion, words) ->
+            val spoken = EmotionSteering.strip(words)
+            if (spoken.isBlank()) return@mapNotNull null
+            val steer = emotion?.let { steerFor(voiceId, it, method, spoken, speed, voiceId) }
+            val audio = synthesize(spoken, voiceId, speed * (steer?.speedFactor ?: 1f), steer?.offset)
+            if (steer == null) audio else EmotionSteering.finish(audio, SAMPLE_RATE, steer)
+        }
+        if (audio.isEmpty()) throw IllegalStateException("Nothing to say after phonemisation")
+        if (audio.size == 1) return audio[0]
+        val out = FloatArray(audio.sumOf { it.size })
+        var at = 0
+        audio.forEach { it.copyInto(out, at); at += it.size }
+        return out
+    }
+
+    private fun synthesize(text: String, voiceId: String, speed: Float, offset: FloatArray? = null): FloatArray {
         val phonemes = phonemizer.phonemize(text)
         val ids = tokenizer.encode(phonemes)
         if (ids.size <= 2) throw IllegalStateException("Nothing to say after phonemisation")
 
         // The row is indexed by the token count WITHOUT the two padding symbols, which is how the
         // reference implementation indexes it; off by those two and the pacing drifts.
-        val style = styleFor(voiceId, ids.size - 2)
+        val base = styleFor(voiceId, ids.size - 2)
+        // A COPY when steered: the cached row is shared by every sentence in this voice.
+        val style = if (offset == null) base else FloatArray(base.size) { base[it] + (offset.getOrNull(it) ?: 0f) }
 
         val inputIds = OnnxTensor.createTensor(
             environment,
@@ -429,6 +519,19 @@ class KokoroEngine private constructor(
      * which is what one chunk's synthesis costs the listener in waiting time if they are quick to
      * stop. Keeping to ~10s keeps first-sound fast for long text; short utterances pass whole.
      */
+    /**
+     * [chunkText], with each chunk carrying the emotion indicator that governs it. An indicator
+     * applies to everything after it until the next one, so a chunk cut from the middle of an angry
+     * paragraph is still angry.
+     */
+    private fun chunkTagged(text: String): List<String> {
+        val segments = EmotionSteering.segments(text)
+        if (segments.none { it.first != null }) return chunkText(text)
+        return segments.flatMap { (emotion, words) ->
+            chunkText(words).map { if (emotion != null) "[${emotion.id}] $it" else it }
+        }
+    }
+
     private fun chunkText(text: String): List<String> {
         val sentences = text.split(Regex("(?<=([.!?;…。！？]|\\n))"))
             .map { it.trim() }
@@ -517,7 +620,21 @@ class KokoroEngine private constructor(
          * Null rather than an exception: "not downloaded yet" is an ordinary state on a fresh
          * install, and the caller's response to it is to use something else, not to fail.
          */
-        fun openOrNull(modelPath: String? = null): KokoroEngine? {
+        /**
+         * How many threads Kokoro may use right now: up to eight on a cold machine, cut by Prism's
+         * thermal and memory governor ([com.prism.core.PrismSustain.inferenceThreads]) when the device is
+         * hot or short of memory. Kokoro used to take eight regardless, which on a phone already at
+         * SEVERE heat meant a podcast's minutes of synthesis drove it into Samsung's overheating kill.
+         */
+        fun threadBudget(): Int =
+            com.prism.core.PrismSustain.inferenceThreads(Runtime.getRuntime().availableProcessors().coerceIn(1, 8))
+
+        /**
+         * @param threads intra-op threads; defaults to [threadBudget] as it stands now.
+         * @param lean when memory is short: no CPU memory arena and no memory-pattern planning, so ONNX
+         *   Runtime holds only what each run needs instead of keeping its high-water mark reserved.
+         */
+        fun openOrNull(modelPath: String? = null, threads: Int = threadBudget(), lean: Boolean = false): KokoroEngine? {
             // An imported Kokoro-format ONNX export can replace the built-in weights while still
             // using the tokenizer, lexicon and voice files that were downloaded with Kokoro. That
             // is the shape the importer already recognises; the extra branch makes it runnable
@@ -537,13 +654,13 @@ class KokoroEngine private constructor(
             return runCatching {
                 val environment = OrtEnvironment.getEnvironment()
                 val options = OrtSession.SessionOptions().apply {
-                    setIntraOpNumThreads(
-                        // A DESKTOP CEILING THAT IS NOT FOUR. The old cap was written for a phone,
-                        // where four big cores is the whole budget and more threads only fight the
-                        // scheduler. Kokoro is ~200 ms of inference per sentence on a desktop and
-                        // the machine has nothing else to do while it speaks.
-                        Runtime.getRuntime().availableProcessors().coerceIn(1, 8),
-                    )
+                    // Up to eight on a cold machine (Kokoro is ~200 ms a sentence on a desktop with
+                    // nothing else to do), fewer as the governor says the device is hot or short.
+                    setIntraOpNumThreads(threads.coerceIn(1, 8))
+                    if (lean) {
+                        setCPUArenaAllocator(false)
+                        setMemoryPatternOptimization(false)
+                    }
                     // NOT lowered from the default. Turning fusion down was tried, on the theory
                     // that the SkipLayerNormalization failure described in KokoroInstall was an
                     // optimiser fusion losing a tensor. It is not -- BASIC_OPT fails identically, so

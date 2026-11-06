@@ -52,6 +52,9 @@ object NativePayload {
         // absent on a machine that has not run :desktop:buildRandomx -- which costs mining and nothing
         // else, so it is reported rather than fatal like every other entry here.
         "randomx_jni",
+        // NINE, the x86-64 translator that runs Windows and Linux programs on the Virtualization
+        // page (desktop/native/nine, :desktop:buildNine). Absent means no program runner, nothing else.
+        "nexus_core",
     )
 
     private val loaded = LinkedHashMap<String, String>()

@@ -21,6 +21,9 @@
     <!-- A package just downloaded by the App Store, handed to Android's installer. Only that
          folder is exposed: the store's other cache files are not the installer's business. -->
     <cache-path name="appstore" path="appstore/" />
+    <!-- A file opened from a USB drive Prism reads itself (NTFS, ext4...): it is copied here first,
+         because no other app can read the drive, and only this folder is shared. -->
+    <cache-path name="usb_drive" path="usb-drive/" />
     <!--
         Finished VideoCraft films. They are written to Prism/VideoCraft/ in shared storage (see
         VideoCraftStore.root), so they need an <external-path> entry: a FileProvider cannot grant

@@ -113,6 +113,24 @@ object CloudVault {
          * a peer renting space could open the camera roll.
          */
         PHOTOS("photos"),
+
+        /**
+         * Trusted devices' drives. See `com.prism.launcher.storage.remote.SecureDriveChannel`.
+         *
+         * Every connection to another device's drive is encrypted and mutually authenticated with
+         * keys derived from this one, so only the owner's own devices -- the ones holding the
+         * recovery phrase -- can read or write a drive, whatever network carries the bytes.
+         */
+        DRIVES("drives"),
+
+        /**
+         * Seals this device's own private key at rest. See `com.prism.launcher.trusted.DeviceKeys`.
+         *
+         * Only ever used on this device: what crosses the wire between trusted devices is sealed
+         * with keys agreed from the two devices' key pairs, not with anything derived here, so two
+         * paired devices do not need the same recovery phrase.
+         */
+        DEVICE("device"),
     }
 
     // ── Derivation ─────────────────────────────────────────────────────────

@@ -116,7 +116,114 @@ object SystemServiceHook {
             field = "IActivityTaskManagerSingleton",
             iface = "android.app.IActivityTaskManager",
         )
+
+        hookPackageManager()
     }
+
+    // -- The package manager -------------------------------------------------
+
+    /** Each virtualized package's APK and the ApplicationInfo it was loaded with. */
+    private val archives = java.util.concurrent.ConcurrentHashMap<String, Pair<String, android.content.pm.ApplicationInfo>>()
+
+    /** Called by [VirtualPackage] when an app is loaded, so questions about it can be answered. */
+    fun registerPackage(packageName: String, apkPath: String, info: android.content.pm.ApplicationInfo) {
+        archives[packageName] = apkPath to info
+    }
+
+    /**
+     * Answers the package manager's questions about a virtualized app with the app's own manifest.
+     *
+     * ## Why
+     *
+     * Apps ask about themselves constantly -- getPackageInfo(getPackageName()) for a version string,
+     * getApplicationInfo(..., GET_META_DATA) for the keys libraries keep in the manifest. The
+     * device's package manager never installed the virtualized copy: when the original is
+     * uninstalled it answers "not found" and the app crashes on its own name, and when it is still
+     * installed it describes that copy instead.
+     *
+     * ## Analytics, specifically
+     *
+     * Firebase Analytics reads its switches from that manifest metadata, then asks Google Play
+     * services to log events in the app's name -- and Play services refuses, because the call comes
+     * from Prism's uid: "SecurityException: Unknown calling package name". Play services is not a
+     * system service and cannot be rewritten the way the activity manager is. So the metadata a
+     * virtualized app sees switches analytics off, a setting Firebase documents and honours, and
+     * the refused call is never made. [GuestLooperGuard] covers anything that still gets through.
+     */
+    private fun hookPackageManager() {
+        runCatching {
+            val threadClass = Class.forName("android.app.ActivityThread")
+            val real = threadClass.getDeclaredMethod("getPackageManager")
+                .apply { isAccessible = true }
+                .invoke(null) ?: return
+            val contract = Class.forName("android.content.pm.IPackageManager")
+            val proxy = Proxy.newProxyInstance(
+                contract.classLoader,
+                arrayOf(contract),
+                InvocationHandler { _, method, args ->
+                    val result = try {
+                        if (args == null) method.invoke(real) else method.invoke(real, *args)
+                    } catch (e: InvocationTargetException) {
+                        throw e.targetException
+                    }
+                    val name = args?.firstOrNull() as? String ?: return@InvocationHandler result
+                    val archive = archives[name] ?: return@InvocationHandler result
+                    when (method.name) {
+                        "getApplicationInfo" ->
+                            withAnalyticsOff((result as? android.content.pm.ApplicationInfo) ?: archive.second)
+                        "getPackageInfo" -> {
+                            val info = (result as? android.content.pm.PackageInfo) ?: archivePackageInfo(archive.first)
+                            info?.apply { applicationInfo = withAnalyticsOff(applicationInfo ?: archive.second) }
+                        }
+                        else -> result
+                    }
+                },
+            )
+            threadClass.getDeclaredField("sPackageManager").apply { isAccessible = true }.set(null, proxy)
+            // The application's PackageManager captured the real binder when it was created.
+            val app = threadClass.getDeclaredMethod("currentApplication").invoke(null) as? android.content.Context
+            app?.packageManager?.let { pm ->
+                var type: Class<*>? = pm.javaClass
+                while (type != null) {
+                    val field = runCatching { type.getDeclaredField("mPM") }.getOrNull()
+                    if (field != null) {
+                        field.isAccessible = true
+                        field.set(pm, proxy)
+                        break
+                    }
+                    type = type.superclass
+                }
+            }
+            PrismLogger.logInfo(TAG, "Hooked the package manager")
+        }.onFailure {
+            PrismLogger.logWarning(TAG, "Could not hook the package manager: ${it.message}")
+        }
+    }
+
+    private fun archivePackageInfo(apkPath: String): android.content.pm.PackageInfo? = runCatching {
+        val context = Class.forName("android.app.ActivityThread")
+            .getDeclaredMethod("currentApplication").invoke(null) as? android.content.Context ?: return null
+        val flags = android.content.pm.PackageManager.GET_ACTIVITIES or
+            android.content.pm.PackageManager.GET_SERVICES or
+            android.content.pm.PackageManager.GET_PROVIDERS or
+            android.content.pm.PackageManager.GET_RECEIVERS or
+            android.content.pm.PackageManager.GET_META_DATA or
+            android.content.pm.PackageManager.GET_PERMISSIONS or
+            android.content.pm.PackageManager.GET_SIGNING_CERTIFICATES
+        context.packageManager.getPackageArchiveInfo(apkPath, flags)
+    }.getOrNull()
+
+    /** A copy of [info] whose metadata switches Firebase Analytics off. See [hookPackageManager]. */
+    fun withAnalyticsOff(info: android.content.pm.ApplicationInfo): android.content.pm.ApplicationInfo =
+        android.content.pm.ApplicationInfo(info).apply {
+            metaData = android.os.Bundle(info.metaData ?: android.os.Bundle()).apply {
+                putBoolean("firebase_analytics_collection_deactivated", true)
+                putBoolean("firebase_analytics_collection_enabled", false)
+                putBoolean("google_analytics_adid_collection_enabled", false)
+                putBoolean("google_analytics_ssaid_collection_enabled", false)
+            }
+            uid = android.os.Process.myUid()
+        }
 
     private fun hook(owner: String, field: String, iface: String) {
         runCatching {

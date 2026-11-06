@@ -120,6 +120,11 @@ class ModelCraftTest {
                     assertTrue(spec.csv)
                     assertTrue(spec.frames, "the interpolator trains on frames, not clips")
                 }
+                ModelCraft.Kind.COMPRESSION -> {
+                    assertFalse(spec.csv, "a compressor learns any files themselves, not a CSV of them")
+                    assertFalse(spec.frames)
+                    assertEquals(listOf("*/*"), spec.mimeTypes, "every data type is training data")
+                }
                 else -> assertTrue(spec.csv, "${kind.label} datasets name their media from a CSV")
             }
         }

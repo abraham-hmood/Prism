@@ -78,6 +78,7 @@ object ModelCapacity {
         ModelCraft.Kind.INTERPOLATION -> 6
         ModelCraft.Kind.VIDEO -> 20
         ModelCraft.Kind.GAME -> 10
+        ModelCraft.Kind.COMPRESSION -> 4
     }
 
     /** The input vocabulary a kind's first layer sees. */
@@ -88,6 +89,7 @@ object ModelCapacity {
         ModelCraft.Kind.INTERPOLATION -> 256
         ModelCraft.Kind.VIDEO -> 4_096
         ModelCraft.Kind.GAME -> 1_024
+        ModelCraft.Kind.COMPRESSION -> 770
     }
 
     /** A fresh model's starting parameter count, by kind. */
@@ -98,6 +100,7 @@ object ModelCapacity {
         ModelCraft.Kind.INTERPOLATION -> 20_000_000L
         ModelCraft.Kind.VIDEO -> 1_300_000_000L
         ModelCraft.Kind.GAME -> 50_000_000L
+        ModelCraft.Kind.COMPRESSION -> 10_000_000L
     }
 
     /** A fresh model's starting context window, by kind. */
@@ -108,6 +111,7 @@ object ModelCapacity {
         ModelCraft.Kind.INTERPOLATION -> 512
         ModelCraft.Kind.VIDEO -> 8_192
         ModelCraft.Kind.GAME -> 4_096
+        ModelCraft.Kind.COMPRESSION -> 1_024
     }
 
     /** What a model's boxes currently say. */

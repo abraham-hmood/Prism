@@ -226,6 +226,10 @@ object CloudAiService {
             conn.setRequestProperty("Content-Type", "application/json")
             conn.doOutput = true
             conn.connectTimeout = 5000
+            // A model Ollama has not loaded yet can take a minute or more before its first token
+            // (it reads the weights from disk first); with no read timeout at all, a server that
+            // stalled for good held the caller forever. Five minutes covers a cold load.
+            conn.readTimeout = 300_000
 
             val messages = JSONArray()
             messages.put(JSONObject().apply {

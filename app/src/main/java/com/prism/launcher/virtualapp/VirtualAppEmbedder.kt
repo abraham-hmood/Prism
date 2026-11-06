@@ -203,7 +203,35 @@ class VirtualAppEmbedder(
         surfaceView.requestLayout()
     }
 
-    private fun sendHost(packageName: String) {
+    /**
+     * Sends the request once the surface has a host token, waiting briefly for one.
+     *
+     * ## Why waiting matters
+     *
+     * Since Android 14 the window manager only lets an ordinary app give input to an embedded window
+     * when it names the HOST window's token; without one the call needs INTERNAL_SYSTEM_WINDOW, a
+     * permission only system apps hold, and fails with "Requires INTERNAL_SYSTEM_WINDOW permission".
+     * The token exists only once the SurfaceView is attached and has its surface, which can be a few
+     * frames after it is sized -- the log showed "Host token: none" and then "present" 280 ms later,
+     * and the request had gone with the first. Some apps happened to win that race; Acorns did not.
+     */
+    private fun sendHost(packageName: String, attempt: Int = 0) {
+        if (service == null) return
+        if (hostTokenOrNull() == null && attempt < TOKEN_ATTEMPTS) {
+            main.postDelayed({ if (current == packageName) sendHost(packageName, attempt + 1) }, TOKEN_RETRY_MS)
+            return
+        }
+        if (hostToken() == null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            current = null
+            onFailure?.invoke(
+                "The page's surface never became ready, so the app could not be shown. Open it again.",
+            )
+            return
+        }
+        sendHostNow(packageName)
+    }
+
+    private fun sendHostNow(packageName: String) {
         val target = service ?: return
 
         val width = surfaceView.width.takeIf { it > 0 } ?: context.resources.displayMetrics.widthPixels
@@ -314,6 +342,11 @@ class VirtualAppEmbedder(
      * Returns null rather than throwing: the embedded app then renders without receiving input,
      * which is worth reporting but not worth refusing to show anything over.
      */
+    /** The token without logging, for the wait in [sendHost]. */
+    private fun hostTokenOrNull(): IBinder? = runCatching {
+        SurfaceView::class.java.getMethod("getHostToken").invoke(surfaceView) as? IBinder
+    }.getOrNull()
+
     private fun hostToken(): IBinder? = runCatching {
         (SurfaceView::class.java.getMethod("getHostToken").invoke(surfaceView) as? IBinder)
             .also { PrismLogger.logInfo(TAG, "Host token: ${if (it == null) "none" else "present"}") }
@@ -324,5 +357,9 @@ class VirtualAppEmbedder(
 
     private companion object {
         const val TAG = "PrismVirtualApp"
+
+        /** About three seconds of waiting for the host token, in 50 ms steps. */
+        const val TOKEN_ATTEMPTS = 60
+        const val TOKEN_RETRY_MS = 50L
     }
 }

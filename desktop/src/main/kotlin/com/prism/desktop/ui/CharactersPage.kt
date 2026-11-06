@@ -271,7 +271,12 @@ private fun CharacterConversation(character: CharacterStore.Character, onBack: (
                 Surface(
                     color = if (fromUser) Color(0xFF1F2A3A) else Color(0xFF1E1E26),
                     shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp).let { m ->
+                        // Right-click one of their replies to hear it in their own voice.
+                        if (fromUser) m else m.rightClickable {
+                            com.prism.launcher.speech.VoiceChoices.speak(line.substringAfter(": ", line), character.voice)
+                        }
+                    },
                 ) {
                     Text(
                         line.substringAfter(": ", line),
@@ -318,9 +323,14 @@ private fun CharacterConversation(character: CharacterStore.Character, onBack: (
     }
 }
 
-/** Create or edit. One composable for both, so a field cannot exist only when creating. */
+/**
+ * Create or edit. One composable for both, so a field cannot exist only when creating.
+ *
+ * Internal rather than private because Podcasts opens this same editor for its "New Character"
+ * button: a podcast host IS a Messages character, so it is made in the one place characters are made.
+ */
 @Composable
-private fun CharacterEditor(
+internal fun CharacterEditor(
     existing: CharacterStore.Character?,
     onDismiss: () -> Unit,
     onSaved: (CharacterStore.Character) -> Unit,
@@ -331,6 +341,8 @@ private fun CharacterEditor(
     var description by remember { mutableStateOf(existing?.description.orEmpty()) }
     var backend by remember { mutableStateOf(existing?.backend ?: CharacterStore.Backend.SAM) }
     var imagePath by remember { mutableStateOf(existing?.imagePath.orEmpty()) }
+    var voice by remember { mutableStateOf(existing?.voice.orEmpty()) }
+    val voices = remember { com.prism.launcher.speech.VoiceChoices.all() }
     val id = remember { existing?.id ?: CharacterStore.newId() }
 
     androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
@@ -389,6 +401,29 @@ private fun CharacterEditor(
                 }
 
                 Spacer(Modifier.height(12.dp))
+                Text("Voice", fontSize = 13.sp)
+                Text(
+                    "How they sound: their replies read aloud, and every line they say as a podcast host.",
+                    fontSize = 11.sp,
+                    color = colors.faint,
+                )
+                Spacer(Modifier.height(4.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    PrismDropdown(
+                        label = "",
+                        selection = voices.firstOrNull { it.id == voice }?.label ?: com.prism.launcher.speech.VoiceChoices.labelOf(voice),
+                        options = voices.map { it.label },
+                        modifier = Modifier.weight(1f),
+                    ) { label -> voice = voices.firstOrNull { it.label == label }?.id.orEmpty() }
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedButton(onClick = {
+                        com.prism.launcher.speech.VoiceChoices.speak(
+                            "Hi, I'm " + name.trim().ifBlank { "your new character" } + ". This is how I sound.", voice,
+                        )
+                    }) { Text("Hear it", fontSize = 12.sp) }
+                }
+
+                Spacer(Modifier.height(12.dp))
                 Text("Portrait", fontSize = 13.sp)
                 Spacer(Modifier.height(4.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -436,6 +471,7 @@ private fun CharacterEditor(
                                     backend = backend,
                                     modelPath = existing?.modelPath,
                                     imagePath = imagePath.takeIf { it.isNotBlank() },
+                                    voice = voice,
                                 )
                             )
                         },

@@ -73,8 +73,22 @@ class DesktopNotifier : Notifier {
         trayIcon?.toolTip = text?.takeIf { it.isNotBlank() } ?: "Prism"
     }
 
-    /** Not supported by AWT. See the class comment -- this is a real gap, not a stub. */
-    override fun cancel(id: Int) = Unit
+    private val progressShown = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
+
+    /**
+     * Progress goes to the tray tooltip, with one balloon when the work starts. A balloon cannot be
+     * replaced by id, so posting one per update stacked a balloon for every percent of a voice being
+     * tuned; the tooltip is replaceable, which is what a progress report needs.
+     */
+    override fun notifyProgress(channel: String, id: Int, title: String, body: String, percent: Int, ongoing: Boolean) {
+        status(title + (if (percent >= 0) " - $percent%" else "") + ": " + body)
+        if (progressShown.add(id)) notify(channel, id, title, body)
+    }
+
+    /** AWT cannot withdraw a balloon (see the class comment); a progress tooltip is cleared. */
+    override fun cancel(id: Int) {
+        if (progressShown.remove(id)) status(null)
+    }
 
     override fun isAvailable(): Boolean = SystemTray.isSupported()
 }

@@ -53,6 +53,7 @@ object DesktopDiagnostics {
         models(),
         storage(),
         email(),
+        podcasts(),
     )
 
     /** The whole thing as text, for the clipboard and for a bug report. */
@@ -65,6 +66,25 @@ object DesktopDiagnostics {
                 appendLine(check.status.name.padEnd(5) + " " + check.name + ": " + check.detail)
             }
         }
+    }
+
+    /** Podcast failures: caught exceptions, pauses for heat or memory, and jobs the system stopped. */
+    private fun podcasts(): Panel {
+        val checks = mutableListOf<Check>()
+        safely("Podcasts") {
+            checks += info("Conditions now", com.prism.launcher.podcasts.PodcastDiagnostics.conditions())
+            val missing = com.prism.launcher.podcasts.PodcastStudio.missingRequirements()
+            checks += if (missing.isEmpty()) ok("Requirements", "a text model and a voice are ready")
+            else fail("Requirements", missing.joinToString(" "))
+            com.prism.launcher.podcasts.PodcastStudio.all().forEach { job ->
+                val title = com.prism.launcher.podcasts.PodcastStore.find(job.podcastId)?.title ?: job.podcastId
+                checks += if (job.error != null) fail("Job", "$title: ${job.error}") else info("Job", "$title: ${job.stage}")
+            }
+            val incidents = com.prism.launcher.podcasts.PodcastDiagnostics.recent(25)
+            if (incidents.isEmpty()) checks += ok("Incidents", "none recorded")
+            incidents.forEach { checks += if (it.kind == "paused" || it.kind == "resumed") warn(it.kind, it.line()) else fail(it.kind, it.line()) }
+        }?.let { checks += it }
+        return Panel("Podcasts", checks)
     }
 
     private fun ok(name: String, detail: String) = Check(name, Status.OK, detail)

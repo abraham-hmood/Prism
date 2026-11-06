@@ -6,7 +6,9 @@ import com.prism.core.PrismPlatform
 import com.prism.core.json.JSONArray
 import com.prism.core.json.JSONObject
 import com.prism.launcher.cloud.CloudVault
+import com.prism.launcher.trusted.DeviceKeys
 import com.prism.launcher.trusted.TrustedDevices
+import com.prism.launcher.trusted.TrustedSeal
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.Base64
@@ -546,12 +548,12 @@ object MeshCalls {
         // fingerprint inside. Either way the new address is recorded so replies go back the right way.
         var json: JSONObject?
         if (trustedPeer) {
-            val opened = openWithAny(payload, listOfNotNull(record?.linkKeyBytes(), walletKey()))
+            val opened = openWithAny(payload, openKeys(peerIp))
             json = opened?.first
             if (opened != null) key = opened.second
         } else if (!payload.trim().startsWith("{")) {
-            val candidates = TrustedDevices.all()
-                .mapNotNull { device -> device.linkKeyBytes()?.let { it to device } } +
+            val candidates = TrustedDevices.all().filter { it.confirmed }
+                .flatMap { device -> deviceKeys(device).map { it to device } } +
                 listOfNotNull(walletKey()?.let { it to null })
             var known: TrustedDevices.Trust? = null
             var opened: JSONObject? = null
@@ -973,17 +975,27 @@ object MeshCalls {
     internal fun walletKey(): ByteArray? = CloudVault.keyFor(CloudVault.Purpose.CALLS)
 
     /**
-     * The key to seal to the trusted device at [peerIp]: the pair's own link key when the pairing
-     * made one, otherwise the wallet key (which only works when both devices share a wallet).
+     * The keys this device shares with [device], most preferred first: the calls key the two agreed
+     * from their device key pairs (see DeviceKeys), then the pairing's link key for a pair that has
+     * not exchanged device keys yet.
+     */
+    private fun deviceKeys(device: TrustedDevices.Trust): List<ByteArray> = listOfNotNull(
+        TrustedSeal.keyFor(device, DeviceKeys.Purpose.CALLS),
+        device.linkKeyBytes(),
+    )
+
+    /**
+     * The key to seal to the trusted device at [peerIp]: the pair's calls key, the link key while
+     * the two have not exchanged device keys, otherwise the wallet key (which only works when both
+     * devices share a wallet).
      */
     fun peerKey(peerIp: String): ByteArray? =
-        TrustedDevices.byIp(peerIp)?.takeIf { it.confirmed }?.linkKeyBytes() ?: walletKey()
+        TrustedDevices.byIp(peerIp)?.takeIf { it.confirmed }?.let { deviceKeys(it).firstOrNull() } ?: walletKey()
 
     /** Every key this device could open a packet from [peerIp] with, most specific first. */
-    internal fun openKeys(peerIp: String): List<ByteArray> = listOfNotNull(
-        TrustedDevices.byIp(peerIp)?.takeIf { it.confirmed }?.linkKeyBytes(),
-        walletKey(),
-    )
+    internal fun openKeys(peerIp: String): List<ByteArray> =
+        TrustedDevices.byIp(peerIp)?.takeIf { it.confirmed }?.let { deviceKeys(it) }.orEmpty() +
+            listOfNotNull(walletKey())
 
     /** The first of [keys] that opens a sealed signal, with the key that did. */
     private fun openWithAny(payload: String, keys: List<ByteArray>): Pair<JSONObject, ByteArray>? {

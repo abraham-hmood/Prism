@@ -67,7 +67,13 @@ object PrismCrawler {
     fun crawl(
         config: Config,
         shouldContinue: () -> Boolean = { true },
-        onProgress: (fetched: Int, queued: Int, url: String) -> Unit = { _, _, _ -> }
+        onProgress: (fetched: Int, queued: Int, url: String) -> Unit = { _, _, _ -> },
+        /**
+         * Every fetched page's raw HTML, for a caller that needs more than the index keeps -- the
+         * podcast cover search reads `og:image` and `<img>` tags out of it. Called on the crawl
+         * thread, after robots and the per-host courtesy rules have already been applied.
+         */
+        onHtml: ((url: String, html: String) -> Unit)? = null,
     ): Crawled {
         val queue = ArrayDeque<String>()
         val seen = HashSet<String>()
@@ -104,6 +110,7 @@ object PrismCrawler {
 
             val html = fetch(url) ?: continue
             perHost[host] = (perHost[host] ?: 0) + 1
+            onHtml?.let { runCatching { it(url, html) } }
 
             val title = extractTitle(html).ifBlank { url }
             val text = htmlToText(html)

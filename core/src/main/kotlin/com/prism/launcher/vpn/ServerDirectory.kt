@@ -416,8 +416,20 @@ object ServerDirectory {
         PrismSettings.getOrCreateDirectoryToken()
         val probe = checkPublicPort(port)
         if (!probe.reachable) {
-            lastAnnouncement = probe
-            return probe
+            // A phone serving from mobile data cannot be port-forwarded, but it is not unreachable:
+            // it registers with the punching directories instead. See HolePunch.
+            val punching = HolePunch.active?.takeIf { it.isRunning() }
+            val result = if (punching != null) {
+                probe.copy(
+                    message = "Not port-forwarded, but reachable by hole punching through " +
+                        "${HolePunch.targets().size} director${if (HolePunch.targets().size == 1) "y" else "ies"}" +
+                        (if (punching.publicEndpoint.isNotBlank()) " (mapped to ${punching.publicEndpoint})" else "") + ".",
+                )
+            } else {
+                probe
+            }
+            lastAnnouncement = result
+            return result
         }
         val reports = advertiseSelf(PrismSettings.getPrismNodeName(), probe.publicIp, port)
         val published = reports.count { it.ok }
@@ -769,7 +781,7 @@ object ServerDirectory {
     private fun PrismSettings.PrismDirectory.isConfigured(): Boolean =
         address.isNotBlank() || url.isNotBlank()
 
-    private fun credential(directory: PrismSettings.PrismDirectory): String =
+    internal fun credential(directory: PrismSettings.PrismDirectory): String =
         Base64.getEncoder().encodeToString(
             "${directory.username}:${directory.password}".toByteArray(StandardCharsets.UTF_8),
         )

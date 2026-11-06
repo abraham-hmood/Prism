@@ -49,6 +49,8 @@ class CharacterCreatorActivity : PrismBaseActivity() {
     private lateinit var nameField: EditText
     private lateinit var descriptionField: EditText
     private lateinit var backendSpinner: Spinner
+    private lateinit var voiceSpinner: Spinner
+    private val voices by lazy { com.prism.launcher.speech.VoiceChoices.all() }
     private lateinit var modelRow: LinearLayout
     private lateinit var imageRow: LinearLayout
     private lateinit var modelButton: TextView
@@ -114,6 +116,35 @@ class CharacterCreatorActivity : PrismBaseActivity() {
                 this,
                 "The description is passed to the chosen AI as the character's persona, so write " +
                     "it as instructions rather than as a summary."
+            )
+        )
+        root.addView(spacer(16))
+
+        // ── Voice ──────────────────────────────────────────────────────────
+        root.addView(IosUi.sectionHeader(this, "VOICE"))
+        val voiceCard = IosUi.card(this)
+        voiceSpinner = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@CharacterCreatorActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                voices.map { it.label },
+            )
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+        }
+        voiceCard.addView(voiceSpinner)
+        val preview = IosUi.tintedButton(this, "Hear This Voice")
+        preview.setOnClickListener {
+            val choice = voices[voiceSpinner.selectedItemPosition.coerceIn(0, voices.size - 1)]
+            val name = nameField.text.toString().trim().ifBlank { "your new character" }
+            com.prism.launcher.speech.VoiceChoices.speak("Hi, I'm $name. This is how I sound.", choice.id)
+        }
+        voiceCard.addView(preview)
+        root.addView(voiceCard)
+        root.addView(
+            IosUi.sectionFooter(
+                this,
+                "How they sound when they speak: their replies here when read aloud, and every line " +
+                    "they say as a host in Podcasts. A published voice downloads the first time it is used."
             )
         )
         root.addView(spacer(16))
@@ -187,6 +218,7 @@ class CharacterCreatorActivity : PrismBaseActivity() {
             backendSpinner.setSelection(
                 CharacterStore.Backend.entries.indexOf(existing.backend).coerceAtLeast(0)
             )
+            voiceSpinner.setSelection(voices.indexOfFirst { it.id == existing.voice }.coerceAtLeast(0))
         }
 
         refreshBackdropRows()
@@ -243,6 +275,7 @@ class CharacterCreatorActivity : PrismBaseActivity() {
                 ],
                 modelPath = modelPath,
                 imagePath = imagePath,
+                voice = voices.getOrNull(voiceSpinner.selectedItemPosition)?.id.orEmpty(),
             )
         )
         setResult(RESULT_OK)

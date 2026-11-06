@@ -11,16 +11,13 @@ import java.io.File
  * ## What NINE is, and what it is not
  *
  * It is a user-mode DBT: it decodes x86-64 (ELF and PE) and runs it on an ARM64 Android device by
- * translation, with its own loaders, syscall layer and Windows ABI thunks. It is not an emulator (no
- * OS image is booted) and not Wine (no Windows libraries are used). That makes it a different tool
- * from the two already on the virtualization page:
+ * translation, with its own loaders, its own Linux syscall layer and its own Windows ABI (ntdll,
+ * kernel32, user32... as thunks). It is not an emulator (no OS image is booted) and not Wine (no
+ * Windows libraries are used) -- so running a program needs nothing installed beside it.
  *
- *  - [WineContainer] runs Windows programs through Wine under PRoot, which needs a Windows-shaped
- *    filesystem and userland;
- *  - QEMU boots a whole guest OS for the operating-system page.
- *
- * A single .exe or Linux ELF that does not need either belongs here, which is why the page prefers
- * this path when the library is present.
+ * It is THE way the Virtualization page runs Windows and Linux x86-64 programs. The Wine + box64 +
+ * Linux root filesystem layer this replaced was a multi-hundred-megabyte download per device; NINE
+ * is already inside Prism.
  *
  * ## Where the library comes from
  *
@@ -78,6 +75,19 @@ object NineRuntime {
         }.onFailure {
             PrismLogger.logError(TAG, "Could not run ${program.name} through NINE", it)
         }
+    }
+
+    /** Where programs opened from elsewhere are copied, so NINE has a real path to load. */
+    fun programsDir(context: android.content.Context): File =
+        File(context.filesDir, "nine/programs").apply { mkdirs() }
+
+    /** Copies a program in from a stream (a content:// URI), keeping its name. */
+    fun stage(context: android.content.Context, name: String, input: java.io.InputStream): File {
+        val safe = name.replace(Regex("[^A-Za-z0-9 ._()-]"), "_").ifBlank { "program" }
+        val target = File(programsDir(context), safe)
+        target.outputStream().use { input.copyTo(it) }
+        target.setExecutable(true)
+        return target
     }
 
     /** Asks NINE to stop the running program, if one is running. */

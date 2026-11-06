@@ -148,6 +148,13 @@ object WalletVault {
     fun wordCount(): Int = prefs().getInt(KEY_WORD_COUNT, 0)
 
     /**
+     * Which wallet is stored, without decrypting it: a hash of the encrypted phrase, or null when
+     * there is none. Cheap enough to check per packet, so a cache of keys derived from the wallet
+     * can tell that the wallet was wiped or replaced underneath it.
+     */
+    fun revision(): Int? = prefs().getString(KEY_PHRASE, null)?.takeIf { it.isNotBlank() }?.hashCode()
+
+    /**
      * The master seed, derived on demand and never stored.
      *
      * Recomputed from the phrase each time rather than cached: PBKDF2 at 2048 rounds costs a few

@@ -86,27 +86,13 @@ class ExeLaunchActivity : PrismBaseActivity() {
         // changed underneath a chooser that was already on screen -- rare, and not a licence to
         // change a setting the user did not touch.
         if (!PrismSettings.getWindowsMode()) {
-            finishWith("Windows mode is off. Turn it on in Settings > OS Virtualization.")
+            finishWith("Running programs is off. Turn on Run Windows and Linux programs in Settings > OS Virtualization.")
             return
         }
 
         // The filter accepts application/octet-stream so Prism appears in the chooser at all (see
-        // the manifest), so this is where a file that merely shares that type is turned away.
-        // Checked on the display name: it is the only thing a content:// URI carries that says what
-        // the file actually is.
-        val name = displayNameOf(uri)
-        if (!name.endsWith(".exe", true) && !name.endsWith(".msi", true)) {
-            finishWith("$name is not a Windows executable.")
-            return
-        }
-
-        // DELIBERATELY NOT CHECKED HERE. This used to refuse when the Windows layer was missing,
-        // which is the commonest case on a phone that has never run a .exe -- so picking Prism from
-        // the chooser showed a toast and vanished, and the file never reached the page that could
-        // have offered to install it. VirtualizationPageView already handles a missing layer by
-        // prompting to install and then running the executable it was given, so the honest thing is
-        // to hand the file over and let the page ask.
-
+        // the manifest). Whether it is a program is decided from the file itself once it is copied
+        // in -- a Linux program has no extension -- by NineProgram, in stageAndLaunch.
         stageAndLaunch(uri)
     }
 
@@ -114,12 +100,9 @@ class ExeLaunchActivity : PrismBaseActivity() {
         lifecycleScope.launch {
             val staged = withContext(Dispatchers.IO) {
                 runCatching {
-                    val container = WineContainer.containers(this@ExeLaunchActivity).firstOrNull()
-                        ?: WineContainer.createContainer(this@ExeLaunchActivity, "default")
-
                     val name = displayNameOf(uri)
                     contentResolver.openInputStream(uri)?.use { input ->
-                        WineContainer.stageExecutable(container, name, input)
+                        NineRuntime.stage(this@ExeLaunchActivity, name, input)
                     }
                 }.getOrNull()
             }
@@ -129,7 +112,15 @@ class ExeLaunchActivity : PrismBaseActivity() {
                 return@launch
             }
 
-            PrismLogger.logInfo("PrismWine", "Staged ${staged.name} for the Windows runtime")
+            when (val found = com.prism.launcher.nine.NineProgram.identify(staged)) {
+                is com.prism.launcher.nine.NineProgram.Identified.Refused -> {
+                    staged.delete()
+                    finishWith(found.reason)
+                    return@launch
+                }
+                is com.prism.launcher.nine.NineProgram.Identified.Runnable ->
+                    PrismLogger.logInfo("PrismNine", "Staged ${staged.name} (${found.kind.title}) for NINE")
+            }
             handOffToVirtualizationPage(staged)
         }
     }
@@ -160,14 +151,14 @@ class ExeLaunchActivity : PrismBaseActivity() {
     }
 
     private fun displayNameOf(uri: Uri): String {
-        uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.endsWith(".exe", true) }
+        uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() && uri.scheme == "file" }
             ?.let { return it }
         return runCatching {
             contentResolver.query(uri, null, null, null, null)?.use { cursor ->
                 val index = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
                 if (index >= 0 && cursor.moveToFirst()) cursor.getString(index) else null
             }
-        }.getOrNull() ?: "program.exe"
+        }.getOrNull() ?: "program"
     }
 
     private fun buildBusyView(): LinearLayout = LinearLayout(this).apply {

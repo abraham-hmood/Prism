@@ -39,6 +39,11 @@ class ApkManifest private constructor(
     val applicationTheme: Int,
     val activities: Map<String, Entry>,
     val launchActivity: String?,
+    /**
+     * `<uses-library>` names: framework libraries that are NOT on the boot class path and must be
+     * added to the app's own class loader -- org.apache.http.legacy is the one apps actually hit.
+     */
+    val usesLibraries: List<String> = emptyList(),
 ) {
 
     /**
@@ -152,6 +157,7 @@ class ApkManifest private constructor(
             var applicationClass: String? = null
             var applicationTheme = 0
             val activities = linkedMapOf<String, Entry>()
+            val libraries = mutableListOf<String>()
 
             // Element path, and the state of whichever activity and intent-filter we are inside.
             val path = ArrayDeque<String>()
@@ -202,6 +208,9 @@ class ApkManifest private constructor(
                                 pendingTheme = attributes.reference(ATTR_THEME, "theme")
                                 pendingRank = Int.MAX_VALUE
                             }
+
+                            "uses-library" ->
+                                attributes.value(ATTR_NAME, "name")?.let { libraries += it }
 
                             "intent-filter" -> {
                                 filterHasMain = false
@@ -265,6 +274,7 @@ class ApkManifest private constructor(
                 applicationTheme = applicationTheme,
                 activities = activities,
                 launchActivity = launch,
+                usesLibraries = libraries.distinct(),
             )
         }
 

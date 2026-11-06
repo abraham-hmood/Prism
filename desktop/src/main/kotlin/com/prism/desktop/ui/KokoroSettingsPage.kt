@@ -160,6 +160,10 @@ fun KokoroSettingsPage(onNavigate: (PageId) -> Unit = {}) {
             )
             Spacer(Modifier.height(18.dp))
 
+            // ── Emotion ──────────────────────────────────────────────────
+            EmotionSection()
+            Spacer(Modifier.height(18.dp))
+
             // ── Sharing ──────────────────────────────────────────────────
             //
             // ALWAYS VISIBLE, sometimes disabled. A switch that vanished when the mesh was off
@@ -668,4 +672,109 @@ internal fun NoteBar(text: String, ok: Boolean) {
             modifier = Modifier.padding(10.dp),
         )
     }
+}
+
+/**
+ * Emotion steering, as on the phone: particle swarm or gradient descent (the swarm wins, so ticking
+ * it disables the other), an emotion to try, and a button that speaks a line marked with it.
+ */
+@Composable
+private fun EmotionSection() {
+    val colors = LocalPrismColors.current
+    var pso by remember { mutableStateOf(PrismSettings.getKokoroEmotionPso()) }
+    var gradient by remember { mutableStateOf(PrismSettings.getKokoroEmotionGradient() && !PrismSettings.getKokoroEmotionPso()) }
+    var breathing by remember { mutableStateOf(PrismSettings.getKokoroBreathing()) }
+    var emotionId by remember { mutableStateOf(PrismSettings.getKokoroTestEmotion()) }
+    var status by remember { mutableStateOf("") }
+    var speaking by remember { mutableStateOf(false) }
+    val emotions = com.prism.launcher.speech.EmotionSteering.ALL
+    val emotion = emotions.firstOrNull { it.id == emotionId } ?: emotions.first()
+
+    SectionHeader("EMOTION")
+    Card {
+        // One method at a time, either way round: ticking one switches the other off and greys it out.
+        androidx.compose.foundation.layout.Row(
+            Modifier.padding(horizontal = 8.dp, vertical = 2.dp).alphaIf(!gradient),
+            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+        ) {
+            androidx.compose.material3.Checkbox(pso, {
+                pso = it
+                PrismSettings.setKokoroEmotionPso(it)
+                if (it) { gradient = false; PrismSettings.setKokoroEmotionGradient(false) }
+            }, enabled = !gradient)
+            androidx.compose.foundation.layout.Column {
+                Text("Particle Swarm Optimization", fontSize = 14.sp)
+                Text(
+                    "A swarm of candidate styles searches for the one whose pitch, range, pace, loudness and " +
+                        "brightness best match the emotion. Searched once per voice and emotion, then remembered.",
+                    fontSize = 11.sp, color = colors.faint,
+                )
+            }
+        }
+        Hairline()
+        androidx.compose.foundation.layout.Row(
+            Modifier.padding(horizontal = 8.dp, vertical = 2.dp).alphaIf(!pso),
+            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+        ) {
+            androidx.compose.material3.Checkbox(gradient, {
+                gradient = it
+                PrismSettings.setKokoroEmotionGradient(it)
+                if (it) { pso = false; PrismSettings.setKokoroEmotionPso(false) }
+            }, enabled = !pso)
+            androidx.compose.foundation.layout.Column {
+                Text("Gradient descent during inference", fontSize = 14.sp)
+                Text(
+                    "Estimates the gradient by simultaneous perturbation and descends it on the sentence being " +
+                        "spoken, refining over the next sentences. The first line in a new emotion takes a few seconds longer.",
+                    fontSize = 11.sp, color = colors.faint,
+                )
+            }
+        }
+        Hairline()
+        androidx.compose.foundation.layout.Row(
+            Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+        ) {
+            androidx.compose.material3.Checkbox(breathing, { breathing = it; PrismSettings.setKokoroBreathing(it) })
+            androidx.compose.foundation.layout.Column {
+                Text("Breathing sounds in pauses", fontSize = 14.sp)
+                Text(
+                    "A quiet inhale in each pause long enough to breathe in, and before each new sentence group. " +
+                        "Works with every Kokoro voice, cloned ones too.",
+                    fontSize = 11.sp, color = colors.faint,
+                )
+            }
+        }
+        Hairline()
+        androidx.compose.foundation.layout.Column(Modifier.padding(16.dp)) {
+            PrismDropdown("Emotion to test", emotion.label, emotions.map { it.label }) { label ->
+                emotions.firstOrNull { it.label == label }?.let { emotionId = it.id; PrismSettings.setKokoroTestEmotion(it.id) }
+            }
+            Text(emotion.sound, fontSize = 11.sp, color = colors.faint, modifier = Modifier.padding(top = 6.dp))
+            Spacer(Modifier.height(10.dp))
+            androidx.compose.material3.Button(
+                enabled = !speaking,
+                onClick = {
+                    speaking = true
+                    status = when (com.prism.launcher.speech.EmotionSteering.method()) {
+                        com.prism.launcher.speech.EmotionSteering.Method.NONE -> "Neither method is on, so this plays without steering."
+                        com.prism.launcher.speech.EmotionSteering.Method.PSO -> "Tuning the voice for ${emotion.label.lowercase()}. The first time takes a little while."
+                        com.prism.launcher.speech.EmotionSteering.Method.GRADIENT -> "Steering towards ${emotion.label.lowercase()} while it speaks."
+                    }
+                    com.prism.launcher.speech.PrismSpeaker.speakAs(
+                        emotion.sample, PrismSettings.getKokoroVoice(PrismSettings.VOICE_SPEAKER_SAM),
+                    ) { error ->
+                        speaking = false
+                        status = error ?: "\"" + com.prism.launcher.speech.EmotionSteering.strip(emotion.sample) + "\""
+                    }
+                },
+            ) { Text(if (speaking) "Speaking…" else "Test Emotion", fontSize = 13.sp) }
+            if (status.isNotBlank()) Text(status, fontSize = 12.sp, color = colors.muted, modifier = Modifier.padding(top = 8.dp))
+        }
+    }
+    SectionFooter(
+        "Mark a line with an emotion in brackets -- [angry], [in a sad voice], (excitedly) -- and Kokoro speaks it " +
+            "that way when a method is on. Only the prosody half of the voice is moved, so it stays recognisably " +
+            "the same person. Other speech engines ignore the marks.",
+    )
 }

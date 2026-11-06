@@ -7,6 +7,9 @@ import com.prism.core.json.JSONArray
 import com.prism.core.json.JSONObject
 import com.prism.launcher.PrismSettings
 import com.prism.launcher.cloud.CloudVault
+import com.prism.launcher.trusted.DeviceKeys
+import com.prism.launcher.trusted.TrustedDevices
+import com.prism.launcher.trusted.TrustedSeal
 import java.util.Base64
 import java.util.UUID
 
@@ -27,8 +30,10 @@ import java.util.UUID
  *
  * ## Who can read one
  *
- * The payload is sealed with the wallet's MESSAGING key, the same key trusted-device texts use. It
- * is therefore readable on devices that hold the same recovery phrase and nowhere else. That is a
+ * The payload is sealed for this user's own Prism devices: the content key is wrapped for each
+ * trusted device this one shares messages with, using the key the two agreed from their device key
+ * pairs, and with the wallet's MESSAGING key for devices on the same recovery phrase. It is readable
+ * there and nowhere else. That is a
  * deliberate boundary rather than an oversight: an arbitrary Prism peer has published no identity
  * key this build can encrypt to, so claiming end-to-end encryption to a stranger would be false. The
  * Messages page says "your Prism devices" instead of implying it reaches any phone number.
@@ -119,8 +124,16 @@ object RcsChat {
             put("at", System.currentTimeMillis())
         }
 
+        // Sealed for this user's own Prism devices: each one this device shares messages with gets
+        // the content key wrapped with the key the pair agreed (see TrustedSeal.sealForAll), and the
+        // wallet key still opens it for devices on the same wallet.
         val sealed = runCatching {
-            CloudVault.seal(envelope.toString().toByteArray(Charsets.UTF_8), key)
+            TrustedSeal.sealForAll(
+                TrustedDevices.recipientsFor(TrustedDevices.Kind.MESSAGES),
+                DeviceKeys.Purpose.MESSAGES,
+                envelope.toString().toByteArray(Charsets.UTF_8),
+                key,
+            ) ?: error("no key")
         }.getOrElse { error ->
             PrismPlatform.log.error(TAG, "Could not seal an RCS message", error)
             return MessagingApi.SendResult.Failed("The message could not be sealed: ${error.message}")
@@ -143,9 +156,12 @@ object RcsChat {
      * owner, which is the normal case rather than a failure.
      */
     fun onPacket(payload: String) {
-        val key = CloudVault.keyFor(CloudVault.Purpose.MESSAGING) ?: return
         val sealed = runCatching { Base64.getDecoder().decode(payload) }.getOrNull() ?: return
-        val plain = CloudVault.open(sealed, key) ?: return
+        val opened = TrustedSeal.openFromAny(
+            sealed, DeviceKeys.Purpose.MESSAGES, CloudVault.keyFor(CloudVault.Purpose.MESSAGING),
+        ) ?: return
+        opened.device?.let { if (TrustedDevices.Kind.MESSAGES !in it.incoming) return }
+        val plain = opened.plain
         val json = runCatching { JSONObject(String(plain, Charsets.UTF_8)) }.getOrNull() ?: return
 
         val body = json.optString("body")

@@ -64,7 +64,7 @@ fun CloudAiPage() {
             .mapNotNull { PrismSettings.getActiveCloudModelId(it) }
             .toSet()
     }
-    var servers by remember { mutableStateOf<List<OllamaDiscoveryService.OllamaServer>>(emptyList()) }
+    var servers by remember { mutableStateOf(OllamaDiscoveryService.cached()) }
     var scanning by remember { mutableStateOf(false) }
     var adding by remember { mutableStateOf(false) }
 

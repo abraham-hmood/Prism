@@ -61,7 +61,7 @@ class ModelsPageView @JvmOverloads constructor(
     private val host: LauncherActivity? = context as? LauncherActivity
 
     private val viewScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
-    private var ollamaServers: List<OllamaDiscoveryService.OllamaServer> = emptyList()
+    private var ollamaServers: List<OllamaDiscoveryService.OllamaServer> = OllamaDiscoveryService.cached()
     private var ollamaScanJob: Job? = null
 
     /**
@@ -301,7 +301,10 @@ class ModelsPageView @JvmOverloads constructor(
     private fun scanOllama() {
         ollamaScanJob?.cancel()
         ollamaScanJob = viewScope.launch {
-            ollamaServers = OllamaDiscoveryService.scan()
+            // A scan that found nothing keeps the last list: the servers are remembered, and one
+            // missed sweep should not empty the page.
+            ollamaServers = OllamaDiscoveryService.scan().ifEmpty { OllamaDiscoveryService.cached() }
+            OllamaDiscoveryService.ensureDefault(ollamaServers)
             refreshList()
         }
     }
@@ -706,9 +709,7 @@ class ModelsPageView @JvmOverloads constructor(
     }
 
     private fun setActiveOllama(host: String, port: Int, modelName: String) {
-        PrismSettings.clearSelectedP2pModel()
-        PrismSettings.setSelectedOllamaEndpoint(PrismSettings.OllamaEndpoint(host, port, modelName))
-        PrismSettings.setAiMode(PrismSettings.AI_MODE_LOCAL_CLOUD)
+        OllamaDiscoveryService.activate(host, port, modelName)
         Toast.makeText(context, "$modelName is now the active model", Toast.LENGTH_SHORT).show()
         refreshList()
     }

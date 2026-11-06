@@ -165,7 +165,7 @@ fun AgenticToolsPage() {
 
             SectionHeader("SYNTAX PROFILE")
             Card {
-                SyntaxRow("None (native tool calling)", activeSyntax == null) {
+                SyntaxRow("Automatic (native tool calling, prompt when refused)", activeSyntax == null) {
                     PrismSettings.setActiveAgenticSyntaxId(null)
                     activeSyntax = null
                 }
@@ -178,11 +178,15 @@ fun AgenticToolsPage() {
                 }
             }
             SectionFooter(
-                "Cloud and Ollama models receive every tool's name, description and argument " +
-                    "schema through their native tool-calling field, so they need no profile. Local " +
-                    "GGUF models have no such field: Prism's default profile puts the same three " +
-                    "things in the prompt and recognises calls in the reply. An imported profile " +
-                    "replaces that default when one is selected."
+                "Tools work with any text model, including ones never trained for tool calling. " +
+                    "Cloud and Ollama models first receive every tool through their native " +
+                    "tool-calling field; a model whose server refuses it is switched to Prism's " +
+                    "default profile automatically and remembered. Local models, P2P models and " +
+                    "the platform's own engines always use the profile, which puts each tool's " +
+                    "name, description and arguments in the prompt. Calls are recognised in that " +
+                    "format and in the shapes untrained models improvise: JSON blocks, " +
+                    "[TOOL_CALLS], <function=…> and Action/Action Input. An imported profile " +
+                    "replaces the default when one is selected."
             )
 
             Spacer(Modifier.height(16.dp))

@@ -26,6 +26,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <!-- Required on Android 14+ for the dataSync foreground type CakeChat training runs under. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Nora's training runs for hours. The wake lock keeps the CPU alive once the screen
          turns off; without it a foreground service still pauses when the device suspends. -->
@@ -247,6 +248,15 @@
             android:theme="@style/Theme.PrismSettings" />
         <!-- GeoTag: live camera, a placed artwork, and a wall key from the device's location. Not
              exported, because it is only ever opened from the Minigames page. -->
+        <!-- The home screen in augmented reality (Settings → Other). Portrait like GeoTag, and in the
+             launcher's task so Home brings the launcher back, which reopens this. -->
+        <activity
+            android:name=".ar.ArHomeActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
+            android:screenOrientation="portrait"
+            android:launchMode="singleTop"
+            android:exported="false"
+            android:theme="@style/Theme.PrismLauncher" />
         <activity
             android:name=".minigames.GeoTagActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|navigation|uiMode|density"
@@ -362,6 +372,16 @@
              that fits, because the work is a local computation whose output is written to storage. -->
         <service
             android:name=".imagecraft.ImageCraftService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+        <!-- Drive compression: keeps a long compression alive in the background and carries its
+             persistent progress notification. dataSync, because the work rewrites local storage. -->
+        <service
+            android:name=".files.DriveCompressionService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+        <service
+            android:name=".podcasts.PodcastStudioService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
         <activity
@@ -1068,6 +1088,27 @@
                 <action android:name="android.telecom.InCallService" />
             </intent-filter>
         </service>
+
+        <!-- Call recording access: Android 10+ silences every app's microphone during a carrier
+             call unless an accessibility service of that app is enabled. Listens to nothing. -->
+        <service
+            android:name=".calls.CallRecordingAccessService"
+            android:exported="true"
+            android:label="Prism call recording"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/call_recording_accessibility" />
+        </service>
+
+        <!-- Keeps a call recording's microphone open while the call screen is in the background. -->
+        <service
+            android:name=".calls.CallRecordingService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
 
         <activity
             android:name=".calls.CallRecordingsActivity"

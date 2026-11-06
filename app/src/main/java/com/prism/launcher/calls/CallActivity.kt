@@ -459,7 +459,8 @@ class CallActivity : PrismBaseActivity() {
             )
         }
         if (!started.started) {
-            Toast.makeText(this, started.message, Toast.LENGTH_LONG).show()
+            if (started.needsAccess) showRecordingAccessDialog(started.message)
+            else Toast.makeText(this, started.message, Toast.LENGTH_LONG).show()
             return
         }
         recording = true
@@ -474,6 +475,31 @@ class CallActivity : PrismBaseActivity() {
         }
         recordingView.text = "● Recording · " + (source ?: "call audio")
         Toast.makeText(this, "Recording this call", Toast.LENGTH_SHORT).show()
+    }
+
+    /**
+     * Explains why a phone call cannot be recorded yet, and opens the setting that fixes it.
+     *
+     * Android 13+ greys the switch out for apps installed outside a store until "Allow restricted
+     * settings" is chosen in App info, so that path is offered too.
+     */
+    private fun showRecordingAccessDialog(message: String) {
+        val builder = android.app.AlertDialog.Builder(this)
+            .setTitle("Allow call recording")
+            .setMessage(
+                message + "\n\nThe service reads no screen content. If Android says the setting is " +
+                    "restricted, open App info, tap ⋮ and choose \"Allow restricted settings\" first.",
+            )
+            .setPositiveButton("Open Accessibility") { _, _ ->
+                runCatching { startActivity(CallRecordingAccessService.settingsIntent()) }
+            }
+            .setNegativeButton("Not now", null)
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            builder.setNeutralButton("App info") { _, _ ->
+                runCatching { startActivity(CallRecordingAccessService.appInfoIntent(this)) }
+            }
+        }
+        builder.show()
     }
 
     private fun stopCallRecording() {

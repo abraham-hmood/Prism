@@ -403,6 +403,10 @@ class PrismApp : Application(), ComponentCallbacks2 {
         com.prism.launcher.trusted.TrustedDevices.peerCheck = { ip ->
             com.prism.launcher.mesh.PrismMeshService.isPeer(ip)
         }
+        // Exchanges device keys with every paired device once the wallet can unseal this one's.
+        // Android does not call registerWithMesh (its service dispatches the opcodes), so it is
+        // started here; it waits for the wallet cipher, which is installed further down.
+        com.prism.launcher.trusted.TrustedDevices.startKeyExchange()
         // THE ADDRESS OF A TRUSTED DEVICE MUST BE ABLE TO CHANGE. Trust is stored against a
         // fingerprint, but everything that addresses a peer -- calls above all -- uses the last IP
         // it was paired at. This announces the fingerprint with our current address, so the other
@@ -588,11 +592,18 @@ class PrismApp : Application(), ComponentCallbacks2 {
         // Browser history, both directions, from :core -- the store is portable, so the bridge is too and
         // neither platform writes its own copy of the payload shape.
         com.prism.launcher.trusted.TrustedSharing.install()
+        com.prism.launcher.podcasts.PodcastSync.install()
+        com.prism.launcher.podcasts.PodcastAndroid.install(this)
 
         // Hosted folders and the trusted-device bridge. Installed here rather than when the Files
         // page opens, because a request can arrive before the user has opened Files and the phrase
         // has to be able to reach a screen.
         com.prism.launcher.trusted.TrustedStorageBridge.install()
+        // Whole drives, both directions: this phone's storage offered to trusted devices, theirs
+        // listed in Files. A separate trusted-device permission from shared folders.
+        com.prism.launcher.files.PhoneDrives.install(this)
+        // Hole punching, for a Server-role phone whose only network is mobile data.
+        com.prism.launcher.vpn.PhonePunching.install(this)
         com.prism.launcher.trusted.TrustedStorageBridge.presentChallenge = { challenge ->
             presentStorageChallenge(challenge)
         }

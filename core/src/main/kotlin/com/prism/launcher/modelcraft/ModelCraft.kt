@@ -161,7 +161,14 @@ object ModelCraft {
          * kind -- including the diffuser and byte-latent shapes -- because those are network shapes,
          * not output formats.
          */
-        GAME("Game", "Game asset generation");
+        GAME("Game", "Game asset generation"),
+
+        /**
+         * Neural compression: a network that learns the data it compresses. Lossless or lossy, chosen
+         * when the model is made. Its vector-based family trains and runs on the device (see
+         * VectorCompressor); it also offers every architecture family the other kinds do.
+         */
+        COMPRESSION("Compression", "Neural compression");
 
         companion object {
             fun of(raw: String): Kind =
@@ -195,7 +202,7 @@ object ModelCraft {
      * flow-matching DiT for speech. The note is one line of what the family is for, because a
      * dropdown of fifteen names with no hints is a quiz.
      */
-    val archTypes: Map<Kind, List<ArchType>> = mapOf(
+    private val generativeArchTypes: Map<Kind, List<ArchType>> = mapOf(
         Kind.TEXT to listOf(
             ArchType("Decoder-only causal transformer", "The GPT shape: predicts the next token from what precedes it."),
             ArchType("Encoder-decoder transformer", "The T5/BART shape: reads the input both ways, then generates."),
@@ -283,6 +290,31 @@ object ModelCraft {
             ArchType("Point-cloud completion", "Fills a sparse partial scan out into a complete prop or creature."),
         ),
     )
+
+    /**
+     * Compression's own families, then every family any other kind offers -- text, image, audio and
+     * speech, frame interpolation, video and game -- because a compressor can be built on any of
+     * those shapes: a transformer predicting the next byte, a VAE with a learned prior, a diffusion
+     * decoder, a state-space model.
+     */
+    private val compressionArchTypes: List<ArchType> = listOf(
+        ArchType(
+            VectorCompressor.FAMILY,
+            "Each byte is an angle; each pair is coded as the lowest intercept of its two tangents. " +
+                "Adaptive, trains on any file type, and runs on this device.",
+        ),
+        ArchType("Byte-level transformer + arithmetic coding", "Predicts the next byte; an entropy coder spends -log2 p bits on it."),
+        ArchType("Context-mixing network (PAQ / cmix style)", "Many context models blended by a learned mixer."),
+        ArchType("LSTM predictor (NNCP / DeepZip style)", "A recurrent byte predictor driving an arithmetic coder."),
+        ArchType("Variational autoencoder + hyperprior", "Learned transform, quantised latent and a learned entropy model."),
+        ArchType("Vector-quantised autoencoder (VQ-VAE)", "Codes data as indices into a learned codebook."),
+        ArchType("Implicit neural representation", "Stores data as the weights of a small coordinate network."),
+        ArchType("Diffusion decoder (lossy)", "Sends a compact latent and denoises a faithful reconstruction."),
+    )
+
+    val archTypes: Map<Kind, List<ArchType>> = generativeArchTypes + (
+        Kind.COMPRESSION to (compressionArchTypes + generativeArchTypes.values.flatten()).distinctBy { it.name }
+        )
 
     /**
      * One training input. [default] is what an untouched form contributes to the recipe.
@@ -690,6 +722,57 @@ object ModelCraft {
             Field("resume_from", "Resume from checkpoint", ""),
             Field("output_dir", "Output directory", "model/"),
         ),
+        Kind.COMPRESSION to listOf(
+            Field(
+                VectorCompressor.KEY_MODE, "Lossless or lossy", VectorCompressor.MODE_LOSSLESS,
+                listOf(VectorCompressor.MODE_LOSSLESS, VectorCompressor.MODE_LOSSY),
+            ),
+            Field("base_model", "Base compression model or checkpoint", ""),
+            Field(KEY_QUANTIZATION, "Model quantization", DEFAULT_QUANTIZATION, quantizations),
+            Field(
+                TrainingTechniques.KEY,
+                "Training technique",
+                TrainingTechniques.DEFAULT.label,
+                TrainingTechniques.choices,
+            ),
+            Field("model_config", "Model config", "same as base"),
+            Field("symbol_unit", "Symbol unit", "byte", listOf("bit", "byte", "16-bit word", "angle pair (vector-based)")),
+            Field("context_length", "Context length (symbols)", "1024"),
+            Field("block_size", "Block size (bytes)", "1048576"),
+            Field("entropy_coder", "Entropy coder", "arithmetic", listOf("arithmetic", "range (rANS)", "tANS / FSE", "Huffman")),
+            Field("probability_precision", "Probability precision (bits)", "12"),
+            Field(VectorCompressor.KEY_TABLE_BITS, "Context table size (log2 entries)", "16"),
+            Field("context_orders", "Context orders mixed", "0,1,2,3,4"),
+            Field(VectorCompressor.KEY_MIXER_LR, "Mixer learning rate", "0.002"),
+            Field(VectorCompressor.KEY_ADAPT_RATE, "Table adaptation (shift; lower adapts faster)", "4"),
+            Field("hidden_size", "Hidden size", "256"),
+            Field("layers", "Layers", "4"),
+            Field("heads", "Attention heads", "4"),
+            Field("latent_channels", "Latent channels (autoencoders)", "192"),
+            Field("codebook_size", "Codebook size (vector quantisation)", "1024"),
+            Field(VectorCompressor.KEY_LOSSY_STEP, "Lossy step in angle steps (lossy only)", "4"),
+            Field("rate_distortion_lambda", "Rate-distortion lambda (lossy only)", "0.01"),
+            Field("distortion_metric", "Distortion metric (lossy only)", "MSE", listOf("MSE", "MAE", "MS-SSIM", "perceptual (LPIPS)")),
+            Field("target_bits_per_byte", "Target bits per byte (lossy only)", "2.0"),
+            Field(VectorCompressor.KEY_ADAPTIVE, "Keep learning unfamiliar data", "true", listOf("true", "false")),
+            Field(VectorCompressor.KEY_NOVELTY, "Unfamiliar-data threshold (fraction above average cost)", "0.15"),
+            Field(VectorCompressor.KEY_SEED_PERTURBATION, "Archive seed weight perturbation", "0.02"),
+            Field("batch_size", "Batch size", "16"),
+            Field("grad_accumulation", "Gradient accumulation steps", "1"),
+            Field("max_steps", "Max steps (overrides epochs)", "0"),
+            Field("learning_rate", "Learning rate", "0.0003"),
+            Field("optimizer", "Optimizer", "adamw"),
+            Field("weight_decay", "Weight decay", "0.0"),
+            Field("lr_scheduler", "LR scheduler", "cosine"),
+            Field("warmup_steps", "LR warmup steps", "100"),
+            Field("max_grad_norm", "Gradient clipping", "1.0"),
+            Field("precision", "Mixed precision", "bf16"),
+            Field("seed", "Seed", "42"),
+            Field("save_steps", "Checkpoint every N steps", "500"),
+            Field("eval_steps", "Evaluate every N steps", "200"),
+            Field("resume_from", "Resume from checkpoint", ""),
+            Field("output_dir", "Output directory", "model/"),
+        ),
     )
 
     // ── The two switches that are not plain fields ───────────────────────────────────────────────
@@ -1080,6 +1163,7 @@ object ModelCraft {
         Kind.VIDEO -> Schedule(epochs = 30, stepsPerEpoch = 0)
         Kind.INTERPOLATION -> Schedule(epochs = 12, stepsPerEpoch = 0)
         Kind.GAME -> Schedule(epochs = 8, stepsPerEpoch = 0)
+        Kind.COMPRESSION -> Schedule(epochs = 2, stepsPerEpoch = 0)
     }
 
     /** Reads the two schedule params off [model], falling back to [defaultSchedule] for its kind. */
@@ -1130,6 +1214,7 @@ object ModelCraft {
         Kind.INTERPOLATION -> "frame_model"
         Kind.VIDEO -> "video_model"
         Kind.GAME -> "game_model"
+        Kind.COMPRESSION -> "compression_model"
     }
 
     /** True when [model] is being built from nothing rather than from a base checkpoint. */
@@ -1183,6 +1268,7 @@ object ModelCraft {
                     activateVideoArtifact(model)
                 }
                 Kind.GAME -> GameTrainer.train(model, recipe)
+                Kind.COMPRESSION -> CompressionTrainer.train(model, recipe)
             }
         }
     }
@@ -1288,6 +1374,7 @@ object ModelCraft {
         Kind.GAME to listOf(
             "base_model", "model_config", "training_method", "lora_rank", "lora_alpha",
         ),
+        Kind.COMPRESSION to listOf("base_model", "model_config", "resume_from"),
     )
 
     /**
@@ -1374,6 +1461,20 @@ object ModelCraft {
                 put("heads", 4)
                 put("dim", 64)
                 put("objective", "flow-matching between frames")
+            }
+            Kind.COMPRESSION -> {
+                put("mode", model.param(VectorCompressor.KEY_MODE))
+                put("symbol_unit", model.param("symbol_unit"))
+                put("context_length", paramInt(model, "context_length", 1024).coerceIn(8, 65_536))
+                put("hidden_size", paramInt(model, "hidden_size", 256))
+                put("layers", paramInt(model, "layers", 4))
+                put("heads", paramInt(model, "heads", 4))
+                put("entropy_coder", model.param("entropy_coder"))
+                put(
+                    "objective",
+                    if (VectorCompressor.lossy(model)) "rate-distortion: bits plus lambda times distortion"
+                    else "minimise -log2 p of every symbol (lossless)",
+                )
             }
             Kind.GAME -> {
                 put("shape_dim", GameTrainer.SHAPE_DIM)
@@ -1510,6 +1611,16 @@ object ModelCraft {
             frames = false,
             help = ".obj, .ply and .glb meshes train directly; textures and scenes are catalogued. " +
                 "The CSV can caption each mesh; its captions condition the shapes the model learns.",
+        ),
+        Kind.COMPRESSION to DatasetSpec(
+            "Any files at all",
+            // A compressor learns the bytes it will meet: text, parquet tables, photos, video, audio,
+            // executables. Every type is training data, so the picker offers every type.
+            listOf("*/*"),
+            csv = false,
+            frames = false,
+            help = "Text, Parquet, CSV, images, video, audio, binaries, folders -- every file is " +
+                "read as its raw bytes, which is what a compressor has to learn.",
         ),
     )
 

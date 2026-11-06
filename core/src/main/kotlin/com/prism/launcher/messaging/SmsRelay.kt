@@ -4,6 +4,9 @@ import com.prism.core.PrismPlatform
 import com.prism.core.json.JSONArray
 import com.prism.core.json.JSONObject
 import com.prism.launcher.cloud.CloudVault
+import com.prism.launcher.trusted.DeviceKeys
+import com.prism.launcher.trusted.TrustedDevices
+import com.prism.launcher.trusted.TrustedSeal
 import java.io.File
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -116,7 +119,6 @@ object SmsRelay {
      */
     fun seal(messages: List<Relayed>, fromDevice: String): ByteArray? {
         if (messages.isEmpty()) return null
-        val key = CloudVault.keyFor(CloudVault.Purpose.MESSAGING) ?: return null
 
         val json = JSONObject().apply {
             put("v", 1)
@@ -136,13 +138,25 @@ object SmsRelay {
                 }
             })
         }
-        return CloudVault.seal(json.toString().toByteArray(), key)
+        // ONE PACKET THAT ONLY THE DEVICES THIS ONE SHARES MESSAGES WITH CAN OPEN: the relay is a
+        // broadcast, so the batch is sealed once and its key wrapped for each of them with the key the
+        // pair agreed (see TrustedSeal.sealForAll), plus the wallet key for devices on this wallet.
+        return TrustedSeal.sealForAll(
+            TrustedDevices.recipientsFor(TrustedDevices.Kind.MESSAGES),
+            DeviceKeys.Purpose.SMS,
+            json.toString().toByteArray(),
+            CloudVault.keyFor(CloudVault.Purpose.MESSAGING),
+        )
     }
 
-    /** Opens a batch, or null when this device holds a different wallet. */
+    /** Opens a batch, or null when it was not sealed for this device or came from one not accepted. */
     fun open(sealed: ByteArray): List<Relayed>? {
-        val key = CloudVault.keyFor(CloudVault.Purpose.MESSAGING) ?: return null
-        val plain = CloudVault.open(sealed, key) ?: return null
+        val opened = TrustedSeal.openFromAny(
+            sealed, DeviceKeys.Purpose.SMS, CloudVault.keyFor(CloudVault.Purpose.MESSAGING),
+        ) ?: return null
+        // Opened by a pair key: that device must be one this device accepts messages from.
+        opened.device?.let { if (TrustedDevices.Kind.MESSAGES !in it.incoming) return null }
+        val plain = opened.plain
         return runCatching {
             val json = JSONObject(String(plain))
             val device = json.optString("device")

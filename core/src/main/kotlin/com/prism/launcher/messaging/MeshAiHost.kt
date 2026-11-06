@@ -100,6 +100,15 @@ object MeshAiHost : MeshConnect.DomainHost {
                     output,
                 )
             }
+            // A podcast's cover, episode audio or transcript, for a trusted device that was told
+            // about it in a share. Authorised inside PodcastSync against the peer's address.
+            requestLine.startsWith("GET " + com.prism.launcher.podcasts.PodcastSync.PATH) -> {
+                com.prism.launcher.podcasts.PodcastSync.serve(
+                    runCatching { socket.inetAddress?.hostAddress }.getOrNull().orEmpty(),
+                    requestLine.pathOfRequestLine(),
+                    output,
+                )
+            }
             requestLine.startsWith("POST /generate") -> serveGeneration(head.orEmpty(), input, output)
             // A platform's own route. Checked before the 404 and after the two this host owns, so a
             // registration can never shadow model serving or generation.

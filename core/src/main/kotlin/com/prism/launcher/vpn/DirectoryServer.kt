@@ -42,6 +42,13 @@ import kotlin.concurrent.thread
  * advertising somebody else's server to their own clients. When no username or password is set, the
  * server refuses every request and says so in the log rather than silently running open.
  *
+ * ## Hole punching
+ *
+ * A hosted directory also runs a [HolePunch.Rendezvous] on UDP [HolePunch.DEFAULT_PORT], on every
+ * interface rather than the mesh address: the phones it exists for are on mobile data and not on the
+ * mesh yet. It authenticates with the same credential, and it is paid for through pay-later at
+ * [HolePunch.DEFAULT_PRICE_PER_MB] to this device's Prism Coin address.
+ *
  * ## Bounds
  *
  * One listener, at most eight concurrent requests, a ten-second socket timeout, and hard limits on
@@ -69,6 +76,18 @@ object DirectoryServer {
         private set
 
     val isRunning: Boolean get() = server != null
+
+    /** The hole punching rendezvous that runs beside the directory. See [HolePunch]. */
+    val rendezvous = HolePunch.Rendezvous(
+        authorized = ::authorized,
+        payout = {
+            runCatching {
+                com.prism.launcher.wallet.CoinRegistry
+                    .bySymbol(com.prism.launcher.wallet.psc.PrismCoinConsensus.SYMBOL)
+                    ?.let { com.prism.launcher.wallet.WalletVault.addressFor(it) }
+            }.getOrNull().orEmpty()
+        },
+    )
 
     private val workers = ThreadPoolExecutor(
         1, 8, 30L, TimeUnit.SECONDS,
@@ -123,10 +142,12 @@ object DirectoryServer {
         PrismPlatform.log.info(TAG, "Directory server listening on $bind:$port")
 
         thread(name = "prism-directory", isDaemon = true) { acceptLoop(bound) }
+        rendezvous.start()
         return port
     }
 
     fun stop() {
+        rendezvous.stop()
         val current = server ?: return
         server = null
         port = 0

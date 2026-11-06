@@ -218,6 +218,8 @@ object SettingsActions {
                     val found = kotlinx.coroutines.runBlocking {
                         com.prism.launcher.messaging.OllamaDiscoveryService.scan()
                     }
+                    // Nothing chosen yet: the first model found becomes the active text model.
+                    com.prism.launcher.messaging.OllamaDiscoveryService.ensureDefault(found)
                     PrismPlatform.log.info(
                         TAG,
                         if (found.isEmpty()) "No Ollama server answered on this network."

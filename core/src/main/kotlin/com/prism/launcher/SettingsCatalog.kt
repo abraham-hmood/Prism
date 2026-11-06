@@ -84,6 +84,7 @@ object SettingsCatalog {
         val set: (Boolean) -> Unit,
         override val reach: Reach = Reach.EVERYWHERE,
         override val relevant: () -> Boolean = { true },
+        override val enabled: () -> Boolean = { true },
     ) : Item
 
     /**
@@ -377,6 +378,21 @@ object SettingsCatalog {
                     "and the desktop",
                 get = { PrismSettings.getWindowedPages() },
                 set = { PrismSettings.setWindowedPages(it) },
+            ),
+            Switch(
+                "Augmented reality for all of Prism",
+                "The home screen becomes your room: put each page on a wall, the floor or the ceiling, " +
+                    "and it stays there. The phone uses its camera and ARCore; a computer uses its webcam.",
+                get = { PrismSettings.getArEverywhere() },
+                set = { PrismSettings.setArEverywhere(it) },
+            ),
+            // Greyed out rather than hidden while AR is off, so it is findable.
+            Switch(
+                "Interact live",
+                "Use a placed page where it is, instead of tapping it up into a movable window first",
+                get = { PrismSettings.getArInteractLive() },
+                set = { PrismSettings.setArInteractLive(it) },
+                enabled = { PrismSettings.getArEverywhere() },
             ),
             // THE PHOTO BACKUP SWITCH. Under Other because it is neither a launcher preference
             // nor a network one: it copies the camera roll, encrypted with the wallet's photo key,
@@ -1455,15 +1471,9 @@ object SettingsCatalog {
                 set = { PrismSettings.setVirtualizeAndroidApps(it) },
             ),
             Switch(
-                "Run Windows executables", "Switch the drawer to Windows programs",
+                "Run Windows and Linux programs", "64-bit .exe and Linux programs through NINE, with nothing to install",
                 get = { PrismSettings.getWindowsMode() },
                 set = { PrismSettings.setWindowsMode(it) },
-            ),
-            Text(
-                "Windows layer source", "Where the compatibility layer is fetched from",
-                get = { PrismSettings.getWindowsLayerUrl() },
-                set = { PrismSettings.setWindowsLayerUrl(it) },
-                relevant = { PrismSettings.getWindowsMode() },
             ),
             Switch(
                 "Enable virtualization", "Run a whole guest operating system",

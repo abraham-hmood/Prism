@@ -45,4 +45,5 @@
     <string name="virt_not_supported">Virtualization not supported on this device</string>
     <string name="writer_subtype_en">English (Prism Writer)</string>
     <string name="writer_ime_label">Prism Writer</string>
+    <string name="call_recording_access_description">Lets Prism record phone calls. Android silences the microphone of every app during a call unless that app has an accessibility service switched on. This service reads no screen content and receives no events.</string>
 </resources>

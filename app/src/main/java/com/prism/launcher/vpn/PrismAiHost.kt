@@ -129,6 +129,24 @@ object PrismAiHost {
                 return@withContext
             }
 
+            // A podcast file for a trusted device. Same tunnel and same reasons as a copied file; the
+            // route and its authorisation live in :core so the desktop serves it identically.
+            if (requestLine.startsWith("GET " + com.prism.launcher.podcasts.PodcastSync.PATH)) {
+                if (!preLines.isNotEmpty()) {
+                    while (true) {
+                        val line = readLine(input) ?: break
+                        if (line.isEmpty()) break
+                    }
+                }
+                val path = requestLine.removePrefix("GET ").substringBefore(" ").trim()
+                com.prism.launcher.podcasts.PodcastSync.serve(
+                    socket.inetAddress?.hostAddress.orEmpty(),
+                    path,
+                    output,
+                )
+                return@withContext
+            }
+
             if (!requestLine.startsWith("POST")) {
                 sendError(output, 405, "Method Not Allowed — POST a prompt to /generate, or GET /model/<name>")
                 return@withContext

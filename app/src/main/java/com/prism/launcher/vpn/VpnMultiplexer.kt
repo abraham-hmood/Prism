@@ -55,6 +55,8 @@ class VpnMultiplexer(
                     val socket = channel.socket()
                     socket.bind(InetSocketAddress(p))
                     channels.add(channel)
+                    // The WireGuard port is the one a punching phone keeps open at its carrier.
+                    if (p == 51820) PhonePunching.socket = socket
                     Log.d("PrismVpn", "Extreme Multiplexer listening on UDP $p (REUSE_PORT active)")
                     
                     val buffer = ByteArray(2048)
@@ -67,6 +69,10 @@ class VpnMultiplexer(
                         
                         // Handle WireGuard (Standard port 51820)
                         if (p == 51820) {
+                            // Directory keep-alive answers, introductions and punches share the port.
+                            if (PhonePunching.onPacket(rawData, rawData.size, InetSocketAddress(packet.address, packet.port))) {
+                                continue
+                            }
                             wgServerEngine.handlePacket(rawData, packet.address, packet.port, socket)
                             continue
                         }
@@ -127,6 +133,7 @@ class VpnMultiplexer(
     }
 
     fun stop() {
+        PhonePunching.socket = null
         scope.cancel()
         for (c in channels) {
             try { c.close() } catch (e: Exception) {}

@@ -487,6 +487,84 @@ class TrustedDevicesTest {
     }
 
     @Test
+    fun `an offering device with no wallet asks for one and receives the answerer's`() {
+        // THE BUG THIS EXISTS FOR. A desktop with no wallet offered the pairing and a phone with one
+        // answered; the handoff only ran towards the ANSWERING side, so the desktop stayed without a
+        // wallet, its user made a new one, and every share between the two failed to decrypt.
+        val theirs = phrase.joinToString(" ")
+        WalletVault.wipe()
+        assertFalse(WalletVault.isInitialized())
+
+        TrustedDevices.offer(
+            "10.8.0.9", "Phone", "android",
+            setOf(TrustedDevices.Kind.WALLET, TrustedDevices.Kind.MESSAGES),
+        )
+        val offer = sent.last { it.opcode == TrustedDevices.OPCODE_TRUST_OFFER }
+        val salt = java.util.Base64.getDecoder().decode(JSONObject(offer.payload).optString("salt"))
+        val key = PairingCode.keyFor(TrustedDevices.displayedCode("10.8.0.9")!!, salt)!!
+        assertTrue(
+            TrustedDevices.onReply(
+                "10.8.0.9",
+                replyProving("10.8.0.9", "55443322", listOf(TrustedDevices.Kind.WALLET, TrustedDevices.Kind.MESSAGES)),
+            ),
+        )
+
+        val ack = sent.last { it.opcode == TrustedDevices.OPCODE_TRUST_ACK }
+        assertTrue(JSONObject(ack.payload).optBoolean("needsWallet"), "the confirmation has to ask for the wallet")
+
+        // The phone seals its phrase with the code key, as it would in [sendWallet].
+        val handoff = JSONObject().apply {
+            put("fp", "55443322")
+            put("name", "Phone")
+            put("seed", java.util.Base64.getEncoder().encodeToString(PairingCode.sealPhrase(theirs, key, salt)))
+        }.toString()
+        assertTrue(TrustedDevices.onWallet("10.8.0.9", handoff), "the phrase should open and be imported")
+        assertEquals(theirs, WalletVault.phrase()!!.joinToString(" "))
+        // The repeats of the same handoff are ignored, not imported again or treated as an intrusion.
+        assertFalse(TrustedDevices.onWallet("10.8.0.9", handoff))
+    }
+
+    @Test
+    fun `an answering device sends its wallet when the offering one asks in the confirmation`() {
+        val mine = WalletVault.phrase()!!.joinToString(" ")
+        val salt = PairingCode.salt()
+        TrustedDevices.onOffer(
+            "10.8.0.7",
+            offerPayload(kinds = listOf(TrustedDevices.Kind.WALLET, TrustedDevices.Kind.MESSAGES), salt = salt),
+        )
+        val code = "alpha bravo charlie"
+        val accepted = setOf(TrustedDevices.Kind.WALLET, TrustedDevices.Kind.MESSAGES)
+        assertTrue(TrustedDevices.respondToOffer("aabbccdd", accepted, code))
+        val ack = JSONObject().apply {
+            put("fp", "aabbccdd")
+            put("name", "Desktop")
+            put("platform", "windows")
+            put("accepted", com.prism.core.json.JSONArray().also { a -> accepted.forEach { a.put(it.id) } })
+            put("needsWallet", true)
+        }.toString()
+        assertTrue(TrustedDevices.onAck("10.8.0.7", ack))
+
+        val handoff = sent.lastOrNull { it.opcode == TrustedDevices.OPCODE_TRUST_WALLET }
+        assertNotNull(handoff, "the offering device asked for the wallet and the pairing includes it")
+        val sealed = java.util.Base64.getDecoder().decode(JSONObject(handoff.payload).optString("seed"))
+        assertEquals(mine, PairingCode.openPhrase(sealed, PairingCode.keyFor(code, salt)!!, salt))
+    }
+
+    @Test
+    fun `an answering device does not send its wallet when the pairing leaves it out`() {
+        val salt = PairingCode.salt()
+        TrustedDevices.onOffer("10.8.0.7", offerPayload(salt = salt))
+        assertTrue(TrustedDevices.respondToOffer("aabbccdd", setOf(TrustedDevices.Kind.MESSAGES), "alpha bravo charlie"))
+        val ack = JSONObject().apply {
+            put("fp", "aabbccdd")
+            put("accepted", com.prism.core.json.JSONArray().also { it.put("messages") })
+            put("needsWallet", true)
+        }.toString()
+        assertTrue(TrustedDevices.onAck("10.8.0.7", ack))
+        assertNull(sent.firstOrNull { it.opcode == TrustedDevices.OPCODE_TRUST_WALLET })
+    }
+
+    @Test
     fun `a device that already has a wallet is not sent one`() {
         TrustedDevices.offer(
             "10.8.0.9", "Other", "windows", setOf(TrustedDevices.Kind.WALLET),

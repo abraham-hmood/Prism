@@ -132,6 +132,39 @@ object ComputeDebtLedger {
     }
 
     /**
+     * Charges a fixed [amount] for a service that is not priced per token -- the hole punching
+     * rendezvous a directory provides, billed per megabyte (see `com.prism.launcher.vpn.HolePunch`).
+     * Pays outright when the balance allows and records a debt otherwise, exactly like [charge].
+     */
+    fun chargeAmount(
+        creditorAddress: String,
+        creditorIp: String,
+        deviceName: String,
+        amount: BigInteger,
+        units: Int,
+    ): Boolean {
+        if (amount.signum() <= 0) return true
+        if (creditorAddress.isBlank()) return false
+        if (pay(creditorAddress, amount, deviceName)) return true
+        record(
+            Debt(
+                id = "${System.currentTimeMillis()}-$creditorIp",
+                creditorAddress = creditorAddress,
+                creditorIp = creditorIp,
+                deviceName = deviceName,
+                amountMinor = amount,
+                tokens = units,
+                createdAt = System.currentTimeMillis(),
+                settled = false,
+                settledAt = 0L,
+            )
+        )
+        announce(creditorAddress, amount)
+        PrismPlatform.log.info(TAG, "Owe ${ComputePricing.format(amount)} to $deviceName; will settle when funded")
+        return false
+    }
+
+    /**
      * Pays whatever can be paid, oldest first.
      *
      * Oldest first rather than smallest first: paying the cheapest debts to make the list shorter

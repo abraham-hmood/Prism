@@ -844,7 +844,10 @@ class SettingsActivity : PrismBaseActivity() {
         Toast.makeText(this, "${folder.name} added as a video model", Toast.LENGTH_SHORT).show()
     }
 
-    private var ollamaScanResults: List<com.prism.launcher.messaging.OllamaDiscoveryService.OllamaServer> = emptyList()
+    // Starts from what earlier scans found -- on any page -- so leaving Settings and coming back
+    // does not mean scanning again before the picker has anything in it.
+    private var ollamaScanResults: List<com.prism.launcher.messaging.OllamaDiscoveryService.OllamaServer> =
+        com.prism.launcher.messaging.OllamaDiscoveryService.cached()
     private var ollamaScanning = false
     private var manualOllamaHost = ""
     private var manualOllamaProbe: kotlinx.coroutines.Job? = null
@@ -855,8 +858,11 @@ class SettingsActivity : PrismBaseActivity() {
         lifecycleScope.launch(Dispatchers.IO) {
             val report = com.prism.launcher.messaging.OllamaDiscoveryService.scanReport()
             withContext(Dispatchers.Main) {
-                ollamaScanResults = report.servers
+                ollamaScanResults = report.servers.ifEmpty { ollamaScanResults }
                 ollamaScanning = false
+                // With nothing chosen yet, the first model found becomes the active text model --
+                // the picker used to SHOW it selected without ever selecting it.
+                com.prism.launcher.messaging.OllamaDiscoveryService.ensureDefault(ollamaScanResults)
                 refresh()
                 // NAMING THE SWEPT NETWORKS IS THE DIAGNOSIS. "Not found" on its own reads as a bug;
                 // "nothing on 192.168.1.0/24" points at the two real causes, a server bound to its
@@ -901,8 +907,8 @@ class SettingsActivity : PrismBaseActivity() {
                 }
                 ollamaScanResults = (ollamaScanResults + server).distinctBy { it.host + ":" + it.port }
                 server.models.firstOrNull()?.let { model ->
-                    PrismSettings.setSelectedOllamaEndpoint(
-                        PrismSettings.OllamaEndpoint(server.host, server.port, model)
+                    com.prism.launcher.messaging.OllamaDiscoveryService.activate(
+                        server.host, server.port, model
                     )
                 }
                 refresh()
@@ -1961,6 +1967,26 @@ class SettingsActivity : PrismBaseActivity() {
                     PrismSettings.getVpnMode() == PrismSettings.VPN_MODE_PRISM &&
                     PrismSettings.getPrismVpnRole() == PrismSettings.PRISM_ROLE_SERVER
             ),
+            SettingItem.Nav(
+                "Hole punching on mobile data",
+                com.prism.launcher.vpn.PhonePunching.status() +
+                    " Tap to copy the line a client's WireGuard config needs.",
+                {
+                    val line = com.prism.launcher.vpn.PhonePunching.clientConfigLine()
+                    if (line == null) {
+                        Toast.makeText(this, com.prism.launcher.vpn.PhonePunching.status(), Toast.LENGTH_LONG).show()
+                    } else {
+                        val clipboard = getSystemService(android.content.ClipboardManager::class.java)
+                        clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("Prism punch", line))
+                        Toast.makeText(
+                            this,
+                            "Copied. Add it to the client's WireGuard config: Prism clients punch to this " +
+                                "phone through the directory before connecting.",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                },
+            ),
             SettingItem.Picker(
                 "VPN Protocol",
                 "Choose protocol or let Prism auto-detect",
@@ -2501,6 +2527,9 @@ class SettingsActivity : PrismBaseActivity() {
                     if (newMode == PrismSettings.AI_MODE_LOCAL_CLOUD && ollamaScanResults.isEmpty() && !ollamaScanning) {
                         rescanOllama()
                     } else {
+                        if (newMode == PrismSettings.AI_MODE_LOCAL_CLOUD) {
+                            com.prism.launcher.messaging.OllamaDiscoveryService.ensureDefault(ollamaScanResults)
+                        }
                         refresh()
                     }
                 }
@@ -2554,7 +2583,8 @@ class SettingsActivity : PrismBaseActivity() {
                     { idx ->
                         if (entries.isNotEmpty()) {
                             val (server, modelName) = entries[idx]
-                            PrismSettings.setSelectedOllamaEndpoint(PrismSettings.OllamaEndpoint(server.host, server.port, modelName))
+                            // The pick IS the active text model, exactly as choosing it on the Models page.
+                            com.prism.launcher.messaging.OllamaDiscoveryService.activate(server.host, server.port, modelName)
                             refresh()
                         }
                     },
@@ -2709,6 +2739,23 @@ class SettingsActivity : PrismBaseActivity() {
                     { showRingtonePicker(mesh = true, callTone = true) },
                 ),
             ) else emptyArray()),
+            SettingItem.Nav(
+                "Call recording access",
+                if (com.prism.launcher.calls.CallRecordingAccessService.isEnabled(this)) {
+                    "On. Phone calls can be recorded."
+                } else {
+                    "Off. Android silences the microphone during phone calls until \"Prism call " +
+                        "recording\" is on in Accessibility."
+                },
+                { startActivity(com.prism.launcher.calls.CallRecordingAccessService.settingsIntent()) },
+            ),
+            SettingItem.Toggle(
+                "Record both sides through the speaker",
+                "Recording a phone call turns the speaker on, so the other person is captured too. " +
+                    "Off records only your side unless your phone allows the call line itself.",
+                PrismSettings.getCallRecordSpeaker(),
+                { enabled -> PrismSettings.setCallRecordSpeaker(enabled) },
+            ),
 
             SettingItem.Header("Speech"),
             run {
@@ -3507,18 +3554,13 @@ class SettingsActivity : PrismBaseActivity() {
                 }
             ),
             SettingItem.Toggle(
-                "Switch to running Windows executables",
-                when {
-                    !PrismSettings.getWindowsMode() ->
-                        "Turns the Virtualization page into a Windows runtime (Wine + box64) and " +
-                            "lets Prism open .exe files. Replaces the guest-OS view while on."
-                    com.prism.launcher.virtualization.WineInstaller.isInstalled(this) ->
-                        "Windows mode is on — the Virtualization page runs .exe files, and " +
-                            "Prism appears in the chooser for them."
-                    else ->
-                        "Windows mode is on, but the compatibility layer is not installed yet. " +
-                            "Open the Virtualization page to download it — roughly " +
-                            "${com.prism.launcher.virtualization.WineInstaller.approximateDownloadMb()} MB."
+                "Run Windows and Linux programs",
+                if (!PrismSettings.getWindowsMode()) {
+                    "Turns the Virtualization page into a runner for 64-bit Windows (.exe) and Linux " +
+                        "programs, through NINE -- nothing to install. Replaces the guest-OS view while on."
+                } else {
+                    "On -- the Virtualization page runs Windows and Linux x86-64 programs with NINE. " +
+                        com.prism.launcher.virtualization.NineRuntime.describe()
                 },
                 PrismSettings.getWindowsMode(),
                 { enabled ->
@@ -3532,19 +3574,6 @@ class SettingsActivity : PrismBaseActivity() {
                     com.prism.launcher.virtualization.ExeLaunchActivity.syncHandlerRegistration(this)
                     refresh()
                 }
-            ),
-            SettingItem.TextInput(
-                "Windows layer source",
-                PrismSettings.getWindowsLayerUrl().ifBlank {
-                    // An override, not a requirement: Prism builds the layer from the Ubuntu,
-                    // box64 and WineHQ projects on its own. This is here for somebody who wants a
-                    // Winlator container or a build of their own instead.
-                    "Optional — Prism assembles the layer itself. Set a URL to use your own " +
-                        "Wine + box64 + rootfs archive instead."
-                },
-                PrismSettings.getWindowsLayerUrl(),
-                { PrismSettings.setWindowsLayerUrl(it) },
-                isEnabled = PrismSettings.getWindowsMode()
             ),
             SettingItem.Toggle(
                 "Enable Virtualization",
@@ -3869,6 +3898,26 @@ class SettingsActivity : PrismBaseActivity() {
                 "Draw each page as a titled window with the desktop around it",
                 PrismSettings.getWindowedPages(),
                 { PrismSettings.setWindowedPages(it) }
+            ),
+            // The home screen as the room: pages on walls, the floor and the ceiling. Same stored
+            // value the desktop reads.
+            SettingItem.Toggle(
+                "Augmented reality for all of Prism",
+                "The home screen becomes your room: put each page on a wall, the floor or the ceiling, and it stays there",
+                PrismSettings.getArEverywhere(),
+                {
+                    PrismSettings.setArEverywhere(it)
+                    if (it) com.prism.launcher.ar.ArHomeActivity.flat = false
+                    refresh()
+                }
+            ),
+            // Greyed out until AR is on: it only means something there.
+            SettingItem.Toggle(
+                "Interact live",
+                "Use a placed page where it is, instead of tapping it up into a movable window first",
+                PrismSettings.getArInteractLive(),
+                { PrismSettings.setArInteractLive(it) },
+                isEnabled = PrismSettings.getArEverywhere(),
             ),
             SettingItem.Nav(
                 "Wireless displays",

@@ -22,12 +22,13 @@ import java.util.Base64
  *  1. **Per-device consent, off by default.** A device receives this user's position only when the
  *     user switched sharing on FOR THAT FINGERPRINT. Trust as a whole does not imply it; a laptop
  *     paired for clipboard has no business knowing where the phone is.
- *  2. **Sealed with the wallet-derived key.** [CloudVault.Purpose.LOCATION] is its own HKDF label,
- *     so a location cannot be decrypted with the messaging key even if a packet is misrouted, and
- *     a peer without the same recovery phrase gets ciphertext it cannot open.
- *  3. **Accepted only from a confirmed device at its last-known address.** The payload is checked
- *     against [TrustedDevices.byIp] and the device must be confirmed. A forged sender address can
- *     therefore make the packet be dropped, never make it be believed.
+ *  2. **Sealed for that one device.** Each fix is sealed with the location key this device agreed
+ *     with the recipient from their two key pairs ([DeviceKeys.Purpose.LOCATION]), so only that
+ *     device can open it, and a location cannot be opened with any other kind's key even if a
+ *     packet is misrouted.
+ *  3. **Accepted only from a confirmed device.** The key that opens the packet names the device
+ *     that sent it, and that device must be confirmed. A forged sender address can therefore make
+ *     the packet be dropped, never make it be believed.
  *  4. **Bounded in time.** A fix older than [MAX_AGE_MS] is refused on receipt, so a replay of an
  *     old packet cannot resurrect a stale position, and stored positions expire as well.
  *  5. **Encrypted at rest.** The cache is one sealed blob; a filesystem read on a stolen laptop
@@ -99,7 +100,8 @@ object TrustedLocations {
         }
         if (recipients.isEmpty()) return 0
 
-        val key = CloudVault.keyFor(CloudVault.Purpose.LOCATION) ?: return 0
+        // The old wallet key, only for a pair that has not exchanged device keys yet. See TrustedSeal.
+        val legacy = CloudVault.keyFor(CloudVault.Purpose.LOCATION)
         val payload = JSONObject().apply {
             put("t", "loc")
             put("lat", fix.latitude)
@@ -109,13 +111,14 @@ object TrustedLocations {
             put("name", fix.name)
             put("fp", TrustedDevices.localFingerprint())
         }
-        val sealed = CloudVault.seal(payload.toString().toByteArray(), key)
-        val encoded = Base64.getEncoder().encodeToString(sealed)
+        val plain = payload.toString().toByteArray()
 
         var sent = 0
         recipients.forEach { device ->
+            // Sealed per device, with the key this pair agreed; nothing is sent without a key.
+            val sealed = TrustedSeal.sealFor(device, DeviceKeys.Purpose.LOCATION, plain, legacy) ?: return@forEach
             runCatching {
-                MeshTransport.sendToPeer(device.lastIp, OPCODE_LOCATION, encoded)
+                MeshTransport.sendToPeer(device.lastIp, OPCODE_LOCATION, Base64.getEncoder().encodeToString(sealed))
                 sent++
             }.onFailure {
                 PrismPlatform.log.warn(TAG, "Could not send a location to ${device.name}: ${it.message}")
@@ -134,15 +137,16 @@ object TrustedLocations {
     fun requestFind(fingerprint: String): Boolean {
         val device = TrustedDevices.byFingerprint(fingerprint) ?: return false
         if (!device.confirmed || device.lastIp.isBlank()) return false
-        val key = CloudVault.keyFor(CloudVault.Purpose.LOCATION) ?: return false
-        val sealed = CloudVault.seal(
+        val sealed = TrustedSeal.sealFor(
+            device,
+            DeviceKeys.Purpose.LOCATION,
             JSONObject().apply {
                 put("t", "find")
                 put("at", System.currentTimeMillis())
                 put("fp", TrustedDevices.localFingerprint())
             }.toString().toByteArray(),
-            key,
-        )
+            CloudVault.keyFor(CloudVault.Purpose.LOCATION),
+        ) ?: return false
         return runCatching {
             MeshTransport.sendToPeer(device.lastIp, OPCODE_FIND, Base64.getEncoder().encodeToString(sealed))
             true
@@ -181,20 +185,26 @@ object TrustedLocations {
 
     fun receiveFind(peerIp: String, payload: String) = acceptFind(peerIp, payload)
 
+    /** Opens a location packet; the device is the one whose key opened it. */
+    private fun openLocation(peerIp: String, payload: String): TrustedSeal.Opened? {
+        val sealed = runCatching { Base64.getDecoder().decode(payload) }.getOrNull() ?: return null
+        return TrustedSeal.openFrom(
+            peerIp, sealed, DeviceKeys.Purpose.LOCATION, CloudVault.keyFor(CloudVault.Purpose.LOCATION),
+        )
+    }
+
     private fun accept(peerIp: String, payload: String) {
-        val device = TrustedDevices.byIp(peerIp) ?: return
+        val opened = openLocation(peerIp, payload) ?: run {
+            PrismPlatform.log.warn(TAG, "A location from $peerIp would not open")
+            TrustedDevices.byIp(peerIp)?.takeIf { it.confirmed }?.let { TrustedDevices.requestKey(it) }
+            return
+        }
+        val device = opened.device ?: TrustedDevices.byIp(peerIp) ?: return
         if (!device.confirmed) {
             PrismPlatform.log.warn(TAG, "Refused a location from an unconfirmed device at $peerIp")
             return
         }
-
-        val key = CloudVault.keyFor(CloudVault.Purpose.LOCATION) ?: return
-        val plain = runCatching {
-            CloudVault.open(Base64.getDecoder().decode(payload), key)
-        }.getOrNull() ?: run {
-            PrismPlatform.log.warn(TAG, "A location from ${device.name} would not open")
-            return
-        }
+        val plain = opened.plain
 
         val json = runCatching { JSONObject(String(plain)) }.getOrNull() ?: return
         if (json.optString("t") != "loc") return
@@ -226,7 +236,8 @@ object TrustedLocations {
     }
 
     private fun acceptFind(peerIp: String, payload: String) {
-        val device = TrustedDevices.byIp(peerIp) ?: return
+        val opened = openLocation(peerIp, payload) ?: return
+        val device = opened.device ?: TrustedDevices.byIp(peerIp) ?: return
         if (!device.confirmed) return
         // Only a device the user allowed to see this position may also make this one ring: the
         // find request is a physical action in the user's environment, not a network probe.
@@ -234,11 +245,7 @@ object TrustedLocations {
             PrismPlatform.log.warn(TAG, "Ignored a find request from ${device.name}: not allowed")
             return
         }
-        val key = CloudVault.keyFor(CloudVault.Purpose.LOCATION) ?: return
-        val plain = runCatching {
-            CloudVault.open(Base64.getDecoder().decode(payload), key)
-        }.getOrNull() ?: return
-        val json = runCatching { JSONObject(String(plain)) }.getOrNull() ?: return
+        val json = runCatching { JSONObject(String(opened.plain)) }.getOrNull() ?: return
         if (json.optString("t") != "find") return
         val at = json.optLong("at", 0L)
         if (at <= 0 || System.currentTimeMillis() - at > MAX_AGE_MS) return

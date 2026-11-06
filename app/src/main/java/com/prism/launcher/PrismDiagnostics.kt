@@ -30,7 +30,38 @@ object PrismDiagnostics {
         network()
         email()
         storage(context)
+        podcasts()
         PrismLogger.logInfo(TAG, "===== end of diagnostics =====")
+    }
+
+    // -- Podcasts ---------------------------------------------------------------------------
+
+    /**
+     * What went wrong making or playing podcasts: every caught exception, every pause for heat or
+     * memory, and every job the system killed -- found at the next launch from the job's marker, with
+     * Android's own exit reason. See PodcastDiagnostics.
+     */
+    private fun podcasts() {
+        PrismLogger.logInfo(TAG, "--- Podcasts ---")
+        safely("Podcasts") {
+            emit(Status.INFO, "Conditions now", com.prism.launcher.podcasts.PodcastDiagnostics.conditions())
+            val missing = com.prism.launcher.podcasts.PodcastStudio.missingRequirements()
+            emit(if (missing.isEmpty()) Status.OK else Status.FAIL, "Requirements",
+                if (missing.isEmpty()) "a text model and a voice are ready" else missing.joinToString(" "))
+            com.prism.launcher.podcasts.PodcastStudio.all().forEach { job ->
+                emit(if (job.error != null) Status.FAIL else Status.INFO, "Job",
+                    (com.prism.launcher.podcasts.PodcastStore.find(job.podcastId)?.title ?: job.podcastId) + ": " + (job.error ?: job.stage))
+            }
+            val incidents = com.prism.launcher.podcasts.PodcastDiagnostics.recent(25)
+            if (incidents.isEmpty()) emit(Status.OK, "Incidents", "none recorded")
+            incidents.forEach { incident ->
+                val status = when (incident.kind) {
+                    "paused", "resumed" -> Status.INFO
+                    else -> Status.FAIL
+                }
+                emit(status, incident.kind, incident.line())
+            }
+        }
     }
 
     // -- Search engine ----------------------------------------------------------------------

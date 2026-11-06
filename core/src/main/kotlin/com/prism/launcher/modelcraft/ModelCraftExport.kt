@@ -797,7 +797,115 @@ if __name__ == '__main__':
         ModelCraft.Kind.AUDIO -> PY_AUDIO
         ModelCraft.Kind.INTERPOLATION -> PY_INTERPOLATION
         ModelCraft.Kind.GAME -> PY_GAME
+        ModelCraft.Kind.COMPRESSION -> PY_COMPRESSION
     }
+
+    private val PY_COMPRESSION = """
+# ---------------------------------------------------------------------------------------------
+# The compression model: a network that predicts the next symbol, so an entropy coder can spend
+# -log2 p bits on it. Its training loss in bits per symbol IS the compression rate it reaches.
+# The vector-based family codes each pair of bytes (two angles) as their lowest tangent
+# intercept -- short-arc distance, direction, midpoint -- and learns how intercepts follow.
+# ---------------------------------------------------------------------------------------------
+
+
+def intercept_tokens(data):
+    tokens = []
+    for i in range(0, len(data) - 1, 2):
+        a, b = data[i], data[i + 1]
+        delta = (b - a) & 0xFF
+        if delta >= 128:
+            delta -= 256
+        mid2 = (2 * a + delta) & 0x1FF
+        tokens.append(abs(delta) * 2 + (1 if delta < 0 else 0))
+        tokens.append(258 + (mid2 >> 1))
+    if len(data) % 2:
+        tokens.append(514 + data[-1])
+    return tokens
+
+
+def build_model(cfg):
+    import torch
+    import torch.nn as nn
+
+    base = cfg.get('base') or ''
+    if base and not cfg.get('from_scratch'):
+        payload = torch.load(base, map_location='cpu')
+        return payload.get('model', payload) if isinstance(payload, dict) else payload
+
+    shape = cfg.get('initialisation', {})
+    vocab = 770 if 'Vector' in (cfg.get('family') or '') else 256
+    width = int(shape.get('hidden_size', 256))
+    context = int(shape.get('context_length', 1024))
+
+    class Compressor(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.context = context
+            self.embed = nn.Embedding(vocab, width)
+            self.position = nn.Embedding(context, width)
+            layer = nn.TransformerEncoderLayer(width, int(shape.get('heads', 4)), width * 4, batch_first=True)
+            self.blocks = nn.TransformerEncoder(layer, int(shape.get('layers', 4)))
+            self.head = nn.Linear(width, vocab)
+
+        def forward(self, ids):
+            length = ids.shape[1]
+            mask = torch.triu(torch.full((length, length), float('-inf'), device=ids.device), diagonal=1)
+            hidden = self.embed(ids) + self.position(torch.arange(length, device=ids.device))
+            return self.head(self.blocks(hidden, mask=mask))
+
+    model = Compressor()
+    initialise(model)
+    return model
+
+
+def load_dataset(cfg, data_dir):
+    import torch
+
+    # Every file is training data: text, parquet, images, video, audio, binaries. All are bytes.
+    vector = 'Vector' in (cfg.get('family') or '')
+    ids = []
+    files = 0
+    for root, _, names in os.walk(data_dir):
+        for name in names:
+            path = os.path.join(root, name)
+            if name in ('config.json',) or name.endswith('.py'):
+                continue
+            with open(path, 'rb') as handle:
+                data = handle.read(32 * 1024 * 1024)
+            ids.extend(intercept_tokens(data) if vector else list(data))
+            files += 1
+    if not ids:
+        raise SystemExit('the dataset folder holds no files to learn from')
+    tokens = torch.tensor(ids, dtype=torch.long)
+    context = int(cfg.get('initialisation', {}).get('context_length', 1024))
+    print('dataset    :', files, 'files,', tokens.numel(), 'symbols')
+    return {'tokens': tokens, 'block': max(8, min(context, tokens.numel() - 1))}
+
+
+def train(model, data, steps=200, lr=0.0003):
+    import math
+    import torch
+    import torch.nn.functional as F
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model.to(device)
+    model.train()
+    tokens = data['tokens'].to(device)
+    block = min(int(data['block']), int(getattr(model, 'context', data['block'])))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    for step in range(1, steps + 1):
+        start = int(torch.randint(0, max(1, tokens.numel() - block - 1), (1,)).item())
+        chunk = tokens[start:start + block + 1]
+        logits = model(chunk[:-1].unsqueeze(0))
+        loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), chunk[1:].reshape(-1))
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        if step == 1 or step % 10 == 0 or step == steps:
+            print('step %6d  %.4f bits per symbol' % (step, loss.item() / math.log(2)))
+""".trimIndent()
 
     private val PY_TEXT = """
 # ---------------------------------------------------------------------------------------------

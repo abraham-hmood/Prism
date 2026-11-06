@@ -112,8 +112,10 @@ fun VirtualizationPage() {
         return
     }
 
-    PageScaffold("Virtualization", "A whole guest operating system, inside Prism") {
+    PageScaffold("Virtualization", "Windows and Linux programs through NINE, and whole guest operating systems") {
         Column(Modifier.verticalScroll(rememberScrollState())) {
+
+            ProgramsSection()
 
             SectionHeader("this machine")
             Card {
@@ -322,4 +324,73 @@ private fun chooseImage(): File? {
     val directory = dialog.directory ?: return null
     val name = dialog.file ?: return null
     return File(directory, name)
+}
+
+
+/**
+ * Running a 64-bit Windows (.exe) or Linux program with NINE: pick it, watch its output, stop it.
+ * Nothing to install -- NINE carries its own Windows and Linux layers. See DesktopNine.
+ */
+@Composable
+private fun ProgramsSection() {
+    val colors = LocalPrismColors.current
+    val running = com.prism.desktop.DesktopNine.running.value
+    val lines = com.prism.desktop.DesktopNine.lines
+    val listState = androidx.compose.foundation.lazy.rememberLazyListState()
+    LaunchedEffect(lines.size) { if (lines.isNotEmpty()) listState.scrollToItem(lines.size - 1) }
+
+    SectionHeader("windows and linux programs")
+    Card {
+        Column(Modifier.padding(16.dp)) {
+            Text(com.prism.desktop.DesktopNine.describe(), fontSize = 12.sp, color = colors.faint, lineHeight = 17.sp)
+            Spacer(Modifier.height(10.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Button(
+                    enabled = running == null,
+                    onClick = { chooseProgram()?.let { com.prism.desktop.DesktopNine.run(it) } },
+                ) { Text("Choose a program…", fontSize = 13.sp) }
+                Spacer(Modifier.width(10.dp))
+                OutlinedButton(enabled = running != null, onClick = { com.prism.desktop.DesktopNine.stop() }) {
+                    Text("Stop", fontSize = 13.sp)
+                }
+                if (running != null) {
+                    Spacer(Modifier.width(12.dp))
+                    Text("Running " + running, fontSize = 12.sp, color = colors.accent)
+                }
+            }
+            if (lines.isNotEmpty()) {
+                Spacer(Modifier.height(10.dp))
+                androidx.compose.material3.Surface(
+                    color = Color(0xFF0A0A12),
+                    shape = androidx.compose.foundation.shape.RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth().height(260.dp),
+                ) {
+                    androidx.compose.foundation.lazy.LazyColumn(state = listState, modifier = Modifier.padding(10.dp)) {
+                        items(lines.size) { index ->
+                            val line = lines[index]
+                            Text(
+                                line,
+                                fontSize = 11.sp,
+                                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                                color = if (line.contains("stdout:") || line.contains("stderr:")) Color(0xFF00E5FF) else Color(0xFFB9B9C4),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+    SectionFooter(
+        "64-bit (x86-64) programs only: a Windows .exe, or a Linux program (which has no extension). " +
+            "NINE carries its own Windows and Linux layers, so there is nothing to install. Program output " +
+            "appears here as it is written."
+    )
+}
+
+/** The native file dialog. Any file: Linux programs have no extension, and NINE reads the header. */
+private fun chooseProgram(): File? {
+    val dialog = java.awt.FileDialog(null as java.awt.Frame?, "Run a Windows or Linux program", java.awt.FileDialog.LOAD)
+    dialog.isVisible = true
+    val name = dialog.file ?: return null
+    return File(dialog.directory, name)
 }

@@ -71,6 +71,7 @@ class VirtualAppActivity : Activity() {
         // Installed here as well as in the service: this window is its own entry point, and an app
         // launched through it must produce the same report when its process dies.
         VirtualAppDiagnostics.installCrashHandler(this)
+        GuestWebView.isolate()
 
         container = FrameLayout(this)
         setContentView(container)
@@ -78,6 +79,20 @@ class VirtualAppActivity : Activity() {
         val packageName = intent?.getStringExtra(EXTRA_PACKAGE)
         if (packageName.isNullOrBlank()) {
             failWith("No package was passed in")
+            return
+        }
+
+        // NO CRASH LOOP. When the guest kills this process, Android brings the activity back with
+        // the same intent, which used to start the same app into the same crash, forever, on
+        // "Opening app…". A crash recorded AFTER this launch was requested means this is that
+        // relaunch: show what happened instead of trying again. Launching it anew starts fresh.
+        val requestedAt = intent?.getLongExtra(EXTRA_REQUESTED_AT, 0L) ?: 0L
+        if (requestedAt > 0L && VirtualAppDiagnostics.crashedSince(this, packageName, requestedAt)) {
+            PrismLogger.logWarning(TAG, "$packageName crashed during this launch; not starting it again")
+            failWith(
+                "$packageName stopped while starting, so it was not started again.\n\n" +
+                    (VirtualAppDiagnostics.read(this, packageName) ?: "No report was recorded."),
+            )
             return
         }
 
@@ -93,6 +108,9 @@ class VirtualAppActivity : Activity() {
         // Before any of the app's code runs, because the first thing an app does is talk to the
         // system in its own name, and the system refuses claims that do not match the caller's uid.
         SystemServiceHook.install(packageName, getPackageName())
+        // And keep it alive through refusals the hook cannot prevent (Play services checks the
+        // caller itself); see GuestLooperGuard.
+        GuestLooperGuard.install()
 
         showPreparing(packageName)
         startVirtualized(packageName)
@@ -252,9 +270,13 @@ class VirtualAppActivity : Activity() {
         const val EXTRA_PACKAGE = "virtual_package"
         const val EXTRA_ACTIVITY = "virtual_activity"
 
+        /** When the launch was asked for; see the crash-loop check in onCreate. */
+        const val EXTRA_REQUESTED_AT = "virtual_requested_at"
+
         fun intentFor(context: Context, packageName: String, activityName: String? = null): Intent =
             Intent(context, VirtualAppActivity::class.java).apply {
                 putExtra(EXTRA_PACKAGE, packageName)
+                putExtra(EXTRA_REQUESTED_AT, System.currentTimeMillis())
                 if (activityName != null) putExtra(EXTRA_ACTIVITY, activityName)
             }
     }

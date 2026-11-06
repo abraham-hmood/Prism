@@ -73,6 +73,14 @@ import kotlinx.coroutines.launch
  */
 @Composable
 fun LauncherShell(onExit: () -> Unit) {
+    // Augmented reality for all of Prism: the home screen is the room, seen through the webcam.
+    // "2D" visits these flat pages until the AR button below brings the room back.
+    var arFlat by remember { mutableStateOf(false) }
+    val arOn = com.prism.launcher.PrismSettings.getArEverywhere()
+    if (arOn && !arFlat) {
+        ArHomePage(onFlat = { arFlat = true })
+        return
+    }
     val prefs = remember { SlotPreferences() }
     var slots by remember { mutableStateOf(prefs.getAssignments().toList()) }
     var switcherOpen by remember { mutableStateOf(false) }
@@ -214,6 +222,14 @@ fun LauncherShell(onExit: () -> Unit) {
             PageDots(pagerState.currentPage, slots.size) { goTo(it) }
         }
 
+        if (arOn) {
+            Text(
+                "AR", fontSize = 12.sp, color = colors.accent,
+                modifier = Modifier.align(Alignment.TopEnd).padding(top = 6.dp, end = 160.dp)
+                    .clickableRow { arFlat = false }.padding(horizontal = 10.dp, vertical = 4.dp),
+            )
+        }
+
         AnimatedVisibility(
             visible = switcherOpen,
             enter = slideInVertically { it },
@@ -301,7 +317,7 @@ fun LauncherShell(onExit: () -> Unit) {
  * clicks away. A port that contradicts itself is worse than one that is incomplete.
  */
 @Composable
-private fun SlotPage(slot: SlotAssignment, index: Int) {
+internal fun SlotPage(slot: SlotAssignment, index: Int) {
     when (slot) {
         is SlotAssignment.Default, is SlotAssignment.DesktopGrid -> DesktopGridPage(pageIndex = index)
         is SlotAssignment.KineticHalo -> KineticHaloPage()
@@ -340,6 +356,7 @@ private fun SlotPage(slot: SlotAssignment, index: Int) {
         is SlotAssignment.EmailClient -> EmailClientPage()
         is SlotAssignment.TimeMachine -> TimeMachinePage()
         is SlotAssignment.Journal -> JournalPage()
+        is SlotAssignment.Podcasts -> PodcastsPage()
         is SlotAssignment.AppStore -> AppStorePage()
         is SlotAssignment.Vpn -> UnsupportedSlot(
             "VPN",
@@ -575,7 +592,7 @@ private fun SlotEditorDialog(
     )
 }
 
-private fun slotLabel(slot: SlotAssignment): String = when (slot) {
+internal fun slotLabel(slot: SlotAssignment): String = when (slot) {
     is SlotAssignment.Default -> "Home"
     is SlotAssignment.Browser -> "Browser"
     is SlotAssignment.DesktopGrid -> "Desktop"
@@ -611,6 +628,7 @@ private fun slotLabel(slot: SlotAssignment): String = when (slot) {
     is SlotAssignment.EmailClient -> "Email"
     is SlotAssignment.TimeMachine -> "Time Machine"
     is SlotAssignment.Journal -> "Journal"
+    is SlotAssignment.Podcasts -> "Podcasts"
     is SlotAssignment.AppStore -> "App Store"
     is SlotAssignment.Helper -> "Helper"
     is SlotAssignment.Vpn -> "VPN"
@@ -633,6 +651,7 @@ private fun slotIcon(slot: SlotAssignment): ImageVector = when (slot) {
     is SlotAssignment.AgenticTools -> Icons.Filled.Build
     is SlotAssignment.TimeMachine -> Icons.Filled.History
     is SlotAssignment.Journal -> Icons.Filled.MenuBook
+    is SlotAssignment.Podcasts -> Icons.Filled.Podcasts
     is SlotAssignment.AppStore -> Icons.Filled.Storefront
     is SlotAssignment.Helper -> Icons.Filled.Favorite
     is SlotAssignment.Vpn -> Icons.Filled.Lock

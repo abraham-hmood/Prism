@@ -1,5 +1,6 @@
 package com.prism.launcher.virtualization
 
+import com.nine.dbt.GuestLog
 import android.content.ComponentName
 import android.content.Context
 import android.view.LayoutInflater
@@ -204,19 +205,22 @@ class VirtualizationPageView(context: Context) : FrameLayout(context) {
         vmController.pause()
     }
 
-    // -- Windows mode ---------------------------------------------------------
+    // -- Windows and Linux programs, through NINE ------------------------------
 
     /**
-     * The Windows session, created only in Windows mode.
+     * True when the page runs Windows and Linux programs rather than booting a guest OS.
      *
-     * Held here rather than in [VmController] because the two are alternatives, not layers: one
-     * boots a guest OS under QEMU, the other runs Wine under PRoot, and only one owns the surface at
-     * a time. Merging them into one controller would mean a state machine with two unrelated halves.
+     * The setting kept its old key (it was "Windows mode"); it now means NINE, which runs both
+     * kinds with its own Windows and Linux layers -- nothing is installed to make it work.
      */
-    private var wineSession: WineSession? = null
-
-    /** True when the page should be a Windows runtime rather than the guest-OS viewer. */
     private fun windowsMode(): Boolean = PrismSettings.getWindowsMode()
+
+    /** The console a running program writes into, built the first time one runs. */
+    private var programConsole: android.widget.LinearLayout? = null
+    private var programOutput: TextView? = null
+    private var programTitle: TextView? = null
+    private var programStop: android.widget.Button? = null
+    @Volatile private var programRunning = false
 
     // -- Embedded Android apps -------------------------------------------------
 
@@ -264,162 +268,131 @@ class VirtualizationPageView(context: Context) : FrameLayout(context) {
     }
 
     /**
-     * Runs [exe], installing the compatibility layer first if it is missing.
+     * Runs a Windows (.exe) or Linux (ELF) x86-64 program through NINE.
      *
-     * Called from the launcher when a .exe arrives through [ExeLaunchActivity], and from this page's
-     * own controls.
+     * Called from the launcher when a program arrives through [ExeLaunchActivity], and from this
+     * page. The program's own output and NINE's log stream into a console on the page; Stop asks
+     * NINE to end it.
      */
-    fun runWindowsExecutable(exe: java.io.File?) {
+    fun runProgram(program: java.io.File) {
         if (!windowsMode()) {
             android.widget.Toast.makeText(
                 context,
-                "Turn on “Switch to running Windows executables” in Settings first",
+                "Turn on “Run Windows and Linux programs” in Settings first",
                 android.widget.Toast.LENGTH_LONG,
             ).show()
             return
         }
-
-        WineContainer.unavailableReason(context)?.let { reason ->
-            if (!WineInstaller.isInstalled(context)) {
-                promptWindowsInstall(exe)
-            } else {
-                android.widget.Toast.makeText(context, reason, android.widget.Toast.LENGTH_LONG).show()
+        if (programRunning) {
+            android.widget.Toast.makeText(context, "A program is already running; stop it first", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        val kind = when (val found = com.prism.launcher.nine.NineProgram.identify(program)) {
+            is com.prism.launcher.nine.NineProgram.Identified.Refused -> {
+                showProgramConsole(program.name)
+                appendProgramLine(found.reason)
+                return
             }
+            is com.prism.launcher.nine.NineProgram.Identified.Runnable -> found.kind
+        }
+        if (!NineRuntime.available()) {
+            showProgramConsole(program.name)
+            appendProgramLine(NineRuntime.describe())
             return
         }
 
-        startWineSession(exe)
-    }
-
-    private fun startWineSession(exe: java.io.File?) {
-        // The QEMU guest and a Wine session cannot share the surface, so whichever was running
-        // stops before the other starts.
+        // The guest OS and a program cannot both own the page.
         vmController.pause()
-
-        val container = WineContainer.containers(context).firstOrNull()
-            ?: WineContainer.createContainer(context, "default")
-
-        val session = wineSession ?: WineSession(context).also { wineSession = it }
-        session.onStateChanged = { state, detail ->
-            post {
-                when (state) {
-                    WineSession.State.RUNNING -> {
-                        PrismLogger.logSuccess(TAG, "Windows session running: ${detail.orEmpty()}")
-                        val surface = vmSurface.holder.surface
-                        if (surface != null && surface.isValid) {
-                            vmController.attachVnc(session.vncPort, surface)
-                        }
-                    }
-                    WineSession.State.FAILED ->
-                        android.widget.Toast.makeText(
-                            context, detail ?: "The Windows session failed",
-                            android.widget.Toast.LENGTH_LONG
-                        ).show()
-                    else -> Unit
-                }
-            }
-        }
-        session.start(container, exe)
-    }
-
-    /** Offers to fetch the layer, and says what that involves before a few hundred megabytes. */
-    private fun promptWindowsInstall(pendingExe: java.io.File?) {
-        val override = PrismSettings.getWindowsLayerUrl()
-        val message = if (override.isNotBlank()) {
-            "Downloads and unpacks the archive set in Settings > OS Virtualization, instead of " +
-                "assembling the layer from upstream.\n\nIt has to contain:\n\n" +
-                WineInstaller.expectedLayout()
-        } else {
-            "Running .exe files needs Wine, box64 and a small Linux root filesystem. Prism " +
-                "assembles them from the Ubuntu, box64 and WineHQ projects -- roughly " +
-                "${WineInstaller.approximateDownloadMb()} MB, downloaded once.\n\n" +
-                "64-bit Windows programs only: box64 translates x86_64, and 32-bit x86 would " +
-                "need a different translator."
-        }
-
-        com.prism.launcher.theme.PrismDialogs.Builder(context)
-            .setTitle("Install the Windows layer?")
-            .setMessage(message)
-            .setPositiveButton("Install") { _, _ -> installWindowsLayer(pendingExe) }
-            .setNegativeButton("Cancel", null)
-            .show()
-    }
-
-    /**
-     * Runs the install with progress on screen.
-     *
-     * A dialog rather than the toast this used to show, because the work behind it is a few hundred
-     * megabytes over several stages and can take many minutes -- long enough that without a visible
-     * percentage the only signal that anything is happening is that Prism has not crashed.
-     */
-    private fun installWindowsLayer(pendingExe: java.io.File?) {
-        WineInstaller.sourceUrl = PrismSettings.getWindowsLayerUrl()
-
-        val status = android.widget.TextView(context).apply {
-            textSize = 14f
-            setTextColor(com.prism.launcher.nora.IosUi.secondaryLabel(context))
-            text = "Starting…"
-        }
-        val bar = android.widget.ProgressBar(
-            context, null, android.R.attr.progressBarStyleHorizontal,
-        ).apply {
-            max = 100
-            progressDrawable = com.prism.launcher.nora.IosUi.progressDrawable(context)
-        }
-        val body = android.widget.LinearLayout(context).apply {
-            orientation = android.widget.LinearLayout.VERTICAL
-            val side = com.prism.launcher.nora.IosUi.dp(context, 20f)
-            setPadding(side, com.prism.launcher.nora.IosUi.dp(context, 4f), side, side)
-            addView(status)
-            addView(
-                bar,
-                android.widget.LinearLayout.LayoutParams(
-                    android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
-                    android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
-                ).apply { topMargin = com.prism.launcher.nora.IosUi.dp(context, 12f) },
-            )
-        }
-
-        val dialog = com.prism.launcher.theme.PrismDialogs.Builder(context)
-            .setTitle("Installing the Windows layer")
-            .setView(body)
-            .setCancelable(false)
-            .create()
-        dialog.show()
+        showProgramConsole(program.name)
+        appendProgramLine("Running ${program.name} (${kind.title}) with NINE…")
+        programRunning = true
+        programStop?.isEnabled = true
+        GuestLog.setListener { line -> post { appendProgramLine(line) } }
 
         Thread({
-            // The installer reports every megabyte and every line apt prints, which is far more
-            // often than a screen can usefully change -- so the UI is only touched when the
-            // percentage moves or a quarter of a second has passed.
-            var lastPercent = -1
-            var lastPost = 0L
-            val error = WineInstaller.install(context) { percent, message ->
-                val now = android.os.SystemClock.uptimeMillis()
-                if (percent != lastPercent || now - lastPost > 250L) {
-                    lastPercent = percent
-                    lastPost = now
-                    post {
-                        bar.progress = percent
-                        status.text = message
-                    }
-                }
-            }
+            val result = NineRuntime.run(program, java.io.File(context.cacheDir, "nine"))
             post {
-                runCatching { dialog.dismiss() }
-                if (error == null) {
-                    android.widget.Toast.makeText(
-                        context, "Windows layer installed", android.widget.Toast.LENGTH_SHORT
-                    ).show()
-                    startWineSession(pendingExe)
-                } else {
-                    com.prism.launcher.theme.PrismDialogs.Builder(context)
-                        .setTitle("The install did not finish")
-                        .setMessage(error)
-                        .setPositiveButton("OK", null)
-                        .show()
-                }
+                programRunning = false
+                programStop?.isEnabled = false
+                GuestLog.setListener(null)
+                appendProgramLine(
+                    result.fold(
+                        { status -> "Finished. NINE reported: " + status.take(600) },
+                        { error -> "NINE could not run it: " + (error.message ?: error.javaClass.simpleName) },
+                    ),
+                )
+                PrismLogger.logInfo(TAG, "${program.name} finished: ${result.getOrNull()?.take(200) ?: result.exceptionOrNull()?.message}")
             }
-        }, "wine-install").apply { isDaemon = true; start() }
+        }, "nine-run").apply { isDaemon = true; start() }
+    }
+
+    /** Kept for the launcher's older entry point; a program is a program. */
+    fun runWindowsExecutable(exe: java.io.File?) {
+        if (exe != null) runProgram(exe)
+    }
+
+    private fun showProgramConsole(title: String) {
+        bootOverlay.visibility = View.GONE
+        val console = programConsole ?: buildProgramConsole().also { programConsole = it }
+        console.visibility = View.VISIBLE
+        programTitle?.text = title
+        programOutput?.text = ""
+    }
+
+    private fun buildProgramConsole(): android.widget.LinearLayout {
+        val pad = com.prism.launcher.nora.IosUi.dp(context, 12f)
+        val console = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setBackgroundColor(0xF00A0A12.toInt())
+            setPadding(pad, pad, pad, pad)
+            isClickable = true
+        }
+        val header = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+        }
+        programTitle = TextView(context).apply {
+            setTextColor(0xFF00E5FF.toInt())
+            textSize = 15f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+        }
+        header.addView(programTitle, android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        programStop = android.widget.Button(context).apply {
+            text = "Stop"
+            isEnabled = false
+            setOnClickListener {
+                NineRuntime.stop()
+                appendProgramLine("Stopping…")
+            }
+        }
+        header.addView(programStop)
+        header.addView(android.widget.Button(context).apply {
+            text = "Close"
+            setOnClickListener {
+                if (programRunning) NineRuntime.stop()
+                console.visibility = View.GONE
+            }
+        })
+        console.addView(header)
+        programOutput = TextView(context).apply {
+            setTextColor(0xFFE6E6EE.toInt())
+            textSize = 12f
+            typeface = android.graphics.Typeface.MONOSPACE
+            setTextIsSelectable(true)
+        }
+        val scroller = android.widget.ScrollView(context).apply { addView(programOutput) }
+        console.addView(scroller, android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        addView(console, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+        return console
+    }
+
+    /** Appends a line, keeping the console to its last few thousand lines. */
+    private fun appendProgramLine(line: String) {
+        val view = programOutput ?: return
+        view.append(line.removeSuffix("\n") + "\n")
+        val text = view.text
+        if (text.length > 200_000) view.text = text.subSequence(text.length - 150_000, text.length)
+        (view.parent as? android.widget.ScrollView)?.post { (view.parent as android.widget.ScrollView).fullScroll(View.FOCUS_DOWN) }
     }
 
     /**
@@ -441,8 +414,8 @@ class VirtualizationPageView(context: Context) : FrameLayout(context) {
     }
 
     private fun bootFromSettings() {
-        // WINDOWS MODE BOOTS NOTHING. The two halves of this page are exclusive -- one runs a guest
-        // OS under QEMU, the other runs Wine under PRoot, and only one of them can own the surface
+        // PROGRAM MODE BOOTS NOTHING. The two halves of this page are exclusive -- one runs a guest
+        // OS under QEMU, the other runs Windows and Linux programs through NINE, and only one owns the surface
         // (the class comment says so). This check was missing, so turning "switch to running Windows
         // executables" on changed which UI appeared while the surface callback went on booting
         // PrismOS underneath it: the setting looked ignored because, for the part that matters, it

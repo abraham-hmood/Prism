@@ -1282,6 +1282,24 @@ object PrismSettings {
         prefs().edit().putBoolean(KEY_WINDOWED_PAGES, value).apply()
 
     /**
+     * Augmented reality for all of Prism: the home screen becomes the room, with each page on a
+     * wall, the floor or the ceiling where the user put it (see `ArHome`). One setting for both
+     * builds, like [getWindowedPages]: the phone sees the room through ARCore, a computer through
+     * its webcam.
+     */
+    fun getArEverywhere(): Boolean = prefs().getBoolean("ar_everywhere", false)
+
+    fun setArEverywhere(value: Boolean) = prefs().edit().putBoolean("ar_everywhere", value).apply()
+
+    /**
+     * Interact with a placed page where it is, rather than tapping it up into a movable popup first.
+     * Only meaningful while [getArEverywhere] is on.
+     */
+    fun getArInteractLive(): Boolean = prefs().getBoolean("ar_interact_live", false)
+
+    fun setArInteractLive(value: Boolean) = prefs().edit().putBoolean("ar_interact_live", value).apply()
+
+    /**
      * Echo Chamber's own assets.
      *
      * The game ships with 1024 × 1024 textures and generated 3D meshes, which is enough to play.
@@ -3124,6 +3142,13 @@ object PrismSettings {
     fun getMeshCallTone(): String = prefs().getString("call_tone_mesh", "") ?: ""
     fun setMeshCallTone(value: String) = prefs().edit().putString("call_tone_mesh", value).apply()
 
+    /**
+     * Whether recording a phone call may switch the call to the speaker. Without root an app hears
+     * the microphone, not the line, so the speaker is how the other person ends up in the file.
+     */
+    fun getCallRecordSpeaker(): Boolean = prefs().getBoolean("call_record_speaker", true)
+    fun setCallRecordSpeaker(value: Boolean) = prefs().edit().putBoolean("call_record_speaker", value).apply()
+
     /** The call tone an outgoing call of this kind uses, after the split setting is applied. */
     fun callToneFor(mesh: Boolean): String =
         if (mesh && getSeparateMeshRingtone()) getMeshCallTone() else getCallTone()
@@ -3408,6 +3433,26 @@ object PrismSettings {
         prefs().edit().putFloat(KEY_KOKORO_SPEED, value.coerceIn(0.5f, 2.0f)).apply()
 
     /**
+     * Steer Kokoro's style vector towards the emotion a line is marked with, by particle swarm
+     * optimisation. Takes precedence over [getKokoroEmotionGradient]: the settings page disables that
+     * box while this one is ticked. See `EmotionSteering`.
+     */
+    fun getKokoroEmotionPso(): Boolean = prefs().getBoolean("kokoro_emotion_pso", false)
+    fun setKokoroEmotionPso(value: Boolean) = prefs().edit().putBoolean("kokoro_emotion_pso", value).apply()
+
+    /** Steer towards a line's emotion by gradient descent, run during inference on the line itself. */
+    fun getKokoroEmotionGradient(): Boolean = prefs().getBoolean("kokoro_emotion_gd", false)
+    fun setKokoroEmotionGradient(value: Boolean) = prefs().edit().putBoolean("kokoro_emotion_gd", value).apply()
+
+    /** Kokoro adds quiet breathing sounds in its pauses. See `Breath`. */
+    fun getKokoroBreathing(): Boolean = prefs().getBoolean("kokoro_breathing", false)
+    fun setKokoroBreathing(value: Boolean) = prefs().edit().putBoolean("kokoro_breathing", value).apply()
+
+    /** The emotion the Kokoro settings page's "Test emotion" button speaks. */
+    fun getKokoroTestEmotion(): String = prefs().getString("kokoro_test_emotion", "joy") ?: "joy"
+    fun setKokoroTestEmotion(value: String) = prefs().edit().putString("kokoro_test_emotion", value).apply()
+
+    /**
      * Which published quantisation of Kokoro to fetch.
      *
      * Named rather than numbered because the sizes are what the choice is actually about: the
@@ -3603,6 +3648,34 @@ object PrismSettings {
 
     fun setActiveAgenticSyntaxId(id: String?) =
         prefs().edit().putString(KEY_ACTIVE_AGENTIC_SYNTAX_ID, id).apply()
+
+    /**
+     * Models whose endpoint refused a native `tools` field, keyed by [agenticModelKey].
+     *
+     * Learned rather than configured: the first agentic turn against a model that was never built
+     * for tool calling comes back as a 400 ("does not support tools"), the engine retries that turn
+     * with the tools described in the prompt instead, and remembers the model here so later turns go
+     * straight to the prompt route instead of paying for the refusal every time.
+     */
+    fun isNativeToolsUnsupported(key: String): Boolean =
+        key in nativeToolsUnsupported()
+
+    fun markNativeToolsUnsupported(key: String) {
+        val next = nativeToolsUnsupported() + key
+        prefs().edit().putString(KEY_NO_NATIVE_TOOLS, next.joinToString("\n")).apply()
+    }
+
+    /** Forgets every learned refusal, e.g. after a provider adds tool support to a model. */
+    fun clearNativeToolsUnsupported() =
+        prefs().edit().putString(KEY_NO_NATIVE_TOOLS, "").apply()
+
+    private fun nativeToolsUnsupported(): Set<String> =
+        prefs().getString(KEY_NO_NATIVE_TOOLS, "").orEmpty()
+            .split('\n').filter { it.isNotBlank() }.toSet()
+
+    /** The key a model is remembered under in [isNativeToolsUnsupported]. */
+    fun agenticModelKey(endpoint: String, model: String): String =
+        endpoint.trim().trimEnd('/').lowercase() + "|" + model.trim()
 
     // ── Nebula Social background generation ──────────────────────────────────
 
@@ -3908,6 +3981,7 @@ object PrismSettings {
     private const val KEY_AGENTIC_ENABLED       = "agentic_tools_enabled"
     private const val KEY_CONTEXT_OFFLOAD_ENABLED = "context_offload_enabled"
     private const val KEY_ACTIVE_AGENTIC_SYNTAX_ID = "active_agentic_syntax_id"
+    private const val KEY_NO_NATIVE_TOOLS = "agentic_no_native_tools"
     
     private const val KEY_DNS_PROXY_ENABLED  = "dns_proxy_enabled"
     private const val KEY_DNS_PROXY_MODE     = "dns_proxy_mode"

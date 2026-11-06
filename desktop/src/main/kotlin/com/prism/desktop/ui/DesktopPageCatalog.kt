@@ -70,6 +70,7 @@ object DesktopPageCatalog {
         DesktopPageEntry(SlotAssignment.EmailClient, "Email", Icons.Filled.Mail, PageId.EMAIL_CLIENT),
         DesktopPageEntry(SlotAssignment.TimeMachine, "Time Machine", Icons.Filled.History, PageId.TIME_MACHINE),
         DesktopPageEntry(SlotAssignment.Journal, "Journal", Icons.Filled.MenuBook, PageId.JOURNAL),
+        DesktopPageEntry(SlotAssignment.Podcasts, "Podcasts", Icons.Filled.Podcasts, PageId.PODCASTS),
         DesktopPageEntry(SlotAssignment.AppStore, "App Store", Icons.Filled.Storefront, PageId.APP_STORE),
         DesktopPageEntry(SlotAssignment.TaskManager, "Task Manager", Icons.Filled.Build, PageId.TASK_MANAGER),
     )

@@ -432,6 +432,7 @@ private fun PageContent(
         PageId.EMAIL_CLIENT -> EmailClientPage()
         PageId.TIME_MACHINE -> TimeMachinePage()
         PageId.JOURNAL -> JournalPage()
+        PageId.PODCASTS -> PodcastsPage()
         PageId.APP_STORE -> AppStorePage()
         PageId.TASK_MANAGER -> TaskManagerPage()
         PageId.NORA_TOOLS -> NoraExtrasPage()
@@ -508,6 +509,7 @@ private fun railSlot(page: PageId): SlotAssignment = when (page) {
     PageId.EMAIL_CLIENT -> SlotAssignment.EmailClient
     PageId.TIME_MACHINE -> SlotAssignment.TimeMachine
     PageId.JOURNAL -> SlotAssignment.Journal
+    PageId.PODCASTS -> SlotAssignment.Podcasts
     PageId.APP_STORE -> SlotAssignment.AppStore
     PageId.TASK_MANAGER -> SlotAssignment.TaskManager
     PageId.MODELCRAFT -> SlotAssignment.ModelCraft
@@ -557,6 +559,7 @@ enum class PageId(
     EMAIL_CLIENT("Email", Icons.Filled.Mail),
     TIME_MACHINE("Time Machine", Icons.Filled.History),
     JOURNAL("Journal", Icons.Filled.MenuBook),
+    PODCASTS("Podcasts", Icons.Filled.Podcasts),
     APP_STORE("App Store", Icons.Filled.Storefront),
     TASK_MANAGER("Task Manager", Icons.Filled.Build),
     NEBULA("Nebula", Icons.Filled.Groups),

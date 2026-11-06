@@ -137,7 +137,7 @@ object PrismSpeaker {
         }
 
         target.speak(
-            text = text,
+            text = forEngine(text, target),
             voiceId = voiceFor(speaker),
             speed = PrismSettings.getKokoroSpeed(),
             onDone = onDone,
@@ -180,9 +180,17 @@ object PrismSpeaker {
             return
         }
         target.speak(
-            text = text, voiceId = voiceId, speed = speed, localeTag = localeTag, onDone = onDone,
+            text = forEngine(text, target), voiceId = voiceId, speed = speed, localeTag = localeTag, onDone = onDone,
         )
     }
+
+    /**
+     * [text] as [engine] should receive it. Only Kokoro acts on emotion indicators like `[angry]`
+     * (see [EmotionSteering]); every other engine -- the system voice, a mesh peer, an imported model
+     * -- would read the brackets aloud, so they are removed for it.
+     */
+    private fun forEngine(text: String, engine: TtsEngine): String =
+        if (engine is KokoroEngine) text else EmotionSteering.strip(text)
 
     /** Speaks a sample so a voice can be judged by ear, which is the only way to judge a voice. */
     fun preview(voiceId: String, onDone: (error: String?) -> Unit = {}) {

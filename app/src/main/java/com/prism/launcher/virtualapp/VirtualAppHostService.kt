@@ -78,6 +78,7 @@ class VirtualAppHostService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        GuestWebView.isolate()
         // Before any app is loaded, because the exception this exists to record can be thrown by
         // the first instruction of the guest's own code.
         VirtualAppDiagnostics.installCrashHandler(this)
@@ -141,6 +142,13 @@ class VirtualAppHostService : Service() {
             reply(replyTo, WHAT_HOST, failure("Embedding needs Android 11 or newer"))
             return
         }
+        // No host token, no embedding, on Android 14+: the window manager would demand
+        // INTERNAL_SYSTEM_WINDOW (a system-only permission) to give the window input, and the whole
+        // launch would die inside setView. The embedder waits for the token; this is the backstop.
+        if (hostToken == null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            reply(replyTo, WHAT_HOST, failure("The page's surface was not ready yet. Open the app again."))
+            return
+        }
 
         // Already showing it: hand back the surface it is already rendering into, rather than
         // tearing the app down and reloading it. The page view is recycled whenever the user swipes
@@ -160,6 +168,9 @@ class VirtualAppHostService : Service() {
             return
         }
         SystemServiceHook.install(packageName, getPackageName())
+        // And keep it alive through refusals the hook cannot prevent (Play services checks the
+        // caller itself); see GuestLooperGuard.
+        GuestLooperGuard.install()
         VirtualAppDiagnostics.clear(this, packageName)
         VirtualAppDiagnostics.stage(this, packageName, "loading its APKs")
 

@@ -32,6 +32,7 @@ class VirtualAppCheckService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        GuestWebView.isolate()
         val packageName = intent?.getStringExtra(EXTRA_PACKAGE)
         if (packageName.isNullOrBlank()) {
             stopSelf(startId)

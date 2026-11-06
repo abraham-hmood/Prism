@@ -59,6 +59,12 @@ object CharacterStore {
         val backend: Backend,
         val modelPath: String? = null,
         val imagePath: String? = null,
+        /**
+         * The voice they speak in -- a Kokoro voice id or a cloned voice id -- or blank for the
+         * default. Read by anything that says a character's lines aloud: a podcast episode they
+         * appear in, and their replies in Messages.
+         */
+        val voice: String = "",
     ) {
         val hasModel: Boolean get() = !modelPath.isNullOrBlank()
         val hasImage: Boolean get() = !imagePath.isNullOrBlank()
@@ -85,6 +91,7 @@ object CharacterStore {
                     backend = Backend.of(o.optString("backend")),
                     modelPath = o.optString("model").takeIf { it.isNotBlank() },
                     imagePath = o.optString("image").takeIf { it.isNotBlank() },
+                    voice = o.optString("voice"),
                 )
             }
         }.getOrElse {
@@ -122,6 +129,7 @@ object CharacterStore {
                 put("backend", c.backend.name)
                 put("model", c.modelPath.orEmpty())
                 put("image", c.imagePath.orEmpty())
+                put("voice", c.voice)
             })
         }
         prefs().edit().putString(KEY, array.toString()).apply()

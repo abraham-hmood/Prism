@@ -39,6 +39,7 @@ import com.prism.launcher.storage.BridgedStorageStore
 import com.prism.launcher.storage.HostedStorage
 import com.prism.launcher.storage.HostedStorageStore
 import com.prism.launcher.trusted.TrustedStorageBridge
+import com.prism.launcher.storage.formatBytes
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -50,6 +51,8 @@ sealed class ExplorerPath {
     data object Root : ExplorerPath()
     data class Local(val dir: File) : ExplorerPath()
     data class Network(val storage: PrismSettings.NetworkStorage) : ExplorerPath()
+    /** Inside a partition of a USB drive Prism reads itself; [path] is '/'-separated. */
+    data class Drive(val partKey: String, val path: String) : ExplorerPath()
 }
 
 sealed class FileEntry {
@@ -73,6 +76,15 @@ sealed class FileEntry {
      */
     data class VolumeLink(val volume: RemovableVolume) : FileEntry()
 
+    /** A USB drive Prism has not opened yet; tapping it asks for access. See UsbDrives. */
+    data class UsbRaw(val device: android.hardware.usb.UsbDevice) : FileEntry()
+
+    /** One partition of a USB drive Prism reads itself (NTFS, ext4, exFAT, FAT...). */
+    data class UsbPart(val part: UsbDrives.Part) : FileEntry()
+
+    /** A file or folder inside such a partition. */
+    data class DriveItem(val partKey: String, val entry: com.prism.launcher.storage.drive.DriveEntry) : FileEntry()
+
     val name: String get() = when(this) {
         is Local -> file.name
         is Network -> storage.name
@@ -82,6 +94,9 @@ sealed class FileEntry {
         is InternalStorageLink -> "Internal Storage"
         is AppStorageLink -> "App Storage"
         is VolumeLink -> volume.displayName
+        is UsbRaw -> device.productName?.takeIf { it.isNotBlank() } ?: "USB drive"
+        is UsbPart -> part.title
+        is DriveItem -> entry.name
     }
 }
 
@@ -97,14 +112,74 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
      */
     private val viewScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
+    /**
+     * Listening starts on EVERY attach, not once in init.
+     *
+     * The home pager detaches this page whenever it is swiped off screen and re-attaches the same
+     * instance later. Registering in init and unregistering on detach meant the first swipe away
+     * silenced the page for good: a trusted computer's drives arrived (the log said "DevPC shares 2
+     * drive(s)") and the root list, built before they did, was never redrawn. Re-attaching also
+     * redraws the root, so whatever arrived while it was away shows at once.
+     */
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        startWatching()
+        if (wasDetached && currentPath == ExplorerPath.Root) navigateTo(ExplorerPath.Root)
+    }
+
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
+        wasDetached = true
         viewScope.coroutineContext.cancelChildren()
         if (volumeReceiverRegistered) {
             runCatching { context.unregisterReceiver(volumeReceiver) }
             volumeReceiverRegistered = false
         }
         TrustedStorageBridge.removeListener(storageListener)
+        com.prism.launcher.storage.remote.TrustedDrives.removeListener(drivesListener)
+    }
+
+    private var wasDetached = false
+
+    private fun startWatching() {
+        TrustedStorageBridge.removeListener(storageListener)
+        TrustedStorageBridge.addListener(storageListener)
+        com.prism.launcher.storage.remote.TrustedDrives.removeListener(drivesListener)
+        com.prism.launcher.storage.remote.TrustedDrives.addListener(drivesListener)
+        if (volumeReceiverRegistered) return
+        val mediaFilter = android.content.IntentFilter().apply {
+            addAction(Intent.ACTION_MEDIA_MOUNTED)
+            addAction(Intent.ACTION_MEDIA_UNMOUNTED)
+            addAction(Intent.ACTION_MEDIA_EJECT)
+            addAction(Intent.ACTION_MEDIA_REMOVED)
+            addAction(Intent.ACTION_MEDIA_BAD_REMOVAL)
+            addDataScheme("file")
+        }
+        volumeReceiverRegistered = runCatching {
+            androidx.core.content.ContextCompat.registerReceiver(
+                context, volumeReceiver, mediaFilter,
+                androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED,
+            )
+            // USB drives Prism reads itself come and go without any media broadcast. These are
+            // the system's own, hence EXPORTED.
+            androidx.core.content.ContextCompat.registerReceiver(
+                context, volumeReceiver,
+                android.content.IntentFilter().apply { UsbDrives.attachActions.forEach(::addAction) },
+                androidx.core.content.ContextCompat.RECEIVER_EXPORTED,
+            )
+            true
+        }.getOrElse {
+            com.prism.launcher.PrismLogger.logWarning(
+                "Storage",
+                "Could not watch for volume changes: ${it.message}",
+            )
+            false
+        }
+    }
+
+    /** A trusted device announced its drives: rebuild the root list if it is showing. */
+    private val drivesListener: () -> Unit = {
+        post { if (currentPath == ExplorerPath.Root) navigateTo(ExplorerPath.Root) }
     }
 
     /**
@@ -168,7 +243,6 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
         )
         addConnectionButton.setOnClickListener { showNetworkConnectDialog() }
         TrustedStorageBridge.install()
-        TrustedStorageBridge.addListener(storageListener)
 
         adapter = FileExplorerAdapter(
             onEntryClick = { entry ->
@@ -177,6 +251,9 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
                         if (entry.file.isDirectory) navigateTo(ExplorerPath.Local(entry.file))
                         else openFile(entry.file)
                     }
+                    is FileEntry.UsbRaw -> openUsbDrive(entry.device)
+                    is FileEntry.UsbPart -> openUsbPart(entry.part)
+                    is FileEntry.DriveItem -> openDriveItem(entry)
                     // A saved connection opens its details rather than a listing: what it holds
                     // is real, and a folder of files that were never fetched is not.
                     is FileEntry.Network -> showNetworkDetails(entry.storage)
@@ -231,28 +308,7 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
         })
 
         (context as? com.prism.launcher.LauncherActivity)?.attachFileExplorerPage(this)
-
-        val mediaFilter = android.content.IntentFilter().apply {
-            addAction(Intent.ACTION_MEDIA_MOUNTED)
-            addAction(Intent.ACTION_MEDIA_UNMOUNTED)
-            addAction(Intent.ACTION_MEDIA_EJECT)
-            addAction(Intent.ACTION_MEDIA_REMOVED)
-            addAction(Intent.ACTION_MEDIA_BAD_REMOVAL)
-            addDataScheme("file")
-        }
-        volumeReceiverRegistered = runCatching {
-            androidx.core.content.ContextCompat.registerReceiver(
-                context, volumeReceiver, mediaFilter,
-                androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED,
-            )
-            true
-        }.getOrElse {
-            com.prism.launcher.PrismLogger.logWarning(
-                "Storage",
-                "Could not watch for volume changes: ${it.message}",
-            )
-            false
-        }
+        // Listeners and receivers are registered in onAttachedToWindow; see there.
 
         // 4-column balanced grid
         recycler.layoutManager = androidx.recyclerview.widget.GridLayoutManager(context, 4)
@@ -505,6 +561,11 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
                 navigateTo(ExplorerPath.Root)
                 true
             }
+            is ExplorerPath.Drive -> {
+                if (path.path == "/") navigateTo(ExplorerPath.Root)
+                else navigateTo(ExplorerPath.Drive(path.partKey, path.path.substringBeforeLast('/').ifEmpty { "/" }))
+                true
+            }
         }
     }
 
@@ -519,6 +580,18 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
                 // SD cards and USB-OTG drives sit on the same shelf as internal storage.
                 volumes = StorageVolumes.list(context)
                 roots.addAll(volumes.map { FileEntry.VolumeLink(it) })
+                // USB drives Prism reads itself: every partition of an opened drive, or one row per
+                // drive that has not been opened yet.
+                UsbDrives.prune(context)
+                UsbDrives.attached(context).forEach { device ->
+                    val drive = UsbDrives.opened(device.deviceName)
+                    if (drive == null) roots.add(FileEntry.UsbRaw(device))
+                    else drive.partitions.forEach { roots.add(FileEntry.UsbPart(it)) }
+                }
+                // Every drive of every trusted device -- a computer's disks, another phone's internal
+                // storage, SD card and USB drives -- browsed with the same code as a USB partition.
+                PhoneDrives.remoteParts().forEach { roots.add(FileEntry.UsbPart(it)) }
+                Thread({ runCatching { com.prism.launcher.storage.remote.TrustedDrives.query() } }, "prism-drives-query").start()
                 com.prism.launcher.PrismSettings.getNetworkStorages().forEach {
                     roots.add(FileEntry.Network(it))
                 }
@@ -560,6 +633,33 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
                     }
                 }
             }
+            is ExplorerPath.Drive -> {
+                addConnectionButton.visibility = View.GONE
+                val part = UsbDrives.part(path.partKey)
+                val fs = part?.fileSystem
+                if (fs == null) {
+                    navigateTo(ExplorerPath.Root)
+                    return
+                }
+                pathText.text = part.title + path.path.takeIf { it != "/" }.orEmpty()
+                viewScope.launch {
+                    val listed = withContext(Dispatchers.IO) {
+                        runCatching {
+                            fs.list(path.path)
+                                .sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
+                                .map { FileEntry.DriveItem(path.partKey, it) }
+                        }
+                    }
+                    if (currentPath != path) return@launch
+                    listed.onSuccess {
+                        allEntries = it
+                        filterEntries(searchBar.text.toString())
+                    }.onFailure {
+                        PrismLogger.logWarning("Storage", "Could not list ${path.path} on ${part.title}: ${it.message}")
+                        Toast.makeText(context, "Could not read this folder: ${it.message}", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
             is ExplorerPath.Network -> {
                 // Connections are opened as a details sheet now. This branch only exists so the
                 // path stays exhaustive (and for a back-stack entry made before that change); it
@@ -585,12 +685,56 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
             context = context,
             volume = volume,
             onOpen = { volume.root?.let { navigateTo(ExplorerPath.Local(it)) } },
+            onCompress = {
+                DriveCompressionSheet.show(context, DriveCompressionSheet.Target.Local(PhoneDrives.volumeKey(volume), volume.displayName))
+            },
+            onDecompress = DriveCompressionSheet.Target.Local(PhoneDrives.volumeKey(volume), volume.displayName)
+                .takeIf { PhoneDrives.isCompressed(it, volume.root) }
+                ?.let { target -> { DriveCompressionSheet.decompress(context, target) } },
             onChanged = { navigateTo(ExplorerPath.Root) },
             onDismiss = onDismiss,
         )
     }
 
+    /**
+     * A file compressed in Prism's format opens through a decompressed copy: the app it is handed to
+     * reads the file itself, and only Prism can read the compressed form.
+     */
     private fun openFile(file: File) {
+        if (com.prism.launcher.storage.compress.CompressedFile.isCompressed(file)) {
+            Toast.makeText(context, "Decompressing ${file.name}…", Toast.LENGTH_SHORT).show()
+            viewScope.launch {
+                val copy = withContext(Dispatchers.IO) {
+                    runCatching {
+                        val folder = File(context.cacheDir, "usb-drive").apply { mkdirs() }
+                        File(folder, file.name).also { target ->
+                            com.prism.launcher.storage.compress.CompressedFile.open(file).use { input ->
+                                target.outputStream().use { input.copyTo(it, 256 * 1024) }
+                            }
+                        }
+                    }.getOrNull()
+                }
+                val uri = copy?.let {
+                    runCatching { androidx.core.content.FileProvider.getUriForFile(context, context.packageName + ".fileprovider", it) }.getOrNull()
+                }
+                if (uri == null) {
+                    Toast.makeText(context, "Could not open ${file.name}", Toast.LENGTH_SHORT).show()
+                    return@launch
+                }
+                val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(file.extension.lowercase()) ?: "*/*"
+                runCatching {
+                    context.startActivity(
+                        Intent(Intent.ACTION_VIEW).setDataAndType(uri, mime)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION),
+                    )
+                }.onFailure { Toast.makeText(context, "No app found to open this file", Toast.LENGTH_SHORT).show() }
+            }
+            return
+        }
+        openPlainFile(file)
+    }
+
+    private fun openPlainFile(file: File) {
         // Name and path both go in the searchable text: people look for a file by either, and the
         // path is often the only thing they remember ("it was in that downloads folder").
         com.prism.launcher.history.PrismHistory.record(
@@ -624,6 +768,10 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
     }
 
     private fun showOptions(entry: FileEntry, onDismiss: () -> Unit = {}) {
+        if (entry is FileEntry.DriveItem || entry is FileEntry.UsbPart || entry is FileEntry.UsbRaw) {
+            showUsbOptions(entry, onDismiss)
+            return
+        }
         // A removable volume has its own menu: Format, Burn and Unmount are the actions that matter
         // for a card, and they are meaningless for an ordinary folder.
         if (entry is FileEntry.VolumeLink) {
@@ -641,6 +789,11 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
         if (entry is FileEntry.Hosted) options.add("Stop hosting")
         if (entry is FileEntry.TrustedRemote) options.add("Request bridge")
         if (entry is FileEntry.Bridged) options.add("Remove bridge")
+        val internalTarget = DriveCompressionSheet.Target.Local(PhoneDrives.KEY_INTERNAL, "Internal storage")
+        if (entry is FileEntry.InternalStorageLink) {
+            options.add(COMPRESS)
+            if (PhoneDrives.isCompressed(internalTarget, Environment.getExternalStorageDirectory())) options.add(DECOMPRESS)
+        }
 
         val dialog = PrismDialogFactory.show(
             context,
@@ -680,7 +833,14 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
                                 is FileEntry.InternalStorageLink -> navigateTo(ExplorerPath.Local(Environment.getExternalStorageDirectory()))
                                 is FileEntry.AppStorageLink -> navigateTo(ExplorerPath.Local(context.filesDir))
                                 is FileEntry.VolumeLink -> entry.volume.root?.let { navigateTo(ExplorerPath.Local(it)) }
+                                is FileEntry.UsbRaw, is FileEntry.UsbPart, is FileEntry.DriveItem -> Unit
                             }
+                        }
+                        COMPRESS -> if (entry is FileEntry.InternalStorageLink) {
+                            DriveCompressionSheet.show(context, internalTarget)
+                        }
+                        DECOMPRESS -> if (entry is FileEntry.InternalStorageLink) {
+                            DriveCompressionSheet.decompress(context, internalTarget)
                         }
                         "Move to Trash" -> if (entry is FileEntry.Local) moveToTrash(entry.file)
                         "Add to Desktop" -> addToDesktop(entry)
@@ -764,6 +924,8 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
             // A hosted or bridged row has an owner rather than a stable local address; putting it
             // on a desktop page without that address would create a shortcut to nothing.
             is FileEntry.Hosted, is FileEntry.TrustedRemote, is FileEntry.Bridged -> return
+            // A drive Prism reads itself has no path another app could open.
+            is FileEntry.UsbRaw, is FileEntry.UsbPart, is FileEntry.DriveItem -> return
             is FileEntry.InternalStorageLink -> DesktopItem.DirectoryRef(Environment.getExternalStorageDirectory().absolutePath, "Internal Storage")
             is FileEntry.AppStorageLink -> DesktopItem.DirectoryRef(context.filesDir.absolutePath, "App Storage")
             is FileEntry.VolumeLink -> entry.volume.root?.let {
@@ -771,6 +933,153 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
             } ?: return
         }
         (context as? LauncherActivity)?.addToDesktop(item)
+    }
+
+    // ── USB drives Prism reads itself ─────────────────────────────────────
+
+    /** Asks for access to [device], then opens it and lists its partitions. */
+    private fun openUsbDrive(device: android.hardware.usb.UsbDevice) {
+        val proceed = {
+            UsbDrives.requestPermission(context, device) { granted ->
+                if (!granted) {
+                    Toast.makeText(context, "Prism was not allowed to read the drive", Toast.LENGTH_SHORT).show()
+                    return@requestPermission
+                }
+                Toast.makeText(context, "Reading the drive…", Toast.LENGTH_SHORT).show()
+                viewScope.launch {
+                    val result = withContext(Dispatchers.IO) { runCatching { UsbDrives.openDrive(context, device) } }
+                    result.onFailure {
+                        PrismLogger.logWarning("Storage", "Could not open the USB drive: ${it.message}")
+                        Toast.makeText(context, "Could not read the drive: ${it.message}", Toast.LENGTH_LONG).show()
+                    }
+                    if (currentPath == ExplorerPath.Root) navigateTo(ExplorerPath.Root)
+                    // A drive with one readable partition opens straight into it.
+                    result.getOrNull()?.partitions?.singleOrNull { it.fileSystem != null }?.let { openUsbPart(it) }
+                }
+            }
+        }
+        // Reading the drive directly takes it from Android, which unmounts anything it had mounted.
+        if (volumes.any { it.kind == VolumeKind.USB && it.isMounted }) {
+            PrismDialogFactory.show(
+                context,
+                "Read this drive with Prism?",
+                "Android already has part of a USB drive open. Reading a drive directly takes it from " +
+                    "Android, so its Android volume closes until the drive is plugged in again.",
+                onPositive = { proceed() },
+            )
+        } else {
+            proceed()
+        }
+    }
+
+    private fun openUsbPart(part: UsbDrives.Part) {
+        if (part.fileSystem == null) {
+            PrismDialogFactory.show(context, part.title, part.problem, onPositive = {})
+            return
+        }
+        navigateTo(ExplorerPath.Drive(part.key, "/"))
+    }
+
+    private fun openDriveItem(item: FileEntry.DriveItem) {
+        if (item.entry.isDirectory) {
+            navigateTo(ExplorerPath.Drive(item.partKey, item.entry.path))
+            return
+        }
+        copyFromDrive(item, File(context.cacheDir, "usb-drive")) { copy ->
+            val uri = runCatching {
+                androidx.core.content.FileProvider.getUriForFile(context, context.packageName + ".fileprovider", copy)
+            }.getOrNull() ?: return@copyFromDrive
+            val extension = copy.extension.lowercase()
+            val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension) ?: "*/*"
+            runCatching {
+                context.startActivity(
+                    Intent(Intent.ACTION_VIEW).setDataAndType(uri, mime)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION),
+                )
+            }.onFailure { Toast.makeText(context, "No app found to open this file", Toast.LENGTH_SHORT).show() }
+        }
+    }
+
+    /** Copies a file off the drive into [folder], then hands the copy to [then] on the main thread. */
+    private fun copyFromDrive(item: FileEntry.DriveItem, folder: File, then: (File) -> Unit) {
+        val fs = UsbDrives.part(item.partKey)?.fileSystem ?: return
+        Toast.makeText(context, "Copying ${item.entry.name}…", Toast.LENGTH_SHORT).show()
+        viewScope.launch {
+            val copied = withContext(Dispatchers.IO) {
+                runCatching {
+                    folder.mkdirs()
+                    var target = File(folder, item.entry.name)
+                    var n = 2
+                    while (target.exists() && folder.name != "usb-drive") {
+                        target = File(folder, item.entry.name.substringBeforeLast('.') + " ($n)" +
+                            item.entry.name.substringAfterLast('.', "").let { if (it.isEmpty()) "" else ".$it" })
+                        n++
+                    }
+                    fs.open(item.entry.path).use { input -> target.outputStream().use { input.copyTo(it, 256 * 1024) } }
+                    target
+                }
+            }
+            copied.onSuccess(then).onFailure {
+                PrismLogger.logWarning("Storage", "Could not copy ${item.entry.path}: ${it.message}")
+                Toast.makeText(context, "Could not copy the file: ${it.message}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    private fun showUsbOptions(entry: FileEntry, onDismiss: () -> Unit) {
+        val options = mutableListOf("Open")
+        if (entry is FileEntry.DriveItem && !entry.entry.isDirectory) options += "Copy to Downloads"
+        // A whole drive -- a trusted device's, or a USB partition -- can be compressed.
+        val partTarget = (entry as? FileEntry.UsbPart)?.let { PhoneDrives.compressionTarget(it.part) }
+        if (partTarget != null) {
+            options += COMPRESS
+            if (PhoneDrives.isCompressed(partTarget, null)) options += DECOMPRESS
+        }
+        val dialog = PrismDialogFactory.show(
+            context,
+            entry.name,
+            when (entry) {
+                is FileEntry.UsbPart -> if (UsbDrives.isRemote(entry.part)) entry.part.typeName
+                    else entry.part.typeName + " · " + formatBytes(entry.part.sizeBytes) + " · read-only"
+                is FileEntry.DriveItem -> {
+                    val where = UsbDrives.part(entry.partKey)?.let { if (UsbDrives.isRemote(it)) it.typeName else "a USB drive" } ?: "a drive"
+                    if (entry.entry.isDirectory) "Folder on $where" else formatBytes(entry.entry.size) + " on $where"
+                }
+                else -> "USB drive"
+            },
+            onPositive = {},
+            customView = android.widget.ListView(context).apply {
+                // Drawn in the theme's colours, like every other menu on this page.
+                adapter = object : android.widget.ArrayAdapter<String>(context, android.R.layout.simple_list_item_1, options) {
+                    override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                        val view = super.getView(position, convertView, parent)
+                        (view as? TextView)?.apply {
+                            setTextColor(this@FileExplorerPageView.resolveAttr(context, com.prism.launcher.R.attr.prismTextPrimary))
+                            setPadding(48, 48, 48, 48)
+                        }
+                        return view
+                    }
+                }
+                setOnItemClickListener { _, _, position, _ ->
+                    when (options[position]) {
+                        COMPRESS -> if (partTarget != null) DriveCompressionSheet.show(context, partTarget)
+                        DECOMPRESS -> if (partTarget != null) DriveCompressionSheet.decompress(context, partTarget)
+                        "Open" -> when (entry) {
+                            is FileEntry.UsbRaw -> openUsbDrive(entry.device)
+                            is FileEntry.UsbPart -> openUsbPart(entry.part)
+                            is FileEntry.DriveItem -> openDriveItem(entry)
+                            else -> Unit
+                        }
+                        "Copy to Downloads" -> if (entry is FileEntry.DriveItem) {
+                            copyFromDrive(entry, File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "Prism USB")) {
+                                Toast.makeText(context, "Saved to Downloads/Prism USB/${it.name}", Toast.LENGTH_LONG).show()
+                            }
+                        }
+                    }
+                }
+            },
+        )
+        dialog.setOnDismissListener { onDismiss() }
     }
 
     private fun promptRename(file: File) {
@@ -795,6 +1104,12 @@ class FileExplorerPageView(context: Context) : FrameLayout(context) {
     }
 }
 
+/** The drive menus' entry for compressing a whole drive. See DriveCompressionSheet. */
+private const val COMPRESS = "Compress drive…"
+
+/** Shown beside [COMPRESS] when the drive is compressed: restores every file in the background. */
+private const val DECOMPRESS = "Decompress drive"
+
 private object FileEntryDiff : DiffUtil.ItemCallback<FileEntry>() {
     fun key(e: FileEntry): String = when (e) {
         is FileEntry.Local -> "local:${e.file.absolutePath}"
@@ -803,6 +1118,9 @@ private object FileEntryDiff : DiffUtil.ItemCallback<FileEntry>() {
         is FileEntry.Hosted -> "hosted:${e.storage.id}"
         is FileEntry.TrustedRemote -> "trusted:${e.share.ownerFingerprint}:${e.share.share.id}"
         is FileEntry.Bridged -> "bridged:${e.storage.ownerFingerprint}:${e.storage.id}"
+        is FileEntry.UsbRaw -> "usbraw:${e.device.deviceName}"
+        is FileEntry.UsbPart -> "usbpart:${e.part.key}"
+        is FileEntry.DriveItem -> "drive:${e.partKey}:${e.entry.path}"
         is FileEntry.InternalStorageLink -> "internal"
         is FileEntry.AppStorageLink -> "appstorage"
         is FileEntry.VolumeLink -> "volume:${e.volume.id}"
@@ -873,6 +1191,43 @@ class FileExplorerAdapter(
                 }
                 holder.fileSubtitle.text = entry.volume.subtitle()
                 holder.fileSubtitle.visibility = View.VISIBLE
+            }
+            is FileEntry.UsbRaw -> {
+                holder.fileIcon.setImageResource(android.R.drawable.stat_sys_download_done)
+                typeColor = android.graphics.Color.parseColor("#9B9BA1")
+                holder.fileSubtitle.text = "USB drive · tap to read it"
+                holder.fileSubtitle.visibility = View.VISIBLE
+            }
+            is FileEntry.UsbPart -> {
+                holder.fileIcon.setImageResource(android.R.drawable.stat_sys_download_done)
+                val readable = entry.part.fileSystem != null
+                typeColor = android.graphics.Color.parseColor(if (readable) "#00BA7C" else "#9B9BA1")
+                holder.fileSubtitle.text = if (UsbDrives.isRemote(entry.part)) {
+                    entry.part.typeName + if (entry.part.sizeBytes > 0) " · " + formatBytes(entry.part.sizeBytes) else ""
+                } else {
+                    entry.part.typeName + " · " + formatBytes(entry.part.sizeBytes) +
+                        if (readable) " · USB" else " · cannot be read here"
+                }
+                holder.fileSubtitle.visibility = View.VISIBLE
+            }
+            is FileEntry.DriveItem -> {
+                if (entry.entry.isDirectory) {
+                    holder.fileIcon.setImageResource(android.R.drawable.ic_dialog_email)
+                    typeColor = android.graphics.Color.parseColor("#FFD700")
+                } else {
+                    val ext = entry.entry.name.substringAfterLast('.', "").lowercase()
+                    holder.fileIcon.setImageResource(
+                        when {
+                            isImage(ext) -> android.R.drawable.ic_menu_gallery
+                            isVideo(ext) -> android.R.drawable.ic_media_play
+                            isAudio(ext) -> android.R.drawable.ic_lock_silent_mode_off
+                            else -> android.R.drawable.ic_menu_crop
+                        },
+                    )
+                    typeColor = android.graphics.Color.parseColor("#4CAF50")
+                    holder.fileSubtitle.text = formatBytes(entry.entry.size)
+                    holder.fileSubtitle.visibility = View.VISIBLE
+                }
             }
             is FileEntry.Network -> {
                 holder.fileIcon.setImageResource(android.R.drawable.stat_sys_download_done)

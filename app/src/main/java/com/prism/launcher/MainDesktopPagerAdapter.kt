@@ -187,6 +187,7 @@ class MainDesktopPagerAdapter(
         SlotAssignment.EmailClient -> "Email"
         SlotAssignment.TimeMachine -> "Time Machine"
         SlotAssignment.Journal -> "Journal"
+        SlotAssignment.Podcasts -> "Podcasts"
         SlotAssignment.AppStore -> "App Store"
         SlotAssignment.Helper -> "Helper"
         SlotAssignment.Vpn -> "VPN"
@@ -329,6 +330,7 @@ class MainDesktopPagerAdapter(
 
             SlotAssignment.TimeMachine -> com.prism.launcher.timemachine.TimeMachinePageView(activity)
             SlotAssignment.Journal -> com.prism.launcher.journal.JournalPageView(activity)
+            SlotAssignment.Podcasts -> com.prism.launcher.podcasts.PodcastsPageView(activity)
             SlotAssignment.AppStore -> com.prism.launcher.appstore.AppStorePageView(activity)
             SlotAssignment.Helper -> com.prism.launcher.helper.HelperPageView(activity)
             SlotAssignment.Vpn -> com.prism.launcher.vpn.VpnPageView(activity)

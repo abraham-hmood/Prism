@@ -79,14 +79,18 @@ class VirtualAppRunner(private val hostContext: Context) {
         val clazz = virtual.classLoader.loadClass(name)
         val app = clazz.getDeclaredConstructor().newInstance() as Application
 
+        // PUBLISHED BEFORE attach, not after. An app's attachBaseContext often stores
+        // `base.getApplicationContext()` for later and casts it to Application (TikTok's push
+        // initialiser does). Before this existed the virtual context answered with itself, and the
+        // cast failed seconds later on a worker thread: "VirtualContext cannot be cast to
+        // android.app.Application". The Application object exists from here on, so it is the answer.
+        virtual.application = app
+        adoptAsProcessApplication(app)
+
         Application::class.java
             .getDeclaredMethod("attach", Context::class.java)
             .apply { isAccessible = true }
             .invoke(app, VirtualContext(hostContext, virtual))
-
-        // Published BEFORE onCreate, because an app's Application.onCreate routinely reaches for
-        // getApplicationContext() and casts it to itself.
-        virtual.application = app
 
         // The framework creates content providers BEFORE Application.onCreate, and apps depend on
         // that: a provider is where they bootstrap libraries that Application then assumes exist.
@@ -120,11 +124,34 @@ class VirtualAppRunner(private val hostContext: Context) {
                 .apply { isAccessible = true }
                 .invoke(fallback, VirtualContext(hostContext, virtual))
             virtual.application = fallback
+            adoptAsProcessApplication(fallback)
             fallback
         }.getOrElse {
             PrismLogger.logError(TAG, "Could not build even a plain Application for ${virtual.packageName}", it)
             null
         }
+    }
+
+    /**
+     * Makes [app] the process's Application, as far as the framework is concerned.
+     *
+     * `ActivityThread.currentApplication()` and `AppGlobals.getInitialApplication()` are how a lot
+     * of library code finds "the" Application without a Context -- analytics, crash reporters,
+     * ByteDance's and Google's own frameworks -- and they cast the answer to the app's own class.
+     * In `:virtualapp` that answer was Prism's Application. This process exists to host guests, so
+     * the guest is what it should say.
+     */
+    private fun adoptAsProcessApplication(app: Application) {
+        runCatching {
+            val threadClass = Class.forName("android.app.ActivityThread")
+            val thread = threadClass.getDeclaredMethod("currentActivityThread")
+                .apply { isAccessible = true }.invoke(null) ?: return
+            threadClass.getDeclaredField("mInitialApplication").apply { isAccessible = true }.set(thread, app)
+            @Suppress("UNCHECKED_CAST")
+            val all = threadClass.getDeclaredField("mAllApplications").apply { isAccessible = true }
+                .get(thread) as? MutableList<Application>
+            if (all != null && app !in all) all.add(app)
+        }.onFailure { PrismLogger.logWarning(TAG, "Could not make the app the process's Application: ${it.message}") }
     }
 
     /**

@@ -220,10 +220,10 @@ fun AppDrawerPage(onNavigate: (PageId) -> Unit = {}) {
 
                     item(span = { GridItemSpan(maxLineSpan) }) {
                         SectionFooter(
-                            "These live on a phone you trust. Opening one downloads its APK over the " +
-                                "meshnet. Running it is PHASE 111 — this machine has no Android runtime " +
-                                "yet, so a download is where it stops, and Prism says so rather than " +
-                                "appearing to launch something."
+                            "These live on a phone you trust. Opening one downloads it over the meshnet " +
+                                "and starts it in Prism's own Android runtime on this computer -- no " +
+                                "emulator. That runtime is early: it runs an app's startup code and " +
+                                "reports what happened, and does not draw app screens yet."
                         )
                     }
                 }

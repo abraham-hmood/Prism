@@ -118,3 +118,9 @@
 # launcher that reports its own crashes should report them legibly.
 -keepattributes SourceFile,LineNumberTable
 -renamesourcefileattribute SourceFile
+
+# NINE (x86-64 translator). Its native library calls these by name through JNI: GuestRuntime's
+# natives, and GuestLog.onNativeLine/add for every log and program-output line. Nothing in Java calls
+# GuestLog's entry points, so without this R8 removes them and the program console stays empty.
+-keep class com.nine.dbt.GuestRuntime { *; }
+-keep class com.nine.dbt.GuestLog { *; }

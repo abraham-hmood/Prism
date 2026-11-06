@@ -143,11 +143,8 @@ object TrustedApps {
 
         val start = launcher
         if (!canVirtualize || start == null) {
-            // Stated rather than silently doing half the job. On a desktop the download IS the whole
-            // feature until PHASE 111 lands, and a user who clicked expecting an app should be told
-            // which of the two happened.
-            return app.label + " is downloaded. This device cannot run Android apps yet, so it is " +
-                "waiting in " + apkDir(app).absolutePath + "."
+            // Stated rather than silently doing half the job, on a platform with no runtime hooked in.
+            return app.label + " is downloaded to " + apkDir(app).absolutePath + "."
         }
         return start(app) ?: (app.label + " is starting.")
     }

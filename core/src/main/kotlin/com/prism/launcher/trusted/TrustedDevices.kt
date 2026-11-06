@@ -38,13 +38,13 @@ import java.io.File
  * ## Why the payloads are encrypted even between trusted devices
  *
  * Because they cross the mesh, and the mesh is a shared network. Trust decides WHO MAY READ; encryption is
- * what makes that enforceable rather than a convention. Keys come from the wallet seed via
- * [CloudVault.Purpose.MESSAGING], which is the same pairing the SMS relay already uses — so the practical
- * requirement is the one already documented there: both devices hold the same recovery phrase.
+ * what makes that enforceable rather than a convention.
  *
- * That has a consequence worth stating: a device you have trusted but whose wallet differs will receive
- * packets it cannot open. The offer and the acceptance are about POLICY; the phrase is about CAPABILITY,
- * and [Trust.canDecrypt] is how the UI tells the two apart instead of reporting "not working".
+ * Each device has its own key pair, its private half sealed with that device's own recovery phrase,
+ * and paired devices exchange public keys ([OPCODE_TRUST_KEY]). Everything sent to a trusted device is
+ * sealed with the key the two derive from their key pairs -- see [DeviceKeys] and [TrustedSeal]. The
+ * two devices do NOT need the same recovery phrase, and nothing else on the network can open what
+ * passes between them. A locked wallet still stops everything: the private key cannot be unsealed.
  */
 object TrustedDevices {
 
@@ -100,6 +100,14 @@ object TrustedDevices {
      */
     const val OPCODE_PRESENCE: Byte = 0x35
 
+    /**
+     * A paired device's public key (see [DeviceKeys]), proved with the pair's link key.
+     *
+     * Sent when a pairing completes, when a device makes a new key pair, and on request when a packet
+     * would not open. 0x3B was free (0x3A is Prism RCS).
+     */
+    const val OPCODE_TRUST_KEY: Byte = 0x3B
+
     /** What may be shared. Each is opt-in per device. */
     enum class Kind(val id: String, val label: String, val detail: String) {
         MESSAGES(
@@ -148,6 +156,30 @@ object TrustedDevices {
         ),
 
         /**
+         * Whole drives: a phone's internal storage, SD cards and USB drives, a computer's disks and
+         * anything plugged into it, browsable from the other device and, on a computer, mounted in
+         * its own file explorer. Separate from [STORAGE] because it offers everything on a drive,
+         * not chosen folders. See TrustedDrives.
+         */
+        DRIVES(
+            "drives", "Drives",
+            "Every drive on one device -- internal storage, SD cards, USB and external drives -- " +
+                "can be browsed from the other, and a computer shows them in its file explorer.",
+        ),
+
+        /**
+         * AI-generated podcasts and their episodes.
+         *
+         * The podcast and each episode's details travel as shares; the audio, the cover and the
+         * transcript are fetched over the TCP channel, because one episode is megabytes. See
+         * `PodcastSync`.
+         */
+        PODCASTS(
+            "podcasts", "Podcasts",
+            "Podcasts made on one device, and every episode of them, play on the other.",
+        ),
+
+        /**
          * The wallet recovery phrase.
          *
          * NOT LIKE THE OTHERS, in two ways that matter. It is sent ONCE, during pairing, rather than
@@ -156,8 +188,9 @@ object TrustedDevices {
          * phrase receives packets it cannot open. Accepting this is what turns a paired device into one
          * that can actually read what it is sent.
          *
-         * Sent only to a device that HAS NO WALLET. A device with one already has an identity, and
-         * overwriting it would replace whatever that identity holds.
+         * Sent only to a device that HAS NO WALLET, in whichever direction the pairing went. A device
+         * with one already has an identity, and overwriting it would replace whatever that identity
+         * holds.
          */
         WALLET(
             "wallet", "Wallet recovery phrase",
@@ -224,6 +257,13 @@ object TrustedDevices {
          * compares by value.
          */
         val linkKey: String = "",
+        /**
+         * That device's public key (see [DeviceKeys]), base64; blank until the two have exchanged
+         * keys. Everything sent to it is sealed with the key this device derives from it.
+         */
+        val peerKey: String = "",
+        /** When that key was made on the other device, so a replayed older key is refused. */
+        val peerKeyAt: Long = 0L,
     ) {
         /** The link key as bytes, or null when this pairing predates them. */
         fun linkKeyBytes(): ByteArray? = PairLink.decode(linkKey)
@@ -415,6 +455,8 @@ object TrustedDevices {
                     confirmed = item.optBoolean("confirmed"),
                     aliases = aliases(aliasArray),
                     linkKey = item.optString("lk"),
+                    peerKey = item.optString("pk"),
+                    peerKeyAt = item.optLong("pka"),
                 )
             }.filter { it.fingerprint.isNotBlank() && it.confirmed }
         }.getOrDefault(emptyList())
@@ -567,6 +609,10 @@ object TrustedDevices {
                     put("confirmed", device.confirmed)
                     put("alias", JSONArray().also { a -> device.aliases.forEach { a.put(it) } })
                     if (device.linkKey.isNotBlank()) put("lk", device.linkKey)
+                    if (device.peerKey.isNotBlank()) {
+                        put("pk", device.peerKey)
+                        put("pka", device.peerKeyAt)
+                    }
                 }
             )
         }
@@ -664,6 +710,8 @@ object TrustedDevices {
             aliases = (target.aliases + retired).distinct().takeLast(MAX_ALIASES),
             // Both rows are the same device; whichever holds the pair's link key keeps it.
             linkKey = target.linkKey.ifBlank { source.linkKey },
+            peerKey = if (source.peerKeyAt > target.peerKeyAt) source.peerKey else target.peerKey.ifBlank { source.peerKey },
+            peerKeyAt = maxOf(source.peerKeyAt, target.peerKeyAt),
         )
         save(devices.filterNot { it == source || it == target } + merged)
     }
@@ -1323,12 +1371,23 @@ object TrustedDevices {
             )
         )
         outgoingPairings.remove(provisional)
+        // THE WALLET CAN ALSO TRAVEL THIS WAY. The handoff above only covers an answering device
+        // without a wallet; a device that OFFERED the pairing without one used to be left with none,
+        // and the user then made a fresh wallet on it -- a different phrase, so every share between
+        // the two failed to decrypt. Asked for in the confirmation, and the code key is kept so the
+        // phrase the other side seals with it can be opened here (see [onAck] and [onWallet]).
+        val needsWallet = Kind.WALLET in agreed && !WalletVault.isInitialized()
+        if (needsWallet) {
+            acceptedKeys[fingerprint] = key
+            pendingSalts[fingerprint] = challenge.salt
+        }
         // THE LAST HALF OF THE PAIRING. Until this packet arrives the answering device has no row,
         // by design: it proved what it typed, and this is the only side that can verify it. Sending
         // it here, after the proof and after the save, is what makes the list mean "confirmed"
         // rather than "somebody pressed Accept".
-        sendAck(peerIp, fingerprint, agreed, offered.id)
+        sendAck(peerIp, fingerprint, agreed, offered.id, needsWallet)
         PrismPlatform.log.info(TAG, "Trust confirmed with ${json.optString("name")} ($peerIp)")
+        exchangeKeysWith(fingerprint)
         // On a thread of its own: a listener may start a transfer, and this runs on a mesh receive thread
         // with other packets behind it.
         byFingerprint(fingerprint)?.let { confirmed ->
@@ -1356,6 +1415,7 @@ object TrustedDevices {
         fingerprint: String,
         accepted: Set<Kind>,
         offerId: String = "",
+        needsWallet: Boolean = false,
     ) {
         val payload = JSONObject().apply {
             put("fp", localFingerprint())
@@ -1363,6 +1423,7 @@ object TrustedDevices {
             put("platform", localPlatform)
             put("accepted", JSONArray().also { a -> accepted.forEach { a.put(it.id) } })
             if (offerId.isNotBlank()) put("ackFor", offerId)
+            if (needsWallet) put("needsWallet", true)
         }.toString()
         runCatching { sender(peerIp, OPCODE_TRUST_ACK, payload) }
         kotlin.concurrent.thread(name = "trust-ack-retry", isDaemon = true) {
@@ -1451,6 +1512,19 @@ object TrustedDevices {
             )
         )
         PrismPlatform.log.info(TAG, "Trust confirmed by ${pending.name} ($peerIp)")
+        exchangeKeysWith(fingerprint)
+        // The offering device has no wallet and the pairing includes one: send ours, sealed with the
+        // code key this device derived from what its user typed. Otherwise the key is no longer
+        // needed here unless a wallet is on its way to THIS device.
+        val codeKey = acceptedKeys[fingerprint]
+        val codeSalt = pendingSalts[fingerprint]
+        if (json.optBoolean("needsWallet") && Kind.WALLET in accepted && codeKey != null && codeSalt != null) {
+            sendWallet(peerIp, codeKey, codeSalt)
+        }
+        if (WalletVault.isInitialized()) {
+            acceptedKeys.remove(fingerprint)
+            pendingSalts.remove(fingerprint)
+        }
         byFingerprint(fingerprint)?.let { confirmed ->
             val listener = onConfirmed
             if (listener != null) {
@@ -1500,21 +1574,26 @@ object TrustedDevices {
             PrismPlatform.log.info(TAG, "Asked for a wallet, but this device has none to send")
             return
         }
-        runCatching {
-            sender(
-                peerIp, OPCODE_TRUST_WALLET,
-                JSONObject().apply {
-                    put("fp", localFingerprint())
-                    put("name", localName())
-                    put(
-                        "seed",
-                        java.util.Base64.getEncoder()
-                            .encodeToString(PairingCode.sealPhrase(phrase, key, salt)),
-                    )
-                }.toString(),
+        val payload = JSONObject().apply {
+            put("fp", localFingerprint())
+            put("name", localName())
+            put(
+                "seed",
+                java.util.Base64.getEncoder()
+                    .encodeToString(PairingCode.sealPhrase(phrase, key, salt)),
             )
-            PrismPlatform.log.info(TAG, "Sent the recovery phrase to $peerIp")
+        }.toString()
+        // SENT THREE TIMES, like the confirmation (see [sendAck]). It was one UDP datagram, and a
+        // lost one left the other device without a wallet and its user making a new, different one.
+        // The receiver imports the first and ignores the repeats.
+        runCatching { sender(peerIp, OPCODE_TRUST_WALLET, payload) }
+        kotlin.concurrent.thread(name = "trust-wallet-send", isDaemon = true) {
+            longArrayOf(1_500L, 3_000L).forEach { wait ->
+                runCatching { Thread.sleep(wait) }.onFailure { return@thread }
+                runCatching { sender(peerIp, OPCODE_TRUST_WALLET, payload) }
+            }
         }
+        PrismPlatform.log.info(TAG, "Sent the recovery phrase to $peerIp")
     }
 
     /**
@@ -1530,6 +1609,8 @@ object TrustedDevices {
         val fingerprint = json.optString("fp")
         val key = acceptedKeys[fingerprint]
         if (key == null) {
+            // A repeat of a handoff that already landed (it is sent three times) is not news.
+            if (WalletVault.isInitialized()) return false
             PrismPlatform.log.warn(TAG, "A wallet arrived from $peerIp with no pairing in progress")
             return false
         }
@@ -1620,31 +1701,35 @@ object TrustedDevices {
     private fun shareTo(recipients: List<Trust>, kind: Kind, body: JSONObject): Int {
         if (recipients.isEmpty()) return 0
 
-        val key = CloudVault.keyFor(CloudVault.Purpose.MESSAGING)
-        if (key == null) {
-            // Refused rather than sent in the clear. The same rule the SMS relay follows, and the one
-            // failure mode this must never have.
-            PrismPlatform.log.info(TAG, "Not sharing ${kind.id}: no wallet, so no key")
-            return 0
-        }
-
         val envelope = JSONObject().apply {
             put("kind", kind.id)
             put("from", localFingerprint())
             put("name", localName())
             put("at", System.currentTimeMillis())
             put("body", body)
-        }
-        val sealed = CloudVault.seal(envelope.toString().toByteArray(), key)
-        val encoded = java.util.Base64.getEncoder().encodeToString(sealed)
+        }.toString().toByteArray()
+        // The old wallet key, only for a pair that has not exchanged device keys yet. See TrustedSeal.
+        val legacy = CloudVault.keyFor(CloudVault.Purpose.MESSAGING)
 
         var sent = 0
+        var unsealed = 0
         recipients.forEach { device ->
             if (device.lastIp.isBlank()) return@forEach
+            // SEALED PER DEVICE, with the key this pair agreed. Refused rather than sent in the clear
+            // when there is no key at all -- the one failure mode this must never have.
+            val sealed = TrustedSeal.sealFor(device, DeviceKeys.Purpose.SHARE, envelope, legacy)
+            if (sealed == null) {
+                unsealed++
+                return@forEach
+            }
+            if (device.peerKey.isBlank()) requestKey(device)
             runCatching {
-                sender(device.lastIp, OPCODE_SHARE, encoded)
+                sender(device.lastIp, OPCODE_SHARE, java.util.Base64.getEncoder().encodeToString(sealed))
                 sent++
             }
+        }
+        if (unsealed > 0) {
+            PrismPlatform.log.info(TAG, "Not sharing ${kind.id}: the wallet is locked or missing, so there is no key")
         }
         return sent
     }
@@ -1678,23 +1763,30 @@ object TrustedDevices {
     /** Handles an incoming share. Registered on [OPCODE_SHARE]. */
     fun onShare(peerIp: String, payload: String): Boolean = runCatching {
         val sealed = java.util.Base64.getDecoder().decode(payload)
-        val key = CloudVault.keyFor(CloudVault.Purpose.MESSAGING) ?: return false
-        val plain = CloudVault.open(sealed, key) ?: run {
-            // A trusted device whose wallet differs. Policy said yes and capability says no, and the
-            // distinction is what [Trust.canDecrypt] surfaces rather than reporting a generic failure.
-            PrismPlatform.log.info(TAG, "A share from $peerIp did not decrypt — different recovery phrase")
+        val opened = TrustedSeal.openFrom(
+            peerIp, sealed, DeviceKeys.Purpose.SHARE, CloudVault.keyFor(CloudVault.Purpose.MESSAGING),
+        ) ?: run {
+            // Most likely the two have not exchanged device keys yet (or this wallet is locked):
+            // ask for the sender's key, and the next share opens.
+            PrismPlatform.log.info(TAG, "A share from $peerIp did not open: no key shared with it yet")
+            byIp(peerIp)?.takeIf { it.confirmed }?.let { requestKey(it) }
             return false
         }
 
-        val json = JSONObject(String(plain))
+        val json = JSONObject(String(opened.plain))
         val kind = Kind.byId(json.optString("kind")) ?: return false
 
         // THE AUTHORISATION CHECK, and it is here rather than at the sender. A sender decides what it
         // offers; only the receiver can decide what it accepts, and a receiver that stored whatever
-        // arrived would make its own consent meaningless.
-        if (!accepts(peerIp, kind)) {
+        // arrived would make its own consent meaningless. The device is the one whose key OPENED the
+        // packet when there is one -- that is proof, where an address is only a hint.
+        val sender = opened.device ?: byIp(peerIp)
+        if (sender == null || !sender.confirmed || kind !in sender.incoming) {
             PrismPlatform.log.info(TAG, "Dropped a ${kind.id} share from $peerIp — not accepted from them")
             return false
+        }
+        if (opened.device != null && normaliseAddress(sender.lastIp) != normaliseAddress(peerIp)) {
+            upsert(sender.copy(lastIp = peerIp, lastSeen = System.currentTimeMillis()))
         }
 
         val listeners = consumers[kind]
@@ -1718,6 +1810,159 @@ object TrustedDevices {
         true
     }.getOrDefault(false)
 
+    // ── Device keys ────────────────────────────────────────────────────────
+
+    private val keyListeners = java.util.concurrent.CopyOnWriteArrayList<(Trust) -> Unit>()
+
+    /** Called with the device whenever this one learns a trusted device's (new) public key. */
+    fun addKeyListener(listener: (Trust) -> Unit) { keyListeners += listener }
+
+    /**
+     * Sends this device's public key to [device], proved with the pair's link key.
+     *
+     * [want] asks for theirs back. False when there is nothing to send with: no link key (a pairing
+     * made before link keys existed, which has to be paired again) or no unlocked wallet.
+     */
+    fun sendKey(device: Trust, want: Boolean = device.peerKey.isBlank()): Boolean {
+        val link = device.linkKeyBytes() ?: return false
+        if (device.lastIp.isBlank()) return false
+        val me = DeviceKeys.identity() ?: return false
+        val fingerprint = localFingerprint()
+        val tag = DeviceKeys.announceTag(link, fingerprint, me.publicKey, me.createdAt)
+        return runCatching {
+            sender(
+                device.lastIp, OPCODE_TRUST_KEY,
+                JSONObject().apply {
+                    put("fp", fingerprint)
+                    put("pub", me.publicKey)
+                    put("at", me.createdAt)
+                    put("tag", java.util.Base64.getEncoder().encodeToString(tag))
+                    if (want) put("want", true)
+                }.toString(),
+            )
+            true
+        }.getOrDefault(false)
+    }
+
+    private val keyRequestedAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /** [sendKey] asking for theirs, at most every half minute per device. */
+    fun requestKey(device: Trust) {
+        val now = System.currentTimeMillis()
+        val last = keyRequestedAt[device.fingerprint] ?: 0L
+        if (now - last < 30_000L) return
+        keyRequestedAt[device.fingerprint] = now
+        kotlin.concurrent.thread(name = "trust-key-request", isDaemon = true) {
+            runCatching { sendKey(device, want = true) }
+        }
+    }
+
+    /**
+     * Handles a paired device's public key. Registered on [OPCODE_TRUST_KEY].
+     *
+     * ACCEPTED ONLY WITH A VALID PROOF under the pair's link key. That key came out of the pairing
+     * ceremony -- the code on screen and an exchange of fresh keys -- so a device in the middle that
+     * swapped in its own public key could not produce the proof, and could not read anything sealed
+     * to the key it was trying to plant.
+     */
+    fun onKey(peerIp: String, payload: String): Boolean = runCatching {
+        val json = JSONObject(payload)
+        val fingerprint = json.optString("fp")
+        val device = byFingerprint(fingerprint)?.takeIf { it.confirmed } ?: return false
+        val link = device.linkKeyBytes() ?: run {
+            PrismPlatform.log.warn(
+                TAG,
+                "${device.name} sent its device key, but this pairing predates link keys and cannot " +
+                    "prove it. Pair the two devices again.",
+            )
+            return false
+        }
+        val publicKey = json.optString("pub")
+        val createdAt = json.optLong("at")
+        val tag = runCatching { java.util.Base64.getDecoder().decode(json.optString("tag")) }.getOrDefault(ByteArray(0))
+        if (!DeviceKeys.isValidPublic(publicKey) ||
+            !DeviceKeys.verifyAnnounce(link, fingerprint, publicKey, createdAt, tag)
+        ) {
+            PrismPlatform.log.warn(TAG, "Refused a device key for ${device.name} from $peerIp: the proof did not match")
+            return false
+        }
+        val changed = publicKey != device.peerKey
+        if (changed && createdAt < device.peerKeyAt) {
+            // An older key than the one on file: a replay, not a new key pair.
+            PrismPlatform.log.warn(TAG, "Refused an older device key for ${device.name}")
+            return false
+        }
+        val updated = device.copy(
+            peerKey = publicKey,
+            peerKeyAt = createdAt,
+            lastIp = peerIp,
+            lastSeen = System.currentTimeMillis(),
+        )
+        if (changed || normaliseAddress(device.lastIp) != normaliseAddress(peerIp)) upsert(updated)
+        if (changed) {
+            PrismPlatform.log.info(TAG, "Exchanged device keys with ${device.name}")
+            keyListeners.forEach { listener ->
+                kotlin.concurrent.thread(name = "trust-key-learned", isDaemon = true) {
+                    runCatching { listener(updated) }
+                }
+            }
+        }
+        if (json.optBoolean("want")) sendKey(updated, want = false)
+        true
+    }.getOrDefault(false)
+
+    private val keyExchangeStarted = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * Keeps every paired device's key current, for as long as the process runs.
+     *
+     * Waits for the wallet (the private key cannot be unsealed before it), then sends this device's
+     * key to every paired device that does not have it and asks for theirs; again whenever this device
+     * makes a new key pair; and every few minutes for anything still missing, because each of these
+     * is one UDP datagram and some are lost.
+     */
+    fun startKeyExchange() {
+        if (!keyExchangeStarted.compareAndSet(false, true)) return
+        kotlin.concurrent.thread(name = "trust-key-exchange", isDaemon = true) {
+            var announced: String? = null
+            var lastSweep = 0L
+            while (true) {
+                val wait = runCatching {
+                    val me = DeviceKeys.identity()
+                    when {
+                        me == null -> 5_000L
+                        me.publicKey != announced -> {
+                            all().filter { it.confirmed }.forEach { sendKey(it) }
+                            announced = me.publicKey
+                            lastSweep = System.currentTimeMillis()
+                            30_000L
+                        }
+                        System.currentTimeMillis() - lastSweep > 3 * 60_000L -> {
+                            all().filter { it.confirmed && it.peerKey.isBlank() }.forEach { sendKey(it, want = true) }
+                            lastSweep = System.currentTimeMillis()
+                            30_000L
+                        }
+                        else -> 30_000L
+                    }
+                }.getOrDefault(30_000L)
+                runCatching { Thread.sleep(wait) }.onFailure { return@thread }
+            }
+        }
+    }
+
+    /** Sends this device's key to a device that has just been paired, from a thread of its own. */
+    private fun exchangeKeysWith(fingerprint: String) {
+        kotlin.concurrent.thread(name = "trust-key-pair", isDaemon = true) {
+            // Twice, a moment apart: the pairing's last packets are still in flight and UDP drops some.
+            longArrayOf(500L, 4_000L).forEach { wait ->
+                runCatching { Thread.sleep(wait) }.onFailure { return@thread }
+                val device = byFingerprint(fingerprint) ?: return@thread
+                if (device.peerKey.isNotBlank() && wait > 500L) return@thread
+                runCatching { sendKey(device, want = true) }
+            }
+        }
+    }
+
     // ── Registration ───────────────────────────────────────────────────────
 
     /**
@@ -1734,6 +1979,8 @@ object TrustedDevices {
         MeshCore.register(OPCODE_SHARE) { peerIp, payload -> onShare(peerIp, payload) }
         MeshCore.register(OPCODE_TRUST_WALLET) { peerIp, payload -> onWallet(peerIp, payload) }
         MeshCore.register(OPCODE_PRESENCE) { peerIp, payload -> onPresence(peerIp, payload) }
+        MeshCore.register(OPCODE_TRUST_KEY) { peerIp, payload -> onKey(peerIp, payload) }
+        startKeyExchange()
         // Paired devices are kept in touch with by unicast even when they drop out of the peer
         // table, so a dozing laptop is found again without toggling the mesh. See MeshCore.reconnect.
         MeshCore.probeTargets = { all().map { it.lastIp }.filter { it.isNotBlank() } }

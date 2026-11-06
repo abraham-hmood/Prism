@@ -665,6 +665,17 @@ class CharacterConversationActivity : PrismBaseActivity() {
                 lp.gravity = if (line.fromUser) Gravity.END else Gravity.START
                 holder.bubble.layoutParams = lp
             }
+            // The character's own voice: long-press one of their replies to hear it in the voice
+            // chosen in the character creator.
+            if (line.fromUser || line.live) {
+                holder.bubble.setOnLongClickListener(null)
+            } else {
+                holder.bubble.setOnLongClickListener {
+                    com.prism.launcher.speech.VoiceChoices.speak(line.text, character.voice)
+                    android.widget.Toast.makeText(ctx, "Reading aloud as ${character.name}", android.widget.Toast.LENGTH_SHORT).show()
+                    true
+                }
+            }
         }
     }
 }

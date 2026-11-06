@@ -58,6 +58,20 @@ object DisplayPageFactory {
     }
 
     /**
+     * The page for one slot, built for somewhere other than the pager -- a display, or a wall in
+     * the AR home screen. Never throws: a page that cannot be built becomes a message.
+     */
+    fun buildPage(context: Context, assignment: SlotAssignment, index: Int): android.view.View {
+        val themed = themedContext(context)
+        return try {
+            page(themed, assignment, index)
+        } catch (failure: Exception) {
+            Log.w("PrismDisplay", "Could not build page " + assignment.serialize() + ": " + failure.message)
+            message(themed, "This page could not be drawn here.")
+        }
+    }
+
+    /**
      * A context that can inflate a Material page.
      *
      * A page built while Prism is in the background used to inherit the Application theme, which
@@ -122,6 +136,7 @@ object DisplayPageFactory {
             // a snapshot started from the television is still taken by this phone.
             SlotAssignment.TimeMachine -> com.prism.launcher.timemachine.TimeMachinePageView(context)
             SlotAssignment.Journal -> com.prism.launcher.journal.JournalPageView(context)
+            SlotAssignment.Podcasts -> com.prism.launcher.podcasts.PodcastsPageView(context)
             // The store can be browsed from a television; publishing needs a file picker and is
             // therefore a phone or desktop action, which the page gates on its own.
             SlotAssignment.AppStore -> com.prism.launcher.appstore.AppStorePageView(context)

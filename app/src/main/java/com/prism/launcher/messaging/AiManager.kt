@@ -127,6 +127,14 @@ object AiManager {
         // Local Cloud mode toggle.
         val p2pModel = PrismSettings.getSelectedP2pModel()
         if (p2pModel != null) {
+            // A peer's model is a text route like any other, so agentic tools reach it too: the
+            // tools are described in the prompt and the calls are read back out of its reply.
+            if (!plainText && PrismSettings.getAgenticToolsEnabled() && imageUri == null) {
+                return@withContext com.prism.launcher.agentic.AgenticEngine.run(
+                    userText, onToken, onReasoning, history,
+                    complete = { prompt -> fetchP2pModelResponse(p2pModel.peerIp, prompt, null) },
+                )
+            }
             val textRaw = fetchP2pModelResponse(p2pModel.peerIp, userText, if (streaming) onToken else null)
             return@withContext Pair(textRaw, Pair(null, null))
         }

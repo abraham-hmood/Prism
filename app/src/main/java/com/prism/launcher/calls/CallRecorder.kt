@@ -31,7 +31,17 @@ class CallRecorder(
     private val name: String,
 ) {
 
-    data class Start(val started: Boolean, val message: String = "")
+    /**
+     * [needsAccess] is true when nothing could be recorded because Android's in-call audio policy
+     * is silencing Prism, which [CallRecordingAccessService] fixes; the call screen offers it.
+     * [usesSpeaker] is true when the other person is captured through the speaker.
+     */
+    data class Start(
+        val started: Boolean,
+        val message: String = "",
+        val needsAccess: Boolean = false,
+        val usesSpeaker: Boolean = false,
+    )
 
     var sourceLabel: String = ""
         private set
@@ -65,12 +75,29 @@ class CallRecorder(
         }
         if (buffer <= 0) return Start(false, "This device cannot open a call recorder.")
 
+        // WITHOUT THE ACCESS SERVICE NOTHING BELOW CAN WORK. Android 10+ hands every app silence
+        // during a carrier call unless it has an enabled accessibility service; trying the sources
+        // anyway only produced the old "returns silence for every source" dead end.
+        val access = CallRecordingAccessService.isEnabled(context)
+        if (!access && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            return Start(
+                false,
+                "Android silences the microphone during phone calls. Turn on \"Prism call " +
+                    "recording\" in Accessibility settings to record calls.",
+                needsAccess = true,
+            )
+        }
+
+        // VOICE_CALL is the real mix of both sides, and works only where the vendor lets it. The
+        // rest hear the microphone, so the other person is recorded from the speaker.
+        // VOICE_COMMUNICATION comes LAST: its echo canceller exists to remove exactly what the
+        // speaker plays, which is the other person's voice.
         val sources = listOf(
             MediaRecorder.AudioSource.VOICE_CALL to "both sides",
-            MediaRecorder.AudioSource.VOICE_COMMUNICATION to "call audio (this side on most devices)",
-            MediaRecorder.AudioSource.VOICE_RECOGNITION to "call audio (this side)",
-            MediaRecorder.AudioSource.UNPROCESSED to "microphone only (unprocessed)",
-            MediaRecorder.AudioSource.MIC to "microphone only",
+            MediaRecorder.AudioSource.VOICE_RECOGNITION to "both sides (speaker)",
+            MediaRecorder.AudioSource.MIC to "both sides (speaker)",
+            MediaRecorder.AudioSource.UNPROCESSED to "both sides (speaker, unprocessed)",
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION to "this side",
         )
         var opened: AudioRecord? = null
         var openedLabel = ""
@@ -86,6 +113,12 @@ class CallRecorder(
                 )
             }.getOrNull()
             if (attempt != null && attempt.state == AudioRecord.STATE_INITIALIZED) {
+                // The microphone path only hears the other person once the speaker is playing
+                // them; switch before probing so the probe hears the line, not just this room.
+                if (source != MediaRecorder.AudioSource.VOICE_CALL && !speakerSwitched && wantsSpeaker()) {
+                    speakerSwitched = PrismTelecom.snapshot()?.speaker == false
+                    if (speakerSwitched) PrismTelecom.setSpeaker(true)
+                }
                 // The microphone chosen in Settings → Phone and Meshnet Calls, where it applies.
                 CallDevices.applyTo(context, attempt)
                 // Initialising is not permission to record: some devices construct a VOICE_CALL
@@ -111,11 +144,18 @@ class CallRecorder(
         }
         val active = opened
         if (active == null) {
+            restoreSpeaker()
             return Start(
                 false,
-                "This device returns silence for every call-audio source Android allows. " +
-                    "Carrier call recording is blocked here; voice notes still record normally.",
+                "Every call-audio source was silent. Check that \"Prism call recording\" is still " +
+                    "on in Accessibility settings, then try again.",
+                needsAccess = true,
             )
+        }
+        if (opened != null && openedLabel != "both sides" && !speakerSwitched &&
+            PrismTelecom.snapshot()?.speaker != true
+        ) {
+            openedLabel = "this side (turn on the speaker to record both)"
         }
 
         val stream = runCatching { FileOutputStream(file) }.getOrElse {
@@ -158,8 +198,21 @@ class CallRecorder(
             }
         }, "prism-call-recorder").apply { isDaemon = true; start() }
 
+        CallRecordingService.start(context, name.ifBlank { number })
         PrismLogger.logInfo(TAG, "Call recording started ($openedLabel)")
-        return Start(true)
+        return Start(true, usesSpeaker = speakerSwitched)
+    }
+
+    /** Whether the user lets recording switch the speaker on (Settings → Phone and Meshnet Calls). */
+    private fun wantsSpeaker(): Boolean = com.prism.launcher.PrismSettings.getCallRecordSpeaker()
+
+    private var speakerSwitched = false
+
+    /** Puts the call back on the earpiece if recording was what moved it to the speaker. */
+    private fun restoreSpeaker() {
+        if (!speakerSwitched) return
+        speakerSwitched = false
+        runCatching { PrismTelecom.setSpeaker(false) }
     }
 
     /**
@@ -203,6 +256,8 @@ class CallRecorder(
     fun stop(): CallRecordings.Recording? {
         if (!running) return null
         running = false
+        CallRecordingService.stop(context)
+        restoreSpeaker()
         runCatching { recorder?.stop() }
         runCatching { thread?.join(800) }
         runCatching { recorder?.release() }

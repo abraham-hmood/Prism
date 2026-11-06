@@ -285,6 +285,95 @@ object DesktopVirtualApp {
         }
     }
 
+    /**
+     * Opens an app a trusted phone shared: imports its base APK into the vault, runs its Application
+     * startup, then its launch activity's onCreate, all on Prism's own runtime. Returns what to tell
+     * the user, which says plainly how far the app got.
+     *
+     * ## Why it stops at onCreate
+     *
+     * [AndroidSurface] provides the framework calls an app's startup makes; it does not yet inflate
+     * layouts or draw Views, so an activity's screen has nothing to appear in. Running onCreate still
+     * matters: every framework call it reaches that the surface lacks is recorded with its signature,
+     * which is the list of what to build next for that app.
+     */
+    fun launchShared(apks: List<File>, label: String): String {
+        val base = apks.firstOrNull() ?: return label + " arrived without an APK."
+        val imported = import(base).getOrElse { return label + " could not be read: " + it.message }
+        val application = runApplication(imported.packageName)
+        val activity = imported.launchActivity?.let { runActivity(imported.packageName, it) }
+
+        val missing = (application.surfaceReport + "\n" + (activity?.surfaceReport ?: ""))
+        PrismPlatform.log.info(TAG, "Ran " + imported.packageName + ":\n" + missing.take(4000))
+        return buildString {
+            append(label).append(" ran in Prism's Android runtime (")
+            append(application.instructions + (activity?.instructions ?: 0)).append(" instructions). ")
+            append(
+                when {
+                    application.applicationClass == null -> "It has no startup class of its own. "
+                    application.failure == null -> "Its startup finished. "
+                    else -> "Its startup stopped: " + application.failure.lineSequence().first().take(160) + ". "
+                },
+            )
+            when {
+                activity == null -> append("It declares no launch screen. ")
+                activity.failure == null -> append("Its first screen's code ran. ")
+                else -> append("Its first screen stopped: " + activity.failure.lineSequence().first().take(160) + ". ")
+            }
+            append("Prism's runtime does not draw Android screens yet, so no window opens.")
+        }
+    }
+
+    /** Runs the launch activity's constructor and onCreate(null). See [launchShared]. */
+    fun runActivity(packageName: String, activityClass: String): RunResult {
+        val started = System.currentTimeMillis()
+        val apk = DesktopAppVault.apkFile(packageName)
+        val live = runCatching { DesktopAppVault.unseal(packageName) }.getOrElse {
+            return RunResult(packageName, false, activityClass, 0, 0, emptyList(), "", "The vault would not unseal: " + it.message)
+        }
+        val surface = AndroidSurface(
+            packageName = packageName,
+            filesDir = File(live, "files").apply { mkdirs() },
+            cacheDir = File(live, "cache").apply { mkdirs() },
+            manifest = ApkManifest.read(apk),
+        )
+        try {
+            val runtime = DalvikInterpreter.DexRuntime(DexFile.readApk(apk), surface)
+            surface.runtime = runtime
+            val def = runtime.findByName(activityClass)
+                ?: return RunResult(packageName, false, activityClass, 0, System.currentTimeMillis() - started,
+                    surface.logcat(), surface.report(), "no dex defines " + activityClass)
+            runtime.ensureInitialised(def)
+            val instance = DalvikInterpreter.DexObject(def, runtime)
+            def.directMethods.firstOrNull { it.ref.name == "<init>" && it.ref.proto.parameters.isEmpty() }
+                ?.takeIf { it.code != null }
+                ?.let { DalvikInterpreter.execute(runtime, def, it, listOf(instance)) }
+            val onCreate = def.virtualMethods.firstOrNull {
+                it.ref.name == "onCreate" && it.ref.proto.parameters == listOf("Landroid/os/Bundle;")
+            }
+            var failure: String? = null
+            if (onCreate?.code == null) {
+                failure = activityClass + " has no onCreate of its own"
+            } else {
+                runCatching { DalvikInterpreter.execute(runtime, def, onCreate, listOf(instance, null)) }
+                    .onFailure { thrown ->
+                        failure = when (thrown) {
+                            is DalvikInterpreter.UnsupportedOpcode -> thrown.message
+                            is DalvikInterpreter.DalvikThrow -> "The app threw: " + thrown.message + "\n      at " + thrown.trace()
+                            else -> thrown.javaClass.simpleName + ": " + thrown.message
+                        }
+                    }
+            }
+            return RunResult(packageName, failure == null, activityClass, runtime.executed,
+                System.currentTimeMillis() - started, surface.logcat(), surface.report(), failure)
+        } catch (failure: Throwable) {
+            return RunResult(packageName, false, activityClass, 0, System.currentTimeMillis() - started,
+                surface.logcat(), surface.report(), failure.javaClass.simpleName + ": " + failure.message)
+        } finally {
+            runCatching { DesktopAppVault.seal(packageName) }
+        }
+    }
+
     data class CallResult(
         val signature: String,
         val returned: Any?,

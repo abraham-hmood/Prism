@@ -554,10 +554,76 @@ val buildRandomx by tasks.registering(Exec::class) {
     }
 }
 
+// NINE, the x86-64 translator that runs Windows and Linux programs on the Virtualization page, built
+// for THIS computer from the same synced sources Android builds (third_party/nine), with the shim
+// layer in native/nine. Not fatal when the toolchain is missing: that costs the program runner only.
+val nativeNineDir = layout.buildDirectory.dir("nine-native")
+
+val buildNine by tasks.registering {
+    group = "native"
+    description = "Builds NINE (nexus_core) for this machine into build/nativeLibs."
+    dependsOn(rootProject.tasks.named("syncNineSources"))
+    doLast {
+        val out = nativeNineDir.get().asFile.apply { mkdirs() }
+        val source = file("native/nine").absolutePath
+        val windows = System.getProperty("os.name").lowercase().contains("win")
+        val javaHome = nativeJdk.get().metadata.installationPath.asFile.absolutePath
+        val ok: Boolean = if (windows) {
+            // clang-cl in a Visual Studio environment: NINE is GCC/Clang-flavoured C++ (128-bit
+            // integers, GNU extensions) that MSVC's own compiler does not take.
+            val vswhere = File(System.getenv("ProgramFiles(x86)") ?: "C:/Program Files (x86)", "Microsoft Visual Studio/Installer/vswhere.exe")
+            val vs = if (vswhere.isFile) providers.exec {
+                commandLine(vswhere.absolutePath, "-latest", "-products", "*", "-property", "installationPath")
+            }.standardOutput.asText.get().trim() else ""
+            val vcvars = File(vs, "VC/Auxiliary/Build/vcvars64.bat")
+            val clang = listOf(System.getenv("LLVM_HOME")?.let { "$it/bin/clang-cl.exe" }, "C:/Program Files/LLVM/bin/clang-cl.exe")
+                .filterNotNull().map(::File).firstOrNull { it.isFile }
+            if (!vcvars.isFile || clang == null) {
+                logger.warn("NINE: needs Visual Studio Build Tools (C++) and LLVM (clang-cl) to build on Windows; " +
+                    "the Virtualization page's program runner is off in this build.")
+                false
+            } else {
+                val script = File(out, "build-nine.cmd")
+                script.writeText(
+                    listOf(
+                        "@echo off",
+                        "call \"${vcvars.absolutePath}\" >nul",
+                        "cmake -S \"$source\" -B \"${out.absolutePath}\" -G Ninja -DCMAKE_BUILD_TYPE=Release " +
+                            "-DCMAKE_C_COMPILER=\"${clang.invariantSeparatorsPath}\" -DCMAKE_CXX_COMPILER=\"${clang.invariantSeparatorsPath}\" " +
+                            "-DJAVA_HOME=\"${javaHome.replace(File.separatorChar, '/')}\" || exit /b 1",
+                        "cmake --build \"${out.absolutePath}\" || exit /b 1",
+                    ).joinToString(System.lineSeparator(), postfix = System.lineSeparator()),
+                )
+                providers.exec { commandLine("cmd", "/c", script.absolutePath); isIgnoreExitValue = true }.result.get().exitValue == 0
+            }
+        } else {
+            val configure = providers.exec {
+                commandLine("cmake", "-S", source, "-B", out.absolutePath, "-DCMAKE_BUILD_TYPE=Release", "-DJAVA_HOME=$javaHome")
+                isIgnoreExitValue = true
+            }.result.get().exitValue == 0
+            configure && providers.exec {
+                commandLine("cmake", "--build", out.absolutePath, "--parallel")
+                isIgnoreExitValue = true
+            }.result.get().exitValue == 0
+        }
+        if (!ok) {
+            logger.warn("NINE: the desktop build failed; see ${out.absolutePath}. The program runner is off in this build.")
+            return@doLast
+        }
+        val target = layout.buildDirectory.dir("nativeLibs").get().asFile.apply { mkdirs() }
+        out.listFiles().orEmpty()
+            .filter { it.name == "nexus_core.dll" || it.name == "libnexus_core.so" || it.name == "libnexus_core.dylib" }
+            .forEach { lib ->
+                lib.copyTo(File(target, lib.name), overwrite = true)
+                logger.lifecycle("NINE -> ${lib.name}")
+            }
+    }
+}
+
 val buildAllNative by tasks.registering {
     group = "native"
     description = "Builds nora_conv, the llama.cpp bridge and the whisper bridge."
-    dependsOn(buildNativeKernels, buildGguf, buildWhisper, buildRandomx)
+    dependsOn(buildNativeKernels, buildGguf, buildWhisper, buildRandomx, buildNine)
 }
 
 if (project.hasProperty("prismNative")) {

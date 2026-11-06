@@ -112,6 +112,9 @@ object ModelCraftTest {
         ModelCraft.Kind.GAME ->
             "What the asset is. The words pick the category and condition the predicted shape; " +
                 "the model was trained on the dataset's own meshes."
+        ModelCraft.Kind.COMPRESSION ->
+            "The path of a file or folder. It is compressed into its own archive beside it, then " +
+                "decompressed again to prove the archive opens."
     }
 
     /**
@@ -134,7 +137,70 @@ object ModelCraftTest {
             ModelCraft.Kind.INTERPOLATION -> interpolation(model, prompt, seed)
             ModelCraft.Kind.VIDEO -> video(model, prompt, seed)
             ModelCraft.Kind.GAME -> game(model, prompt, seed)
+            ModelCraft.Kind.COMPRESSION -> compression(model, prompt)
         }
+    }
+
+    // ── Compression ────────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Compresses the file or folder at [path] into `<name>.prvc` beside it, then opens that archive
+     * again and compares every file with the original -- exactly for a lossless model, within the
+     * lossy step for a lossy one.
+     */
+    private fun compression(model: CraftedModel, path: String): Output {
+        if (!VectorCompressor.isVector(model)) {
+            throw IllegalStateException(
+                "${model.family} has no on-device runtime in this build; its exported script trains and runs it.",
+            )
+        }
+        val source = java.io.File(path.trim().removeSurrounding("\""))
+        if (path.isBlank() || !source.exists()) throw IllegalStateException("Type the path of a file or folder to compress.")
+        val entries = VectorCompressor.entriesOf(source)
+        val besides = java.io.File(source.parentFile ?: source, source.name + ".prvc")
+        val archive = if (runCatching { besides.parentFile?.canWrite() == true }.getOrDefault(false)) besides
+        else java.io.File(ModelCraft.Store.modelDir(model.id), source.name + ".prvc")
+        val result = archive.outputStream().buffered().use { VectorCompressor.compress(model, entries, it) }
+
+        val originals = entries.filterNot { it.directory }.associate { it.path to it.data }
+        var worst = 0
+        var matched = 0
+        archive.inputStream().buffered().use { input ->
+            VectorCompressor.decompress(input) { entryPath, directory, data ->
+                if (directory) return@decompress
+                val original = originals[entryPath] ?: return@decompress
+                if (original.size == data.size) {
+                    var largest = 0
+                    for (i in original.indices) {
+                        largest = maxOf(largest, kotlin.math.abs((original[i].toInt() and 0xFF) - (data[i].toInt() and 0xFF)))
+                    }
+                    worst = maxOf(worst, largest)
+                    if (largest == 0 || VectorCompressor.lossy(model)) matched++
+                }
+            }
+        }
+        val ratio = if (result.archiveBytes > 0) result.originalBytes.toDouble() / result.archiveBytes else 0.0
+        val text = buildString {
+            appendLine("Archive: ${archive.absolutePath}")
+            appendLine(
+                "%d file(s), %s to %s (%.2fx), %.3f bits per byte.".format(
+                    originals.size, human(result.originalBytes), human(result.archiveBytes), ratio, result.bitsPerByte,
+                ),
+            )
+            appendLine(
+                if (VectorCompressor.lossy(model)) "Lossy: $matched of ${originals.size} restored, every byte within $worst of the original."
+                else if (matched == originals.size) "Lossless: every file came back bit for bit."
+                else "Lossless check FAILED: only $matched of ${originals.size} files came back exactly.",
+            )
+            if (result.learned) append("This data was unfamiliar, so the model learned it and saved new weights.")
+        }
+        return Output.Text(text, "${model.name} · compression")
+    }
+
+    private fun human(bytes: Long): String = when {
+        bytes >= 1L shl 20 -> "%.1f MB".format(bytes / 1_048_576.0)
+        bytes >= 1L shl 10 -> "%.1f KB".format(bytes / 1024.0)
+        else -> "$bytes B"
     }
 
     // ── Text ───────────────────────────────────────────────────────────────────────────────────

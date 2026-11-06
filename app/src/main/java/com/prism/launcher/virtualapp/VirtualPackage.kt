@@ -209,6 +209,23 @@ class VirtualPackage private constructor(
         fun load(context: Context, packageName: String): VirtualPackage? {
             hostContext = context.applicationContext
 
+            // ONE CLASS LOADER PER APP PER PROCESS. A native library can only be loaded by one class
+            // loader in a process, so building a fresh loader for a second launch made YouTube and
+            // TikTok fail with "Shared library ... already opened by ClassLoader" and then wait
+            // forever on initialisation that never finished. The process outlives a launch, so the
+            // package -- loader, resources, and the Application it already built -- is reused while
+            // its APKs are unchanged.
+            val apkStamp = VirtualizedAppVault.apkDir(context, packageName).listFiles().orEmpty()
+                .filter { it.extension.equals("apk", true) }
+                .sortedBy { it.name }
+                .joinToString("|") { it.name + ":" + it.length() + ":" + it.lastModified() }
+            loaded[packageName]?.let { (stamp, cached) ->
+                if (stamp == apkStamp) {
+                    PrismLogger.logInfo(TAG, "Reusing the loaded $packageName")
+                    return cached
+                }
+            }
+
             val apks = VirtualizedAppVault.apkDir(context, packageName)
                 .listFiles().orEmpty()
                 .filter { it.extension.equals("apk", true) }
@@ -222,7 +239,9 @@ class VirtualPackage private constructor(
 
             val info = runCatching {
                 context.packageManager
-                    .getPackageArchiveInfo(apks.first().absolutePath, 0)
+                    // With its metadata: libraries keep their configuration there (see
+                    // SystemServiceHook.withAnalyticsOff), and flags 0 used to drop it.
+                    .getPackageArchiveInfo(apks.first().absolutePath, PackageManager.GET_META_DATA)
                     ?.applicationInfo
             }.getOrNull() ?: run {
                 PrismLogger.logWarning(TAG, "Could not parse ${apks.first().name}")
@@ -252,6 +271,27 @@ class VirtualPackage private constructor(
             VirtualizedAppVault.markReadOnly(apks)
 
             return assemble(context, packageName, apks, info, File(home, "odex"))
+                ?.also { loaded[packageName] = apkStamp to it }
+        }
+
+        /** Packages loaded in this process, with the APK stamp they were loaded from. */
+        private val loaded = java.util.concurrent.ConcurrentHashMap<String, Pair<String, VirtualPackage>>()
+
+        /**
+         * The framework libraries [manifest] asks for that live outside the boot class path.
+         *
+         * A real install gets these from the package manager as "shared libraries" on its class
+         * loader. YouTube needs org.apache.http.legacy ("Failed resolution of
+         * Lorg/apache/http/protocol/HttpRequestHandler;"), which Android 9 moved out of the boot
+         * class path, so it is always offered: apps that bundle their own copy still resolve it
+         * first, because the APKs come first on the path.
+         */
+        private fun sharedLibraries(manifest: ApkManifest?): List<String> {
+            val names = (listOf("org.apache.http.legacy") + manifest?.usesLibraries.orEmpty()).distinct()
+            val folders = listOf("/system/framework", "/system_ext/framework", "/product/framework", "/vendor/framework")
+            return names.mapNotNull { name ->
+                folders.map { File(it, "$name.jar") }.firstOrNull { it.isFile && it.canRead() }?.absolutePath
+            }
         }
 
         /**
@@ -329,8 +369,14 @@ class VirtualPackage private constructor(
             // from outside. It also means hosted code cannot see Prism's classes, which is welcome.
             val bootLoader = context.classLoader.parent ?: ClassLoader.getSystemClassLoader()
 
+            // Read from base.apk, which is where an app bundle keeps the real manifest; the
+            // splits carry stubs that declare nothing a launch needs.
+            val manifest = ApkManifest.read(apks.first())
+            val libraries = sharedLibraries(manifest)
+            if (libraries.isNotEmpty()) PrismLogger.logInfo(TAG, "Shared libraries for $packageName: $libraries")
+
             val loader = DexClassLoader(
-                apks.joinToString(File.pathSeparator) { it.absolutePath },
+                (apks.map { it.absolutePath } + libraries).joinToString(File.pathSeparator),
                 odexDir.apply { mkdirs() }.absolutePath,
                 info.nativeLibraryDir,
                 bootLoader,
@@ -341,9 +387,6 @@ class VirtualPackage private constructor(
                 return null
             }
 
-            // Read from base.apk, which is where an app bundle keeps the real manifest; the
-            // splits carry stubs that declare nothing a launch needs.
-            val manifest = ApkManifest.read(apks.first())
             if (manifest == null) {
                 PrismLogger.logWarning(TAG, "Falling back to PackageManager for $packageName's entry point")
             } else if (info.className.isNullOrBlank() && manifest.applicationClass != null) {
@@ -357,7 +400,9 @@ class VirtualPackage private constructor(
                 TAG,
                 "Loaded $packageName (${apks.size} apk(s), entry=${manifest?.launchActivity ?: "unknown"})",
             )
-            return VirtualPackage(packageName, info, apks, loader, resources, manifest)
+            // The guest asks about itself through the package manager too; this is what answers.
+            SystemServiceHook.registerPackage(packageName, apks.first().absolutePath, info)
+            return VirtualPackage(packageName, SystemServiceHook.withAnalyticsOff(info), apks, loader, resources, manifest)
         }
 
         /**

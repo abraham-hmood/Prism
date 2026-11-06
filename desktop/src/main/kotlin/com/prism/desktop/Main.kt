@@ -429,6 +429,15 @@ fun main(args: Array<String>) {
 
     // Browser history, both directions. Portable, so it is wired in :core rather than here.
     com.prism.launcher.trusted.TrustedSharing.install()
+    com.prism.launcher.podcasts.PodcastSync.install()
+    com.prism.launcher.podcasts.PodcastPlayer.openLine = { rate -> DesktopPodcastLine.open(rate) }
+    // A podcast job this computer was running when Prism last closed or was killed: recorded for
+    // diagnostics and started again. A desktop keeps no system exit record to quote.
+    Thread({
+        com.prism.launcher.podcasts.PodcastDiagnostics.takeInterrupted(null)?.let {
+            com.prism.launcher.podcasts.PodcastStudio.resume(it)
+        }
+    }, "prism-podcast-recover").apply { isDaemon = true; start() }
 
     // The clipboard consumer. AWT gives the SYSTEM clipboard, so a copy on the phone lands where any other
     // application on this machine can paste it. The history receives the entry in :core; this only puts the
@@ -456,13 +465,31 @@ fun main(args: Array<String>) {
     // paired devices. Reads files as well as text: a copy in the OS file manager is the same act.
     com.prism.desktop.DesktopClipboard.install()
 
-    // The catalogue of apps a phone is offering. A PC cannot RUN one yet -- that is PHASE 111 -- but it
-    // can list them and fetch one, which is what was asked for: the download is the whole feature here
-    // until the runtime exists, and TrustedApps says so rather than pretending the click did more.
+    // The catalogue of apps a phone is offering, and running them: the APKs come over the meshnet and
+    // run in Prism's own Android runtime (DesktopVirtualApp: the Dalvik interpreter and the framework
+    // surface) -- no emulator, no Waydroid, nothing installed.
     com.prism.launcher.trusted.TrustedApps.install(
         java.io.File(com.prism.core.PrismPlatform.host.dataDir(), "trust")
     )
-    com.prism.launcher.trusted.TrustedApps.canVirtualize = false
+    com.prism.launcher.trusted.TrustedApps.canVirtualize = true
+    com.prism.launcher.trusted.TrustedApps.launcher = { app ->
+        val apks = com.prism.launcher.trusted.TrustedApps.apkDir(app).listFiles().orEmpty()
+            .filter { it.extension.equals("apk", ignoreCase = true) }
+            // The base APK holds the manifest and the main dex; splits are resources and ABIs.
+            .sortedBy { if (it.name.startsWith("base")) "" else it.name }
+        com.prism.desktop.vm.DesktopVirtualApp.launchShared(apks, app.label)
+    }
+
+    // Drives: this computer's disks are offered to trusted devices, and theirs are mounted here --
+    // a drive letter on Windows, a GVfs mount on Linux -- as well as listed in Files.
+    com.prism.desktop.DesktopRemoteDrives.installProvider()
+    com.prism.desktop.DesktopCompression.install()
+    com.prism.desktop.ui.DriveCompressionUi.install()
+    com.prism.launcher.storage.remote.TrustedDrives.install()
+    Thread({ com.prism.desktop.DesktopRemoteDrives.start() }, "prism-drives-mount").apply {
+        isDaemon = true
+        start()
+    }
     com.prism.launcher.trusted.TrustedApps.iconFetcher = { app, target ->
         fetchFromDevice(app.deviceFingerprint, "/trusted-app/" + app.pkg + "/icon", target)
     }
@@ -5781,6 +5808,9 @@ private fun gui(page: String? = null) = androidx.compose.ui.window.application {
     ) {
         com.prism.desktop.ui.PrismWindow(startOn)
     }
+
+    // A drive being compressed: the desktop's persistent notification. See CompressionProgressWindow.
+    com.prism.desktop.ui.CompressionProgressWindow()
 
     // EXTEND. A page the sender is not looking at, rendered fullscreen. Undecorated so the display
     // is the page rather than a window that contains it.

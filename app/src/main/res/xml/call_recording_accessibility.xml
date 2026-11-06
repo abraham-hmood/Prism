@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Prism's call recording access. It listens to no events and reads no windows: being enabled is
+    what lets Prism's microphone capture survive Android's in-call audio policy.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeAnnouncement"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:canRetrieveWindowContent="false"
+    android:description="@string/call_recording_access_description"
+    android:notificationTimeout="1000"
+    android:packageNames="com.prism.launcher.none" />

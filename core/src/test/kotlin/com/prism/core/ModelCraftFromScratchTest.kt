@@ -326,6 +326,7 @@ class ModelCraftFromScratchTest {
             ModelCraft.Kind.VIDEO -> "shots.csv"
             ModelCraft.Kind.INTERPOLATION -> "clips.csv"
             ModelCraft.Kind.GAME -> "props.csv"
+            ModelCraft.Kind.COMPRESSION -> "corpus.bin"
         }
         val body = when (kind) {
             ModelCraft.Kind.TEXT -> "Once upon a time, in a repository far away…\n"
@@ -334,6 +335,7 @@ class ModelCraftFromScratchTest {
             ModelCraft.Kind.VIDEO -> "path,caption\nshot.mp4,a dog running\n"
             ModelCraft.Kind.INTERPOLATION -> "path,caption\nclip.mp4,a pan\n"
             ModelCraft.Kind.GAME -> "path,caption\nrock.obj,a mossy rock\n"
+            ModelCraft.Kind.COMPRESSION -> "Any bytes at all are a compression dataset.\n"
         }
         return File(scratch, name).apply { writeText(body) }
     }

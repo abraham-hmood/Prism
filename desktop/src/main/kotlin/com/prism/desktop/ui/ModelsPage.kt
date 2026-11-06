@@ -88,7 +88,7 @@ fun ModelsPage() {
     }
     // Ollama servers on this network, and the conversions of their models into GGUFs. Scanned on
     // entering the page because a server can have been started or stopped since the last visit.
-    var ollamaServers by remember { mutableStateOf<List<OllamaDiscoveryService.OllamaServer>>(emptyList()) }
+    var ollamaServers by remember { mutableStateOf(OllamaDiscoveryService.cached()) }
     // The report, not just the servers: when nothing answers, the page names the networks it asked.
     var ollamaReport by remember { mutableStateOf<OllamaDiscoveryService.ScanReport?>(null) }
     var ollamaAddress by remember { mutableStateOf("") }
@@ -101,7 +101,9 @@ fun ModelsPage() {
     LaunchedEffect(ollamaScanRevision) {
         ollamaScanning = true
         val report = withContext(Dispatchers.IO) { OllamaDiscoveryService.scanReport() }
-        ollamaServers = report.servers
+        // A sweep that found nothing keeps the remembered servers rather than emptying the page.
+        ollamaServers = report.servers.ifEmpty { OllamaDiscoveryService.cached() }
+        OllamaDiscoveryService.ensureDefault(ollamaServers)
         ollamaReport = report
         ollamaScanning = false
         ollamaScanned = true
@@ -488,11 +490,7 @@ fun ModelsPage() {
                                 Modifier.fillMaxWidth()
                                     .rightClickable { ollamaMenuFor = key }
                                     .clickableRow {
-                                        PrismSettings.clearSelectedP2pModel()
-                                        PrismSettings.setSelectedOllamaEndpoint(
-                                            PrismSettings.OllamaEndpoint(server.host, server.port, modelName)
-                                        )
-                                        PrismSettings.setAiMode(PrismSettings.AI_MODE_LOCAL_CLOUD)
+                                        OllamaDiscoveryService.activate(server.host, server.port, modelName)
                                         status = modelName + " on " + server.host +
                                             " will now answer in Prism"
                                     }
@@ -564,11 +562,7 @@ fun ModelsPage() {
                                     text = { Text("Use it from this server", fontSize = 13.sp) },
                                     onClick = {
                                         ollamaMenuFor = null
-                                        PrismSettings.clearSelectedP2pModel()
-                                        PrismSettings.setSelectedOllamaEndpoint(
-                                            PrismSettings.OllamaEndpoint(server.host, server.port, modelName)
-                                        )
-                                        PrismSettings.setAiMode(PrismSettings.AI_MODE_LOCAL_CLOUD)
+                                        OllamaDiscoveryService.activate(server.host, server.port, modelName)
                                         status = modelName + " on " + server.host +
                                             " will now answer in Prism"
                                     },

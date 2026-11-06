@@ -712,6 +712,10 @@ class LauncherActivity : PrismBaseActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        // A Home press ends a visit to the flat pages: the AR home screen comes back.
+        if (intent.action == Intent.ACTION_MAIN && intent.hasCategory(Intent.CATEGORY_HOME)) {
+            com.prism.launcher.ar.ArHomeActivity.flat = false
+        }
         handleLaunchIntent(intent)
     }
 
@@ -731,7 +735,7 @@ class LauncherActivity : PrismBaseActivity() {
             // exist until the pager has laid it out, and a cold start arrives before that.
             binding.desktopPager.post {
                 (findPageViewAt(position) as? com.prism.launcher.virtualization.VirtualizationPageView)
-                    ?.runWindowsExecutable(java.io.File(path))
+                    ?.runProgram(java.io.File(path))
             }
         }
     }
@@ -778,6 +782,12 @@ class LauncherActivity : PrismBaseActivity() {
         // Home cannot be intercepted, but Prism IS home -- so a press of it lands here, and this is
         // where a lock that was dismissed that way gets put back.
         com.prism.launcher.lock.LockGate.showIfLocked(this)
+
+        // Augmented reality for all of Prism: the home screen is the room. Behind the lock (which
+        // is shown first, above) and not while the user has asked for the flat pages.
+        if (com.prism.launcher.ar.ArHomeActivity.shouldShow() && !com.prism.launcher.lock.LockGate.isLocked) {
+            com.prism.launcher.ar.ArHomeActivity.open(this)
+        }
 
         // The tour, once. Shown from onResume rather than onCreate so it lands after the pager has
         // laid out -- an overlay added to an empty root flickers as the pages inflate behind it.
@@ -1706,6 +1716,9 @@ class LauncherActivity : PrismBaseActivity() {
             PagePickChoice.EmailServer -> SlotAssignment.EmailServer
             PagePickChoice.EmailClient -> SlotAssignment.EmailClient
             PagePickChoice.AppStore -> SlotAssignment.AppStore
+            PagePickChoice.Podcasts -> SlotAssignment.Podcasts
+            PagePickChoice.Journal -> SlotAssignment.Journal
+            PagePickChoice.TimeMachine -> SlotAssignment.TimeMachine
             PagePickChoice.TaskManager -> SlotAssignment.TaskManager
             PagePickChoice.Helper -> SlotAssignment.Helper
             PagePickChoice.Vpn -> SlotAssignment.Vpn

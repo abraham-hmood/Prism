@@ -7,7 +7,9 @@ import com.prism.core.json.JSONArray
 import com.prism.core.json.JSONObject
 import com.prism.launcher.PrismSettings
 import com.prism.launcher.cloud.CloudVault
+import com.prism.launcher.trusted.DeviceKeys
 import com.prism.launcher.trusted.TrustedDevices
+import com.prism.launcher.trusted.TrustedSeal
 import java.io.File
 import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
@@ -24,12 +26,13 @@ import java.util.concurrent.TimeUnit
  * only by the wallet that made it, and it is not paid for. Reusing the market would have meant a
  * backup that fails when nobody is selling space and that strangers hold a copy of.
  *
- * ## The key is the wallet, the same as calls
+ * ## Two keys: the pair's on the wire, each device's own at rest
  *
- * [CloudVault.Purpose.PHOTOS] is derived from the recovery phrase, exactly like call audio and
- * messages. A trusted device already shares that phrase -- that is what trusting it means here -- so
- * it can open the backup, and a device that merely sits on the same Wi-Fi cannot. There is no new
- * secret to hand over and no key exchange to get wrong.
+ * On the wire every packet is sealed with the photos key this device agreed with that trusted device
+ * from their two key pairs (see DeviceKeys and TrustedSeal), so only the two of them can read it and
+ * they need not share a recovery phrase. On disk each device seals what it holds with its OWN
+ * wallet's [CloudVault.Purpose.PHOTOS] key, so the vault is not a plain copy of the camera roll and
+ * a device holding someone's backup still needs its own unlocked wallet to read it.
  *
  * ## The local copy is real
  *
@@ -166,6 +169,11 @@ object PhotoBackup {
 
     private fun key(): ByteArray? = CloudVault.keyFor(CloudVault.Purpose.PHOTOS)
 
+    /** Seals a packet for the trusted device at [peerIp]; null when there is no key for it. */
+    private fun sealFor(peerIp: String, body: JSONObject): String? =
+        TrustedSeal.sealForIp(peerIp, DeviceKeys.Purpose.PHOTOS, body.toString().toByteArray(), key())
+            ?.let { Base64.getEncoder().encodeToString(it) }
+
     // ── Storage ───────────────────────────────────────────────────────────
 
     fun root(): File = File(PrismPlatform.host.dataDir(), "photos/backups").apply { mkdirs() }
@@ -298,14 +306,15 @@ object PhotoBackup {
      * time is already using the link. Returns the names of the peers that acknowledged every chunk.
      */
     fun send(entry: Entry, peers: List<Pair<String, String>>, onProgress: (Double) -> Unit = {}): List<String> {
-        val encryption = key() ?: return emptyList()
+        if (key() == null) return emptyList()
         if (!MeshTransport.isOnMesh()) return emptyList()
         val accepted = ArrayList<String>()
         for ((ip, name) in peers) {
             var all = true
             for (index in 0 until entry.chunks) {
-                val sealed = readLocalChunk(entry.id, index)
-                if (sealed == null) {
+                // Decrypted from this device's vault; it travels inside a packet sealed for the peer.
+                val chunk = readLocalChunk(entry.id, index)
+                if (chunk == null) {
                     all = false
                     break
                 }
@@ -316,10 +325,14 @@ object PhotoBackup {
                     put("total", entry.chunks)
                     put("meta", encodeEntry(entry))
                     put("from", TrustedDevices.localFingerprint())
-                    put("data", Base64.getEncoder().encodeToString(sealed))
+                    put("data", Base64.getEncoder().encodeToString(chunk))
                 }
-                val packet = CloudVault.seal(body.toString().toByteArray(), encryption)
-                MeshTransport.sendToPeer(ip, OPCODE_PUT, Base64.getEncoder().encodeToString(packet))
+                val packet = sealFor(ip, body)
+                if (packet == null) {
+                    all = false
+                    break
+                }
+                MeshTransport.sendToPeer(ip, OPCODE_PUT, packet)
                 onProgress((index + 1).toDouble() / entry.chunks)
             }
             if (all) {
@@ -366,24 +379,25 @@ object PhotoBackup {
     }
 
     /**
-     * Opens one of our own sealed packets from an unknown address.
+     * Opens a packet from a trusted device, wherever it is now.
      *
-     * This is how a peer whose IP changed is still recognised. The photo key is derived from the
-     * wallet, so being able to open the packet IS the proof that the sender shares the wallet; the
-     * fingerprint inside then says which trusted device it is. Without this, a phone that moved to a
-     * new lease silently stopped backing up and stopped being seen, which is exactly the shape of
+     * This is how a peer whose IP changed is still recognised: every trusted device's photos key is
+     * tried, and the one that opens the packet names the device. Without this, a phone that moved to
+     * a new lease silently stopped backing up and stopped being seen, which is exactly the shape of
      * the bug the call engine has.
      */
-    private fun openOwn(payload: String): Pair<JSONObject, String>? {
-        val encryption = key() ?: return null
+    private fun openOwn(peerIp: String, payload: String): Pair<JSONObject, String>? {
         val sealed = runCatching { Base64.getDecoder().decode(payload) }.getOrNull() ?: return null
-        val plain = CloudVault.open(sealed, encryption) ?: return null
-        val json = runCatching { JSONObject(String(plain)) }.getOrNull() ?: return null
-        return json to json.optString("from")
+        val opened = TrustedSeal.openFrom(peerIp, sealed, DeviceKeys.Purpose.PHOTOS, key()) ?: run {
+            TrustedDevices.byIp(peerIp)?.takeIf { it.confirmed }?.let { TrustedDevices.requestKey(it) }
+            return null
+        }
+        val json = runCatching { JSONObject(String(opened.plain)) }.getOrNull() ?: return null
+        return json to (opened.device?.fingerprint ?: json.optString("from"))
     }
 
     private fun onList(peerIp: String, payload: String) {
-        val (json, from) = openOwn(payload) ?: return
+        val (json, from) = openOwn(peerIp, payload) ?: return
         if (json.optString("t") != "list") return
         val requestId = json.optString("rid")
 
@@ -399,7 +413,6 @@ object PhotoBackup {
         // Paginated so a large library does not exceed one datagram. Each page is its own packet.
         val pageSize = 8
         val pages = if (entries.isEmpty()) 1 else (entries.size + pageSize - 1) / pageSize
-        val encryption = key() ?: return
         for (page in 0 until pages) {
             val array = JSONArray()
             entries.drop(page * pageSize).take(pageSize).forEach { array.put(encodeEntry(it)) }
@@ -412,13 +425,13 @@ object PhotoBackup {
                 put("from", TrustedDevices.localFingerprint())
                 put("entries", array)
             }
-            val sealed = CloudVault.seal(body.toString().toByteArray(), encryption)
-            MeshTransport.sendToPeer(peerIp, OPCODE_LIST, Base64.getEncoder().encodeToString(sealed))
+            val sealed = sealFor(peerIp, body) ?: return
+            MeshTransport.sendToPeer(peerIp, OPCODE_LIST, sealed)
         }
     }
 
     private fun onPut(peerIp: String, payload: String) {
-        val (json, from) = openOwn(payload) ?: return
+        val (json, from) = openOwn(peerIp, payload) ?: return
         if (json.optString("t") != "put") return
         // A device that shares the wallet is trusted by construction, but the record is what names
         // it on the page. Anything else is refused rather than silently stored.
@@ -433,11 +446,10 @@ object PhotoBackup {
         val index = json.optInt("chunk", -1)
         val total = json.optInt("total", 0)
         if (id.isBlank() || index < 0 || total <= 0) return
-        val sealed = runCatching { Base64.getDecoder().decode(json.optString("data")) }.getOrNull() ?: return
+        val plain = runCatching { Base64.getDecoder().decode(json.optString("data")) }.getOrNull() ?: return
+        // Stored sealed with THIS device's own wallet, bound to its id and index.
         val encryption = key() ?: return
-        // Prove it opens before storing: an unopenable chunk is not a backup, it is garbage that
-        // would make `hasLocalCopy` lie.
-        val plain = CloudVault.open(sealed, encryption, aad(id, index)) ?: return
+        val sealed = CloudVault.seal(plain, encryption, aad(id, index))
         runCatching {
             File(root(), id).mkdirs()
             chunkFile(id, index).writeBytes(sealed)
@@ -462,19 +474,17 @@ object PhotoBackup {
             put("chunk", index)
             put("from", TrustedDevices.localFingerprint())
         }
-        val sealedAck = CloudVault.seal(ack.toString().toByteArray(), encryption)
-        MeshTransport.sendToPeer(peerIp, OPCODE_ACK, Base64.getEncoder().encodeToString(sealedAck))
+        sealFor(peerIp, ack)?.let { MeshTransport.sendToPeer(peerIp, OPCODE_ACK, it) }
     }
 
     private fun onGet(peerIp: String, payload: String) {
-        val (json, from) = openOwn(payload) ?: return
+        val (json, from) = openOwn(peerIp, payload) ?: return
         if (json.optString("t") != "get") return
         if (TrustedDevices.byFingerprint(from) == null) return
         val id = json.optString("id")
         val index = json.optInt("chunk", -1)
         if (id.isBlank() || index < 0) return
         val data = readLocalChunk(id, index) ?: return
-        val encryption = key() ?: return
         val body = JSONObject().apply {
             put("t", "data")
             put("id", id)
@@ -483,18 +493,16 @@ object PhotoBackup {
             put("from", TrustedDevices.localFingerprint())
             put("data", Base64.getEncoder().encodeToString(data))
         }
-        val sealed = CloudVault.seal(body.toString().toByteArray(), encryption, aad(id, index))
-        MeshTransport.sendToPeer(peerIp, OPCODE_DATA, Base64.getEncoder().encodeToString(sealed))
+        val sealed = sealFor(peerIp, body) ?: return
+        MeshTransport.sendToPeer(peerIp, OPCODE_DATA, sealed)
     }
 
     private fun onData(peerIp: String, payload: String) {
-        val (json, _) = openOwn(payload) ?: return
+        val (json, _) = openOwn(peerIp, payload) ?: return
         if (json.optString("t") != "data") return
         val id = json.optString("id")
         val index = json.optInt("chunk", -1)
-        val seals = runCatching { Base64.getDecoder().decode(json.optString("data")) }.getOrNull() ?: return
-        val encryption = key() ?: return
-        val plain = CloudVault.open(seals, encryption, aad(id, index)) ?: return
+        val plain = runCatching { Base64.getDecoder().decode(json.optString("data")) }.getOrNull() ?: return
         pendingChunks.remove("$id:$index")?.invoke(plain)
         pendingChunks.remove("$id:any")?.invoke(plain)
     }
@@ -506,11 +514,6 @@ object PhotoBackup {
      * blocking the UI thread for a UDP round trip is how a page freezes on a lossy network.
      */
     fun requestList(peerIp: String, timeoutMs: Long = 2500, onResult: (List<Entry>) -> Unit) {
-        val encryption = key()
-        if (encryption == null) {
-            onResult(emptyList())
-            return
-        }
         val requestId = java.util.UUID.randomUUID().toString()
         val collected = java.util.Collections.synchronizedList(mutableListOf<Entry>())
         pendingLists[requestId] = { entries ->
@@ -522,8 +525,13 @@ object PhotoBackup {
             put("rid", requestId)
             put("from", TrustedDevices.localFingerprint())
         }
-        val sealed = CloudVault.seal(body.toString().toByteArray(), encryption)
-        MeshTransport.sendToPeer(peerIp, OPCODE_LIST, Base64.getEncoder().encodeToString(sealed))
+        val sealed = sealFor(peerIp, body)
+        if (sealed == null) {
+            pendingLists.remove(requestId)
+            onResult(emptyList())
+            return
+        }
+        MeshTransport.sendToPeer(peerIp, OPCODE_LIST, sealed)
 
         // The timeout callback is deliberately silent when entries arrived late: partial is better
         // than nothing, and the page can refresh.
@@ -558,7 +566,6 @@ object PhotoBackup {
     fun fetchChunk(peerIp: String, id: String, index: Int, timeoutMs: Long = 4_000): ByteArray? {
         // A local copy wins: no reason to ask the network for something already here.
         readLocalChunk(id, index)?.let { return it }
-        val encryption = key() ?: return null
         val latch = CountDownLatch(1)
         var result: ByteArray? = null
         pendingChunks["$id:$index"] = { bytes ->
@@ -572,8 +579,12 @@ object PhotoBackup {
             put("rid", "$id:$index")
             put("from", TrustedDevices.localFingerprint())
         }
-        val sealed = CloudVault.seal(body.toString().toByteArray(), encryption)
-        MeshTransport.sendToPeer(peerIp, OPCODE_GET, Base64.getEncoder().encodeToString(sealed))
+        val sealed = sealFor(peerIp, body)
+        if (sealed == null) {
+            pendingChunks.remove("$id:$index")
+            return null
+        }
+        MeshTransport.sendToPeer(peerIp, OPCODE_GET, sealed)
         latch.await(timeoutMs, TimeUnit.MILLISECONDS)
         pendingChunks.remove("$id:$index")
         return result

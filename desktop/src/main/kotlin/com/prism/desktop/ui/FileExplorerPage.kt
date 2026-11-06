@@ -2,6 +2,7 @@ package com.prism.desktop.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -75,8 +76,21 @@ fun FileExplorerPage() {
     var renaming by remember { mutableStateOf<File?>(null) }
     var creatingFolder by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf<List<File>>(emptyList()) }
+    // A drive right-clicked in the sidebar, whose compression dialog is open.
+    var compressTarget by remember { mutableStateOf<DriveCompressionUi.Target?>(null) }
 
     val networks = remember { PrismSettings.getNetworkStorages() }
+
+    // USB drives, re-read every few seconds while the page is open: a stick plugged in (or pulled)
+    // shows up without leaving the page. See DesktopDrives for how each OS mounts them.
+    var drives by remember { mutableStateOf<List<com.prism.desktop.DesktopDrives.Drive>>(emptyList()) }
+    var driveBusy by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            drives = withContext(Dispatchers.IO) { com.prism.desktop.DesktopDrives.list() }
+            kotlinx.coroutines.delay(4_000)
+        }
+    }
 
     // Remote browsing state. Null means the local filesystem is showing; when set, the listing
     // pane shows the remote share instead. Kept separate from `current` rather than pretending a
@@ -86,6 +100,23 @@ fun FileExplorerPage() {
     var remotePath by remember { mutableStateOf("") }
     var remoteResult by remember { mutableStateOf<NetworkStorage.Result?>(null) }
     var remoteBusy by remember { mutableStateOf(false) }
+
+    // A trusted device's drive the OS could not mount, browsed directly instead. A mounted one is
+    // just a folder (a drive letter, or a GVfs path) and opens in the ordinary listing.
+    var remoteDrive by remember { mutableStateOf<com.prism.desktop.DesktopRemoteDrives.Mounted?>(null) }
+    var remoteDrivePath by remember { mutableStateOf("/") }
+    var remoteDriveItems by remember { mutableStateOf<Result<List<com.prism.launcher.storage.remote.DriveItem>>?>(null) }
+    LaunchedEffect(remoteDrive, remoteDrivePath, refreshToken) {
+        val drive = remoteDrive ?: return@LaunchedEffect
+        remoteDriveItems = null
+        remoteDriveItems = withContext(Dispatchers.IO) {
+            runCatching {
+                val access = com.prism.desktop.DesktopRemoteDrives.access(drive) ?: error("${drive.device} is offline")
+                access.list(remoteDrivePath).sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
+            }
+        }
+    }
+    LaunchedEffect(Unit) { withContext(Dispatchers.IO) { com.prism.launcher.storage.remote.TrustedDrives.query() } }
 
     LaunchedEffect(remote, remotePath) {
         val storage = remote ?: return@LaunchedEffect
@@ -223,15 +254,89 @@ fun FileExplorerPage() {
                 networks = networks,
                 current = current,
                 remote = remote,
-                onPick = { current = it; selected = emptySet(); remote = null },
+                onPick = { current = it; selected = emptySet(); remote = null; remoteDrive = null },
+                drives = drives,
+                busyDrive = driveBusy,
+                onPickDrive = { drive ->
+                    val open = drive.mountPoint
+                    if (drive.isMounted && open != null) {
+                        current = open; selected = emptySet(); remote = null
+                    } else {
+                        driveBusy = drive.id
+                        status = "Mounting ${drive.title}…" +
+                            if (drive.needsWsl) " Windows will ask for administrator rights to attach it to WSL." else ""
+                        scope.launch {
+                            val result = withContext(Dispatchers.IO) { com.prism.desktop.DesktopDrives.mount(drive) }
+                            driveBusy = null
+                            result.onSuccess { folder ->
+                                current = folder; selected = emptySet(); remote = null
+                                status = "${drive.title} is open"
+                            }.onFailure { status = "Could not mount ${drive.title}: ${it.message}" }
+                            drives = withContext(Dispatchers.IO) { com.prism.desktop.DesktopDrives.list() }
+                        }
+                    }
+                },
+                onEjectDrive = { drive ->
+                    driveBusy = drive.id
+                    scope.launch {
+                        val result = withContext(Dispatchers.IO) { com.prism.desktop.DesktopDrives.eject(drive) }
+                        driveBusy = null
+                        status = result.fold({ "${drive.title} can be removed" }, { "Could not eject ${drive.title}: ${it.message}" })
+                        if (drive.mountPoint != null && current.absolutePath.startsWith(drive.mountPoint.absolutePath)) {
+                            current = roots.firstOrNull() ?: File(".")
+                        }
+                        drives = withContext(Dispatchers.IO) { com.prism.desktop.DesktopDrives.list() }
+                    }
+                },
                 onPickRemote = { storage ->
                     remote = storage
                     remotePath = ""
                     selected = emptySet()
+                    remoteDrive = null
+                },
+                onCompress = { compressTarget = it },
+                onStatus = { status = it },
+                remoteDrives = com.prism.desktop.DesktopRemoteDrives.mounts.values
+                    .sortedWith(compareBy({ it.device.lowercase() }, { it.drive.name.lowercase() })),
+                activeRemoteDrive = remoteDrive?.key,
+                onPickRemoteDrive = { mounted ->
+                    val folder = mounted.folder
+                    if (folder != null && folder.isDirectory) {
+                        current = folder; selected = emptySet(); remote = null; remoteDrive = null
+                    } else {
+                        remote = null
+                        remoteDrive = mounted
+                        remoteDrivePath = "/"
+                        status = mounted.problem?.let { "Not in the system file explorer: $it" }
+                    }
                 },
             )
 
-            if (remote != null) {
+            if (remoteDrive != null) {
+                DriveListing(
+                    mounted = remoteDrive!!,
+                    path = remoteDrivePath,
+                    items = remoteDriveItems,
+                    onEnter = { remoteDrivePath = it },
+                    onUp = { remoteDrivePath = remoteDrivePath.substringBeforeLast('/').ifEmpty { "/" } },
+                    onDownload = { item ->
+                        val drive = remoteDrive
+                        if (drive != null) scope.launch {
+                            status = "Downloading ${item.name}..."
+                            val target = File(current, item.name)
+                            val ok = withContext(Dispatchers.IO) {
+                                runCatching {
+                                    val access = com.prism.desktop.DesktopRemoteDrives.access(drive) ?: error("offline")
+                                    access.open(item.path).use { input -> target.outputStream().use { input.copyTo(it, 256 * 1024) } }
+                                }.isSuccess
+                            }
+                            status = if (ok) "Downloaded ${item.name} to ${current.name}" else "Could not download ${item.name}"
+                            refresh()
+                        }
+                    },
+                    modifier = Modifier.weight(1f),
+                )
+            } else if (remote != null) {
                 RemoteListing(
                     storage = remote!!,
                     path = remotePath,
@@ -281,8 +386,12 @@ fun FileExplorerPage() {
 
         SectionFooter(
             "Press and hold any item to drag it onto the desktop. Click the checkbox to select " +
-                "several, then cut, copy or delete them together."
+                "several, then cut, copy or delete them together. Right-click a drive for its menu."
         )
+    }
+
+    compressTarget?.let { target ->
+        DriveCompressionDialog(target, onDismiss = { compressTarget = null }, onStarted = { status = it })
     }
 
     renaming?.let { file ->
@@ -468,11 +577,23 @@ private fun RootsSidebar(
     current: File,
     remote: PrismSettings.NetworkStorage?,
     onPick: (File) -> Unit,
+    drives: List<com.prism.desktop.DesktopDrives.Drive>,
+    busyDrive: String?,
+    onPickDrive: (com.prism.desktop.DesktopDrives.Drive) -> Unit,
+    onEjectDrive: (com.prism.desktop.DesktopDrives.Drive) -> Unit,
     onPickRemote: (PrismSettings.NetworkStorage) -> Unit,
+    onCompress: (DriveCompressionUi.Target) -> Unit,
+    onStatus: (String) -> Unit,
+    remoteDrives: List<com.prism.desktop.DesktopRemoteDrives.Mounted>,
+    activeRemoteDrive: String?,
+    onPickRemoteDrive: (com.prism.desktop.DesktopRemoteDrives.Mounted) -> Unit,
 ) {
     val colors = LocalPrismColors.current
+    // Which drive's right-click menu is open: the phone's long-press popup, on a desktop.
+    var menuFor by remember { mutableStateOf<String?>(null) }
     Column(
-        Modifier.width(190.dp).fillMaxHeight().background(Color(0xFF121215)).padding(vertical = 8.dp),
+        Modifier.width(190.dp).fillMaxHeight().background(Color(0xFF121215)).padding(vertical = 8.dp)
+            .verticalScroll(androidx.compose.foundation.rememberScrollState()),
     ) {
         Text(
             "THIS MACHINE", fontSize = 9.sp, letterSpacing = 1.1.sp, color = colors.faint,
@@ -482,6 +603,7 @@ private fun RootsSidebar(
             val active = remote == null && root.absolutePath == current.absolutePath
             Row(
                 Modifier.fillMaxWidth().clickableRow { onPick(root) }
+                    .onRightClick { menuFor = "root:" + root.absolutePath }
                     .background(if (active) Color(0xFF23232B) else Color.Transparent)
                     .padding(horizontal = 14.dp, vertical = 7.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -499,6 +621,134 @@ private fun RootsSidebar(
                     fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
                     color = if (active) Color.White else colors.muted,
                 )
+                DriveMenu(
+                    expanded = menuFor == "root:" + root.absolutePath,
+                    target = DriveCompressionUi.Target.Local(root, root.name.ifBlank { root.absolutePath }),
+                    onDismiss = { menuFor = null },
+                    onOpen = { onPick(root) },
+                    onCompress = onCompress,
+                    onStatus = onStatus,
+                )
+            }
+        }
+
+        if (drives.isNotEmpty()) {
+            Spacer(Modifier.height(10.dp))
+            Text(
+                "USB DRIVES", fontSize = 9.sp, letterSpacing = 1.1.sp, color = colors.faint,
+                modifier = Modifier.padding(start = 14.dp, bottom = 4.dp),
+            )
+            drives.forEach { drive ->
+                val active = remote == null && drive.mountPoint != null &&
+                    current.absolutePath.startsWith(drive.mountPoint.absolutePath)
+                Row(
+                    Modifier.fillMaxWidth()
+                        .clickableRow { if (busyDrive == null) onPickDrive(drive) }
+                        .onRightClick { menuFor = "usb:" + drive.id }
+                        .background(if (active) Color(0xFF23232B) else Color.Transparent)
+                        .padding(start = 14.dp, end = 6.dp, top = 7.dp, bottom = 7.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        Icons.Filled.Usb, null,
+                        tint = if (drive.isMounted) colors.accent else colors.faint,
+                        modifier = Modifier.size(15.dp),
+                    )
+                    Spacer(Modifier.width(9.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(drive.title, fontSize = 12.sp, color = colors.muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            listOf(
+                                drive.fileSystem.ifBlank { "unknown" },
+                                com.prism.launcher.storage.formatBytes(drive.sizeBytes).takeIf { drive.sizeBytes > 0 },
+                                when {
+                                    busyDrive == drive.id -> "working…"
+                                    drive.isMounted -> null
+                                    else -> "click to mount"
+                                },
+                            ).filterNotNull().joinToString(" · "),
+                            fontSize = 9.sp, color = colors.faint, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    if (drive.isMounted) {
+                        Icon(
+                            Icons.Filled.Eject, "Eject",
+                            tint = colors.faint,
+                            modifier = Modifier.size(22.dp).clickableRow { if (busyDrive == null) onEjectDrive(drive) }.padding(3.dp),
+                        )
+                    }
+                    DriveMenu(
+                        expanded = menuFor == "usb:" + drive.id,
+                        // An unmounted stick has no folder to compress yet: Open mounts it first.
+                        target = drive.mountPoint?.takeIf { drive.isMounted }?.let { DriveCompressionUi.Target.Local(it, drive.title) },
+                        onDismiss = { menuFor = null },
+                        onOpen = { if (busyDrive == null) onPickDrive(drive) },
+                        onCompress = onCompress,
+                        onStatus = onStatus,
+                        extra = if (drive.isMounted) listOf("Eject" to { if (busyDrive == null) onEjectDrive(drive) }) else emptyList(),
+                    )
+                }
+            }
+        }
+
+        // Every drive of every trusted device: a phone's internal storage, SD card and USB drives,
+        // another computer's disks. Grouped by device; mounted ones are also in the OS's explorer.
+        if (remoteDrives.isNotEmpty()) {
+            remoteDrives.groupBy { it.device }.forEach { (device, driveList) ->
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    device.uppercase(), fontSize = 9.sp, letterSpacing = 1.1.sp, color = colors.faint,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(start = 14.dp, end = 8.dp, bottom = 4.dp),
+                )
+                driveList.forEach { mounted ->
+                    val folder = mounted.folder
+                    val active = activeRemoteDrive == mounted.key ||
+                        (remote == null && activeRemoteDrive == null && folder != null &&
+                            current.absolutePath.startsWith(folder.absolutePath))
+                    Row(
+                        Modifier.fillMaxWidth().clickableRow { onPickRemoteDrive(mounted) }
+                            .onRightClick { menuFor = "remote:" + mounted.key }
+                            .background(if (active) Color(0xFF23232B) else Color.Transparent)
+                            .padding(horizontal = 14.dp, vertical = 7.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            when (mounted.drive.kind) {
+                                com.prism.launcher.storage.remote.DriveKind.USB -> Icons.Filled.Usb
+                                com.prism.launcher.storage.remote.DriveKind.SD_CARD -> Icons.Filled.SdCard
+                                com.prism.launcher.storage.remote.DriveKind.PHONE -> Icons.Filled.PhoneAndroid
+                                else -> Icons.Filled.Storage
+                            },
+                            null,
+                            tint = if (active) colors.accent else colors.muted,
+                            modifier = Modifier.size(15.dp),
+                        )
+                        Spacer(Modifier.width(9.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(mounted.drive.name, fontSize = 12.sp, color = colors.muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(
+                                listOfNotNull(
+                                    mounted.drive.kind.title,
+                                    com.prism.launcher.storage.formatBytes(mounted.drive.freeBytes)
+                                        .takeIf { mounted.drive.freeBytes >= 0 }?.let { "$it free" },
+                                    folder?.path?.takeIf { it.length <= 3 },
+                                ).joinToString(" · "),
+                                fontSize = 9.sp, color = colors.faint, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        DriveMenu(
+                            expanded = menuFor == "remote:" + mounted.key,
+                            target = DriveCompressionUi.Target.Remote(
+                                mounted.fingerprint, mounted.device, mounted.drive.id, mounted.drive.name, mounted.drive.compression,
+                            ),
+                            onDismiss = { menuFor = null },
+                            onOpen = { onPickRemoteDrive(mounted) },
+                            onCompress = onCompress,
+                            onStatus = onStatus,
+                        )
+                    }
+                }
             }
         }
 
@@ -628,6 +878,66 @@ private fun RemoteListing(
                 }
                 SectionFooter("Click a file to download it into the current local folder.")
             }
+        }
+    }
+}
+
+/**
+ * A trusted device's drive, listed directly. Used only when the OS could not mount it; a mounted
+ * drive is a folder and gets the full file manager instead.
+ */
+@Composable
+private fun DriveListing(
+    mounted: com.prism.desktop.DesktopRemoteDrives.Mounted,
+    path: String,
+    items: Result<List<com.prism.launcher.storage.remote.DriveItem>>?,
+    onEnter: (String) -> Unit,
+    onUp: () -> Unit,
+    onDownload: (com.prism.launcher.storage.remote.DriveItem) -> Unit,
+    modifier: Modifier,
+) {
+    val colors = LocalPrismColors.current
+    Column(modifier) {
+        Row(
+            Modifier.fillMaxWidth().background(Color(0xFF1A1A20)).padding(horizontal = 10.dp, vertical = 7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (path != "/") {
+                Icon(Icons.Filled.ArrowUpward, "Up", tint = colors.muted, modifier = Modifier.size(15.dp).clickableRow { onUp() })
+                Spacer(Modifier.width(10.dp))
+            }
+            Text(
+                mounted.device + " / " + mounted.drive.name + path.takeIf { it != "/" }.orEmpty(),
+                fontSize = 11.sp, color = colors.muted, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            if (items == null) CircularProgressIndicator(Modifier.size(13.dp), strokeWidth = 2.dp)
+        }
+        items?.onFailure {
+            RemoteNotice(Icons.Filled.ErrorOutline, "Could not reach ${mounted.device}", it.message ?: "")
+        }
+        items?.onSuccess { list ->
+            if (list.isEmpty()) RemoteNotice(Icons.Filled.FolderOpen, "Empty", "Nothing in this folder.")
+            LazyColumn(Modifier.weight(1f)) {
+                items(list, key = { it.path }) { item ->
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .clickableRow { if (item.isDirectory) onEnter(item.path) else onDownload(item) }
+                            .padding(horizontal = 10.dp, vertical = 7.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            if (item.isDirectory) Icons.Filled.Folder else Icons.Filled.CloudDownload, null,
+                            tint = if (item.isDirectory) colors.accent else colors.faint,
+                            modifier = Modifier.size(16.dp),
+                        )
+                        Spacer(Modifier.width(11.dp))
+                        Text(item.name, fontSize = 13.sp, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        if (!item.isDirectory) Text(FileOps.humanSize(item.size), fontSize = 11.sp, color = colors.faint)
+                    }
+                }
+            }
+            SectionFooter("Click a file to download it into the current local folder.")
         }
     }
 }

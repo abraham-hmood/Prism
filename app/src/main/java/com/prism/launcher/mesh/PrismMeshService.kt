@@ -604,6 +604,14 @@ object PrismMeshService {
                 }, "trust-wallet").start()
             }
 
+            // A paired device's public key, proved with the pair's link key. Everything sent between
+            // trusted devices is sealed with keys derived from these -- see TrustedDevices.onKey.
+            com.prism.launcher.trusted.TrustedDevices.OPCODE_TRUST_KEY -> {
+                Thread({
+                    com.prism.launcher.trusted.TrustedDevices.onKey(peerIp, payload)
+                }, "trust-key").start()
+            }
+
             // A trusted peer saying where it is now. Cheap and frequent, so it runs inline: this
             // only rewrites an existing record's address, and doing it on a thread per packet
             // would cost more than the work.

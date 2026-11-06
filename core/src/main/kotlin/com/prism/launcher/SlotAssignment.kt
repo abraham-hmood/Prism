@@ -93,6 +93,12 @@ sealed class SlotAssignment {
     /** Diary entries and the recipes kept beside them. */
     data object Journal : SlotAssignment()
 
+    /**
+     * AI-generated podcasts: shows the user made or a trusted device shared, their episodes, and the
+     * player. Needs an active text model and a voice (an imported speech model or Kokoro).
+     */
+    data object Podcasts : SlotAssignment()
+
     /** The mesh-gated app catalogue and the publisher upload flow. */
     data object AppStore : SlotAssignment()
 
@@ -145,6 +151,7 @@ sealed class SlotAssignment {
         is EmailClient -> "email_client"
         is TimeMachine -> "time_machine"
         is Journal -> "journal"
+        is Podcasts -> "podcasts"
         is AppStore -> "app_store"
         is Helper -> "helper"
         is Vpn -> "vpn"
@@ -189,6 +196,7 @@ sealed class SlotAssignment {
             if (raw == "email_client") return EmailClient
             if (raw == "time_machine") return TimeMachine
             if (raw == "journal") return Journal
+            if (raw == "podcasts") return Podcasts
             if (raw == "app_store") return AppStore
             if (raw == "helper") return Helper
             if (raw == "vpn") return Vpn

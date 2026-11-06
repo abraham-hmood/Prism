@@ -51,12 +51,100 @@ object OllamaDiscoveryService {
 
     suspend fun scan(): List<OllamaServer> = scanReport().servers
 
+    // -- Remembered servers ------------------------------------------------
+    //
+    // A SCAN USED TO BE FORGOTTEN THE MOMENT ITS PAGE CLOSED. Settings found a server, kept it in the
+    // activity, and the Models page -- which runs its own sweep -- never heard of it: a server typed in
+    // by address, or one on another subnet, is out of reach of a /24 sweep, so it simply was not on
+    // the Models page, and going back to Settings meant scanning again. Every server any probe finds
+    // is now remembered here with its port and models, every page starts from that list, and every
+    // scan asks the remembered servers first.
+
+    private const val PREFS = "prism_ollama"
+    private const val KEY_SERVERS = "servers"
+
+    @Volatile private var memory: List<OllamaServer>? = null
+
+    /** The servers the last scans found, for a page to show before (or instead of) scanning again. */
+    fun cached(): List<OllamaServer> {
+        memory?.let { return it }
+        val loaded = runCatching {
+            val array = com.prism.core.json.JSONArray(
+                com.prism.core.PrismPlatform.host.prefs(PREFS).getString(KEY_SERVERS, "[]").orEmpty(),
+            )
+            (0 until array.length()).mapNotNull { i ->
+                val o = array.optJSONObject(i) ?: return@mapNotNull null
+                val models = o.optJSONArray("models")
+                OllamaServer(
+                    o.optString("host"), o.optInt("port", OLLAMA_PORT),
+                    if (models == null) emptyList() else (0 until models.length()).map { models.optString(it) },
+                ).takeIf { it.host.isNotBlank() && it.models.isNotEmpty() }
+            }
+        }.getOrDefault(emptyList())
+        memory = loaded
+        return loaded
+    }
+
+    private fun remember(servers: List<OllamaServer>, replace: Boolean) {
+        val merged = LinkedHashMap<String, OllamaServer>()
+        if (!replace) cached().forEach { merged[it.host + ":" + it.port] = it }
+        servers.forEach { merged[it.host + ":" + it.port] = it }
+        val list = merged.values.toList()
+        memory = list
+        runCatching {
+            val array = com.prism.core.json.JSONArray()
+            list.forEach { s ->
+                array.put(JSONObject().put("host", s.host).put("port", s.port)
+                    .put("models", com.prism.core.json.JSONArray().also { a -> s.models.forEach { a.put(it) } }))
+            }
+            com.prism.core.PrismPlatform.host.prefs(PREFS).edit().putString(KEY_SERVERS, array.toString()).apply()
+        }
+    }
+
+    /**
+     * Makes [model] on [host] the active text model: Prism's engine switches to Local Cloud and every
+     * text feature -- Sam, characters, podcasts, VideoCraft -- uses it. The same thing the Models page
+     * does when a model is chosen there, so the two pages can never disagree about which is active.
+     */
+    fun activate(host: String, port: Int, model: String) {
+        PrismSettings.clearSelectedP2pModel()
+        PrismSettings.setSelectedOllamaEndpoint(PrismSettings.OllamaEndpoint(host, port, model))
+        PrismSettings.setAiMode(PrismSettings.AI_MODE_LOCAL_CLOUD)
+    }
+
+    /**
+     * When Local Cloud is the engine but no model is chosen -- or the chosen one is no longer served --
+     * picks the first one [servers] offer and makes it active. Returns it, or null when nothing
+     * changed. This is what makes "the model shown first" actually the model in use: before, the
+     * Settings picker displayed the first model as selected without ever selecting it.
+     */
+    fun ensureDefault(servers: List<OllamaServer>): PrismSettings.OllamaEndpoint? {
+        if (PrismSettings.getAiMode() != PrismSettings.AI_MODE_LOCAL_CLOUD) return null
+        if (PrismSettings.getSelectedP2pModel() != null) return null
+        val selected = PrismSettings.getSelectedOllamaEndpoint()
+        val stillServed = selected != null && servers.any { it.host == selected.host && selected.model in it.models }
+        if (stillServed) return null
+        // A chosen server that simply did not answer this time keeps its choice: it may be asleep.
+        if (selected != null && servers.none { it.host == selected.host }) return null
+        val first = servers.firstOrNull { it.models.isNotEmpty() } ?: return null
+        activate(first.host, first.port, first.models.first())
+        return PrismSettings.getSelectedOllamaEndpoint()
+    }
+
     suspend fun scanReport(): ScanReport = withContext(Dispatchers.IO) {
         // A SERVER THE USER ALREADY PICKED IS PROBED FIRST, even when it sits outside every subnet
         // this device can see: it is a known answer, and re-listing it means a server on another
         // floor -- or one typed in by address -- does not vanish from the page between visits.
-        val known = PrismSettings.getSelectedOllamaEndpoint()?.host?.takeIf { it.isNotBlank() }
+        val selected = PrismSettings.getSelectedOllamaEndpoint()
+        val known = selected?.host?.takeIf { it.isNotBlank() }
         val found = LinkedHashMap<String, OllamaServer>()
+
+        // Every server any earlier probe found, on ITS port, with a patient timeout: these are
+        // known answers, and a slow /api/tags on a busy server must not drop one from the list.
+        val remembered = (cached().map { it.host to it.port } + listOfNotNull(selected?.let { it.host to it.port }))
+            .distinct()
+        remembered.map { (host, port) -> async { probe(host, port, patient = true) } }
+            .awaitAll().filterNotNull().forEach { found[it.host] = it }
 
         // LOOPBACK FIRST, and never only. A daemon installed beside Prism listens on 127.0.0.1,
         // which the subnet sweep below never reaches -- it sweeps 1..254 of a private subnet, and
@@ -64,13 +152,15 @@ object OllamaDiscoveryService {
         // Ollama and Prism on one machine reported no servers at all, which is the most common
         // arrangement there is.
         probe("127.0.0.1", OLLAMA_PORT)?.let { found[it.host] = it }
-        known?.let { host -> probe(host, OLLAMA_PORT)?.let { found[it.host] = it } }
+        if (known != null && selected != null && known !in found) {
+            probe(known, selected.port, patient = true)?.let { found[it.host] = it }
+        }
 
         val subnets = localSubnets()
         for (base in subnets) {
             // ONE REAL ANSWER IS ENOUGH. Sweeping a second /24 means 254 more sockets; on a network
             // that already answered there is nothing to learn from it, so the scan stays fast.
-            if (found.keys.any { it != "127.0.0.1" && it != known }) break
+            if (found.keys.any { it != "127.0.0.1" && it != known && remembered.none { r -> r.first == it } }) break
             val semaphore = Semaphore(CONCURRENCY)
             val hits = (1..254).map { host ->
                 async {
@@ -82,7 +172,12 @@ object OllamaDiscoveryService {
             hits.forEach { found[it.host] = it }
         }
 
-        ScanReport(found.values.toList(), subnets)
+        // A scan that found anything replaces the remembered list, so a server that has really gone
+        // stops appearing. One that found nothing at all keeps it: a Wi-Fi hiccup during a single
+        // scan should not erase every server the user has ever used.
+        val servers = found.values.toList()
+        if (servers.isNotEmpty()) remember(servers, replace = true)
+        ScanReport(servers, subnets)
     }
 
     /**
@@ -92,7 +187,7 @@ object OllamaDiscoveryService {
      * user knows and typed in.
      */
     suspend fun probeHost(host: String, port: Int = OLLAMA_PORT): OllamaServer? =
-        withContext(Dispatchers.IO) { probe(host, port) }
+        withContext(Dispatchers.IO) { probe(host, port, patient = true)?.also { remember(listOf(it), replace = false) } }
 
     /**
      * `192.168.1.42` or `192.168.1.42:11434` to a host and a port, or null when it is neither.
@@ -140,13 +235,15 @@ object OllamaDiscoveryService {
         return "${parts[0]}.${parts[1]}.${parts[2]}"
     }
 
-    private suspend fun probe(ip: String, port: Int): OllamaServer? {
-        return withTimeoutOrNull((CONNECT_TIMEOUT_MS + READ_TIMEOUT_MS).toLong()) {
+    private suspend fun probe(ip: String, port: Int, patient: Boolean = false): OllamaServer? {
+        val connect = if (patient) 3_000 else CONNECT_TIMEOUT_MS
+        val read = if (patient) 8_000 else READ_TIMEOUT_MS
+        return withTimeoutOrNull((connect + read).toLong()) {
             try {
                 val url = com.prism.core.Urls.of("http://$ip:$port/api/tags")
                 val conn = url.openConnection() as HttpURLConnection
-                conn.connectTimeout = CONNECT_TIMEOUT_MS
-                conn.readTimeout = READ_TIMEOUT_MS
+                conn.connectTimeout = connect
+                conn.readTimeout = read
                 conn.requestMethod = "GET"
 
                 if (conn.responseCode != 200) {

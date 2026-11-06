@@ -42,6 +42,9 @@ sealed interface PagePickChoice {
     data object EmailServer : PagePickChoice
     data object EmailClient : PagePickChoice
     data object AppStore : PagePickChoice
+    data object Podcasts : PagePickChoice
+    data object Journal : PagePickChoice
+    data object TimeMachine : PagePickChoice
     data object TaskManager : PagePickChoice
     data object Helper : PagePickChoice
     data object Vpn : PagePickChoice
@@ -203,6 +206,9 @@ class VerticalPageOptionsAdapter(
         add(Option("Email server", "Serve inbound mail, submission and IMAP, with a live dashboard", PagePickChoice.EmailServer))
         add(Option("Email", "Inbox, folders, filters, several accounts and text alerts", PagePickChoice.EmailClient))
         add(Option("App Store", "Mesh-gated apps, games, tools and your publisher listings", PagePickChoice.AppStore))
+        add(Option("Podcasts", "AI-made shows your characters host, researched from this week's news", PagePickChoice.Podcasts))
+        add(Option("Journal", "Dated diary entries, and the recipes kept beside them", PagePickChoice.Journal))
+        add(Option("Time Machine", "Snapshots of Prism and your installed apps, ready to restore", PagePickChoice.TimeMachine))
         add(Option("Task Manager", "Running tasks, their memory, and the files they hold open", PagePickChoice.TaskManager))
         add(Option("Helper", "Bills the mesh can pay toward — ask for part of one, or help someone else", PagePickChoice.Helper))
         add(Option("VPN", "Route through the fastest devices in a country, paid in PrismCoin", PagePickChoice.Vpn))

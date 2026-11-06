@@ -113,6 +113,18 @@ object VirtualAppDiagnostics {
         val previous = Thread.getDefaultUncaughtExceptionHandler()
 
         Thread.setDefaultUncaughtExceptionHandler { thread, error ->
+            // A guest's worker thread refused by Play services or the system for not being the uid
+            // it names: that thread ends, the app does not. See GuestLooperGuard for the main thread.
+            if (currentPackage != null && thread !== android.os.Looper.getMainLooper().thread &&
+                GuestLooperGuard.survivable(error)
+            ) {
+                PrismLogger.logWarning(
+                    TAG,
+                    "${currentPackage}'s thread '${thread.name}' was refused (${error.javaClass.simpleName}: " +
+                        "${error.message}); the app keeps running",
+                )
+                return@setDefaultUncaughtExceptionHandler
+            }
             val packageName = currentPackage
             if (packageName != null) {
                 runCatching {
@@ -148,6 +160,12 @@ object VirtualAppDiagnostics {
             }
         }.trim()
     }
+
+    /** Whether [packageName] recorded a crash after [time] (epoch millis). */
+    fun crashedSince(context: Context, packageName: String, time: Long): Boolean = runCatching {
+        val crash = file(context, packageName, CRASH_FILE)
+        crash.isFile && crash.lastModified() >= time
+    }.getOrDefault(false)
 
     /** Forgets the previous launch, so a report always describes the run that just failed. */
     fun clear(context: Context, packageName: String) {

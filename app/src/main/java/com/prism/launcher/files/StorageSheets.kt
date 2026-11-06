@@ -72,6 +72,9 @@ object StorageSheets {
         onOpen: () -> Unit,
         onChanged: () -> Unit,
         onDismiss: () -> Unit = {},
+        onCompress: (() -> Unit)? = null,
+        /** Set when the volume is compressed: the menu then offers to decompress it. */
+        onDecompress: (() -> Unit)? = null,
     ) {
         val sheet = Sheet(context, volume.displayName, "${volume.kind.title} · ${volume.capacityLine()}")
         // The file grid suppresses the tap that follows a long press until its menu is gone, so it
@@ -91,6 +94,22 @@ object StorageSheets {
             },
         )
         sheet.body.addView(sheet.divider())
+        if (onCompress != null && volume.isMounted) {
+            sheet.body.addView(
+                sheet.row("Compress drive…", "Save space: choose an algorithm, or keep it compressed automatically") {
+                    sheet.dismiss(); onCompress()
+                },
+            )
+            sheet.body.addView(sheet.divider())
+        }
+        if (onDecompress != null && volume.isMounted) {
+            sheet.body.addView(
+                sheet.row("Decompress drive", "Restore every file to its full size, in the background") {
+                    sheet.dismiss(); onDecompress()
+                },
+            )
+            sheet.body.addView(sheet.divider())
+        }
         sheet.body.addView(
             sheet.row("Format…", "File system, label and partition layout") {
                 sheet.dismiss(); showFormat(context, volume, onChanged)
